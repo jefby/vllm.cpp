@@ -78,14 +78,41 @@
 
 ### 3.3 OpenAI 服务器
 
-`examples/server/main.cpp` 直接拼装 C++ 引擎栈：
+`examples/server/main.cpp` 直接拼装 C++ 引擎栈，提供 **OpenAI 兼容 HTTP API**：
 
 ```text
 命令行参数
     → LoadChatTemplate / HfConfig / Tokenizer
     → LoadedEngine::FromModelDir() 构造 {LLMEngine | AsyncLLM}
     → api_server + serving_chat / serving_completion
-    → cpp-httplib 处理 /v1/completions、/v1/chat/completions、/metrics 等
+    → cpp-httplib 处理 HTTP 请求
+```
+
+已实现的端点：
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| POST | `/v1/completions` | 文本补全 |
+| POST | `/v1/chat/completions` | 聊天 + tools / reasoning / streaming |
+| GET  | `/v1/models` | 列出模型 |
+| GET  | `/health`、`/ping`、`/version` | 健康检查 |
+| GET  | `/metrics` | Prometheus 指标（vLLM 同名） |
+| POST | `/tokenize`、`/detokenize` | 分词/反分词 |
+| POST | `/reset_prefix_cache` | 重置前缀缓存 |
+| GET  | `/server_info` | 服务信息 |
+
+启动示例：
+
+```sh
+build/examples/server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
+```
+
+任意 OpenAI 客户端直接连接即可：
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+client.completions.create(model="Qwen3.6-27B", prompt="Hi", max_tokens=64)
 ```
 
 ---

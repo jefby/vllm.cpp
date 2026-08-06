@@ -65,7 +65,8 @@ PR_REFERENCE = re.compile(r"\(#\d+\)|#\d+")
 
 def git(*args: str) -> str:
     return subprocess.check_output(
-        ["git", *args], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ["git", *args], cwd=ROOT, text=True, encoding="utf-8",
+        errors="replace", stderr=subprocess.DEVNULL
     ).strip()
 
 

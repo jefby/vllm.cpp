@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -147,7 +148,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
     if role == "operator":
         path = lock_path()
         record = {"session": me, "claimed_at": time.time(), "heartbeat": time.time(),
-                  "host": os.uname().nodename, "pid": os.getpid()}
+                  "host": platform.node(), "pid": os.getpid()}
         try:
             # Create-exclusive: a second self-declared operator FAILS here rather
             # than racing on main, which is the whole point of the lock.

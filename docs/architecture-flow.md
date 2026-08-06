@@ -115,6 +115,8 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 client.completions.create(model="Qwen3.6-27B", prompt="Hi", max_tokens=64)
 ```
 
+> 完整 server 流程（启动、路由、/v1/completions、/v1/chat/completions、SSE、错误处理）见 [docs/server-flow.md](server-flow.md)。
+
 ---
 
 ## 4. 引擎核心执行流程

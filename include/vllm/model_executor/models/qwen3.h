@@ -162,6 +162,22 @@ class Qwen3DenseModel {
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
+
+  // POOLING forward (ARCH-ONE-SURFACE ROW 6): the same embed + layer stack,
+  // stopping after the final RMSNorm (+ the logits_indices gather) with NO
+  // lm_head — the forward of an as_embedding_model conversion
+  // (vllm/model_executor/models/adapters.py:135-151 replaces the output layer
+  // with a missing-layer stage; the pooler consumes the post-final-norm
+  // hidden). Returns a HOST ForwardLogits carrier of [n_out, hidden_size] f32
+  // rows (`vocab` == hidden_size on this path); the engine's pooling branch
+  // hands them to the landed PoolingRunner. Additive: no text caller routes
+  // here, and the lm_head tail above is byte-identical.
+  static ForwardLogits ForwardHidden(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
 };
 
 // SHARED pure-dense decode CUDA-graph driver — the sibling of Qwen3MoeDecodeGraph
@@ -220,12 +236,14 @@ class Qwen3DenseDecodeGraph {
   std::unique_ptr<Impl> impl_;
 };
 
-// Per-family opt-in for the shared dense decode CUDA-graph. Reads
-// VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH (DEFAULT OFF — the graph is a same-binary
-// opt-in until its per-model SACRED token-exact gate has been run on GB10; the
-// eager default path is then byte-identical to the pre-change forward), and honors
-// the framework kill switch VLLM_CPP_CUDAGRAPH=0. When false the dense factories'
-// forward is LITERALLY unchanged (never constructs or routes through a graph).
+// Per-family gate for the shared dense decode CUDA-graph. Reads
+// VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH (DEFAULT ON as of row QUANT-CT-MXFP4-MARLIN-STRUCT
+// step 1 — its per-model SACRED token-exact gate PASSED on GB10: paged-engine 184/184
+// + async 82/82 graph ON == OFF, and the Qwen3-8B-MXFP4 #44 smoke 3/3 token-exact +
+// coherent). An explicit =0 opts back out to eager (byte-identical to the pre-graph
+// forward); the framework kill switch VLLM_CPP_CUDAGRAPH=0 also forces eager inside
+// the driver. When false the dense factories' forward is LITERALLY unchanged (never
+// constructs or routes through a graph).
 bool DenseDecodeGraphEnabled();
 
 // SHARED routing helper used by all five dense factory forwards. When this step is

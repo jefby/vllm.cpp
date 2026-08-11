@@ -110,6 +110,16 @@ class CudaBackend final : public Backend {
   }
   bool UnifiedMemory() const override { return unified_memory_; }
 
+  // cuda_gdn.cu's conv kernels read/write a bf16 conv_state in place through f32
+  // registers (cuda_gdn.cu:2460). This states as a CAPABILITY what
+  // CheckConvCommon used to spell as `device == kCUDA`, so CUDA keeps EXACTLY
+  // the branch it took before.
+  bool SupportsCompressedConvState() const override { return true; }
+
+  // CheckGdnCommon's compressed-state clause used to name kCUDA directly; the
+  // capability query keeps CUDA on exactly the branch it took before.
+  bool SupportsCompressedGdnState() const override { return true; }
+
   // --- Async-output primitives (ENG-ASYNC-SCHED W3, async_utils.py:12-70) ------
   // Page-locked host memory the copy engine DMAs into without a staging bounce
   // (a pageable destination would force cudaMemcpyAsync to block), plus real
@@ -188,6 +198,9 @@ class CudaBackend final : public Backend {
   bool SupportsGraphCapture() const override { return true; }
   // S7: CUDA has a secondary stream for the MoE shared-expert overlap fork.
   bool SupportsAuxStream() const override { return true; }
+  // The sampled token id is device-mirrored (async_device_mirror()), so the
+  // between-steps host readback the depth-2 async input-combine needs is valid.
+  bool SupportsAsyncSampledTokenReadback() const override { return true; }
   void BeginCapture(Queue& q) override {
     Check(cudaStreamBeginCapture(AsStream(q), cudaStreamCaptureModeThreadLocal),
           "cudaStreamBeginCapture");

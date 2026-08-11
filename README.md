@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>Same tokens as vLLM. Same throughput. 140x less to install.</b><br>
-  <sub>Continuous batching, paged KV, 25+ architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
+  <sub>Continuous batching, paged KV, 37 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
 <p align="center">
@@ -26,12 +26,26 @@
 > used here only to name the upstream project this port mirrors and is measured against. See
 > [Trademarks](#trademarks).
 
+> **Why this exists:** [MANIFESTO.md](MANIFESTO.md).
+
 > ⚠️ **Under heavy development.** This project moves fast right now: internals, CLI flags, and
 > server behavior can change between commits, so expect breakage if you track `main`.
 > The one thing we keep disciplined is the **C ABI** in [`include/vllm.h`](include/vllm.h):
 > it is versioned (`VLLM_ABI_VERSION`, checkable at runtime with `vllm_abi_version()`), grows by
 > appending fields whose zero value keeps existing behavior byte-identical, and only bumps on an
 > incompatible change. If you embed us, embed through that header.
+
+## News
+
+- **2026-08** **v0.0.2 ships eight server archives.** Download CPU, CUDA, Vulkan, Metal, and MLX
+  builds from [GitHub Releases](https://github.com/mudler/vllm.cpp/releases/tag/v0.0.2).
+- **2026-08** **MiniMax-H3 generates video with audio.** All tasks run through `POST /v1/videos`;
+  use Q4_K_M.
+- **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
+  matches the vLLM oracle token for token, and decodes **45.45 vs 41.94 tok/s**.
+- **2026-08** **Vulkan matches llama.cpp on a 27B.** `opt-125m` greedy is STRICT token-exact;
+  Qwen3.6-27B decodes **4.36 vs llama.cpp Vulkan 4.35 tok/s** on GB10, up from 2.40 at the start of
+  the campaign. A narrow pass: the 0.69% leg spread is the noise floor. Prefill **21.5x**.
 
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
@@ -45,9 +59,8 @@ scheduling ideas (RadixAttention, LPM cache-aware admission, jump-forward decodi
 ABI, GGUF straight off the shelf, and compute directly on the quantized blocks). MLX's GEMM where it
 wins on Apple Silicon. Safetensors and GGUF, CUDA and CPU and Metal and Vulkan, from one source tree.
 
-What keeps that honest is the oracle. Every architecture is gated **token-for-token against vLLM
-itself** on the same workload, so "grounded in vLLM" is a test result rather than a design claim, and
-speed is only ever quoted against a reference measured in its own production config.
+Every architecture is gated **token-for-token against vLLM** on the same workload. Speed claims use
+the reference engine's production configuration.
 
 ![vllm.cpp vs vLLM on Qwen3.6-27B: identical output at every concurrency](benchmarks/media/concurrency_race.gif)
 
@@ -65,12 +78,9 @@ Where that stands today:
   band; the other five, 0.7% to 1.7%, are ties. Also **1.18x llama.cpp's prefill** on the same
   GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
   correct but speed-pending, and each one says so.
-- **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
+- **Everything.** 37 registered architectures, 36 tool-parser families, structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
-- **Grounded.** Every architecture is **gated token-for-token against a pinned vLLM oracle**, and
-  where vLLM's own greedy decode is non-deterministic at bf16 near-ties, the gate says so instead of
-  quietly loosening.
 
 ## Performance
 
@@ -84,17 +94,19 @@ point on this curve:
 | vLLM (tok/s) | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
 
-We are ahead at all six, but the margins in the middle are thin. Our run-to-run noise band is 0.5%,
-and c2 through c32 land between 0.7% and 1.7%, so treat those as ties. Only c1, at 4.5%, is clearly
-outside the noise. The tokens come out identical either way, and the install is 66 MiB against
+We are ahead at all six, but only c1 at 4.5% is clearly outside our 0.5% run-to-run noise band, so
+treat c2 through c32 as ties. The tokens are identical either way, and the install is 66 MiB against
 9.1 GiB.
 
-Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, with no Python stack behind
-it:
+Cold start to first `/health`: **36.5 s vs vLLM's 221.5 s (6.1x)**, provisional
+([detail](.agents/benchmark-record.md)).
+
+Peak host memory is a clean win at **24.88 GiB vs vLLM's 28.18 GiB**, with no Python stack behind it:
 
 ![What you install: a 9.1 GiB venv, or one 66 MiB binary](benchmarks/media/footprint.png)
 
 And we hold every other engine to the same treatment: same model, same workload, same box.
+
 
 ### vs llama.cpp, on CPU, from the same GGUF file
 
@@ -104,10 +116,10 @@ And we hold every other engine to the same treatment: same model, same workload,
 | decode | 24.7 tok/s | 25.4 | 0.97x (tie) |
 | peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
 
-Decode lands inside llama.cpp's own run-to-run spread, so that row is a tie, and the memory difference
-is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap, and it goes our way. The
-tokens are **byte-identical to llama.cpp's greedy decode**. Single-stream only: we have not measured
-concurrent serving against llama.cpp's server.
+Decode lands inside llama.cpp's own run-to-run spread, so that row is a tie, and the memory gap is
+30 MiB on a 2.8 GiB working set. Prefill is the only real gap, and it goes our way. The tokens are
+**byte-identical to llama.cpp's greedy decode**. Single-stream only: we have not measured concurrent
+serving against llama.cpp's server.
 
 ### vs MLX-LM, on Apple M4, warm b=1
 
@@ -139,7 +151,7 @@ numbers by [`benchmarks/demo/`](benchmarks/demo/), which reads its values from a
 every figure traces back to the run that produced it.
 
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
-> vLLM oracle across 25+ architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
+> vLLM oracle across 27 gated architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
 > sm_121a) plus a CPU path that matches or beats llama.cpp on GGUF. Every capability is labelled
 > honestly in [docs/STATUS.md](docs/STATUS.md): *correctness-complete*, *speed-pending*,
 > *build-only*, or *hardware-blocked*.
@@ -174,8 +186,8 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), 19 symbols) you can `dlopen` from C, C++, Go, or Rust. No
-  Python interpreter in the process, ever.
+  ([`include/vllm.h`](include/vllm.h), ABI v17, 35 functions) for C, C++, Go, or Rust. No Python
+  interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16
   expansion. Byte-identical greedy output to llama.cpp.
@@ -183,9 +195,8 @@ you get on top, most of it borrowed from whichever engine does it best:
   scheduling, jump-forward decoding, and custom logits processors, opt-in from the library, the C
   ABI, or server flags. Each defaults to today's behavior, so an engine that sets none of them is
   byte-identical to one built without them ([docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md)).
-- **Runs on hardware people actually have.** CUDA, CPU, Metal, and Vulkan from one source tree, with
-  an MLX GEMM provider on Apple Silicon and an Arm i8mm quant-GEMM tier. No datacenter assumption
-  baked in.
+- **Runs on hardware people actually have.** CUDA, CPU, Metal, and Vulkan ship from one tree. ROCm
+  and Tenstorrent are growing; Apple MLX and Arm i8mm providers cover their useful shapes.
 - **Speculative decoding beyond ngram.** MTP, block-diffusion DFlash, and draft-free ngram, through
   the same `--speculative-config` JSON vLLM takes
   ([docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md)).
@@ -205,7 +216,7 @@ you get on top, most of it borrowed from whichever engine does it best:
   sample logprobs.
 - **Structured output.** JSON schema, JSON object, regex, choice, and GBNF grammar, enforced in the
   engine with a per-step logits bitmask.
-- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 9 reasoning
+- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 10 reasoning
   parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
 - **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
@@ -232,12 +243,13 @@ self-inconsistent at bf16 near-ties, the bar is a near-tie-robust check. "Speed"
 
 **Gate models:** Qwen3.6-27B and Qwen3.6-35B-A3B (hybrid GDN + MoE, NVFP4), both token-exact, the
 27B at or above vLLM throughput on every axis. **Also running:** Llama-3.x, Mistral, Qwen3/Qwen2
-dense and MoE, DeepSeek-V2 and V4-Flash (MLA), GLM-4 and GLM-4.7-Flash, Gemma-1 through Gemma-4,
-Phi-1 through Phi-4, OLMo-2, Granite-3, StableLM, InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus
-Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
+dense and MoE, DeepSeek-V2 and V4-Flash (MLA), GLM-4 and GLM-4.7-Flash, Laguna-S/XS-2.1,
+Kimi-Linear-48B, Gemma-1 through Gemma-4, Phi-1 through Phi-4, OLMo-2, Granite-3, StableLM,
+InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus Qwen3-VL and Qwen3.6-27B vision (image + video)
+and Voxtral (audio).
 
 <details>
-<summary><b>The full architecture matrix</b> (26 rows, with per-model correctness and speed state)</summary>
+<summary><b>The full architecture matrix</b> (37 registered architectures grouped by family)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -248,9 +260,11 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 | Mistral dense | Mistral-7B-v0.3 | - | Token-exact | Speed-pending |
 | OPT | OPT-125m | - | Strict token-exact | Speed-pending |
 | DeepSeek-V2 (MLA) | DeepSeek-V2-Lite | - | Token-exact | Speed-pending |
-| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Device-resident decode ~15.87 tok/s (~96% of ds4) |
+| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Decode beats ds4 1.144x by default (byte-exact) |
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
-| GLM-4.7-Flash (MLA MoE) | GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
+| GLM-4.7-Flash (MLA MoE) | zai-org/GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
+| Laguna-S / Laguna-XS 2.1 (MoE) | poolside/Laguna-S-2.1-NVFP4 | NVFP4 + Q4_K | Near-tie (byte-exact) | vLLM parity+ 1.03x by default |
+| Kimi-Linear-48B-A3B (KDA + MLA + MoE) | Kimi-Linear-48B-A3B | - | Near-tie (106/128) | 1.59 tok/s, default off |
 | Gemma-3 / Gemma-2 / Gemma-1 dense | gemma-3-1b-it, gemma-2-2b-it, gemma-2b | - | Token-exact (48/48 each) | Speed-pending |
 | Gemma-4 text (Gemma4ForConditionalGeneration) | unsloth/gemma-4-E4B-it | - | Strict token-exact 32/32 (text path) | Speed-pending |
 | OLMo-2 dense | OLMo-2-0425-1B | - | Token-exact (near-tie-robust) | Speed-pending |
@@ -267,11 +281,21 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 | Qwen3-VL (image + video) | Qwen3-VL-4B-Instruct | - | Strict token-exact 32/32 (image) | Speed-pending |
 | Qwen3.6-27B vision (image + video) | Qwen3.6-27B | - | Strict token-exact 32/32 | Speed-pending |
 | Voxtral (audio) | Voxtral-Mini-3B-2507 | - | Near-tie-robust (decoder 48/48 exact) | Speed-pending |
+| **MiniMax-H3 (video + audio GENERATION)** | MiniMaxAI/MiniMax-H3 | Q4_K_M / NVFP4 | Renders 864x480 / 124f with audio | **34.6 s/step, one Jetson Thor** |
+
+**Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3 renders end to
+end: prompt -> Qwen3-VL-32B encoder -> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE
+-> MP4 with a stereo track. The project's first DIFFUSION architecture (no KV cache, no
+sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning modes and
+`POST /v1/videos`. Use **Q4_K_M**. Detail: [docs/STATUS.md](docs/STATUS.md).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
-sliding-window attention are gated feature-positive. Family-by-family detail, including what is
-hardware-blocked and why: [docs/STATUS.md](docs/STATUS.md).
+sliding-window attention are gated feature-positive. The authoritative per-architecture list, bound
+to the C++ registry (all 37 registered architectures with their tested checkpoint and gate, plus the
+standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
+[docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
+hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 
 </details>
 
@@ -280,11 +304,13 @@ hardware-blocked and why: [docs/STATUS.md](docs/STATUS.md).
 | Backend | Hardware | State |
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
-| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, compiles to real machine code, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
+| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 to sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
-| **Vulkan** | Portable GPU | Skeleton: 8 ops plus the fusion catalogue cross-check against CPU and CUDA. No model runs yet |
-| **Intel XPU / ROCm / ANE** | Intel, AMD, Apple Neural Engine | Spiked or roadmap |
+| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35). Op coverage: [docs/STATUS.md](docs/STATUS.md) |
+| **ROCm** | AMD GPUs | W0 skeleton, gfx1201/2xR9700 contrib-run ([#140](https://github.com/mudler/vllm.cpp/pull/140)); no board: [detail](docs/ROCM.md) |
+| **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
+| **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
 Per-arch build flags, per-op coverage, and the quantization format table:
 [docs/BUILD.md](docs/BUILD.md).
@@ -300,14 +326,14 @@ ctest --test-dir build
 ```
 
 ```sh
-cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON   # NVIDIA GB10
+cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON   # NVIDIA GB10
 cmake --build build-cuda -j
 ```
 
 Triton-AOT cubins for the fast GDN path are vendored, so Python and Triton are needed only to
-regenerate them, never to build or run them. Metal is auto-detected on Apple hosts; Vulkan is opt-in
-with `-DVLLM_CPP_VULKAN=ON`. Every CMake option, per-backend recipe, and the quantization format
-table: [docs/BUILD.md](docs/BUILD.md).
+regenerate them, never to build or run them; a CUDA build ships them. Metal is auto-detected on
+Apple hosts; Vulkan is opt-in with `-DVLLM_CPP_VULKAN=ON`. Every CMake option, per-backend recipe,
+and the quantization format table: [docs/BUILD.md](docs/BUILD.md).
 
 ## Running inference (CLI)
 
@@ -317,6 +343,23 @@ build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt "The capital of Fr
 
 `vllm-bench` (throughput/latency harness) and `tokenize` (tokenizer smoke tool) ship alongside it.
 All flags, including `--speculative-config`: [docs/USAGE.md](docs/USAGE.md).
+
+### Multimodal INPUT and video GENERATION
+
+Multimodal INPUT goes through `/v1/chat/completions` content parts (`image_url`,
+`video_url`, `input_audio`). Video GENERATION:
+
+```sh
+build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \
+  --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
+  --video-vae video_vae.safetensors --audio-vae audio_vae.safetensors \
+  --prompt "A golden retriever runs across a sunlit beach" \
+  --frames 124 --height 480 --width 864 --steps 50 --device cuda --out out.mp4
+```
+
+Weights: [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs)
+(DiT + encoder) and [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (VAEs,
+tokenizer). For SPEECH put the spoken line in the prompt. Recipe: [docs/USAGE.md](docs/USAGE.md).
 
 ## OpenAI-compatible server
 
@@ -342,7 +385,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`, 19 exported symbols) suitable for `dlopen` / FFI.
+llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`, 35 exported functions) suitable for `dlopen` / FFI.
 
 ```c
 vllm_model_params mp = vllm_model_params_default();
@@ -389,21 +432,22 @@ the number stays in the README and the label says *speed-pending*.
 
 | Doc | What is in it |
 |---|---|
-| [docs/USAGE.md](docs/USAGE.md) | CLI, OpenAI server (endpoints + flags), C ABI, C++ API |
-| [docs/BUILD.md](docs/BUILD.md) | Build recipes per backend, every CMake option, hardware and quantization state |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The measured evidence: per-axis grids, memory, reproduction recipes |
-| [docs/FEATURES.md](docs/FEATURES.md) | Feature-by-feature comparison against vLLM, SGLang and llama.cpp |
-| [docs/STATUS.md](docs/STATUS.md) | Per-capability lifecycle ledger, active gaps, next gate |
-| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | The SGLang-inspired knobs, and when to turn them on |
+| [Contribute](CONTRIBUTING.md) | Agent contribution guide |
+| [docs/USAGE.md](docs/USAGE.md) | CLI, server endpoints/flags, C ABI and C++ API |
+| [docs/BUILD.md](docs/BUILD.md) | Backend recipes, CMake options, hardware and quantization |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured grids, memory and repro recipes |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature comparison: vLLM, SGLang and llama.cpp |
+| [docs/STATUS.md](docs/STATUS.md) | Capability lifecycle, gaps and next gate |
+| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | SGLang knobs and when to use them |
 | [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |
-| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | KV offload to CPU/disk, LMCache client, KV events |
+| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | CPU/disk KV offload, LMCache and events |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Runtime environment variables |
 
-The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md):
-the append-only [`.agents/state.md`](.agents/state.md), the
-[parity ledger](.agents/parity-ledger.md), and the [model matrix](.agents/model-matrix.md). The
-portfolio-completion plan is
-[`.agents/specs/roadmap-v1-completion.md`](.agents/specs/roadmap-v1-completion.md).
+The canonical project record is indexed by [AGENTS.md](AGENTS.md) and lives
+under [`.agents/`](.agents/). See [current state](.agents/NOW.md),
+[parity evidence](.agents/parity-ledger.md), the
+[model inventory](.agents/model-matrix.md), and the
+[portfolio roadmap](.agents/specs/roadmap-v1-completion.md).
 
 ## Credits, and what we borrow
 

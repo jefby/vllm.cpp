@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
@@ -59,6 +60,15 @@ OwnedTensor LoadModelBf16Direct(
            "qwen3_5 dense: expected BF16 or F32 for " + name);
   const std::vector<int64_t> shape =
       shape_override.empty() ? t.shape : shape_override;
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): ONLY the BF16 arm is verbatim. The F32
+  // arm below CONVERTS f32 -> bf16 and therefore can never borrow; the dtype
+  // test is what keeps the two apart, and BorrowStTensorBytes independently
+  // rejects the f32 source anyway (its span is twice the bf16 destination).
+  OwnedTensor borrowed;
+  if (t.dtype == "BF16" &&
+      BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, shape)) {
+    return borrowed;
+  }
   OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
   if (t.dtype == "BF16") {
     VT_CHECK(t.nbytes == o.bytes.size(),
@@ -132,6 +142,14 @@ void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
   (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
 }
 
+// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
+// divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
+// GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift.
+bool ModelOptW4A4OptIn() {
+  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
+  return w4a4 != nullptr && w4a4[0] == '1';
+}
+
 // One compressed-tensors NVFP4 W4A4 Linear -> RAW fp4-resident Nvfp4Weight kept
 // in the on-disk [N=out, K=in] orientation vt::MatmulNvfp4 reads directly (notes
 // §5 step-6a — the throughput path; NO bf16 materialization). Reads the CT
@@ -174,14 +192,215 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
            "qwen3_5 dense: zero input_global_scale (divisor) for " + proj);
   r.input_global_scale_inv = igs_disk;   // on-disk divisor, used directly
   r.alpha = r.scale2 * (1.0F / igs_disk);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): both payloads are verbatim.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "qwen3_5 dense: packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "qwen3_5 dense: scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
+  return r;
+}
+
+// --- lm_head dtype dispatch (issue #164) --------------------------------------
+// The 27B NVFP4 publishers do NOT agree on the OUTPUT HEAD, and the head is not
+// a compressed-tensors Linear, so none of the scheme probes above cover it:
+//
+//   BF16     `lm_head.weight` [V,H]                                (transpose)
+//   F8_E4M3  `lm_head.weight` [V,H] + `.weight_scale` [V,1] or []  (per-row/scalar)
+//   U8       `lm_head.weight` [V,H/2] + `.weight_scale` F8 [V,H/16]
+//                                     + `.weight_scale_2` f32       (ModelOpt NVFP4)
+//
+// This loader was written against `unsloth/Qwen3.6-27B-NVFP4` @890bdef7, which
+// ships a BF16 head — the snapshot every recorded 27B-NVFP4 benchmark ran on, so
+// those numbers are unaffected by this change. @ccdaab7e later re-quantized the
+// head to FP8 with a PER-OUTPUT-CHANNEL scale, and nvidia/Qwen3.6-27B-NVFP4 ships
+// a ModelOpt NVFP4 head; both hit the old unconditional BF16 assert.
+//
+// BF16 and FP8 heads land on the SAME bf16 [in, out] Matmul-B operand the logits
+// GEMM already consumes, so a BF16 head stays byte-exact. The NVFP4 form no
+// longer reaches this function: LoadDenseLmHead routes it to the PACKED
+// `lm_head_fp4` (PERF-27B-LMHEAD-FP4, issue #213), and the U8 branch below
+// survives ONLY as the VT_LMHEAD_FP4=0 in-binary rollback.
+//
+// ModelOpt vs compressed-tensors global-scale convention: CT stores the value as
+// a DIVISOR and `DequantCtNvfp4WeightToF32` reciprocates it internally, whereas
+// ModelOpt's `weight_scale_2` IS the scale (qwen3_5_weights.cpp:272 assigns it to
+// `scale2` directly). Passing `1/weight_scale_2` as the "disk divisor" makes the
+// shared CT dequant compute the ModelOpt scale exactly.
+}  // namespace
+
+OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get, const TensorExists& has,
+                               const std::string& name) {
+  const StTensor& w = get(name);
+  VT_CHECK(w.shape.size() == 2, "qwen3_5 dense: expected 2-D weight for " + name);
+
+  if (w.dtype == "BF16") {
+    return LoadBf16Transposed(get, name);  // unchanged byte-for-byte
+  }
+
+  if (w.dtype == "F8_E4M3") {
+    const int64_t out_dim = w.shape[0];
+    const int64_t in_dim = w.shape[1];
+    // Per-output-channel [V,1] (unsloth @ccdaab7e) or a single per-tensor scalar.
+    // Stored BF16 there, F32 elsewhere; normalize both to f32 rows.
+    std::vector<float> row_scale(static_cast<size_t>(out_dim), 1.0F);
+    VT_CHECK(has(name + "_scale"),
+             "qwen3_5 dense: FP8 " + name + " requires " + name + "_scale");
+    const StTensor& sc = get(name + "_scale");
+    const int64_t n_scale =
+        static_cast<int64_t>(sc.nbytes) / (sc.dtype == "BF16" ? 2 : 4);
+    VT_CHECK(n_scale == out_dim || n_scale == 1,
+             "qwen3_5 dense: " + name + "_scale must be per-tensor or [out,1]");
+    for (int64_t r = 0; r < out_dim; ++r) {
+      const int64_t i = (n_scale == 1) ? 0 : r;
+      if (sc.dtype == "BF16") {
+        uint16_t h = 0;
+        std::memcpy(&h, static_cast<const uint8_t*>(sc.data) + i * 2, 2);
+        const uint32_t bits = static_cast<uint32_t>(h) << 16;
+        std::memcpy(&row_scale[static_cast<size_t>(r)], &bits, sizeof(float));
+      } else {
+        std::memcpy(&row_scale[static_cast<size_t>(r)],
+                    static_cast<const uint8_t*>(sc.data) + i * 4, sizeof(float));
+      }
+    }
+    std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
+    for (int64_t r = 0; r < out_dim; ++r) {
+      DequantFp8ToBf16(static_cast<const uint8_t*>(w.data) + r * in_dim,
+                       row_scale[static_cast<size_t>(r)], in_dim,
+                       dq.data() + static_cast<size_t>(r) * in_dim);
+    }
+    MaybeReleaseSourcePages(w.data, w.nbytes);
+    OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
+    dense_loaders::TransposeBf16(dq.data(), out_dim, in_dim,
+                                 reinterpret_cast<uint16_t*>(o.bytes.data()));
+    return o;
+  }
+
+  if (w.dtype == "U8") {
+    const int64_t out_dim = w.shape[0];
+    const int64_t in_dim = w.shape[1] * 2;
+    VT_CHECK(in_dim % 16 == 0,
+             "qwen3_5 dense: NVFP4 in_dim must be a multiple of 16 for " + name);
+    const StTensor& ws = get(name + "_scale");
+    VT_CHECK(ws.dtype == "F8_E4M3",
+             "qwen3_5 dense: expected F8_E4M3 " + name + "_scale");
+    // ModelOpt spells the global scale `weight_scale_2`; compressed-tensors
+    // spells it `weight_global_scale` and stores the reciprocal.
+    float disk_divisor = 0.0F;
+    if (has(name + "_scale_2")) {
+      const float ws2 = ReadF32Scalar(get(name + "_scale_2"));
+      VT_CHECK(ws2 != 0.0F, "qwen3_5 dense: zero " + name + "_scale_2");
+      disk_divisor = 1.0F / ws2;  // ModelOpt scale -> CT divisor convention
+    } else {
+      VT_CHECK(has(name + "_global_scale"),
+               "qwen3_5 dense: NVFP4 " + name + " requires " + name +
+                   "_scale_2 (ModelOpt) or " + name + "_global_scale (CT)");
+      disk_divisor = ReadF32Scalar(get(name + "_global_scale"));
+      VT_CHECK(disk_divisor != 0.0F,
+               "qwen3_5 dense: zero " + name + "_global_scale (divisor)");
+    }
+    std::vector<float> f32(static_cast<size_t>(out_dim) * in_dim);
+    DequantCtNvfp4WeightToF32(static_cast<const uint8_t*>(w.data),
+                              static_cast<const uint8_t*>(ws.data), disk_divisor,
+                              out_dim, in_dim, f32.data());
+    MaybeReleaseSourcePages(w.data, w.nbytes);
+    std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
+    for (size_t i = 0; i < f32.size(); ++i) {
+      uint32_t bits = 0;
+      std::memcpy(&bits, &f32[i], sizeof(bits));
+      // round-to-nearest-even f32 -> bf16, matching DequantFp8ToBf16.
+      const uint32_t lsb = (bits >> 16) & 1U;
+      bits += 0x7FFFU + lsb;
+      dq[i] = static_cast<uint16_t>(bits >> 16);
+    }
+    OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
+    dense_loaders::TransposeBf16(dq.data(), out_dim, in_dim,
+                                 reinterpret_cast<uint16_t*>(o.bytes.data()));
+    return o;
+  }
+
+  VT_CHECK(false, "qwen3_5 dense: unsupported dtype '" + w.dtype + "' for " +
+                      name + "; supported: BF16, F8_E4M3 (+_scale), "
+                      "U8 NVFP4 (+_scale and _scale_2/_global_scale)");
+  return OwnedTensor{};
+}
+
+namespace {
+
+// compressed-tensors and ModelOpt both ship NVFP4, with different names AND a
+// different global-scale convention:
+//
+//   compressed-tensors  <proj>.weight_packed U8 + .weight_scale F8
+//                       + .weight_global_scale F32 (a DIVISOR)
+//   ModelOpt            <proj>.weight        U8 + .weight_scale F8
+//                       + .weight_scale_2    F32 (the SCALE itself)
+//
+// nvidia/Qwen3.6-27B-NVFP4 is ModelOpt, so every `has(<proj>.weight_packed)`
+// probe missed it and the whole tower fell through to the BF16 path and died at
+// the first U8 tensor. LoadCtNvfp4Raw already reciprocates internally, so the
+// ModelOpt scale is passed through as 1/weight_scale_2 to land on the same math
+// (identical to the lm_head conversion in LoadLmHeadAnyDtype).
+bool IsNvfp4Projection(const TensorExists& has, const std::string& proj) {
+  return has(proj + ".weight_packed") || has(proj + ".weight_scale_2");
+}
+
+Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& has,
+                               const std::string& proj) {
+  if (has(proj + ".weight_packed")) return LoadCtNvfp4Raw(get, proj);
+
+  const StTensor& packed = get(proj + ".weight");
+  VT_CHECK(packed.dtype == "U8",
+           "qwen3_5 dense: expected U8 ModelOpt weight for " + proj);
+  VT_CHECK(packed.shape.size() == 2,
+           "qwen3_5 dense: expected 2-D ModelOpt weight for " + proj);
+  const int64_t out_dim = packed.shape[0];
+  const int64_t in_dim = packed.shape[1] * 2;
+  VT_CHECK(in_dim % 16 == 0,
+           "qwen3_5 dense: NVFP4 in_dim must be a multiple of 16 for " + proj);
+  const StTensor& ws = get(proj + ".weight_scale");
+  VT_CHECK(ws.dtype == "F8_E4M3",
+           "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
+  const float ws2 = ReadF32Scalar(get(proj + ".weight_scale_2"));
+  VT_CHECK(ws2 != 0.0F, "qwen3_5 dense: zero weight_scale_2 for " + proj);
+
+  Nvfp4Weight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.scale2 = ws2;                       // ModelOpt stores the scale directly
+  r.weight_global_scale_inv = 1.0F / ws2;  // the CT-convention divisor
+  // W4A16 unless the checkpoint also carries an activation scale. ModelOpt
+  // spells it `input_scale`; leaving alpha at 0 keeps IsTrueW4A4() false so the
+  // weight routes to the W4A16 dispatcher, matching vLLM's use_a16 branch.
+  // A/B(VT_MODELOPT_W4A4=1): default W4A16. ModelOpt ships `input_scale` on every
+  // projection, but consuming it flips IsTrueW4A4() and routes to the
+  // fp4-activation GEMM; leaving alpha at 0 keeps the weight-only dispatcher.
+  const bool w4a4_opt_in = ModelOptW4A4OptIn();
+  if (w4a4_opt_in && has(proj + ".input_scale")) {
+    const float is = ReadF32Scalar(get(proj + ".input_scale"));
+    if (is != 0.0F) {
+      r.input_global_scale_inv = is;
+      r.alpha = r.scale2 * (1.0F / is);
+    }
+  }
   r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
   VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "qwen3_5 dense: packed byte-size mismatch for " + proj);
+           "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
   std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
   MaybeReleaseSourcePages(packed.data, packed.nbytes);
   r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
   VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "qwen3_5 dense: scale byte-size mismatch for " + proj);
+           "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
   std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
   MaybeReleaseSourcePages(ws.data, ws.nbytes);
   return r;
@@ -198,14 +417,31 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   // order (the checkpoint's in_proj_qkv already stacks q|k|v; z appended) and
   // in_proj_ba in exact [b,a] row order. The rollback paths take non-owning
   // row slices of these owners, so the split fields deliberately stay empty.
-  g.in_proj_qkvz = LoadMergedBf16RawNK(
-      get, {la + "in_proj_qkv.weight", la + "in_proj_z.weight"});
+  // FP8 checkpoints (nvidia/Qwen3.6-27B-NVFP4 is `modelopt_mixed`) keep the GDN
+  // shards NATIVE. Merging forces one dtype, and dequantizing fp8 -> bf16 DOUBLES
+  // this tower's resident bytes (6.72 -> 13.44 GiB measured), which both slows
+  // decode and starves the KV pool. `ProjectGdnQkvz` already carries the
+  // separate-fp8 arm the 35B runs and selects it when the merged owner is empty.
+  const StTensor& qkv_probe = get(la + "in_proj_qkv.weight");
+  if (qkv_probe.dtype == "F8_E4M3") {
+    g.in_proj_qkv_fp8 = LoadFp8RawShared(get, la + "in_proj_qkv");
+    g.in_proj_z_fp8 = LoadFp8RawShared(get, la + "in_proj_z");
+  } else {
+    g.in_proj_qkvz = LoadMergedBf16RawNK(
+        get, {la + "in_proj_qkv.weight", la + "in_proj_z.weight"});
+  }
   g.in_proj_ba = LoadMergedBf16RawNK(
       get, {la + "in_proj_b.weight", la + "in_proj_a.weight"});
   // NVFP4 checkpoints use compressed tensors; ordinary checkpoints use raw
   // torch-Linear BF16 [N,K].
-  if (has(la + "out_proj.weight_packed")) {
-    g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
+  if (IsNvfp4Projection(has, la + "out_proj")) {
+    g.out_proj_fp4 = LoadNvfp4AnyNaming(get, has, la + "out_proj");
+  } else if (get(la + "out_proj.weight").dtype == "F8_E4M3") {
+    // Same rule as the in_proj shards above, and for the same measured reason:
+    // the bf16 arm dequantizes this tower and then runs it as a cuBLAS `gemvx`,
+    // which the decode profile shows costing far more than the bytes justify.
+    // `ProjectGdnOut` already selects `out_proj_fp8` when it is populated.
+    g.out_proj_fp8 = LoadFp8RawShared(get, la + "out_proj");
   } else {
     g.out_proj = LoadBf16RawNK(get, la + "out_proj.weight");
   }
@@ -226,17 +462,27 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
                                    const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
+  // Three forms, not two. `modelopt_mixed` checkpoints quantize this tower to
+  // FP8 W8A8 while leaving the MLP NVFP4, and a projection that matches neither
+  // the NVFP4 probe nor an FP8 dtype is genuinely BF16. Without the middle
+  // branch an FP8 tower fell through to `LoadBf16RawNK`, which dequantizes it:
+  // 1.562 GiB of FP8 became 3.12 GiB of BF16 re-read every decode step and
+  // executed as cuBLAS `gemvx`. The `*_fp8` slots and their `MatmulFp8Cutlass*`
+  // consumers already exist and are what the 35B runs.
   const auto load_projection = [&](const std::string& name, Nvfp4Weight& fp4,
-                                   OwnedTensor& plain) {
-    if (has(name + ".weight_packed"))
-      fp4 = LoadCtNvfp4Raw(get, name);
-    else
+                                   Fp8Weight& fp8, OwnedTensor& plain) {
+    if (IsNvfp4Projection(has, name)) {
+      fp4 = LoadNvfp4AnyNaming(get, has, name);
+    } else if (get(name + ".weight").dtype == "F8_E4M3") {
+      fp8 = LoadFp8RawShared(get, name);
+    } else {
       plain = LoadBf16RawNK(get, name + ".weight");
+    }
   };
-  load_projection(sa + "q_proj", a.q_proj_fp4, a.q_proj);
-  load_projection(sa + "k_proj", a.k_proj_fp4, a.k_proj);
-  load_projection(sa + "v_proj", a.v_proj_fp4, a.v_proj);
-  load_projection(sa + "o_proj", a.o_proj_fp4, a.o_proj);
+  load_projection(sa + "q_proj", a.q_proj_fp4, a.q_proj_fp8, a.q_proj);
+  load_projection(sa + "k_proj", a.k_proj_fp4, a.k_proj_fp8, a.k_proj);
+  load_projection(sa + "v_proj", a.v_proj_fp4, a.v_proj_fp8, a.v_proj);
+  load_projection(sa + "o_proj", a.o_proj_fp4, a.o_proj_fp8, a.o_proj);
   a.q_norm = LoadModelBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadModelBf16Direct(get, sa + "k_norm.weight");
   return a;
@@ -247,10 +493,10 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
                              const std::string& base) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights m;
-  if (has(mlp + "gate_proj.weight_packed")) {
-    m.gate_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "gate_proj");
-    m.up_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "up_proj");
-    m.down_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "down_proj");
+  if (IsNvfp4Projection(has, mlp + "gate_proj")) {
+    m.gate_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "gate_proj");
+    m.up_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "up_proj");
+    m.down_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "down_proj");
   } else {
     m.gate_up_proj = dense_loaders::LoadMergedBf16RawNK(
         get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
@@ -260,6 +506,51 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
 }
 
 }  // namespace
+
+bool DenseLmHeadFp4Enabled() {
+  const char* v = std::getenv("VT_LMHEAD_FP4");
+  return v == nullptr || v[0] != '0';
+}
+
+void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
+                     const std::string& proj, OwnedTensor& bf16_out,
+                     Nvfp4Weight& fp4_out) {
+  fp4_out = Nvfp4Weight{};
+  bf16_out = OwnedTensor{};
+  // PERF-27B-LMHEAD-FP4 (issue #213). An NVFP4 head stays PACKED, through the SAME
+  // LoadNvfp4AnyNaming every other NVFP4 projection takes, so the ModelOpt vs
+  // compressed-tensors global-scale convention is handled in exactly one place.
+  // vLLM's mixed scheme likewise resolves a quantized head (modelopt.py:2491-2496).
+  if (DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj)) {
+    fp4_out = LoadNvfp4AnyNaming(get, has, proj);
+    // The head is W4A16, whatever the naming. `LoadNvfp4AnyNaming` decides
+    // activation-quant per SPELLING — the ModelOpt arm ignores `input_scale`
+    // unless VT_MODELOPT_W4A4=1, but `LoadCtNvfp4Raw` consumes
+    // `input_global_scale` UNCONDITIONALLY, correct for a TOWER projection of the
+    // 27B compressed-tensors checkpoint, which really is W4A4. An output head is
+    // not one: vLLM resolves it through ModelOptNvFp4W4A16LinearMethod, which
+    // DELETES input_scale (modelopt.py:1365; registered at :1358) and pins
+    // MarlinNvFp4LinearKernel (modelopt.py:1249,1283-1284). A set alpha would (a)
+    // take the fp4-activation GEMM vLLM refuses here and (b) make
+    // PrepareLmHeadResident early-return, skipping the pre-capture Marlin build.
+    if (!ModelOptW4A4OptIn()) {
+      fp4_out.input_global_scale_inv = 0.0F;
+      fp4_out.alpha = 0.0F;
+    }
+    // The ONE weight that opts into a lifetime dequant-B resident where there is
+    // no fp4 GEMM (qwen3_5_weights.h): the head is re-read whole every step.
+    fp4_out.keep_dequant_b = true;
+    return;
+  }
+  bf16_out = LoadLmHeadAnyDtype(get, has, proj + ".weight");
+}
+
+bool DenseCheckpointHasLmHead(const TensorExists& has, const std::string& proj) {
+  // A bare `<proj>.weight` probe misses a compressed-tensors head, whose only
+  // weight tensor is `<proj>.weight_packed`; no head at all means
+  // `tie_word_embeddings`, so missing CT ties the logits to the embedding table.
+  return has(proj + ".weight") || IsNvfp4Projection(has, proj);
+}
 
 OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
                                 const std::vector<std::string>& names) {
@@ -394,8 +685,8 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
       LoadModelBf16Direct(get, "model.language_model.norm.weight");
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
   // the embedding table and omit lm_head.weight.
-  if (has("lm_head.weight")) {
-    w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
+  if (DenseCheckpointHasLmHead(has, "lm_head")) {
+    LoadDenseLmHead(get, has, "lm_head", w.lm_head, w.lm_head_fp4);
   } else {
     w.tied_lm_head = true;
     w.embed_tokens.nk = true;
@@ -414,6 +705,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 }
 
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
+  // A PACKED head (PERF-27B-LMHEAD-FP4) is not plain bf16: this staging path
+  // only knows how to stage OwnedTensors.
+  if (!weights.lm_head_fp4.Empty()) return false;
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
         !layer.mlp.down_proj_fp4.Empty()) {

@@ -103,6 +103,52 @@ inline bool FusedGateUpEnabled() {
   return on;
 }
 
+// VT_MARLIN_DENSE (default ON; VT_MARLIN_DENSE=0 opts back out to the MoE route):
+// route the E=1 dense NVFP4/MXFP4 projections through vLLM's OWN dense marlin GEMM
+// (vt::MarlinDenseGemm) instead of the single-expert MoE-marlin route. The dense
+// kernel is direct-A + tile-per-CTA with vLLM's dense fp32-C_tmp reduce, so at M<=8
+// it naturally runs the 48-CTA (sms-wide) grid the MoE path only reaches with the
+// VT_MARLIN_E1_PAR1 clamp — WITHOUT that clamp's par regrouping, which costs one bf16
+// ULP vs the oracle and flips a strict 32B token (row QUANT-CT-MXFP4-MARLIN-STRUCT /
+// #50 / #54). Same resident weights + workspace; the repack permute is vLLM's shared
+// marlin_permute for both dense and MoE. FLIPPED ON (row KERNEL-MARLIN-DENSE-EXEC):
+// the dense reduce IS vLLM's own numerics — the teacher-forced near-tie razor on the
+// 32B-NVFP4A16 SACRED gate scores max gap 0.000 nats (every dense token == vLLM's
+// teacher-forced argmax, TIGHTER than the MoE route's 62 mnats), and the c8 decode
+// marlin runs the 48-CTA grid at ~86us/call vs the MoE route's 128-CTA ~118us/call.
+// The MoE route's greedy anchor (our_ids) shifts at two exact bf16 ties, so the 32B
+// goldens were regenerated under dense-ON per the ratified-tie regen rule.
+// Fused shared-expert gate_up dense route (VT_MARLIN_DENSE_PAIR, default ON,
+// opt out with =0) — the sibling of MarlinDenseEnabled() for the ONE fused
+// gate_up sink, which was still taking the single-expert MoE-marlin route.
+// Shared-expert down-proj emits bf16 instead of f32 (VT_SHARED_DOWN_BF16,
+// default ON, opt out with =0). BIT-IDENTICAL: both consumers (SharedExpertGate
+// and MoeCombineGate) widen bf16 in-kernel, which is exact, and both re-round
+// through bf16 on store. Drops one CastF32 launch per layer per step.
+inline bool SharedDownBf16Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_SHARED_DOWN_BF16");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+inline bool MarlinDensePairEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MARLIN_DENSE_PAIR");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+inline bool MarlinDenseEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MARLIN_DENSE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
 // --- Execution counters (the "this path actually RAN" positive signal) ------
 // A passing correctness gate does NOT prove a new code path was exercised — a
 // mis-wired dispatch that silently fell back to the BF16 arm would also pass if
@@ -113,6 +159,7 @@ struct Nvfp4W4A16Stats {
   uint64_t marlin_gemms = 0;      // MatmulNvfp4MarlinD launches
   uint64_t fused_gate_up = 0;     // GateUpFusedMarlinD launches (one per MLP)
   uint64_t fallback_gemms = 0;    // naive vt::MatmulNvfp4 / CPU dequant launches
+  uint64_t dense_gemms = 0;       // vt::MarlinDenseGemm launches (VT_MARLIN_DENSE route)
 };
 
 inline Nvfp4W4A16Stats& MutableW4A16Stats() {
@@ -137,16 +184,30 @@ inline Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   if (!w.d_packed) {
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
+    // ENG-LOAD-DIRECT-UPLOAD (issue #150). `LoadCtNvfp4W4A16`/`LoadCtMxfp4W4A16`
+    // /`LoadCtNvfp4Raw` BORROW `packed` and `scale` from the safetensors mmap,
+    // so this is the one host->device move of those bytes and it must be
+    // accounted and followed by the same post-upload residency step every other
+    // qualifying weight gets. Publishing the allocation on the OwnedTensor is
+    // what lets `AdoptDeviceBytesAsHost` run at all (it keys on `d_dev`); the
+    // two handles share one control block, so the buffer is still freed exactly
+    // once, through the vt Backend.
+    vllm::load_stats::AddDeviceUpload(pb);
     d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
     Backend* bk = &d.b;
     w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    w.packed.d_dev = w.d_packed;
+    AdoptDeviceBytesAsHost(d.b, w.packed);
   }
   if (!w.d_scale) {
     const size_t sb = w.scale.bytes.size();
     void* p = d.b.Alloc(sb);
+    vllm::load_stats::AddDeviceUpload(sb);
     d.b.Copy(d.q, p, w.scale.bytes.data(), sb);
     Backend* bk = &d.b;
     w.d_scale = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    w.scale.d_dev = w.d_scale;
+    AdoptDeviceBytesAsHost(d.b, w.scale);
   }
   Nvfp4Dev r;
   r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
@@ -270,7 +331,20 @@ inline DenseAlignCache& DenseAlignFor(Dev d, int M) {
   auto it = cache.find(M);
   if (it != cache.end()) return it->second;
   DenseAlignCache c;
-  c.block = vt::cuda::MarlinMoeAlignBlockSizeSelect(M, 1, 1);
+  // c8 sliver (#46/#50): vLLM's DENSE marlin uses an 8-row tile for the a16
+  // path at prob_m<=8 (`m_block_size_8 = prob_m<=8 && a16`,
+  // csrc/libtorch_stable/quantization/marlin/marlin.cu:438) — NO padding. Our
+  // grouped single-expert MoE-align picks block_size_m=16 at M=8
+  // (MarlinMoeAlignBlockSizeSelect: 8*1/1/8 == 1.0 fails the `< 0.9` test at
+  // cuda_marlin_repack.cu:362), padding 8 dummy rows into a 16-row tile
+  // (m_block_size_8=false) and wasting ~half the tile — the reproducible
+  // ~0.33ms/step at c8. The m_block_size_8=true 8-row kernels are vendored
+  // (kernel_selector.h:3-8 nvfp4, :33-38 mxfp4) and the fp32 C_tmp reduce is
+  // handled (marlin_mm_moe.cu:363-364 map block=8 -> thread_m_blocks=1 +
+  // m_block_size_8=true). Force block=8 for the single-expert dense case at
+  // M<=8 to match vLLM's dense tile exactly; M>8 is unchanged (already matches
+  // vLLM, which drops m_block_size_8 above 8).
+  c.block = (M <= 8) ? 8 : vt::cuda::MarlinMoeAlignBlockSizeSelect(M, 1, 1);
   vt::cuda::MarlinMoeAlignSizes(M, 1, 1, c.block, &c.max_tok, &c.max_blk);
   c.sorted = d.b.Alloc(static_cast<size_t>(c.max_tok) * sizeof(int32_t));
   c.expert = d.b.Alloc(static_cast<size_t>(c.max_blk) * sizeof(int32_t));
@@ -289,8 +363,10 @@ inline DenseAlignCache& DenseAlignFor(Dev d, int M) {
   return cache.emplace(M, c).first->second;
 }
 
-// Shared zeroed reduction workspace for the dense Marlin GEMMs (sms*4 i32 locks,
-// mirror marlin_make_workspace_new). Memset to zero before each launch.
+// Shared reduction workspace for the dense Marlin GEMMs (sms*4 i32 locks, mirror
+// marlin_make_workspace_new). Zeroed ONCE at allocation; NOT re-zeroed per call
+// (see the self-reset invariant below), exactly as vLLM allocates it with
+// `torch.zeros` (marlin_utils.py:399-407) and reuses it across every call.
 inline void* DenseMarlinWorkspace(Dev d, int* out_sms) {
   static std::mutex mu;
   static void* ws = nullptr;
@@ -299,6 +375,17 @@ inline void* DenseMarlinWorkspace(Dev d, int* out_sms) {
   if (!ws) {
     sms = vt::cuda::MarlinDeviceSms(d.q.device.index);
     ws = d.b.Alloc(static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+    // Zero ONCE. The kernel self-resets its barrier locks: our launch pins
+    // use_atomic_add=false / use_fp32_reduce=true (cuda_moe_marlin.cu:141-142),
+    // so the ONLY reachable cross-CTA reduce is the fp32 barrier, whose LAST
+    // slice-block release re-zeroes the lock (marlin_template.h:2170
+    // `barrier_release(&locks[locks_off], last)` -> `lock[0]=0` at :204); the
+    // slice_count==1 case never touches locks at all (:2162). So every completed
+    // GEMM leaves the workspace back at 0 and re-zeroing before each of the ~120
+    // dense GEMMs/step is redundant host/launch work. (The non-self-clearing
+    // atomic-add path at :614 is unreachable under this pinned config; if that
+    // config ever flips, restore the per-call zero.)
+    d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
   }
   *out_sms = sms;
   return ws;
@@ -310,10 +397,33 @@ inline DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w,
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   MarlinDenseResident& mr = MarlinDenseResidentFor(&w);
   if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
-  void* ws = DenseMarlinWorkspace(d, &sms);
-  d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
+
+  // VT_MARLIN_DENSE (default OFF): route through vLLM's OWN dense marlin GEMM.
+  // Same resident (mr.w/mr.s/mr.g) + workspace; rank-2 operand views (the dense
+  // launcher wants [K/16, N*2] / [K/gs, N], not the MoE rank-3 [1, ...]); NO
+  // moe_align cache (direct-A). Byte-preserving vs the oracle (its own dense
+  // fp32-C_tmp reduce). Only when the op is realized for this device.
+  if (MarlinDenseEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    ++MutableW4A16Stats().dense_gemms;
+    DBuf outbf(d, DType::kBF16, {M, N});
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / w.group_size, N});
+    Tensor ggd = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+    Tensor wstd = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)};
+    dargs.group_size = static_cast<int>(w.group_size);
+    dargs.mxfp4 = w.is_mxfp4;
+    vt::MarlinDenseGemm(d.q, outbf.t(), x, wqd, scd, ggd, wstd, dargs);
+    if (out_dtype == DType::kBF16) return outbf;
+    DBuf out(d, DType::kF32, {M, N});
+    vt::CastF32(d.q, out.t(), outbf.t());
+    return out;
+  }
+
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   ++MutableW4A16Stats().marlin_gemms;
 
   // Marlin's output is bf16 (c_type=kBFloat16); an f32 result is the bf16 output
@@ -362,28 +472,21 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
   if (mr.ready) return;
   const int K = static_cast<int>(gw.k);
   const int N = static_cast<int>(gw.n);
+  const int gs = static_cast<int>(gw.group_size);  // 16 (nvfp4) or 32 (mxfp4)
   void* stream = d.q.handle;
   const size_t w_i32 = static_cast<size_t>(K / 16) * (static_cast<size_t>(2 * N) * 2);
-  const size_t s_b = static_cast<size_t>(K / 16) * (2 * N);
+  const size_t s_b = static_cast<size_t>(K / gs) * (2 * N);  // K/16 nvfp4, K/32 mxfp4
   const size_t pk_b = static_cast<size_t>(N) * (K / 2);   // one shard's packed bytes
-  const size_t sc_b = static_cast<size_t>(N) * (K / 16);  // one shard's scale bytes
+  const size_t sc_b = static_cast<size_t>(N) * (K / gs);  // one shard's scale bytes
   mr.w = d.b.Alloc(w_i32 * 4);
   mr.s = d.b.Alloc(s_b);
   mr.g = d.b.Alloc(sizeof(float));
   mr.n = gw.n;
   mr.k = gw.k;
-  // combined_scale_factor over BOTH shards (vLLM computes it over the MERGED
-  // gate_up scale tensor — marlin_utils_fp4.py:281-284 operates on the whole
-  // parameter, which for gate_up_proj is already the concatenation).
-  std::vector<const uint8_t*> bufs{
-      reinterpret_cast<const uint8_t*>(gw.scale.bytes.data()),
-      reinterpret_cast<const uint8_t*>(uw.scale.bytes.data())};
-  std::vector<size_t> lens{gw.scale.bytes.size(), uw.scale.bytes.size()};
-  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
   Nvfp4Dev dg = ResidentNvfp4(d, gw);
   Nvfp4Dev du = ResidentNvfp4(d, uw);
-  // Flat row-stack concat (packed [N,K/2] u8 / scales [N,K/16] fp8 are row-major
-  // over N; gate rows FIRST — vLLM's merged shard order, qwen3.py:271-274
+  // Flat row-stack concat (packed [N,K/2] u8 / scales [N,K/gs] are row-major over
+  // N; gate rows FIRST — vLLM's merged shard order, qwen3.py:271-274
   // `gate_up_proj: [gate_proj, up_proj]`).
   auto* tmp_w = static_cast<uint8_t*>(d.b.Alloc(2 * pk_b));
   auto* tmp_s = static_cast<uint8_t*>(d.b.Alloc(2 * sc_b));
@@ -393,13 +496,33 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
   d.b.Copy(d.q, tmp_s + sc_b, du.scale.data, sc_b);
   vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index,
                                      static_cast<uint32_t*>(mr.w), tmp_w, K, 2 * N);
-  vt::cuda::MarlinProcessExpertScales(stream, tmp_s, static_cast<uint8_t*>(mr.s), K,
-                                      2 * N, sf);
-  // ONE global scale for both shards (vLLM's merged parameter has exactly one
-  // weight_global_scale — it takes `.max()` across the shards at
-  // compressed_tensors_w4a4_nvfp4.py:111-114; equality is guarded by the caller).
-  const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(gw.scale2, sf);
-  d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  if (gw.is_mxfp4) {
+    // MXFP4: E8M0 passthrough permute over the MERGED 2N scales (no combined
+    // factor, no global — the kernel skips global for E8M0). Byte-identical PER
+    // SHARD to the split-path single-expert resident, because the E8M0 permute is
+    // row-local (each output column's scales depend only on its own group bytes),
+    // so [gate;up] stacked == the two residents concatenated.
+    vt::cuda::MarlinProcessExpertScalesMxfp4(stream, tmp_s,
+                                             static_cast<uint8_t*>(mr.s), K, 2 * N);
+    const float g = 1.0F;  // unused (kernel skips global for E8M0)
+    d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  } else {
+    // combined_scale_factor over BOTH shards (vLLM computes it over the MERGED
+    // gate_up scale tensor — marlin_utils_fp4.py:281-284 operates on the whole
+    // parameter, which for gate_up_proj is already the concatenation).
+    std::vector<const uint8_t*> bufs{
+        reinterpret_cast<const uint8_t*>(gw.scale.bytes.data()),
+        reinterpret_cast<const uint8_t*>(uw.scale.bytes.data())};
+    std::vector<size_t> lens{gw.scale.bytes.size(), uw.scale.bytes.size()};
+    const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+    vt::cuda::MarlinProcessExpertScales(stream, tmp_s, static_cast<uint8_t*>(mr.s),
+                                        K, 2 * N, sf);
+    // ONE global scale for both shards (vLLM's merged parameter has exactly one
+    // weight_global_scale — it takes `.max()` across the shards at
+    // compressed_tensors_w4a4_nvfp4.py:111-114; equality is guarded by the caller).
+    const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(gw.scale2, sf);
+    d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  }
   d.b.Synchronize(d.q);  // repack done -> safe to free staging + fp4 originals
   d.b.Free(tmp_w);
   d.b.Free(tmp_s);
@@ -413,12 +536,20 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
 // True when a gate/up pair takes the fused Marlin gate_up path. Must be checked
 // IDENTICALLY at every call site so exactly ONE resident layout is ever built.
 inline bool GateUpFusedEligible(const Nvfp4Weight& gw, const Nvfp4Weight& uw) {
-  // MXFP4 takes the SPLIT path (two W4A16 GEMMs + MoeSiluMul): the fused merged
-  // gate_up resident is an NVFP4-only optimization; forcing split keeps the
-  // MXFP4 lane correct without a fused mxf4 pair repack (still byte-correct).
+  // Both NVFP4 (group 16, combined scale + per-tensor global) or both MXFP4
+  // (group 32, E8M0 passthrough, NO global). The fused merged gate_up resident
+  // row-stacks the two shards ([gate;up] -> one [2N,K] operand). MXFP4 has NO
+  // cross-shard scale interaction — each group's E8M0 byte is passed through
+  // independently (MarlinProcessExpertScalesMxfp4), with no combined_scale_factor
+  // and no global — so the fused MXFP4 GEMM is byte-identical to the two split
+  // single-expert GEMMs (strictly SAFER than the NVFP4 case, which additionally
+  // needs scale2 equality because its combined factor spans both shards). The
+  // format/group must match (a MLP's gate and up always share both) and, for the
+  // NVFP4 arm, scale2 must be equal (trivially true for MXFP4: both 0).
   return FusedGateUpEnabled() && !gw.Empty() && !uw.Empty() && !gw.IsTrueW4A4() &&
-         !uw.IsTrueW4A4() && !gw.is_mxfp4 && !uw.is_mxfp4 && gw.n == uw.n &&
-         gw.k == uw.k && gw.scale2 == uw.scale2;
+         !uw.IsTrueW4A4() && gw.is_mxfp4 == uw.is_mxfp4 &&
+         gw.group_size == uw.group_size && gw.n == uw.n && gw.k == uw.k &&
+         gw.scale2 == uw.scale2;
 }
 
 // silu(x@gate.T) * (x@up.T) -> bf16 [M,N] via ONE fused Marlin gate_up GEMM.
@@ -427,25 +558,50 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   const int64_t M = x.shape[0], K = x.shape[1], N = gw.n;
   MarlinDensePairResident& mr = MarlinDensePairResidentFor(&gw);
   if (!mr.ready) BuildMarlinDensePairResident(d, gw, uw, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
-  void* ws = DenseMarlinWorkspace(d, &sms);
-  d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
+
+  // VT_MARLIN_DENSE (default OFF): fused gate_up over the 2N-concatenated operand
+  // via vLLM's OWN dense marlin GEMM. Same merged resident (mr.w/mr.s/mr.g), rank-2
+  // views, no moe_align; byte-preserving reduce. Only when the op is realized here.
+  if (MarlinDenseEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    ++MutableW4A16Stats().dense_gemms;
+    DBuf gud(d, DType::kBF16, {M, 2 * N});
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, 2 * N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / gw.group_size, 2 * N});
+    Tensor ggd = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+    Tensor wstd = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(2 * N),
+                              static_cast<int>(K)};
+    dargs.group_size = static_cast<int>(gw.group_size);
+    dargs.mxfp4 = gw.is_mxfp4;
+    vt::MarlinDenseGemm(d.q, gud.t(), x, wqd, scd, ggd, wstd, dargs);
+    DBuf actd(d, DType::kBF16, {M, N});
+    vt::SiluAndMul(d.q, actd.t(), gud.t());
+    return actd;
+  }
+
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   ++MutableW4A16Stats().fused_gate_up;
 
   DBuf gu(d, DType::kBF16, {M, 2 * N});
+  // Weight is always K/16-tiled (marlin interleave is group-independent); the
+  // SCALE grid rows are K/group_size (K/16 nvfp4, K/32 mxfp4).
   Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
-  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
+  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / gw.group_size, 2 * N});
   Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
   Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
   Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
   Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
   Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
   Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
-  vt::MoeGroupedGemmNvfp4Marlin(
-      d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
-      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
-                        static_cast<int>(K), false});
+  vt::MoeMarlinArgs margs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
+                          static_cast<int>(K), false};
+  margs.group_size = static_cast<int>(gw.group_size);
+  margs.mxfp4 = gw.is_mxfp4;
+  vt::MoeGroupedGemmNvfp4Marlin(d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert,
+                                numpad, topkw, margs);
   DBuf act(d, DType::kBF16, {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;

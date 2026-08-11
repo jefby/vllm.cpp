@@ -7,6 +7,7 @@
 #include "vllm/v1/worker/gpu/runner.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
+#include "vllm/v1/worker/gpu/spec_decode/dspark/speculator.h"  // SPEC-DSPARK W5 SampleDsparkBlockDrafts
 #include "vllm/v1/spec_decode/ngram_proposer.h"  // SPEC-NGRAM D3 NgramPropose
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
@@ -83,6 +85,22 @@ static bool GpuSampleEnabled() {
 // flag directly via set_async_input_combine.
 static bool AsyncRunnerEnvDefault() {
   return AsyncRunnerFlagIsOn(std::getenv("VT_ASYNC_RUNNER"));
+}
+
+// Async input-combine reads the sampled token id back on the host between
+// steps. Whether that read is VALID is a backend CAPABILITY, not a device name:
+// ask the backend (vt::Backend::SupportsAsyncSampledTokenReadback, backend.h),
+// which answers true for CPU (host and device memory are one allocation) and
+// CUDA (the sampled id is device-mirrored, async_device_mirror()), and false for
+// a DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) whose sample_tokens_async leg
+// host-dereferences a device Alloc — the root cause of the "!" tokens on the lab
+// R9700 (2026-08-07). An absent backend (device not built into this binary)
+// yields nullptr and therefore false, which also subsumes the old
+// #ifdef VLLM_CPP_CUDA guard. Keeping the question on the backend is what stops
+// this device-agnostic shared layer from naming a device (check-device-leakage).
+static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
+  const vt::Backend* backend = vt::TryGetBackend(queue.device.type);
+  return backend != nullptr && backend->SupportsAsyncSampledTokenReadback();
 }
 
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each
@@ -319,7 +337,15 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
-  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
+                         QueueSupportsAsyncInputCombine(queue_);
+  // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
+  // model's runner pools instead of sampling — build the PoolingRunner over
+  // the model-owned Pooler. Null for every text arch (byte-identical).
+  if (model_->registration().info.is_pooling_model &&
+      model_->pooler() != nullptr) {
+    pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
+  }
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -352,7 +378,15 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
-  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
+                         QueueSupportsAsyncInputCombine(queue_);
+  // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
+  // model's runner pools instead of sampling — build the PoolingRunner over
+  // the model-owned Pooler. Null for every text arch (byte-identical).
+  if (model_->registration().info.is_pooling_model &&
+      model_->pooler() != nullptr) {
+    pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
+  }
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -1111,7 +1145,19 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
-  const bool gather = LogitsGatherEnabled();
+  // SAMPLE-PROMPT-LOGPROBS: a request that asked for prompt logprobs needs an
+  // lm_head row at each of its prompt positions, not just at the one row the
+  // sampler consumes. The gather seam cannot express that: every model's
+  // gather-before-lm_head is guarded on `logits_indices.size() < T` — it is an
+  // optimization for "far fewer rows than tokens", and scoring a whole prompt
+  // is the opposite. So a step that owes prompt logits takes the full-logits
+  // path instead, which is the same shape upstream computes anyway
+  // (gpu_model_runner.py:5680-5682 runs compute_logits over the prompt slice).
+  //
+  // step.prompt_logprob_indices is EMPTY on every step where no request asked,
+  // and then this is exactly the expression it has always been.
+  const bool gather =
+      LogitsGatherEnabled() && step.prompt_logprob_indices.empty();
   const std::vector<int32_t> kNoGather;
   const std::vector<int32_t>& gather_li = gather ? step.logits_indices : kNoGather;
 
@@ -1345,6 +1391,135 @@ int GPUModelRunner::step_num_logits() const {
   return cu.empty() ? exec_state_.num_reqs : cu.back();
 }
 
+// collect_prompt_logprobs — 1:1 vllm/v1/worker/gpu_model_runner.py:5612-5719
+// (`_get_prompt_logprobs_dict`), minus the row selection, which prepare_inputs
+// did (see StepInputs::PromptLogprobRows). What is left is upstream's scoring
+// (:5688-5697), its slice-by-slice accumulation (:5698-5706) and its
+// emit-and-drop on the final chunk (:5665-5667, :5709-5712).
+void GPUModelRunner::collect_prompt_logprobs(
+    std::map<std::string, LogprobsTensors>& prompt_logprobs_dict) {
+  const std::vector<StepInputs::PromptLogprobRows>& rows =
+      exec_state_.step.prompt_logprob_rows;
+  // An in-progress entry can outlive its request: an ABORT mid-prompt drops the
+  // request from the input batch, and upstream frees the same state with the
+  // request object at :1199. Swept on every call, including the early return
+  // below, so a stale tensor cannot survive to the next request with that id.
+  if (!in_progress_prompt_logprobs_.empty()) drop_stale_prompt_logprobs();
+  if (rows.empty()) return;
+
+  const int64_t vocab = config_.vocab_size;
+  ForwardLogits& fl = exec_state_.logits;
+
+  for (const StepInputs::PromptLogprobRows& r : rows) {
+    // The accumulated tensor covers num_prompt_tokens - 1 positions: the first
+    // prompt token has no logprob because nothing precedes it (:5646-5651, and
+    // logprobs.py:162-167 which fills that leading None). Created on first
+    // sight and filled slice by slice across chunks.
+    auto [it, inserted] = in_progress_prompt_logprobs_.try_emplace(r.req_id);
+    if (inserted) {
+      // The height comes from the REQUEST, not from this chunk: prompt length
+      // less one. dst_start + num_rows reaches exactly that on the final chunk,
+      // and prepare_inputs tiles [0, num_prompt_tokens - 1) in order.
+      it->second.num_positions = prompt_logprob_positions(r.req_id);
+      it->second.num_tokens_per_position = r.num_prompt_logprobs + 1;
+      it->second.logprob_token_ids.assign(
+          static_cast<size_t>(it->second.num_positions) *
+              static_cast<size_t>(it->second.num_tokens_per_position),
+          0);
+      it->second.logprobs.assign(it->second.logprob_token_ids.size(), 0.0f);
+      it->second.selected_token_ranks.assign(
+          static_cast<size_t>(it->second.num_positions), 0);
+    }
+    LogprobsTensors& acc = it->second;
+
+    if (r.num_rows > 0) {
+      // The step that OWES rows took the full-logits path in execute_model, so
+      // there is one row per scheduled token and a prompt row is found by its
+      // token-stream index. This belongs HERE, at the slice, not at the top of
+      // the function: prepare_inputs deliberately keeps a final-chunk entry with
+      // num_rows == 0 on the exact-prefill edge (:5668-5673), and that entry
+      // contributes no gather index, so the step correctly kept the gathered
+      // lm_head and has num_reqs rows, not num_actual_tokens. Asserting on
+      // `rows` non-empty instead of on the slice threw whenever any OTHER
+      // request in the same step contributed more than one token — and VT_CHECK
+      // throws out of engine.step(), taking the whole batch down with it, not
+      // just the asking request. Regression: test_llm_engine §9(h).
+      VT_CHECK(fl.rows == exec_state_.num_actual_tokens,
+               "collect_prompt_logprobs: a step that scores prompt rows must "
+               "carry full logits");
+      // A request's prompt rows are the CONTIGUOUS run starting at its first
+      // scheduled token (prepare_inputs built them as query_start + [0,
+      // num_rows)), so this is one slice, on device or on host.
+      const int64_t first = exec_state_.step.prompt_logprob_indices
+                                [static_cast<size_t>(r.src_start)];
+      vt::Tensor view;
+      if (fl.on_device()) {
+        view = fl.device_tensor.Slice(0, first, first + r.num_rows);
+      } else {
+        view = vt::Tensor::Contiguous(
+            fl.host.data() +
+                static_cast<size_t>(first) * static_cast<size_t>(vocab),
+            vt::DType::kF32, queue_.device,
+            {static_cast<int64_t>(r.num_rows), vocab});
+      }
+
+      const LogprobsTensors chunk = sampler_.compute_prompt_logprobs(
+          queue_, view, r.num_prompt_logprobs, r.target_token_ids);
+
+      // Copy into slice(start_idx, start_idx + num_logits) of the accumulated
+      // tensor (:5698-5706).
+      const size_t width =
+          static_cast<size_t>(acc.num_tokens_per_position);
+      VT_CHECK(chunk.num_tokens_per_position == acc.num_tokens_per_position,
+               "collect_prompt_logprobs: chunk width must match the request's");
+      VT_CHECK(r.dst_start + r.num_rows <= acc.num_positions,
+               "collect_prompt_logprobs: chunk overruns the prompt tensor");
+      const size_t dst = static_cast<size_t>(r.dst_start) * width;
+      std::copy(chunk.logprob_token_ids.begin(), chunk.logprob_token_ids.end(),
+                acc.logprob_token_ids.begin() +
+                    static_cast<std::ptrdiff_t>(dst));
+      std::copy(chunk.logprobs.begin(), chunk.logprobs.end(),
+                acc.logprobs.begin() + static_cast<std::ptrdiff_t>(dst));
+      std::copy(chunk.selected_token_ranks.begin(),
+                chunk.selected_token_ranks.end(),
+                acc.selected_token_ranks.begin() +
+                    static_cast<std::ptrdiff_t>(r.dst_start));
+    }
+
+    if (r.final_chunk) {
+      // The prompt is fully scored: hand the tensor to the output and forget
+      // the request on BOTH sides (:5709-5712).
+      prompt_logprobs_dict[r.req_id] = std::move(acc);
+      in_progress_prompt_logprobs_.erase(it);
+      input_batch_.num_prompt_logprobs.erase(r.req_id);
+    }
+  }
+}
+
+// The height of a request's prompt-logprob tensor: num_prompt_tokens - 1
+// (gpu_model_runner.py:5648-5650). Read off the input batch, which is where the
+// request's prompt length lives for us.
+int GPUModelRunner::prompt_logprob_positions(const std::string& req_id) const {
+  const auto it = input_batch_.req_id_to_index.find(req_id);
+  VT_CHECK(it != input_batch_.req_id_to_index.end(),
+           "prompt_logprob_positions: request is not in the batch");
+  return input_batch_.num_prompt_tokens[static_cast<size_t>(it->second)] - 1;
+}
+
+// Drop in-progress prompt logprobs for requests the input batch no longer
+// carries — an abort mid-prompt. Upstream frees the same state with the request
+// object itself (gpu_model_runner.py:1199).
+void GPUModelRunner::drop_stale_prompt_logprobs() {
+  for (auto it = in_progress_prompt_logprobs_.begin();
+       it != in_progress_prompt_logprobs_.end();) {
+    if (input_batch_.num_prompt_logprobs.count(it->first) == 0) {
+      it = in_progress_prompt_logprobs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 // The SPEC-DECODE VERIFY half (SPEC-REJECTION I3). Ported from
 // gpu/model_runner.py:1069-1077 (the rejection_sampler call) +
 // rejection_sampler.py:111 (draft_sampled = input_ids[logits_indices]) +
@@ -1470,6 +1645,87 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
   return out;
 }
 
+// ARCH-ONE-SURFACE ROW 6: the pooling counterpart of sample_tokens. Mirror of
+// gpu/model_runner.py:1586-1607 (pool instead of sample) over the landed
+// PoolingRunner (pool/pooling_runner.py:29-42). The stashed forward result of
+// the pooling arch is the [rows, hidden] POST-FINAL-NORM HIDDEN (the model has
+// no lm_head — adapters.py:135-151), already gathered at logits_indices on the
+// default path, which for LAST pooling IS upstream's
+// `hidden_states[input_batch.logits_indices]` (pooling_runner.py:36).
+ModelRunnerOutput GPUModelRunner::pool_tokens() {
+  const int num_reqs = exec_state_.num_reqs;
+  const int64_t hidden = exec_state_.logits.vocab;  // == hidden_size here
+  ForwardLogits& fl = exec_state_.logits;
+  VT_CHECK(!fl.on_device(),
+           "pool_tokens: the pooling forward returns a HOST hidden carrier");
+
+  // One hidden row per request. Default (gather ON): the forward already
+  // gathered the per-request last-token rows. VT_LOGITS_GATHER=0: re-gather on
+  // host from the full [num_actual_tokens, hidden] rows, exactly as the text
+  // host path re-gathers logits.
+  std::vector<float> gathered;
+  const float* rows = nullptr;
+  if (fl.rows == num_reqs) {
+    rows = fl.host.data();
+  } else {
+    gathered.resize(static_cast<size_t>(num_reqs) * static_cast<size_t>(hidden));
+    for (int i = 0; i < num_reqs; ++i) {
+      const int row = exec_state_.step.logits_indices[static_cast<size_t>(i)];
+      std::memcpy(gathered.data() + static_cast<size_t>(i) *
+                                        static_cast<size_t>(hidden),
+                  fl.host.data() + static_cast<size_t>(row) *
+                                       static_cast<size_t>(hidden),
+                  static_cast<size_t>(hidden) * sizeof(float));
+    }
+    rows = gathered.data();
+  }
+  vt::Tensor hidden_rows = vt::Tensor::Contiguous(
+      const_cast<float*>(rows), vt::DType::kF32, vt::Device{vt::DeviceType::kCPU, 0},
+      {static_cast<int64_t>(num_reqs), hidden});
+
+  // PoolingMetadata over the GATHERED buffer: one row per sequence (first ==
+  // last == i), task embed, activation ON — the unconditional L2 normalize of
+  // pooling_runner.py:38 (a per-request use_activation knob is the matryoshka/
+  // dimensions residual, named in the row spec).
+  vllm::PoolingMetadata md;
+  for (int i = 0; i < num_reqs; ++i) {
+    md.pooling_cursor.first_token_indices.push_back(i);
+    md.pooling_cursor.last_token_indices.push_back(i);
+    md.pooling_cursor.prompt_lens.push_back(1);
+    md.pooling_cursor.seq_lens.push_back(1);
+    md.pooling_cursor.num_scheduled_tokens.push_back(1);
+    vllm::PoolingParams pp;
+    pp.task = vllm::PoolingTask::kEmbed;
+    pp.use_activation = true;
+    md.pooling_params.push_back(pp);
+    md.tasks.push_back(vllm::PoolingTask::kEmbed);
+  }
+  vllm::PoolerOutput pooled = pooling_runner_->Pool(hidden_rows, md);
+  VT_CHECK(static_cast<int>(pooled.size()) == num_reqs,
+           "pool_tokens: pooler must return one vector per request");
+
+  // Validity = the request's whole prompt has been seen (seq_lens == prompt_len,
+  // pooling_runner.py:40-41). Our discard mask is the SAME predicate
+  // (step.seq_lens[i] < num_tokens_no_spec[i] == still consuming prefill), so a
+  // chunked-prefill row reports nullopt and the request keeps running.
+  ModelRunnerOutput out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.sampled_token_ids.reserve(static_cast<size_t>(num_reqs));
+  out.pooler_output.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+    out.req_ids.push_back(req_id);
+    out.req_id_to_index[req_id] = i;
+    out.sampled_token_ids.push_back({});  // a pooling step samples NOTHING
+    if (exec_state_.discard[static_cast<size_t>(i)] != 0) {
+      out.pooler_output.push_back(std::nullopt);
+    } else {
+      out.pooler_output.push_back(std::move(pooled[static_cast<size_t>(i)]));
+    }
+  }
+  return out;
+}
+
 ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::optional<GrammarOutput>& grammar_output) {
   ModelRunnerOutput out;
@@ -1478,8 +1734,24 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     return out;  // 0-token flush step (nothing sampled).
   }
 
+  // POOLING ROUTING (ARCH-ONE-SURFACE ROW 6), mirroring the model-level task
+  // split of gpu/model_runner.py:1586-1607: on a POOLING model the step's
+  // output is the POOLED DATA, never a sampled token. pooling_runner_ is set
+  // iff the registration declares is_pooling_model (ctor), so every text arch
+  // takes the sampler path below byte-identically.
+  if (pooling_runner_ != nullptr) {
+    return pool_tokens();
+  }
+
   std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+
+  // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:3841-3845): score the prompt
+  // rows off the SAME forward result. Done before sampling because sampling
+  // mutates `logits` in place; the prompt rows are outside that view, but
+  // reading them first keeps the two independent of each other. Inert unless a
+  // request asked for prompt logprobs.
+  collect_prompt_logprobs(out.prompt_logprobs_dict);
 
   // SPEC-DECODE VERIFY ROUTING (SPEC-REJECTION I3), mirroring
   // gpu/model_runner.py:1065-1077 (`if input_batch.num_draft_tokens == 0 or
@@ -1490,6 +1762,7 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   // branch is never taken and the sampler path below is byte-identical.
   if (exec_state_.step.num_draft_tokens > 0) {
     ModelRunnerOutput out_rej = sample_tokens_with_rejection(logits);
+    out_rej.prompt_logprobs_dict = std::move(out.prompt_logprobs_dict);
     // SPEC-MTP I5d: propose the next verify step's drafts after committing this
     // step's accepted tokens. The accept accounting lives in num_accepted_tokens
     // (num_sampled = accepted, seeded/overwritten there); num_rejected is derived.
@@ -1543,6 +1816,17 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::vector<int32_t>& toks = sampler_output.sampled_token_ids[
         static_cast<size_t>(i)];
     out.sampled_token_ids.push_back(toks);
+
+    // Lab debug: VT_DEBUG_SAMPLED=1 prints every greedy token id. Read ONCE at
+    // static-init — never a per-token getenv in the sampling hot loop (matches
+    // the "read once, never per-step getenv" discipline stated above).
+    static const bool kDebugSampled = [] {
+      const char* e = std::getenv("VT_DEBUG_SAMPLED");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (kDebugSampled && !toks.empty()) {
+      std::fprintf(stderr, "vt-debug sampled req=%d tok=%d\n", i, toks.front());
+    }
 
     // Write-back: append each sampled token to slot i's token row so it becomes
     // the input at its position next step. num_tokens_no_spec is the next free
@@ -1624,6 +1908,13 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
   }
   // SPEC-DFLASH D5: the block-diffusion drafter has no MTP draft_model_/
   // draft_attn_kv_ (it recomputes context K/V inline); route to its own propose.
+  // SPEC-DSPARK W5: a DSpark draft sets BOTH predicates (dflash_weights_ points
+  // at its inherited backbone, so the shared machinery runs unchanged), so it is
+  // checked first and only the propose tail differs.
+  if (use_dspark()) {
+    propose_drafts_dspark(num_sampled_in, num_rejected_in);
+    return;
+  }
   if (use_dflash()) {
     propose_drafts_dflash(num_sampled_in, num_rejected_in);
     return;
@@ -1681,6 +1972,58 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
     }
   }
   pending_drafts_ = std::move(out);
+}
+
+// SPEC-DFLASH D5: the DFlash branch — the shared block body with the 1 + k
+// fill-in layout and the parallel per-row argmax (dflash/speculator.py:242-273).
+void GPUModelRunner::propose_drafts_dflash(
+    const std::vector<int32_t>& num_sampled_in,
+    const std::vector<int32_t>& num_rejected_in) {
+  // num_sampled_in is derivable from (T_req - num_rejected) per request, so only
+  // num_rejected_in drives the append.
+  (void)num_sampled_in;
+  if (dflash_weights_ == nullptr) {
+    pending_drafts_.reset();
+    return;
+  }
+  const int k = dflash_k_;
+  const int64_t draft_vocab = dflash_weights_->draft_vocab_size;
+  propose_drafts_block(
+      num_rejected_in, *dflash_weights_, *dflash_config_,
+      /*num_query_per_req=*/1 + k,
+      [k, draft_vocab](const std::vector<float>& block_logits, int P,
+                       const std::vector<int32_t>& anchors) {
+        (void)anchors;  // DFlash's anchor is a bonus token, never a prediction.
+        return SampleDflashBlockDrafts(block_logits, P, k, draft_vocab);
+      });
+}
+
+// SPEC-DSPARK W5: the DSpark branch — the SAME shared block body (context
+// accumulation, device KV store, block forward are inherited unchanged) with the
+// anchor-aware query layout and the sequential Markov sampler
+// (dspark/speculator.py:100-169).
+void GPUModelRunner::propose_drafts_dspark(
+    const std::vector<int32_t>& num_sampled_in,
+    const std::vector<int32_t>& num_rejected_in) {
+  (void)num_sampled_in;
+  if (dspark_weights_ == nullptr) {
+    pending_drafts_.reset();
+    return;
+  }
+  vllm::v1::DsparkBlockLayout layout;
+  layout.num_speculative_steps = dflash_k_;
+  layout.sample_from_anchor = dspark_sample_from_anchor_;
+  const vllm::Qwen3DSparkWeights* weights = dspark_weights_;
+  propose_drafts_block(
+      num_rejected_in, weights->backbone, *dflash_config_,
+      layout.num_query_per_req(),
+      [this, layout, weights](const std::vector<float>& block_logits, int P,
+                              const std::vector<int32_t>& anchors) {
+        VT_CHECK(static_cast<int>(anchors.size()) == P,
+                 "propose_drafts_dspark: one anchor token per proposing row");
+        return vllm::v1::SampleDsparkBlockDrafts(block_logits, anchors, layout,
+                                                 *weights, queue_);
+      });
 }
 
 // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE propose. Ported from
@@ -1760,6 +2103,18 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
   dflash_ctx_reqid_.clear();
 }
 
+// SPEC-DSPARK W5: wire a DSpark draft. The inherited backbone goes through
+// set_dflash_draft, so the aux multi-tap capture, the per-request device KV
+// store and the context-aware block forward are the SAME code the landed DFlash
+// lane runs; only the propose tail (use_dspark()) differs.
+void GPUModelRunner::set_dspark_draft(const vllm::Qwen3DSparkWeights* weights,
+                                      const vllm::HfConfig* config, int k,
+                                      bool sample_from_anchor) {
+  dspark_weights_ = weights;
+  dspark_sample_from_anchor_ = sample_from_anchor;
+  set_dflash_draft(weights == nullptr ? nullptr : &weights->backbone, config, k);
+}
+
 // SPEC-DFLASH D5: the DFlash branch of propose_drafts. Ported from
 // dflash/speculator.py::propose (:300-413). Where vLLM writes each step's
 // combined target features into the draft's incremental KV cache
@@ -1770,25 +2125,27 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
 // (the rejected drafts' features are simply never appended). Then it runs the
 // non-autoregressive (1+k) block forward over that context (DflashProposeBlock)
 // and stashes the k drafts/request. Reachable only when use_dflash().
-void GPUModelRunner::propose_drafts_dflash(
-    const std::vector<int32_t>& num_sampled_in,
-    const std::vector<int32_t>& num_rejected_in) {
-  // num_sampled_in is derivable from (T_req - num_rejected) per request (and the
-  // two differ on a non-spec prefill step, where we accumulate ALL chunk features
-  // regardless of num_sampled==1), so only num_rejected_in drives the append.
-  (void)num_sampled_in;
+void GPUModelRunner::propose_drafts_block(
+    const std::vector<int32_t>& num_rejected_in,
+    const vllm::Qwen3DFlashWeights& backbone, const vllm::HfConfig& config,
+    int num_query_per_req,
+    const std::function<std::vector<std::vector<int32_t>>(
+        const std::vector<float>&, int, const std::vector<int32_t>&)>& sample) {
   const int num_reqs = exec_state_.num_reqs;
-  if (num_reqs == 0 || dflash_weights_ == nullptr) {
+  if (num_reqs == 0) {
     pending_drafts_.reset();
     return;
   }
   VT_CHECK(exec_state_.spec_aux.tensor.data != nullptr,
-           "propose_drafts_dflash: missing target aux multi-tap (aux_tap not "
+           "propose_drafts_block: missing target aux multi-tap (aux_tap not "
            "captured on the verify forward)");
-  const int64_t H = dflash_config_->hidden_size;
+  const int64_t H = config.hidden_size;
   const int taps = static_cast<int>(dflash_tap_layer_ids_.size());
-  const int k = dflash_k_;
-  const int32_t mask_id = dflash_weights_->mask_token_id;
+  const int32_t mask_id = backbone.mask_token_id;
+  // The number of NOISE/mask rows after the anchor row. DFlash always emits
+  // 1 + k rows (anchor + k masks). DSpark's anchor-as-first-prediction layout
+  // emits k rows total, so it carries k - 1 masks.
+  const int num_mask_rows = num_query_per_req - 1;
   const StepInputs& step = exec_state_.step;
 
   if (static_cast<int>(dflash_ctx_len_.size()) < num_reqs) {
@@ -1801,7 +2158,7 @@ void GPUModelRunner::propose_drafts_dflash(
   const int64_t T_total = exec_state_.num_actual_tokens;
   const vt::Tensor& aux = exec_state_.spec_aux.tensor;
   VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
-           "propose_drafts_dflash: aux tap shape mismatch");
+           "propose_drafts_block: aux tap shape mismatch");
   std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
                                  static_cast<size_t>(H) * static_cast<size_t>(taps));
   vt::Backend& b = vt::GetBackend(queue_.device.type);
@@ -1817,22 +2174,23 @@ void GPUModelRunner::propose_drafts_dflash(
 
   // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
   const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
-      aux_f32, T_total, *dflash_weights_, *dflash_config_, queue_);
+      aux_f32, T_total, backbone, config, queue_);
 
   // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
   //    rows to the persistent per-request KV store (D9 — no full recompute), and
   //    (for a generating row) build the next (1+k) mask block.
-  std::vector<int32_t> blk_ids;                // [P*(1+k)]
-  std::vector<int32_t> blk_pos;                // [P*(1+k)]
+  std::vector<int32_t> blk_ids;                // [P*num_query_per_req]
+  std::vector<int32_t> blk_pos;                // [P*num_query_per_req]
   std::vector<int32_t> blk_cu = {0};           // [P+1]
   std::vector<int> propose_rows;               // batch rows in the propose batch
+  std::vector<int32_t> anchors;                // [P] each proposing row's anchor token
 
   for (int i = 0; i < num_reqs; ++i) {
     // Reset a reused dense slot (a new request now occupies this row).
     if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
         exec_state_.req_ids[static_cast<size_t>(i)]) {
       dflash_kv_store_[static_cast<size_t>(i)] =
-          Qwen3DFlashModel::MakeDeviceKVStore(*dflash_config_, queue_);
+          Qwen3DFlashModel::MakeDeviceKVStore(config, queue_);
       dflash_ctx_len_[static_cast<size_t>(i)] = 0;
       dflash_ctx_reqid_[static_cast<size_t>(i)] =
           exec_state_.req_ids[static_cast<size_t>(i)];
@@ -1858,7 +2216,7 @@ void GPUModelRunner::propose_drafts_dflash(
     // (the I5e async-input-combine bug class) — assert rather than corrupt.
     const int64_t L = dflash_ctx_len_[static_cast<size_t>(i)];
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
-             "propose_drafts_dflash: context position discontinuity (accumulation "
+             "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
@@ -1874,7 +2232,7 @@ void GPUModelRunner::propose_drafts_dflash(
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
     Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                            new_pos, *dflash_weights_, *dflash_config_, queue_);
+                                            new_pos, backbone, config, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -1889,12 +2247,13 @@ void GPUModelRunner::propose_drafts_dflash(
     const int32_t anchor = input_batch_.last_sampled_tokens[static_cast<size_t>(i)];
     blk_ids.push_back(anchor);
     blk_pos.push_back(static_cast<int32_t>(Lp));
-    for (int j = 1; j <= k; ++j) {
+    for (int j = 1; j <= num_mask_rows; ++j) {
       blk_ids.push_back(mask_id);
       blk_pos.push_back(static_cast<int32_t>(Lp + j));
     }
     blk_cu.push_back(static_cast<int32_t>(blk_ids.size()));
     propose_rows.push_back(i);
+    anchors.push_back(anchor);
   }
 
   // 4. Non-autoregressive (1+k) block propose over the PERSISTENT context KV store.
@@ -1906,6 +2265,14 @@ void GPUModelRunner::propose_drafts_dflash(
   for (int i = 0; i < num_reqs; ++i)
     out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
 
+  // VT_SPEC_TRACE=1: how many rows actually proposed this step, and what the
+  // first row's drafts were. The aggregate acceptance trace on the VERIFY side
+  // cannot distinguish "proposed nothing" from "proposed and everything was
+  // rejected", which is exactly the question the first DSpark e2e raised.
+  static const bool propose_trace = [] {
+    const char* v = std::getenv("VT_SPEC_TRACE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
     // D11 A-wire: run the block forward straight off the per-request DEVICE stores
@@ -1924,15 +2291,42 @@ void GPUModelRunner::propose_drafts_dflash(
       total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
+    const auto t_fwd0 = std::chrono::steady_clock::now();
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
-            stores, ctx_cu, blk_ids, blk_pos, blk_cu, *dflash_weights_, *dflash_config_, queue_);
-    const std::vector<std::vector<int32_t>> drafts = SampleDflashBlockDrafts(
-        block_logits, P, k, dflash_weights_->draft_vocab_size);
+            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
+    const auto t_fwd1 = std::chrono::steady_clock::now();
+    const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
+    const auto t_smp1 = std::chrono::steady_clock::now();
+    if (propose_trace) {
+      // Splits the draft step into the parallel backbone forward and the
+      // sampler. For DSpark the sampler is a k-iteration host loop, each
+      // iteration a Markov GEMV plus a device->host download plus a host argmax
+      // over the draft vocab; upstream captures the WHOLE draft step in one CUDA
+      // graph instead (dspark/speculator.py:22-24).
+      std::fprintf(stderr,
+                   "[spec-phase] backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
+                   std::chrono::duration<double, std::milli>(t_smp1 - t_fwd1).count(),
+                   block_logits.size());
+    }
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];
       out.draft_token_ids[static_cast<size_t>(row)] = drafts[static_cast<size_t>(r)];
     }
+    if (propose_trace) {
+      std::string first;
+      for (int32_t id : drafts[0]) {
+        first += std::to_string(id);
+        first += ' ';
+      }
+      std::fprintf(stderr, "[spec-propose] rows=%d nqpr=%d drafts/row=%zu first=[%s]\n",
+                   P, num_query_per_req, drafts[0].size(), first.c_str());
+    }
+  }
+  if (propose_trace && propose_rows.empty()) {
+    std::fprintf(stderr, "[spec-propose] NO proposing rows this step (num_reqs=%d)\n",
+                 num_reqs);
   }
   pending_drafts_ = std::move(out);
 }
@@ -2165,6 +2559,13 @@ void GPUModelRunner::replay_last_sampled_ops(AsyncDeviceInputs& dev) {
 
 std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
     const std::optional<GrammarOutput>& grammar_output) {
+  // ARCH-ONE-SURFACE ROW 6: pooling models resolve async scheduling OFF
+  // (config/vllm.py:1068-1073 mirror in LoadedEngine::ResolveAsyncEnabled), so
+  // the depth-2 async sampler must never see one — refuse loudly rather than
+  // run the device sampler over hidden states.
+  VT_CHECK(pooling_runner_ == nullptr,
+           "sample_tokens_async: pooling models use the synchronous scheduler "
+           "(async scheduling is disabled for pooling, config/vllm.py:1068)");
   // When async is NOT engaged (production default), degenerate to the byte-
   // identical synchronous path wrapped as a ready output — so a caller in the
   // depth-2 loop can always call sample_tokens_async without branching, yet the
@@ -2191,6 +2592,11 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
 
   std::vector<float> sampled_logits;
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+  // SAMPLE-PROMPT-LOGPROBS: same seam as the synchronous path. The prompt rows
+  // are read off this step's forward result HERE, synchronously, because that
+  // is where the logits still are — the async output only defers the sampled
+  // IDS. Inert unless a request asked.
+  collect_prompt_logprobs(skeleton.prompt_logprobs_dict);
   const SamplingMetadata sm = input_batch_.make_sampling_metadata();
 
   // Sample DEVICE-RESIDENT: the sampler writes the ids into the pool slot's

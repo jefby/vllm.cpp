@@ -54,6 +54,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -69,6 +70,7 @@
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d hidden tap + draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft + aux taps
+#include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft + Markov head
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -79,6 +81,7 @@
 #include "vllm/v1/worker/gpu/input_batch.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
+#include "vllm/v1/worker/gpu/pool/pooling_runner.h"  // PoolingRunner (pooling arch)
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -297,6 +300,39 @@ class GPUModelRunner final : public ModelRunnerBase {
   void set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
                         const vllm::HfConfig* config, int k);
 
+  // SPEC-DSPARK W5: wire the separately-loaded DSpark draft into the SAME
+  // verify/propose loop. DSpark inherits DFlash's context accumulation and block
+  // forward unchanged (Qwen3DSparkModel(DFlashQwen3Model)); it differs only in
+  // the query-block layout (N rows with the anchor itself predicting, or the
+  // DFlash 1+N fill-in when `sample_from_anchor` is false) and in sampling
+  // (sequential Markov instead of one parallel argmax). Wiring it therefore
+  // routes through the same aux-tap capture and the same device KV store —
+  // set_dflash_draft is called internally with `&weights->backbone`, so
+  // use_dflash() stays the predicate for the shared machinery and use_dspark()
+  // only switches the propose tail. Idempotent; null leaves the runner alone.
+  void set_dspark_draft(const vllm::Qwen3DSparkWeights* weights,
+                        const vllm::HfConfig* config, int k,
+                        bool sample_from_anchor);
+
+  // SAMPLE-PROMPT-LOGPROBS route-observation seam. Const, no behaviour, exposed
+  // for the gate: the row count the LAST forward actually produced, the token
+  // count that step ran on, and its request count. On EVERY step where no
+  // request asked for prompt logprobs the forward gathers before lm_head, so
+  // last_forward_rows() == step_num_logits(); a step that owes prompt logits
+  // instead takes the full-logits route and returns num_actual_tokens rows.
+  // test_llm_engine §9(g) asserts that DECISION directly, because an on-vs-off
+  // comparison inside ONE build cannot see a change to the shared route — both
+  // arms move together (review finding 2 on PR #235).
+  int64_t last_forward_rows() const { return exec_state_.logits.rows; }
+  int last_forward_num_actual_tokens() const {
+    return exec_state_.num_actual_tokens;
+  }
+  int last_forward_num_reqs() const { return exec_state_.num_reqs; }
+  // The expanded logit-row count for the stashed step (StepInputs::cu_num_logits
+  // back, == exec_state_.num_reqs on the non-speculative default path). Public
+  // so the gate above can name the expected value instead of re-deriving it.
+  int step_num_logits() const;
+
  private:
   // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed
   // device storage; CPU and VT_DEVICE_KV_CACHE=0 retain the host-vector
@@ -332,6 +368,18 @@ class GPUModelRunner final : public ModelRunnerBase {
                      std::nullopt,
                  std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
                  std::vector<PagedKvCache> draft_kv = {});
+
+  // ARCH-ONE-SURFACE ROW 6: the pooling counterpart of sample_tokens (mirror
+  // of gpu/model_runner.py:1586-1607 + pool/pooling_runner.py:29-42). Consumes
+  // the stashed forward result — for the pooling arch those are the
+  // [rows, hidden] post-final-norm hidden states, NOT vocab logits — applies
+  // the model's Pooler via pooling_runner_, and returns a ModelRunnerOutput
+  // whose pooler_output carries one pooled vector per fully-prefilled request
+  // (nullopt for rows still consuming prefill chunks — the same
+  // seq_len == prompt_len validity predicate as is_valid, pooling_runner.py:
+  // 40-41, which our discard mask already computes). sampled_token_ids rows
+  // stay EMPTY: a pooling step samples nothing.
+  ModelRunnerOutput pool_tokens();
 
   // Allocate the per-full-attn-layer paged KV buffers + the per-GDN-layer
   // persistent mamba ssm/conv buffers from the KVCacheConfig groups.
@@ -378,6 +426,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Queue queue_;
   InputBatch input_batch_;
   Sampler sampler_;
+  // ARCH-ONE-SURFACE ROW 6 (mirror of gpu/model_runner.py:368-369
+  // `if self.is_pooling_model ...: self.pooling_runner = PoolingRunner(model)`):
+  // non-null iff the loaded model's registration declares is_pooling_model and
+  // the model owns a Pooler. sample_tokens then routes to pool_tokens() — the
+  // POOLED DATA takes the place of sampled tokens (model_runner.py:1586-1607).
+  // Null for every text arch: the sampler path below is byte-identical.
+  std::unique_ptr<vllm::PoolingRunner> pooling_runner_;
 
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;
@@ -509,9 +564,20 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Tensor assemble_sample_logits(
       const std::optional<GrammarOutput>& grammar_output,
       std::vector<float>& sampled_logits);
-  // The expanded logit-row count for the stashed step (StepInputs::cu_num_logits
-  // back, == exec_state_.num_reqs on the non-speculative default path).
-  int step_num_logits() const;
+  // (step_num_logits is declared in the public section above — the
+  // SAMPLE-PROMPT-LOGPROBS route gate names it.)
+  // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:5612-5719, called at :3841).
+  // Score the extra logit rows the forward produced for prompt positions, fold
+  // each request's chunk into its accumulated tensor, and move out the tensors
+  // whose prompt finished this step. Returns immediately — no branch taken, no
+  // allocation — when the stashed step named no prompt rows, which is every
+  // step unless a request asked for prompt logprobs.
+  void collect_prompt_logprobs(
+      std::map<std::string, LogprobsTensors>& prompt_logprobs_dict);
+  // A request's prompt-logprob tensor height: num_prompt_tokens - 1.
+  int prompt_logprob_positions(const std::string& req_id) const;
+  // Forget in-progress prompt logprobs whose request left the batch (abort).
+  void drop_stale_prompt_logprobs();
   // The SPEC-DECODE VERIFY half (SPEC-REJECTION I3): route the expanded
   // [Σ(1+k_i), vocab] logits through the greedy rejection sampler, write the
   // accepted tokens back, and record num_accepted_tokens. Called by sample_tokens
@@ -545,6 +611,24 @@ class GPUModelRunner final : public ModelRunnerBase {
   // and stashes the k drafts/request. Only reachable when use_dflash().
   void propose_drafts_dflash(const std::vector<int32_t>& num_sampled,
                              const std::vector<int32_t>& num_rejected);
+  // The shared block-propose body of the DFlash and DSpark branches. Everything
+  // through the context accumulation and the block forward is IDENTICAL for the
+  // two (DSpark inherits it upstream); the two differ only in `num_query_per_req`
+  // / `first_sample_offset` (the anchor-as-first-prediction layout) and in how the
+  // resulting block logits become draft ids, which `sample` supplies. `anchors`
+  // receives each proposing row's anchor token in the target vocab (DFlash
+  // ignores it; DSpark seeds its sequential chain with it).
+  void propose_drafts_block(
+      const std::vector<int32_t>& num_rejected, const vllm::Qwen3DFlashWeights& backbone,
+      const vllm::HfConfig& config, int num_query_per_req,
+      const std::function<std::vector<std::vector<int32_t>>(
+          const std::vector<float>& block_logits, int num_propose_rows,
+          const std::vector<int32_t>& anchors)>& sample);
+  // SPEC-DSPARK W5: the DSpark branch of propose_drafts — the shared body above
+  // with the anchor-aware layout and the sequential Markov sampler
+  // (SampleDsparkBlockDrafts). Only reachable when use_dspark().
+  void propose_drafts_dspark(const std::vector<int32_t>& num_sampled,
+                             const std::vector<int32_t>& num_rejected);
   // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE branch of propose_drafts. Runs the
   // host-side n-gram matcher (v1/spec_decode/ngram_proposer) over each generating
   // request's own committed context (input_batch_.token_ids_cpu[i,
@@ -577,6 +661,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   int dflash_k_ = 0;
   std::vector<int32_t> dflash_tap_layer_ids_;
   bool use_dflash() const { return dflash_weights_ != nullptr; }
+  // ── SPEC-DSPARK W5 ──────────────────────────────────────────────────────────
+  // The separately-loaded DSpark draft (borrow owned by LoadedEngine; null unless
+  // method=="dspark"). When set, dflash_weights_ points at `&dspark_weights_->
+  // backbone`, so every piece of shared machinery — the aux multi-tap capture,
+  // the per-request device KV store, the context-aware block forward — runs
+  // UNCHANGED, and use_dspark() only redirects the propose tail to the sequential
+  // Markov sampler and the anchor-aware block layout.
+  const vllm::Qwen3DSparkWeights* dspark_weights_ = nullptr;
+  bool dspark_sample_from_anchor_ = true;
+  bool use_dspark() const { return dspark_weights_ != nullptr; }
   // Per-request PERSISTENT context KV store (D9 persistent paged draft-KV — the
   // perf form of vLLM's incrementally-written draft KV cache). dflash_kv_store_[i]
   // holds request i's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
@@ -632,6 +726,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   // prompt block of each running request to the external cache (offload-prompt-
   // only). No-op unless kv_connector_ is a worker-capable connector.
   void ConnectorStorePromptKv(const SchedulerOutput& scheduler_output);
+
+  // SAMPLE-PROMPT-LOGPROBS: the partially-filled prompt-logprob tensor of every
+  // request whose prompt is still being consumed, keyed by req_id. A chunked
+  // prefill fills it slice by slice and the final chunk moves it out; upstream
+  // hangs the same tensor off the per-request state object as
+  // `request.in_progress_prompt_logprobs_cpu` (gpu_model_runner.py:5645-5651,
+  // cleared at :5712), which we have no equivalent of on the runner. Empty
+  // unless a request asked for prompt logprobs.
+  std::map<std::string, LogprobsTensors> in_progress_prompt_logprobs_;
 
   // Stashed forward result between execute_model and sample_tokens (upstream
   // ExecuteModelState — hidden_states + input_batch handoff, here the full

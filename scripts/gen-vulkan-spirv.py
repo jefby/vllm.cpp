@@ -47,6 +47,7 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SHADER_DIR = REPO / "src" / "vt" / "vulkan" / "shaders"
 OUT_HEADER = REPO / "src" / "vt" / "vulkan" / "vulkan_spirv.h"
+OUT_SOURCE = REPO / "src" / "vt" / "vulkan" / "vulkan_spirv.cpp"
 
 # Vulkan 1.1 is the floor the backend requires (src/vt/vulkan/vulkan_context.cpp).
 TARGET_ENV = "vulkan1.1"
@@ -104,24 +105,150 @@ def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
     return data
 
 
-def render(blobs: dict[str, bytes], version: str) -> str:
-    lines: list[str] = []
+# SPIR-V decoration constants (SPIR-V core spec: OpDecorate = 71 in §3.32.3
+# Annotation Instructions, Decoration SpecId = 1 in §3.20). Parsing the emitted
+# module is the only source of truth here: glslang offers no side-channel listing
+# of the SpecIds it produced, and a hand-maintained list beside the shaders is
+# exactly the kind of duplicate that drifts silently.
+SPIRV_OP_DECORATE = 71
+SPIRV_DECORATION_SPEC_ID = 1
+SPIRV_HEADER_WORDS = 5
+
+# The rest of the annotation/type opcodes the BINDING ACCESS reflection below
+# needs (SPIR-V core spec §3.52 Instructions, §3.20 Decoration).
+SPIRV_OP_TYPE_POINTER = 32
+SPIRV_OP_VARIABLE = 59
+SPIRV_OP_MEMBER_DECORATE = 72
+SPIRV_DECORATION_NON_WRITABLE = 24
+SPIRV_DECORATION_BINDING = 33
+
+# Mirrors kMaxDispatchBindings in src/vt/vulkan/vulkan_context.cpp. The mask
+# below is one bit per binding, so a shader with more bindings than this could
+# not be described and must fail LOUDLY rather than silently reporting the
+# overflow bindings as read-only.
+MAX_BINDINGS = 32
+
+
+def _instructions(blob: bytes):
+    """Yield (opcode, [operand words]) for one SPIR-V module."""
+    words = [int.from_bytes(blob[i:i + 4], "little") for i in range(0, len(blob), 4)]
+    i = SPIRV_HEADER_WORDS
+    while i < len(words):
+        word_count = words[i] >> 16
+        opcode = words[i] & 0xFFFF
+        if word_count == 0:
+            sys.exit("malformed SPIR-V: zero-length instruction")
+        yield opcode, words[i + 1:i + word_count]
+        i += word_count
+
+
+def binding_access(blob: bytes, name: str) -> tuple[int, int]:
+    """Return (binding_count, writable_mask) for one SPIR-V module.
+
+    WHY THIS IS PARSED OUT OF THE COMPILED MODULE AND NOT WRITTEN DOWN BY HAND.
+    The Vulkan backend can only skip a pipeline barrier between two dispatches if
+    it can prove they do not share a buffer in a hazardous way, and that proof
+    needs each dispatch's READ set and WRITE set. Nothing on the host side knows
+    them: `VulkanContext::Dispatch` receives one flat array of VkBuffers with no
+    roles attached, and guessing a role from the binding index would be exactly
+    the unverified assumption that turns a missing barrier into silently wrong
+    numbers.
+
+    The GLSL already states it, and glslang ENFORCES it: a `readonly buffer`
+    block is a compile error to write to, and the compiler records the promise as
+    a `NonWritable` decoration in the emitted module. So the committed SPIR-V is
+    an authoritative, machine-checked statement of which bindings the shader can
+    write, and the freshness check on this generator keeps it from drifting from
+    the .comp source.
+
+    A binding is reported WRITABLE unless a NonWritable decoration is positively
+    found for it, so an unrecognised encoding degrades to "assume it is written",
+    which costs a barrier rather than correctness.
+    """
+    binding_of: dict[int, int] = {}       # variable id -> binding number
+    var_non_writable: set[int] = set()    # variable ids decorated NonWritable
+    member_non_writable: set[tuple[int, int]] = set()
+    pointee_of: dict[int, int] = {}       # pointer type id -> pointee type id
+    ptr_type_of: dict[int, int] = {}      # variable id -> pointer type id
+    for opcode, ops in _instructions(blob):
+        if opcode == SPIRV_OP_DECORATE and len(ops) >= 3:
+            if ops[1] == SPIRV_DECORATION_BINDING:
+                binding_of[ops[0]] = ops[2]
+        elif opcode == SPIRV_OP_DECORATE and len(ops) == 2:
+            if ops[1] == SPIRV_DECORATION_NON_WRITABLE:
+                var_non_writable.add(ops[0])
+        elif opcode == SPIRV_OP_MEMBER_DECORATE and len(ops) >= 3:
+            if ops[2] == SPIRV_DECORATION_NON_WRITABLE:
+                member_non_writable.add((ops[0], ops[1]))
+        elif opcode == SPIRV_OP_TYPE_POINTER and len(ops) == 3:
+            pointee_of[ops[0]] = ops[2]
+        elif opcode == SPIRV_OP_VARIABLE and len(ops) >= 3:
+            ptr_type_of[ops[1]] = ops[0]
+
+    if not binding_of:
+        sys.exit(f"{name}: no descriptor bindings found in the SPIR-V")
+    mask = 0
+    for var, binding in binding_of.items():
+        if binding >= MAX_BINDINGS:
+            sys.exit(f"{name}: binding {binding} is at or above the backend's "
+                     f"{MAX_BINDINGS}-binding limit")
+        block = pointee_of.get(ptr_type_of.get(var, -1), -1)
+        read_only = var in var_non_writable or (block, 0) in member_non_writable
+        if not read_only:
+            mask |= 1 << binding
+    count = max(binding_of.values()) + 1
+    # The host binds descriptors 0..count-1 densely, so a hole would mean the
+    # mask's bit positions no longer line up with the dispatch's buffer array.
+    if len(set(binding_of.values())) != count:
+        sys.exit(f"{name}: descriptor bindings are not a dense 0..{count - 1} range")
+    return count, mask
+
+
+def spec_ids(blob: bytes) -> list[int]:
+    """Return the SpecId values decorated in one SPIR-V module, sorted ascending."""
+    words = [int.from_bytes(blob[i:i + 4], "little") for i in range(0, len(blob), 4)]
+    ids: set[int] = set()
+    i = SPIRV_HEADER_WORDS
+    while i < len(words):
+        word_count = words[i] >> 16
+        opcode = words[i] & 0xFFFF
+        if word_count == 0:
+            sys.exit("malformed SPIR-V: zero-length instruction")
+        # OpDecorate <target-id> <decoration> [<literal>...]
+        if opcode == SPIRV_OP_DECORATE and word_count >= 4:
+            if words[i + 2] == SPIRV_DECORATION_SPEC_ID:
+                ids.add(words[i + 3])
+        i += word_count
+    return sorted(ids)
+
+
+BANNER = [
+    "// GENERATED FILE - DO NOT EDIT BY HAND.",
+    "// Regenerate with: scripts/gen-vulkan-spirv.py",
+    "//",
+    "// SPIR-V for the Vulkan backend's compute kernels (BACKEND-VULKAN),",
+    "// compiled from the GLSL in src/vt/vulkan/shaders/*.comp.",
+    "//",
+    "// WHY THE SPIR-V IS COMMITTED rather than compiled by the build, as",
+    "// llama.cpp's vulkan-shaders-gen does at build time: the build then needs NO",
+    "// shader toolchain on any machine, which is hermetic everywhere including CI",
+    "// and the aarch64 gate box. libshaderc would also be a compiled third-party",
+    "// dependency, which .agents/discipline.md forbids. The cost is an obligation",
+    "// to re-run this generator when a .comp changes, which the",
+    "// vulkan-spirv-freshness CI job enforces.",
+    "//",
+    "// WHY THE WORDS LIVE IN THE .cpp AND NOT THE HEADER (VK-A1): at the target",
+    "// shader surface the blobs are megabytes of array initializer, and anything in",
+    "// the header is re-parsed by every including TU. The header carries the struct",
+    "// and extern declarations; vulkan_spirv.cpp carries the data, so adding shaders",
+    "// costs one TU's compile time rather than all of them.",
+    "//",
+]
+
+
+def render_header(blobs: dict[str, bytes], version: str) -> str:
+    lines = list(BANNER)
     add = lines.append
-    add("// GENERATED FILE — DO NOT EDIT BY HAND.")
-    add("// Regenerate with: scripts/gen-vulkan-spirv.py")
-    add("//")
-    add("// SPIR-V for the Vulkan backend's compute kernels (BACKEND-VULKAN, W0),")
-    add("// compiled from the GLSL in src/vt/vulkan/shaders/*.comp.")
-    add("//")
-    add("// WHY THE SPIR-V IS COMMITTED rather than compiled by the build, as")
-    add("// llama.cpp's vulkan-shaders-gen does at build time: neither of our boxes")
-    add("// has a GLSL compiler (no glslc/glslangValidator/libshaderc, no sudo), and")
-    add("// libshaderc would be a compiled third-party dependency, which")
-    add("// .agents/discipline.md forbids. Committing the SPIR-V makes the build")
-    add("// hermetic everywhere — including CI and the aarch64 gate box — at the cost")
-    add("// of re-running the generator when a .comp changes. See the generator's")
-    add("// docstring for the full rationale.")
-    add("//")
     add(f"// Produced by: {version}")
     add(f"// Target environment: {TARGET_ENV}")
     add("#ifndef VT_VULKAN_VULKAN_SPIRV_H_")
@@ -132,27 +259,46 @@ def render(blobs: dict[str, bytes], version: str) -> str:
     add("")
     add("namespace vt::vulkan {")
     add("")
-    for name in sorted(blobs):
-        words = [int.from_bytes(blobs[name][i:i + 4], "little")
-                 for i in range(0, len(blobs[name]), 4)]
-        add(f"inline constexpr uint32_t kSpv_{name}[] = {{")
-        for i in range(0, len(words), 8):
-            chunk = ", ".join(f"0x{w:08x}u" for w in words[i:i + 8])
-            add(f"    {chunk},")
-        add("};")
-        add("")
     add("// Name -> SPIR-V module. The NAME is the shader's file stem and is also the")
     add("// key the pipeline cache uses (src/vt/vulkan/vulkan_context.cpp).")
+    add("//")
+    add("// spec_ids lists the SPECIALIZATION CONSTANT IDs the module declares, parsed")
+    add("// from its OpDecorate SpecId instructions and sorted ascending. The host")
+    add("// passes specialization values BY ID, and Vulkan SILENTLY IGNORES a map entry")
+    add("// whose ID the module does not declare - so without this table a host/shader")
+    add("// drift produces WRONG NUMBERS instead of a clean failure.")
+    add("//")
+    add("// binding_count is the number of descriptor bindings the module declares, and")
+    add("// writable_mask has bit i set iff binding i is NOT decorated NonWritable, i.e.")
+    add("// iff the shader is permitted to WRITE that buffer. Both are parsed out of the")
+    add("// compiled module rather than written down beside it.")
+    add("//")
+    add("// This is the READ/WRITE SET the dispatch path needs to decide whether two")
+    add("// dispatches are genuinely independent. Dispatch() is handed one flat array of")
+    add("// VkBuffers with no roles attached, and inferring a role from the binding index")
+    add("// would be an unverified assumption whose failure mode is a MISSING BARRIER and")
+    add("// therefore silently wrong numbers. `readonly` in the GLSL is enforced by")
+    add("// glslang (writing such a block is a compile error) and recorded as NonWritable")
+    add("// in the SPIR-V, so this mask is a machine-checked fact about the shader.")
+    add("//")
+    add("// A bit is SET unless read-only is positively proven, so anything the")
+    add("// reflection does not understand degrades to an extra barrier, never a")
+    add("// missing one.")
     add("struct SpirvModule {")
     add("  const char* name;")
     add("  const uint32_t* words;")
     add("  size_t word_count;")
+    add("  const uint32_t* spec_ids;")
+    add("  size_t spec_id_count;")
+    add("  uint32_t binding_count;")
+    add("  uint32_t writable_mask;")
     add("};")
     add("")
-    add("inline constexpr SpirvModule kSpirvModules[] = {")
-    for name in sorted(blobs):
-        add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t)}},')
-    add("};")
+    add("// DEFINED IN vulkan_spirv.cpp. The array is `extern` and therefore of unknown")
+    add("// bound here, so kSpirvModuleCount is the ONLY way to size it - use it rather")
+    add("// than sizeof/sizeof.")
+    add("extern const SpirvModule kSpirvModules[];")
+    add("extern const size_t kSpirvModuleCount;")
     add("")
     add("}  // namespace vt::vulkan")
     add("")
@@ -160,11 +306,59 @@ def render(blobs: dict[str, bytes], version: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_source(blobs: dict[str, bytes], version: str) -> str:
+    lines = list(BANNER)
+    add = lines.append
+    add(f"// Produced by: {version}")
+    add(f"// Target environment: {TARGET_ENV}")
+    add("")
+    add('#include "vulkan_spirv.h"')
+    add("")
+    add("namespace vt::vulkan {")
+    add("namespace {")
+    add("")
+    for name in sorted(blobs):
+        words = [int.from_bytes(blobs[name][i:i + 4], "little")
+                 for i in range(0, len(blobs[name]), 4)]
+        add(f"constexpr uint32_t kSpv_{name}[] = {{")
+        for i in range(0, len(words), 8):
+            chunk = ", ".join(f"0x{w:08x}u" for w in words[i:i + 8])
+            add(f"    {chunk},")
+        add("};")
+        add("")
+    for name in sorted(blobs):
+        ids = spec_ids(blobs[name])
+        if ids:
+            add(f"constexpr uint32_t kSpecIds_{name}[] = {{")
+            add("    " + ", ".join(f"{i}u" for i in ids) + ",")
+            add("};")
+            add("")
+    add("}  // namespace")
+    add("")
+    add("const SpirvModule kSpirvModules[] = {")
+    for name in sorted(blobs):
+        ids = spec_ids(blobs[name])
+        idp = f"kSpecIds_{name}" if ids else "nullptr"
+        count, mask = binding_access(blobs[name], name)
+        add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t), '
+            f'{idp}, {len(ids)}, {count}u, 0x{mask:08x}u}},')
+    add("};")
+    add("const size_t kSpirvModuleCount = sizeof(kSpirvModules) / sizeof(kSpirvModules[0]);")
+    add("")
+    add("}  // namespace vt::vulkan")
+    return "\n".join(lines) + "\n"
+
+
+def strip_version(s: str) -> str:
+    """Drop the compiler-version line, which legitimately differs per machine."""
+    return "\n".join(l for l in s.splitlines() if not l.startswith("// Produced by:"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compiler", default=None)
     ap.add_argument("--check", action="store_true",
-                    help="fail if the committed header is stale instead of rewriting it")
+                    help="fail if the committed artifacts are stale instead of rewriting them")
     args = ap.parse_args()
 
     cc = find_compiler(args.compiler)
@@ -174,22 +368,24 @@ def main() -> None:
         sys.exit(f"no shaders found in {SHADER_DIR}")
 
     blobs = {src.stem: compile_one(cc, src) for src in sources}
-    text = render(blobs, version)
+    outputs = ((OUT_HEADER, render_header(blobs, version)),
+               (OUT_SOURCE, render_source(blobs, version)))
 
     if args.check:
-        current = OUT_HEADER.read_text() if OUT_HEADER.exists() else ""
-        # The compiler-version line legitimately differs between machines, so
-        # compare everything else.
-        def strip_version(s: str) -> str:
-            return "\n".join(l for l in s.splitlines() if not l.startswith("// Produced by:"))
-        if strip_version(current) != strip_version(text):
-            sys.exit("vulkan_spirv.h is STALE — re-run scripts/gen-vulkan-spirv.py")
-        print("vulkan_spirv.h is up to date")
+        stale = [path.relative_to(REPO) for path, text in outputs
+                 if strip_version(path.read_text() if path.exists() else "")
+                 != strip_version(text)]
+        if stale:
+            sys.exit("STALE, re-run scripts/gen-vulkan-spirv.py: "
+                     + ", ".join(str(p) for p in stale))
+        print("committed SPIR-V is up to date")
         return
 
-    OUT_HEADER.write_text(text)
+    for path, text in outputs:
+        path.write_text(text)
     total = sum(len(b) for b in blobs.values())
-    print(f"wrote {OUT_HEADER.relative_to(REPO)}: {len(blobs)} modules, {total} bytes of SPIR-V")
+    print(f"wrote {OUT_HEADER.relative_to(REPO)} + {OUT_SOURCE.relative_to(REPO)}: "
+          f"{len(blobs)} modules, {total} bytes of SPIR-V")
     print(f"compiler: {version}")
 
 

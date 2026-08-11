@@ -16,6 +16,7 @@
 
 #include "cpu_matmul_elem.h"
 #include "cpu_threadpool.h"
+#include "vt/unaligned.h"
 
 namespace vt::cpu {
 namespace {
@@ -27,10 +28,12 @@ inline void ForRows(int64_t nr, const std::function<void(int64_t, int64_t)>& bod
 }
 
 float LoadF32(const Tensor& t, int64_t elem_offset) {
+  const auto* address = static_cast<const uint8_t*>(t.data) +
+                        elem_offset * SizeOf(t.dtype);
   switch (t.dtype) {
-    case DType::kF32: return t.Ptr<float>()[elem_offset];
-    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[elem_offset]);
-    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[elem_offset]);
+    case DType::kF32: return LoadUnaligned<float>(address);
+    case DType::kF16: return F16ToF32(LoadUnaligned<uint16_t>(address));
+    case DType::kBF16: return BF16ToF32(LoadUnaligned<uint16_t>(address));
     default: VT_CHECK(false, "LoadF32: unsupported dtype"); return 0.0f;
   }
 }
@@ -132,7 +135,14 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
     for (int64_t i = iir1; i < i_hi; ++i) {
       WidenRowToF32(a.dtype, ElemPtr(a, i * a_rs), k, af.data() + (i - iir1) * k);
     }
-    const int mr = (kBT && tier.btm[bi] != nullptr) ? tier.mr : 1;
+    // M blocking applies to BOTH orientations. It used to be gated on kBT, so
+    // the [K,N] path always ran mr=1 and re-read the whole weight tile once per
+    // activation row (a 131-row activation read it 131 times). Each family is
+    // guarded on its own function pointer because a tier may provide one and
+    // not the other (the portable tier has no btm, having no transpose to
+    // amortize, but its nkm still amortizes the weight load).
+    const ElemNkMFn nkm_fn = tier.nkm[bi];
+    const int mr = (kBT ? (tier.btm[bi] != nullptr) : (nkm_fn != nullptr)) ? tier.mr : 1;
     for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
       const int64_t j_hi = std::min(iir0 + blck_0, ir0_end);
       int64_t i = iir1;
@@ -141,7 +151,11 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
       if (j_hi - iir0 == blck_0 && mr > 1) {
         float accm[kElemLanes * 8];
         for (; i + mr <= i_hi; i += mr) {
-          tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
+          if (kBT) {
+            tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
+          } else {
+            nkm_fn(af.data() + (i - iir1) * k, k, ElemPtr(b, iir0), k, n, accm);
+          }
           for (int r = 0; r < mr; ++r) {
             for (int64_t j = iir0; j < j_hi; ++j) {
               StoreF32(out, (i + r) * n + j, accm[r * kElemLanes + (j - iir0)]);
@@ -183,6 +197,16 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
 // re-chunk per-thread when the grid is < nth*4 or NUMA (:1404-1408, IsNuma()
 // stubbed false); each thread starts at chunk ith then steals via the atomic
 // cursor (:1415-1442). num_rows_per_vec_dot is 1 for our scalar dot (no mmla).
+// VT_CPU_MATMUL_STEAL: same-binary A/B for the decode-shape chunk policy above.
+// Read once; default OFF keeps the ggml-mirrored behaviour byte-for-byte.
+bool MatmulStealEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_CPU_MATMUL_STEAL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 template <bool kBT>
 void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1];
@@ -215,7 +239,21 @@ void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
 
     // If the chunking is poor for the number of threads on this setup, scrap
     // the whole plan. Re-chunk it by thread.
-    if (nchunk0 * nchunk1 < nth * 4 || IsNuma()) {
+    //
+    // VT_CPU_MATMUL_STEAL=1 (default OFF) SKIPS this collapse. Rationale, and
+    // why it is an opt-in A/B rather than a new default: the collapse is a
+    // faithful port of ggml (ggml-cpu.c:1404-1408), so changing it by default
+    // would be an unmirrored deviation. But it has a cost this project has not
+    // measured. At decode shapes it rewrites the grid to exactly `nth` chunks
+    // and the loop below then breaks after one chunk each, so a 20-thread
+    // decode GEMV becomes 20 EQUAL STATIC chunks gated by the slowest core,
+    // with the self-balancing steal cursor switched off. On a heterogeneous
+    // core complex (GB10 mixes core classes) that is a straggler trap.
+    // Skipping the collapse keeps the fine-grained grid and lets stealing
+    // balance it. Byte-identity is unaffected either way: every output's
+    // reduction is local and sequential over K (see MatmulOneChunk), so which
+    // thread computes which output changes nothing.
+    if ((nchunk0 * nchunk1 < nth * 4 && !MatmulStealEnabled()) || IsNuma()) {
       nchunk0 = nr0 > nr1 ? nth : 1;  // parallelize by weight rows (N)
       nchunk1 = nr0 > nr1 ? 1 : nth;  // parallelize by src1 rows (M)
     }
@@ -239,7 +277,9 @@ void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
 
       MatmulOneChunk<kBT>(out, a, b, k, n, ir0_start, ir0_end, ir1_start, ir1_end);
 
-      if (nth >= nchunk0 * nchunk1) {
+      // Same switch: the early break is what makes the collapsed grid a pure
+      // static partition. With stealing enabled we keep pulling chunks.
+      if (nth >= nchunk0 * nchunk1 && !MatmulStealEnabled()) {
         break;
       }
 
@@ -256,6 +296,21 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 // accumulation order to MatmulKernel (sequential over K), so on CPU the two
 // orientations are bit-identical for the same logical weight.
 void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  // KERNEL-GEMM-CPU-TILED lever 2: a loader-repacked weight keeps its [N,K]
+  // SHAPE (so this op's contract is unchanged for callers) but its BYTES are
+  // [K,N]. Present it as the [K,N] tensor it literally is and take the
+  // transpose-free path. Byte-identical by the same argument the comment above
+  // MatmulBTKernel already states: both orientations accumulate each output
+  // over K in strict increasing order.
+  if (b.elem_kn_repacked) {
+    Tensor bkn = b;
+    bkn.shape[0] = b.shape[1];   // K
+    bkn.shape[1] = b.shape[0];   // N
+    bkn.stride[0] = b.shape[0];  // one [K,N] row is N elements
+    bkn.stride[1] = 1;
+    MatmulChunked<false>(out, a, bkn);
+    return;
+  }
   MatmulChunked<true>(out, a, b);
 }
 
@@ -1343,6 +1398,110 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
   });
 }
 
+// ── KDA per-K-channel-decay gated-delta recurrence (kKdaGatedDeltaRule) ────────
+// Byte-for-byte GdnHeadTokenStep EXCEPT the decay is per-K-channel: plain GDN
+// does `s_row[ki] *= exp(g_head)` (one scalar per value head), KDA does
+// `s_row[ki] *= exp(g[.,hv,ki])` (one log-decay per K channel), broadcast across
+// the Dv rows. Ported 1:1 from FLA fused_recurrent_gated_delta_rule_fwd_kernel
+// IS_KDA=True (`b_h *= exp(b_gk[None, :])`, fused_recurrent.py:136-137 @ 555967922).
+// All arithmetic f32 (FLA loads bf16 -> tl.float32); same reduction order as GDN.
+void KdaHeadTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Tensor& v_in,
+                      const Tensor& g, const Tensor& beta, float* s_head, int64_t tok,
+                      int64_t hv, int64_t hk, int64_t hk_n, int64_t hv_n, int64_t dk, int64_t dv,
+                      float scale, std::vector<float>& qbuf, std::vector<float>& kbuf,
+                      std::vector<float>& vbuf, std::vector<float>& decaybuf) {
+  const float beta_t = beta.Ptr<float>()[tok * hv_n + hv];
+  const float* g_row = g.Ptr<float>() + (tok * hv_n + hv) * dk;
+  for (int64_t ki = 0; ki < dk; ++ki) {
+    qbuf[static_cast<size_t>(ki)] = LoadF32(q_in, (tok * hk_n + hk) * dk + ki) * scale;
+    kbuf[static_cast<size_t>(ki)] = LoadF32(k_in, (tok * hk_n + hk) * dk + ki);
+    decaybuf[static_cast<size_t>(ki)] = std::exp(g_row[ki]);
+  }
+  for (int64_t vi = 0; vi < dv; ++vi) {
+    float* s_row = s_head + vi * dk;
+    float dot = 0.0f;  // (S * exp(g_channel)) @ k, fused with the per-channel decay
+    for (int64_t ki = 0; ki < dk; ++ki) {
+      s_row[ki] *= decaybuf[static_cast<size_t>(ki)];
+      dot += s_row[ki] * kbuf[static_cast<size_t>(ki)];
+    }
+    vbuf[static_cast<size_t>(vi)] =
+        (LoadF32(v_in, (tok * hv_n + hv) * dv + vi) - dot) * beta_t;
+  }
+  for (int64_t vi = 0; vi < dv; ++vi) {
+    float* s_row = s_head + vi * dk;
+    float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+    for (int64_t ki = 0; ki < dk; ++ki) {
+      s_row[ki] += vbuf[static_cast<size_t>(vi)] * kbuf[static_cast<size_t>(ki)];
+      o += s_row[ki] * qbuf[static_cast<size_t>(ki)];
+    }
+    StoreF32(out, (tok * hv_n + hv) * dv + vi, o);
+  }
+}
+
+void KdaGatedDeltaRuleKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
+                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                             const Tensor& qsl, const GdnArgs& args) {
+  const int64_t n = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
+                dk = state.shape[3];
+  const int32_t* qslp = qsl.Ptr<int32_t>();
+  VT_CHECK(qslp[0] == 0 && qslp[n] == q_in.shape[0],
+           "kda_gated_delta_rule: bad query_start_loc bounds");
+  for (int64_t s = 0; s < n; ++s) {
+    VT_CHECK(qslp[s + 1] >= qslp[s], "kda_gated_delta_rule: query_start_loc not monotonic");
+  }
+  const int64_t hk_n = q_in.shape[1];
+  const int64_t ratio = hv_n / hk_n;
+  const int64_t nitems = n * hv_n;
+  // Row-chunked over (SEQUENCE, VALUE-HEAD) exactly as GdnPrefillKernel — each
+  // (s, hv) owns a disjoint state block + output rows; sequential in tok.
+  ForRows(nitems, [&](int64_t r0, int64_t r1) {
+    std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
+        vbuf(static_cast<size_t>(dv)), decaybuf(static_cast<size_t>(dk));
+    for (int64_t item = r0; item < r1; ++item) {
+      const int64_t s = item / hv_n;
+      const int64_t hv = item % hv_n;
+      const int64_t hk = hv / ratio;
+      float* s_head = state.Ptr<float>() + (s * hv_n + hv) * dv * dk;
+      for (int64_t t = qslp[s]; t < qslp[s + 1]; ++t)
+        KdaHeadTokenStep(out, q_in, k, v, g, beta, s_head, t, hv, hk, hk_n, hv_n, dk, dv,
+                         args.scale, qbuf, kbuf, vbuf, decaybuf);
+    }
+  });
+}
+
+// KDA CHUNK-PREFILL (kKdaChunkPrefill) — CPU reference. There is no portable
+// chunk kernel (the chunk path is the vendored FLA Triton-AOT cubins); the chunked
+// forward computes the SAME per-K-channel gated-delta output as the recurrence up
+// to reduction order, so the CPU reference fuses the gate exactly as FLA's
+// kda_gate_cumsum (g = -exp(a_log)*softplus(g_raw + dt_bias), beta=1 softplus) then
+// runs the proven KdaGatedDeltaRuleKernel recurrence. This keeps the op dual-
+// registered (CPU+CUDA) so the whole-forward CPU gate exercises the wiring; the
+// numerically-meaningful chunked-vs-recurrent comparison runs on the CUDA path.
+void KdaChunkPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                           const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                           const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                           const Tensor& qsl, const GdnArgs& args) {
+  const int64_t T = q_in.shape[0], hv_n = state.shape[1], dk = state.shape[3];
+  const bool has_bias = dt_bias.shape[0] != 0;
+  const float* alp = a_log.Ptr<float>();
+  const float* dbp = has_bias ? dt_bias.Ptr<float>() : nullptr;
+  std::vector<float> g_dec(static_cast<size_t>(T) * hv_n * dk);
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t h = 0; h < hv_n; ++h) {
+      const float a = -std::exp(alp[h]);
+      for (int64_t d = 0; d < dk; ++d) {
+        float x = LoadF32(g_raw, (t * hv_n + h) * dk + d);
+        if (has_bias) x += dbp[h * dk + d];
+        const float sp = x > 20.0f ? x : std::log1p(std::exp(x));  // softplus(beta=1)
+        g_dec[static_cast<size_t>((t * hv_n + h) * dk + d)] = a * sp;
+      }
+    }
+  }
+  Tensor g_t = g_raw;  // same [T,Hv,Dk] f32 contiguous metadata, gated data
+  g_t.data = g_dec.data();
+  KdaGatedDeltaRuleKernel(q, out, q_in, k, v, g_t, beta, state, qsl, args);
+}
+
 // SPECULATIVE (multi-token, slot-snapshotting) gated-delta-rule step.
 // Ported from vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @
 // e24d1b24 — fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN
@@ -2412,6 +2571,12 @@ struct Registrar {
         OpId::kGdnPackedDecode, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
             &GdnPackedDecodeKernel)));
+    RegisterOp(
+        OpId::kKdaGatedDeltaRule, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(&KdaGatedDeltaRuleKernel)));
+    RegisterOp(
+        OpId::kKdaChunkPrefill, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<KdaChunkPrefillFn>(&KdaChunkPrefillKernel)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCPU,
         reinterpret_cast<void*>(

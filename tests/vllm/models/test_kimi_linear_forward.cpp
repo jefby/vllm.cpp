@@ -683,6 +683,68 @@ TEST_CASE("kimi-linear W7 device: NoPE-MLA layer matches the W2 host reference")
   for (size_t i = 0; i < dev.size(); ++i) CHECK(Close(dev[i], ref[i], 1e-4, 1e-5));
 }
 
+// ─── (g2) device MLA attention core (VT_KIMI_DEVICE_MLA): pad-V + vt::Attention ─
+// RED-first gate for the device NoPE-MLA attention wiring (spec §15 residual (d)):
+// the pad-V vt::Attention core (value padded qk_head_dim=qk with zeros; out[:, :, :vh]
+// is exact) matches a from-first-principles causal-softmax reference at the Kimi MLA
+// geometry (asymmetric qk=qn+qr vs v=vh, k_pe shared across heads). vt::Attention runs
+// f32 softmax (vLLM's FA2 regime), the reference f64 — a tight rtol, not bit-exact.
+TEST_CASE("kimi-linear W7 device: NoPE-MLA device attention core (pad-V) matches a softmax reference") {
+  KimiLinearParams p;
+  p.num_attention_heads = 3;
+  p.qk_nope_head_dim = 8;
+  p.qk_rope_head_dim = 4;  // qk = 12
+  p.v_head_dim = 8;
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim, qr = p.qk_rope_head_dim, qk = qn + qr;
+  const int64_t vh = p.v_head_dim, kvw = nah * (qn + vh), T = 7;
+
+  const std::vector<float> q = Rand(T * nah * qk, 401);
+  const std::vector<float> kv = Rand(T * kvw, 402);
+  const std::vector<float> kpe = Rand(T * qr, 403);
+
+  // Reference: per-head causal softmax over [k_nope | k_pe(shared)], weighted v (f64).
+  const double scale = std::pow(static_cast<double>(qk), -0.5);
+  std::vector<float> ref(static_cast<size_t>(T) * nah * vh, 0.0f);
+  std::vector<double> sc(static_cast<size_t>(T));
+  for (int64_t h = 0; h < nah; ++h)
+    for (int64_t t = 0; t < T; ++t) {
+      const float* q_nope = &q[t * nah * qk + h * qk];
+      const float* q_pe = q_nope + qn;
+      double mx = -INFINITY;
+      for (int64_t s = 0; s <= t; ++s) {
+        const float* k_nope = &kv[s * kvw + h * (qn + vh)];
+        const float* kp = &kpe[s * qr];
+        double dot = 0.0;
+        for (int64_t dd = 0; dd < qn; ++dd) dot += static_cast<double>(q_nope[dd]) * k_nope[dd];
+        for (int64_t dd = 0; dd < qr; ++dd) dot += static_cast<double>(q_pe[dd]) * kp[dd];
+        dot *= scale;
+        sc[static_cast<size_t>(s)] = dot;
+        mx = std::max(mx, dot);
+      }
+      double sum = 0.0;
+      for (int64_t s = 0; s <= t; ++s) {
+        const double e = std::exp(sc[static_cast<size_t>(s)] - mx);
+        sc[static_cast<size_t>(s)] = e;
+        sum += e;
+      }
+      float* ot = &ref[t * nah * vh + h * vh];
+      for (int64_t dd = 0; dd < vh; ++dd) {
+        double acc = 0.0;
+        for (int64_t s = 0; s <= t; ++s) {
+          const float* vs = &kv[s * kvw + h * (qn + vh) + qn];
+          acc += (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]);
+        }
+        ot[dd] = static_cast<float>(acc);
+      }
+    }
+
+  vt::Queue qcpu = CpuQueue();
+  const std::vector<float> dev = vllm::KimiMlaAttnCoreDevice(q, kv, kpe, p, T, qcpu);
+  REQUIRE(dev.size() == ref.size());
+  for (size_t i = 0; i < dev.size(); ++i) CHECK(Close(dev[i], ref[i], 3e-3, 3e-4));
+}
+
 // ─── (h) MoE block + dense MLP: device compute == the W2 reference ────────────
 TEST_CASE("kimi-linear W7 device: MoE block + dense MLP match the W2 host reference") {
   KimiLinearParams p;
@@ -890,4 +952,94 @@ TEST_CASE("kimi-linear W7 bf16-resident: ForwardDeviceCompute matches the f32 re
   for (float r : ref) maxabs = std::max(maxabs, std::fabs(static_cast<double>(r)));
   const double atol = 6e-2 * maxabs;
   for (size_t i = 0; i < dl.size(); ++i) CHECK(Close(dl[i], ref[i], 6e-2, atol));
+}
+
+// ─── (l) PAGED-INCREMENTAL decode == full-recompute, byte-exact (§18 lever e) ──
+// The state-carry proof (the Laguna W6 pattern): the paged-incremental path — PREFILL
+// the prompt ONCE (capturing the KDA recurrent+conv state per KDA layer and the
+// latent-KV per NoPE-MLA layer), then advance one token per step from the CARRIED
+// state — must produce BYTE-IDENTICAL logits to the recompute reference (a fresh
+// full-sequence prefill of the growing sequence). Both paths run the SAME device
+// recurrence (vt::KdaGatedDeltaRule), the SAME short-conv (vt::CausalConv1dFwd), and
+// the SAME f64 causal-softmax island over the SAME kv values in the SAME reduction
+// order — so any divergence is a state-carry / cache-append WIRING bug, not numerics
+// (the KDA recurrence is a pure ordered fold; splitting it at the prompt boundary is
+// exact, and each cached token's KV is a per-row projection independent of the batch).
+// This exactly mirrors the GB10 Gate A (harness --incremental vs recompute at the
+// device-KDA config): ForwardDeviceCompute with DEVICE_KDA=1 IS a fresh full-sequence
+// prefill through this same recurrence.
+TEST_CASE("kimi-linear paged-incremental: decode == full-recompute (state carry byte-exact)") {
+  TempFile f(BuildSt(BuildTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  KimiLinearWeights w = LoadKimiLinearForCausalLMWeights(shards, TinyConfig());
+  w.resident = vllm::BuildKimiResidentFromHost(w.host, w.params);
+  REQUIRE(w.resident.resident);
+
+  vt::Queue q = CpuQueue();
+  vt::Backend& be = vt::GetBackend(q.device.type);
+
+  const std::vector<int32_t> prompt = {1, 3, 0};
+  const int kNew = 4;
+
+  auto download_row = [&](const vllm::ForwardLogits& fl) {
+    std::vector<float> row(static_cast<size_t>(fl.vocab));
+    be.Copy(q, row.data(), fl.device_tensor.data, row.size() * sizeof(float));
+    be.Synchronize(q);
+    return row;
+  };
+  auto argmax = [&](const std::vector<float>& row) {
+    int best = 0;
+    for (size_t o = 1; o < row.size(); ++o)
+      if (row[o] > row[static_cast<size_t>(best)]) best = static_cast<int>(o);
+    return best;
+  };
+
+  // ── INCREMENTAL: prefill the prompt ONCE, then decode kNew-1 more from carried state.
+  vllm::KimiDecodeCache cache;
+  std::vector<int32_t> inc_positions(prompt.size());
+  for (size_t t = 0; t < prompt.size(); ++t) inc_positions[t] = static_cast<int32_t>(t);
+  std::vector<std::vector<float>> inc_rows;
+  std::vector<int32_t> inc_tokens;
+  {
+    const vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardPrefillIncremental(
+        prompt, inc_positions, w, q, cache, {static_cast<int32_t>(prompt.size() - 1)});
+    CHECK(fl.on_device());
+    REQUIRE(fl.rows == 1);
+    std::vector<float> row = download_row(fl);
+    inc_rows.push_back(row);
+    inc_tokens.push_back(argmax(row));
+  }
+  // the cache sized one entry per KDA / NoPE-MLA layer (layer 0 KDA, layer 1 MLA).
+  CHECK(cache.kda.size() == 1);
+  CHECK(cache.mla.size() == 1);
+  CHECK(cache.seq_len == static_cast<int64_t>(prompt.size()));
+  for (int s = 1; s < kNew; ++s) {
+    const vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDecodeStepIncremental(
+        inc_tokens.back(), cache.seq_len, w, q, cache);
+    REQUIRE(fl.rows == 1);
+    std::vector<float> row = download_row(fl);
+    inc_rows.push_back(row);
+    inc_tokens.push_back(argmax(row));
+  }
+  CHECK(cache.seq_len == static_cast<int64_t>(prompt.size()) + kNew - 1);
+
+  // ── RECOMPUTE reference: for each step, a FRESH full-sequence prefill of the
+  // growing sequence; take the last-token logits. Same recurrence, fresh state.
+  std::vector<int32_t> seq = prompt;
+  for (int s = 0; s < kNew; ++s) {
+    vllm::KimiDecodeCache fresh;
+    std::vector<int32_t> pos(seq.size());
+    for (size_t t = 0; t < seq.size(); ++t) pos[t] = static_cast<int32_t>(t);
+    const vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardPrefillIncremental(
+        seq, pos, w, q, fresh, {static_cast<int32_t>(seq.size() - 1)});
+    std::vector<float> row = download_row(fl);
+    const int tok = argmax(row);
+    // BYTE-EXACT: the carried-state decode row equals the fresh full-recompute row.
+    REQUIRE(row.size() == inc_rows[static_cast<size_t>(s)].size());
+    for (size_t o = 0; o < row.size(); ++o)
+      CHECK(Close(inc_rows[static_cast<size_t>(s)][o], row[o], 1e-5, 1e-5));
+    CHECK(tok == inc_tokens[static_cast<size_t>(s)]);  // BINDING: identical greedy token
+    seq.push_back(tok);
+  }
 }

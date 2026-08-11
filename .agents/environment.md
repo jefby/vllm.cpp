@@ -20,7 +20,25 @@ environment:
 2. Copy `developer-preferences.example.md` to the untracked
    `developer-preferences.md` for the policy choices (Git integration, which
    remote hosts you may use, contention policy).
-3. Add a profile entry to this file, in the same shape as the entries below:
+3. Set `CHECKPOINT_ROOT` in your `.env` if you have shared or network storage,
+   and download model weights there rather than onto a box's system disk. A
+   30B bf16 checkpoint is ~60 GB; a build tree is ~169 GiB on its own, and a
+   full disk surfaces as unrelated test failures rather than an obvious disk
+   error. Fetching once to shared storage means every host, worktree and agent
+   reuses it instead of each pulling its own copy. It states an INTENT and
+   nothing more: no code in the tree reads `CHECKPOINT_ROOT`, so it neither
+   redirects a download nor resolves a bare directory name — you place the
+   weights under it and pass the full path onward. A setup with no shared mount
+   leaves it empty and uses whatever the tool defaults to (usually the Hugging
+   Face cache under `$HOME`).
+
+   Two rules travel with it. Pin an explicit revision when you fetch:
+   publishers re-quantize in place under an unchanged repo name, so a bare
+   branch name is not reproducible and a checkpoint you gated against can
+   change under you. And setting the variable authorizes nothing on its own —
+   a large asset download still needs authority for the task.
+
+4. Add a profile entry to this file, in the same shape as the entries below:
    hardware, arch, toolkit versions, oracle availability, and the box's
    quirks. A PR for it is welcome, so the shared record says where each gate
    can run. New accelerator classes (an AMD/ROCm box, an Intel GPU) register
@@ -104,6 +122,14 @@ environment:
     Online-gate manifests hash pandas package/distribution files plus Ninja and
     reject missing/drifted dependencies before the GPU lock; profiler launches
     prepend the venv `bin` to spawned EngineCore `PATH`.
+  - **Run the CUDA `ctest` suite with `-j 1`.** GB10 memory is UNIFIED, so a
+    `gpu_memory_utilization` reservation is HOST RAM: concurrent model gates
+    stack into the same ~119 GB and the kernel starts killing. Measured
+    2026-08-09 on a default-ON Triton build, `ctest -j 4` **OOM-rebooted this
+    box** (`NVRM ... Out of memory [NV_ERR_NO_MEMORY]`), which is why the
+    parallel-flake advice in the Apple/Metal profile below does not transfer
+    here. Serialising also means every other probe queues behind the suite, so
+    run attribution arms BEFORE a full suite, never during one.
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds the
     `${GPU_LOCK}` file mutex for the whole job or multi-arm series WHEN other
     agents may run GPU work concurrently (sole owner verified idle via
@@ -119,31 +145,54 @@ environment:
     had 359 GB free afterward. Maintain at least 200 GB headroom before adding
     competitor images.
 - **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: `ssh 192.168.68.23`
-  — hostname `thor`, NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, JetPack
-  R38, driver 580.00, 14 CPU cores, ~122 GB UNIFIED memory, `~91 GB` disk free.
-  On-box `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` returns
-  **11.0** — this CONFIRMS the inferred sm_110. This is the FIRST non-GB10 CUDA
-  board here and the host of the first non-GB10 runtime proof
-  (`CLAIM-CUDA-SM110-RUNTIME`, `BACKEND-CUDA-SM110` RUNTIME-VERIFIED for the
-  portable bf16 path, 2026-07-27).
-  - Non-interactive SSH does NOT put nvcc on PATH — prepend
-    `export PATH=/usr/local/cuda-13.0/bin:$PATH` (nvcc is **`/usr/local/cuda-13.0/bin/nvcc`
-    V13.0.48**, the `>=13` compiler branch, sm_110 in its global target list).
-  - **cutlass is NOT installed on Thor** — and the sm_110 portable path needs none
-    (every fast-path FEATURE-TABLE cell resolves EMPTY, so the CMake cutlass block
-    is skipped). Build with `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON
-    -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF`, Release. Do
-    NOT enable the sm12x fp4 features on sm_110. If a future cutlass-dependent build
-    is ever needed, `scp ~/cutlass-4.5.0` from dgx.casa and point
-    `-DVLLM_CPP_CUTLASS_DIR` at it (still do not enable sm12x features on sm_110).
-  - **GPU-lock discipline (CRITICAL):** Thor runs a `local-ai-worker` docker
-    container that holds the GPU (restart policy `always`). BEFORE any GPU run:
-    `ssh 192.168.68.23 'docker stop local-ai-worker'` (frees the GPU). AFTER all GPU
-    work: `ssh 192.168.68.23 'docker start local-ai-worker'` — RESTORE it, leave
-    Thor exactly as found; NEVER leave the worker stopped on exit. Hold
-    `flock $HOME/gpu.lock` on Thor for the GPU run series. Transfer code with
-    `git archive` (NOT rsync — see [[dgx-transfer-git-archive-not-rsync]]); dgx→Thor
-    scp works after a one-time `-o StrictHostKeyChecking=accept-new`.
+  — NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, 14 CPU cores, ~122 GB
+  UNIFIED memory. `nvidia-smi --query-gpu=compute_cap` returns **11.0**. Host of
+  the first non-GB10 runtime proof (`CLAIM-CUDA-SM110-RUNTIME`, 2026-07-27).
+  - **REIMAGED, re-verified 2026-08-11.** The box is now hostname
+    **`kairos-4db2`** (Ubuntu 24.04 under Kairos), driver **595.78**, and there is
+    **NO host CUDA toolkit, no cmake, no nvcc, no huggingface_hub** — the JetPack
+    R38 / `/usr/local/cuda-13.0` profile described here before is GONE. **The GPU
+    is usable only from inside a container** (developer statement, confirmed on
+    box). There is also no `local-ai-worker` container and no `~/gpu.lock`; the
+    worker-restore discipline below does not apply in this state.
+  - **Working container recipe** (each element was required; all three failed
+    first):
+    - `docker` needs `sudo` (the user is in group `admin`, not `docker`).
+    - Use **`--runtime=nvidia`**, NOT `--gpus all`: the hook refuses the latter
+      outright ("invoking the NVIDIA Container Runtime Hook directly ... is not
+      supported").
+    - Add **`-e NVIDIA_DISABLE_REQUIRE=1`**. The image's `NVIDIA_REQUIRE_CUDA`
+      enumerates BOUNDED driver ranges topping out at `driver<576`, so driver
+      595.78 — which is NEWER and forward-compatible — reads as unsupported.
+    - Image already present: `nvidia/cuda:13.0.1-devel-ubuntu24.04` (nvcc
+      **13.0.88**). Install `cmake ninja-build` inside; build
+      `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=OFF`,
+      no cutlass (every sm_110 fast-path cell resolves EMPTY). **VERIFIED
+      2026-08-11: configure + build of `vllm-cli` both exit 0.**
+    - `nsys` from `nsight-systems-cli` in that image is **2024.2.3 and cannot
+      trace CUDA here** ("does not contain CUDA trace data"). Do not plan a
+      graph/kernel-count measurement on Thor without first installing a newer one.
+  - **★ THIS BOX REBOOTS INSTEAD OF OOM-KILLING — size every load for it.**
+    `vm.overcommit_memory=1` ("always overcommit") with **zero swap**: the kernel
+    grants memory it cannot back, and touching those pages takes the WHOLE MACHINE
+    down. Signature: container `exit=255`, `OOMKilled=false`, NO `dmesg`/journal OOM
+    line, host reboot (`uptime` resets). Observed **three times on 2026-08-11**
+    loading a 27B: bf16 (52 GB target + 8.2 GB draft) twice, and NVFP4 (25 GB +
+    8.2 GB) once, the last of which left the box unreachable pending a power cycle.
+    A 27B target alone loads and runs fine; it is target+draft that crosses the
+    line, consistent with the documented transient double-hold in the load path
+    (`114→67 GiB`, see [[gb10-nvfp4-load-recipe-context-first-shard-release]]).
+    **Do not run a >25 GB model plus a second checkpoint here.** Measured OK on
+    this box: Qwen3-4B bf16 spec-off warm ~24.6 tok/s; Qwen3.6-27B bf16 spec-off
+    warm 4.42 tok/s (portable kernels, no fast paths — absolute numbers are NOT
+    comparable to GB10).
+  - `k3s` runs here and is `enabled`; `sudo systemctl stop k3s` frees its pods
+    (5 containerd shims survive the stop). It was not the crash cause.
+  - Transfer code with `git archive` (NOT rsync — see
+    [[dgx-transfer-git-archive-not-rsync]]). Model weights move dgx→Thor over the
+    LAN with `tar -ch | ssh ... tar -x` into a FRESH directory; dgx reaches
+    192.168.68.23 directly. The reimage CHANGED THE HOST KEY, so dgx's
+    `known_hosts` needs `ssh-keygen -R 192.168.68.23` once.
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import
@@ -187,7 +236,10 @@ environment:
     does not provide, so it returns 0 and the RSS assertions cannot hold.
 
   `test_capi` and `test_openai_conformance` are ctest-PARALLELISM flakes on this
-  box (and on Linux); they pass on rerun. Prefer `ctest -j 3`.
+  box (and on Linux); they pass on rerun. Prefer `ctest -j 3` **here, on this
+  16 GB Mac mini only** — it is not general advice, and in particular the DGX
+  profile above requires `-j 1` because its unified memory OOM-reboots the box
+  under a parallel CUDA suite.
   `test_engine_core_proc` is likewise a timing flake under heavy parallel ctest:
   the case "EngineCoreProc: abort-mode shutdown aborts in-flight requests"
   (`test_engine_core_proc.cpp:315`) races the busy-loop teardown against the
@@ -327,10 +379,35 @@ inner 4096, state 128; context 262144.
 - **Vulkan runtime is already usable and needs no acquisition.** dgx GB10
   enumerates as a real Vulkan `INTEGRATED_GPU` at API 1.4.312 (loader 1.4.328 +
   NVIDIA ICD) with `VK_KHR_cooperative_matrix` v2 and `VK_NV_cooperative_matrix2`;
-  the dev box enumerates `llvmpipe` (Vulkan 1.4.318, CPU) for GPU-free CI. Still
-  to install before Vulkan work: `libvulkan-dev`, `vulkan-tools`, and a
-  **current-SDK** `glslc` — Ubuntu's shaderc 2023.8 is too old for the coopmat2
-  feature probe and fails silently into the slow path.
+  the dev box enumerates `llvmpipe` (Vulkan 1.4.318, CPU) for GPU-free CI.
+  Optional still: `libvulkan-dev` and `vulkan-tools` (neither is needed to build
+  or gate — the backend `dlopen`s the loader and vendors the Khronos TYPE headers).
+- **Vulkan shader toolchain — glslang 16.5.0, installed 2026-08-06 (`VK-A1`).**
+  `$HOME/tools/glslang-16.5.0/bin/glslang`, from the upstream prebuilt Linux
+  x86_64 release tarball; no root, nothing linked (it is a build-time tool, never
+  a dependency — `.agents/discipline.md`). Put that directory on `PATH` to
+  regenerate committed SPIR-V with `scripts/gen-vulkan-spirv.py`.
+  **Two measured facts about the pin.** (1) `src/vt/vulkan/vulkan_spirv.h:16`
+  records `Glslang Version: 11:16.4.0`, but **16.4.0 ships NO release assets** —
+  only `16.5.0` and `main-tot` do, and Ubuntu packages `15.1.0` — so the recorded
+  version cannot be fetched and cannot back a CI gate. (2) The committed SPIR-V
+  nonetheless reproduces **byte-for-byte under 16.5.0** (`--check` passes, exit 0),
+  which proves the committed artifact is what it claims AND that the emitted
+  SPIR-V is stable across a glslang minor bump. The freshness gate therefore pins
+  the DOWNLOAD URL rather than asserting a version string.
+  The older note here — that Ubuntu's shaderc 2023.8 `glslc` is too old for the
+  coopmat2 feature probe — still holds and is why the system package is not used.
+- **dgx Vulkan/llama.cpp comparison toolchain (2026-08-07, `VK-E`).** apt:
+  `glslc`, `glslang-tools`, `libvulkan-dev`, `spirv-headers`. **Ubuntu's `glslc`
+  is shaderc 2023.8 and is NOT USABLE for a fair llama.cpp-Vulkan build** — it
+  disables FOUR of five fast paths (`GL_NV_cooperative_matrix2`,
+  `..._decode_vector`, `GL_EXT_integer_dot_product`, `GL_EXT_bfloat16`), leaving
+  only `GL_KHR_cooperative_matrix`, and the build still configures and runs. A
+  source-built shaderc `v2026.4-dev` lives at `/tmp/shaderc/b/glslc/glslc`; pass
+  `-DVulkan_GLSLC_EXECUTABLE=` to it. **Verify the runtime banner says
+  `matrix cores: NV_coopmat2` before trusting any number.** llama.cpp at pin
+  `237ad9b96` is unpacked at `~/lcpp-vk` with `build-vk/bin/llama-bench` built.
+
 - **No Intel GPU exists on any box here**, so `BACKEND-XPU` end-to-end work is
   HW-BLOCKED; only policy-port, compile coverage and oneAPI CPU-device unit
   numerics are available.

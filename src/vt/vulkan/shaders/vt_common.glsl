@@ -44,6 +44,15 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
+// Opt-in only: a module that does not define VT_SUBGROUP_REDUCE must NOT declare
+// these, because declaring them makes glslang emit the GroupNonUniform*
+// capabilities and a device without them cannot create a pipeline from the
+// module at all. See § vt_tg_sum below.
+#ifdef VT_SUBGROUP_REDUCE
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
 // Storage dtype codes. Mirror the three FLOAT entries of vt::DType; translated
 // host-side by DtypeCode() in vulkan_ops.cpp — the shader never sees vt::DType.
 #define VT_DT_F32  0u
@@ -57,7 +66,43 @@
 // llvmpipe. llama.cpp instead hardcodes 512 (rms_norm.comp:33) and 512/1024
 // elsewhere, which is faster but not universally valid; W0 chooses portability.
 // It is a power of two, which the halving tree reduction below requires.
+//
+// IT STAYS A #define, AND THAT IS A MEASURED DECISION — do not "improve" it into
+// a specialization constant (VK-A1, 2026-08-06). The workgroup size is written
+// down three times (here, each .comp's `local_size_x`, and kWorkgroupSize on the
+// host, which computes the workgroup COUNT from it), which is exactly the shape
+// a specialization constant is supposed to collapse. It cannot, here:
+//
+//   `layout(local_size_x_id = 0, ...)` makes glslang emit
+//   `ExecutionMode LocalSize 1 1 1` plus the LEGACY `BuiltIn WorkgroupSize`
+//   spec-constant vector. The modern `LocalSizeId` execution mode that would
+//   carry the real value needs SPIR-V 1.2 with VK_KHR_maintenance4 (core in
+//   Vulkan 1.3), and this backend targets vulkan1.1 on purpose. MEASURED
+//   consequence on llvmpipe: the literal LocalSize 1 wins, every workgroup runs
+//   ONE thread while the host still dispatches ceil(n/128) groups, and roughly
+//   1/128 of each tensor is computed — cross-device NMSE went from ~1e-14 to
+//   ~0.99 on ops as simple as kAdd.
+//
+// Making VT_TG a specialization constant WITHOUT specializing local_size_x is
+// worse than leaving it alone: it advertises a host-settable knob that silently
+// corrupts, since the shared-memory extent and the reduction tree would follow it
+// while the actual workgroup size would not. The specialization machinery
+// (vulkan_spirv.h spec_ids, GetPipeline) is still the right variant mechanism —
+// it is simply for axes like dtype, quant format and coopmat tier, where the
+// constant does not have to agree with the launch geometry.
+//
+// IT IS OVERRIDABLE AT COMPILE TIME, AND ONLY THAT WAY (VK-RMSNORM, 2026-08-09).
+// A shader that wants a wider workgroup `#define VT_TG` BEFORE including this
+// file and declares the SAME literal in its own `local_size_x`; the two are then
+// baked together into one SPIR-V module, so the "host-settable knob that
+// silently corrupts" failure above cannot occur — a mismatch is a different
+// module, not a different launch of the same one. The host picks the module by
+// NAME after probing maxComputeWorkGroupInvocations, so the 128-wide module
+// stays the always-valid fallback on any conformant device. See
+// vt_rms_norm_wide.comp.
+#ifndef VT_TG
 #define VT_TG 128u
+#endif
 
 // Operand k is declared by each shader as a PAIR of blocks onto the same
 // VkBuffer, at bindings 2*k (uint32_t view) and 2*k+1 (uint16_t view):
@@ -176,6 +221,42 @@ float vt_sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
 // it is written deliberately here rather than rediscovered.
 shared float vt_smem[VT_TG];
 
+#ifdef VT_SUBGROUP_REDUCE
+// SUBGROUP variant of the same reduction, selected by defining
+// VT_SUBGROUP_REDUCE before including this file. Ported from llama.cpp
+// `vulkan-shaders/rms_norm_partials.comp:41-47` @ 237ad9b96 (`subgroupAdd` over a
+// per-lane partial, then a second pass over the per-subgroup results) and
+// `vulkan-shaders/flash_attn_base.comp`'s use of `gl_NumSubgroups` /
+// `subgroupElect` for the shared-memory hand-off. Both extensions are CORE in
+// Vulkan 1.1, which this backend already requires, but the CAPABILITY still has
+// to be present on the device — the host only creates a pipeline from a module
+// containing these instructions when VkPhysicalDeviceSubgroupProperties reports
+// ARITHMETIC and BASIC in the COMPUTE stage (vulkan_context.cpp
+// § SUBGROUP REDUCTION).
+//
+// WHY IT IS FASTER HERE AND WAS A WASH IN THE GEMV. The halving tree costs
+// log2(VT_TG) barriers, and a barrier's cost grows with the number of resident
+// subgroups, so at VT_TG = 1024 it is 10 barriers across 32 subgroups. This
+// collapses that to ONE barrier plus one `subgroupAdd`. In the GEMV the same
+// substitution read as a 4/8 wash because the reduction was a negligible slice
+// of a bandwidth-bound kernel; in a norm the reduction IS the kernel, so the
+// earlier negative result does not transfer (.agents/ negative results are
+// regime-dependent).
+//
+// NOTHING IS ASSUMED ABOUT THE SUBGROUP SIZE. `gl_NumSubgroups` is read from the
+// shader rather than pinned host-side, so the same module is correct at
+// subgroupSize 4 (llvmpipe) and 32 (GB10). VT_TG >= gl_NumSubgroups always, so
+// vt_smem is large enough by construction.
+float vt_tg_sum(uint tid, float v) {
+  const float sg = subgroupAdd(v);
+  barrier();  // load-bearing, see below: protects vt_smem across CALLS
+  if (subgroupElect()) { vt_smem[gl_SubgroupID] = sg; }
+  barrier();
+  float total = 0.0;
+  for (uint i = 0u; i < gl_NumSubgroups; ++i) { total += vt_smem[i]; }
+  return total;
+}
+#else
 float vt_tg_sum(uint tid, float v) {
   barrier();
   vt_smem[tid] = v;
@@ -186,3 +267,4 @@ float vt_tg_sum(uint tid, float v) {
   }
   return vt_smem[0];
 }
+#endif

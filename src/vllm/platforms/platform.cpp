@@ -45,9 +45,23 @@ size_t Index(DeviceType type) {
 
 // Accelerator-first, CPU last — mirrors vLLM resolving `current_platform` by
 // probing accelerators before falling back to CPU (platforms/__init__.py).
+// kROCM sits directly after kCUDA because that is upstream's own probe ORDER:
+// builtin_platform_plugins is {tpu, cuda, rocm, xpu, cpu}
+// (platforms/__init__.py:202-208).
+//
+// THIS ARRAY IS THE ONE PLACE A NEW PLATFORM IS NOT ADDITIVE. The compiler
+// cannot catch an omission here the way -Werror=switch catches a missing enum
+// case: a platform left out of this walk registers fine, answers every query
+// correctly, and is simply never SELECTED. tests/vllm/platforms/test_platform.cpp
+// gates the membership so the next backend does not rediscover this.
+// kTENSTORRENT sits after kMETAL: an extension platform with no upstream probe
+// order to mirror (same as kVULKAN/kMETAL), placed last among accelerators.
+// W2: OPT-125m e2e STRICT token-exact on real Blackhole; still least proven
+// among model-running backends.
 constexpr DeviceType kCurrentPriority[] = {
-    DeviceType::kCUDA, DeviceType::kXPU, DeviceType::kVULKAN,
-    DeviceType::kMETAL, DeviceType::kCPU};
+    DeviceType::kCUDA,   DeviceType::kROCM,        DeviceType::kXPU,
+    DeviceType::kVULKAN, DeviceType::kMETAL, DeviceType::kTENSTORRENT,
+    DeviceType::kCPU};
 }  // namespace
 
 void RegisterPlatform(DeviceType type, Platform* platform) {
@@ -64,6 +78,16 @@ Platform& GetPlatform(DeviceType type) {
 
 bool HasPlatform(DeviceType type) { return Registry()[Index(type)] != nullptr; }
 
+Platform* FindPlatformByName(std::string_view name) {
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    Platform* platform = Registry()[i];
+    if (platform == nullptr) continue;
+    const DeviceType type = static_cast<DeviceType>(i);
+    if (name == vt::DeviceTypeName(type)) return platform;
+  }
+  return nullptr;
+}
+
 Platform& CurrentPlatform() {
   for (DeviceType type : kCurrentPriority) {
     Platform* p = Registry()[static_cast<size_t>(type)];
@@ -71,6 +95,11 @@ Platform& CurrentPlatform() {
   }
   VT_CHECK(false, "no platform registered (not even CPU)");
   return GetPlatform(DeviceType::kCPU);  // unreachable; VT_CHECK throws
+}
+
+const DeviceType* CurrentPlatformPriority(size_t& count) {
+  count = sizeof(kCurrentPriority) / sizeof(kCurrentPriority[0]);
+  return kCurrentPriority;
 }
 
 }  // namespace vllm::platforms

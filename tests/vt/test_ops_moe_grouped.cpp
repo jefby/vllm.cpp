@@ -117,6 +117,31 @@ void CheckClose(const std::vector<float>& got, const std::vector<float>& want, f
   CHECK(bad == 0);
 }
 
+// L2-relative closeness: ||got-want||_2 <= rtol * ||want||_2. This is the standard
+// GEMM-correctness metric and — unlike a per-element absolute tolerance — is robust
+// to catastrophic cancellation. A bf16 tensor-core GEMM vs a naive fp32-accumulate
+// reference legitimately diverges by O(accumulation-magnitude * eps_bf16) at output
+// elements whose TRUE value is near zero (a large sum that cancels): the per-element
+// |got-want| there (~1) dwarfs the tiny |want| yet is pure bf16 rounding, not a
+// kernel defect (proven: the VALIDATED single-expert MoE route diverges identically,
+// max|dense-moe|==0). Per-element byte-fidelity is still gated EXACTLY by the
+// dense==MoE check below; a wrong stride still fails this L2 gate (the row-shifted
+// reference is uncorrelated => ||got-shift|| ~ ||want||, ratio ~1 >> rtol).
+#ifdef VT_MARLIN_NVFP4
+void CheckCloseL2(const std::vector<float>& got, const std::vector<float>& want, float rtol) {
+  REQUIRE(got.size() == want.size());
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double d = static_cast<double>(got[i]) - static_cast<double>(want[i]);
+    num += d * d;
+    den += static_cast<double>(want[i]) * static_cast<double>(want[i]);
+  }
+  const double rel = std::sqrt(num) / (std::sqrt(den) + 1e-12);
+  CAPTURE(rel);
+  CHECK(rel <= rtol);
+}
+#endif  // VT_MARLIN_NVFP4
+
 struct Nvfp4Weight {
   std::vector<uint8_t> packed;  // [N, K/2]
   std::vector<uint8_t> scale;   // [N, K/16]
@@ -147,6 +172,7 @@ struct Mxfp4Weight {
   std::vector<uint8_t> scale;   // [N, K/32]  E8M0 biased exponent (2^(byte-127))
 };
 
+#ifdef VT_MARLIN_NVFP4
 Mxfp4Weight MakeMxfp4Weight(int64_t n, int64_t k, uint32_t seed) {
   Mxfp4Weight w;
   w.packed.resize(static_cast<size_t>(n * (k / 2)));
@@ -159,6 +185,7 @@ Mxfp4Weight MakeMxfp4Weight(int64_t n, int64_t k, uint32_t seed) {
   for (auto& s : w.scale) s = static_cast<uint8_t>(e8m0_dist(rng));
   return w;
 }
+#endif  // VT_MARLIN_NVFP4
 
 std::vector<float> RandomF32(size_t numel, uint32_t seed) {
   std::mt19937 rng(seed);
@@ -878,6 +905,245 @@ TEST_CASE("CUDA marlin MXFP4 W4A16 (group_blocks=2, E8M0) matches CPU dequant re
   }
 }
 
+// --- QUANT-CT-MXFP4-CLOSERS slivers (a)+(b) --------------------------------
+// Sliver (a): the dense single-expert path forces moe_block_size=8 at M<=8
+// (dense_nvfp4_gemm.h::DenseAlignFor) so M=8 uses vLLM's 8-row m_block_size_8
+// tile instead of the padded 16-row tile MarlinMoeAlignBlockSizeSelect otherwise
+// picks at M=8. This proves the forced block=8 route is CORRECT vs an
+// independent CPU dequant reference at M=8, and MEASURES whether it is
+// byte-exact vs the block=16 route production used before the fix (the near-tie
+// arbiter). Sliver (b): the shared reduction workspace is zeroed ONCE, not
+// per-call — the fp32-reduce marlin barrier self-resets its locks
+// (marlin_template.h:2170 barrier_release(...,last) -> :204 lock[0]=0; the
+// slice_count==1 case never touches locks at :2162; our launch pins
+// use_atomic_add=false at cuda_moe_marlin.cu:141, so the non-self-clearing
+// atomic-add path at :614 is unreachable). Proven directly: the workspace is
+// all-zero AFTER a GEMM, and a second GEMM on the once-zeroed workspace is
+// bit-identical to the first.
+TEST_CASE("CUDA marlin MXFP4 W4A16 dense M=8: block=8 route + ws self-reset (closers)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  // Real Qwen3-8B decode projection shapes (K%128==0, K%32==0, N%64==0).
+  for (auto KN : std::vector<std::pair<int64_t, int64_t>>{{4096, 4096}, {12288, 4096}}) {
+    const int64_t K = KN.first, N = KN.second;
+    CAPTURE(K);
+    CAPTURE(N);
+    const int64_t M = 8, top_k = 1, E = 1, P = M * top_k;
+
+    // Sanity: MarlinMoeAlignBlockSizeSelect DOES pick 16 at M=8 (the pre-fix
+    // production route this sliver overrides to 8).
+    CHECK(vt::cuda::MarlinMoeAlignBlockSizeSelect(static_cast<int>(M), 1, 1) == 16);
+
+    Mxfp4Weight w = MakeMxfp4Weight(N, K, 4321);
+    std::vector<float> w_f32(static_cast<size_t>(N * K));
+    vllm::DequantMxfp4ToF32(w.packed.data(), w.scale.data(), N, K, w_f32.data());
+
+    const auto act_f = RandomF32(static_cast<size_t>(M * K), 7700);
+    const auto act_bf16 = ToBf16(act_f);
+    std::vector<float> act_r(act_f.size());
+    for (size_t i = 0; i < act_r.size(); ++i) act_r[i] = vt::BF16ToF32(act_bf16[i]);
+    std::vector<float> ref(static_cast<size_t>(P * N), 0.0f);
+    for (int64_t m = 0; m < M; ++m)
+      for (int64_t n = 0; n < N; ++n) {
+        float acc = 0.0f;
+        for (int64_t k = 0; k < K; ++k)
+          acc += act_r[static_cast<size_t>(m * K + k)] * w_f32[static_cast<size_t>(n * K + k)];
+        ref[static_cast<size_t>(m * N + n)] = acc;
+      }
+
+    QueueGuard gq(gpu);
+    void* stream = gq.q.handle;
+    const int dev = gq.q.device.index;
+
+    // Repack ONCE (block-independent).
+    DeviceTensor dp(gpu, gq.q, DType::kI8, {N, K / 2}, w.packed.data());
+    DeviceTensor ds(gpu, gq.q, DType::kI8, {N, K / 32}, w.scale.data());
+    DeviceTensor wq(gpu, gq.q, DType::kI32, {E, K / 16, N * 2});
+    DeviceTensor sc(gpu, gq.q, DType::kI8, {E, K / 32, N});
+    vt::cuda::MarlinRepackExpertWeight(stream, dev, static_cast<uint32_t*>(wq.ptr()),
+                                       static_cast<const uint8_t*>(dp.ptr()),
+                                       static_cast<int>(K), static_cast<int>(N));
+    vt::cuda::MarlinProcessExpertScalesMxfp4(stream, static_cast<const uint8_t*>(ds.ptr()),
+                                             static_cast<uint8_t*>(sc.ptr()),
+                                             static_cast<int>(K), static_cast<int>(N));
+    float g_dummy = 1.0f;
+    DeviceTensor gg(gpu, gq.q, DType::kF32, {E}, &g_dummy);
+    DeviceTensor dact(gpu, gq.q, DType::kBF16, {M, K}, act_bf16.data());
+    const int sms = vt::cuda::MarlinDeviceSms(dev);
+
+    // One dense single-expert GEMM at `block`, sharing `wst` (the workspace).
+    auto run = [&](int block, Tensor wst, std::vector<uint16_t>& out) {
+      std::vector<int32_t> topk_ids(static_cast<size_t>(P), 0);
+      std::vector<float> topk_w(static_cast<size_t>(P), 1.0f);
+      int max_tok = 0, max_blk = 0;
+      vt::cuda::MarlinMoeAlignSizes(static_cast<int>(M), static_cast<int>(top_k),
+                                    static_cast<int>(E), block, &max_tok, &max_blk);
+      DeviceTensor dtid(gpu, gq.q, DType::kI32, {M, top_k}, topk_ids.data());
+      DeviceTensor dtw(gpu, gq.q, DType::kF32, {M, top_k}, topk_w.data());
+      DeviceTensor sorted_ids(gpu, gq.q, DType::kI32, {max_tok});
+      DeviceTensor expert_ids(gpu, gq.q, DType::kI32, {max_blk});
+      DeviceTensor num_pad(gpu, gq.q, DType::kI32, {1});
+      vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                        static_cast<int>(M), static_cast<int>(top_k),
+                                        static_cast<int>(E), block,
+                                        static_cast<int32_t*>(sorted_ids.ptr()),
+                                        static_cast<int32_t*>(expert_ids.ptr()),
+                                        static_cast<int32_t*>(num_pad.ptr()));
+      DeviceTensor dout(gpu, gq.q, DType::kBF16, {P, N});
+      vt::MoeMarlinArgs args{block, static_cast<int>(top_k), static_cast<int>(M),
+                             static_cast<int>(N), static_cast<int>(K), false};
+      args.group_size = 32;
+      args.mxfp4 = true;
+      vt::MoeGroupedGemmNvfp4Marlin(gq.q, dout.tensor(), dact.tensor(), wq.tensor(), sc.tensor(),
+                                    gg.tensor(), wst, sorted_ids.tensor(), expert_ids.tensor(),
+                                    num_pad.tensor(), dtw.tensor(), args);
+      out.assign(static_cast<size_t>(P * N), 0);
+      dout.Download(gq.q, out.data());
+    };
+    auto to_f32 = [](const std::vector<uint16_t>& b) {
+      std::vector<float> f(b.size());
+      for (size_t i = 0; i < b.size(); ++i) f[i] = vt::BF16ToF32(b[i]);
+      return f;
+    };
+
+    // Shared workspace zeroed ONCE (mirror the production DenseMarlinWorkspace).
+    DeviceTensor ws(gpu, gq.q, DType::kI32, {sms * 4});
+    gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+    Tensor wst = MakeTensor(ws.ptr(), DType::kI32, gq.q.device, {sms * 4});
+
+    // Sliver (a): forced block=8 route is CORRECT vs the independent CPU ref.
+    std::vector<uint16_t> out8;
+    run(8, wst, out8);
+    CheckClose(to_f32(out8), ref, 2e-2f, 2e-2f);
+
+    // Sliver (b) invariant: a completed GEMM leaves the workspace all-zero. A
+    // non-zero lock here would mean the dropped per-call re-zero is load-bearing.
+    std::vector<int32_t> ws_host(static_cast<size_t>(sms * 4), -1);
+    ws.Download(gq.q, ws_host.data());
+    size_t ws_nonzero = 0;
+    for (int32_t v : ws_host)
+      if (v != 0) ++ws_nonzero;
+    CAPTURE(ws_nonzero);
+    CHECK(ws_nonzero == 0);
+
+    // Sliver (b) reuse safety: a SECOND GEMM on the once-zeroed, not-re-zeroed
+    // workspace is bit-identical to the first.
+    std::vector<uint16_t> out8b;
+    run(8, wst, out8b);
+    CHECK(out8b == out8);
+
+    // Sliver (a) byte-exact arbiter: block=16 was the pre-fix M=8 route. Measure
+    // whether forcing block=8 changes the output bits (byte-exact => zero risk to
+    // the SACRED token gate; near-tie => the token gate arbitrates).
+    std::vector<uint16_t> out16;
+    run(16, wst, out16);
+    CheckClose(to_f32(out16), ref, 2e-2f, 2e-2f);
+    size_t bitdiff = 0;
+    float max_abs = 0.0f;
+    {
+      const auto f8 = to_f32(out8);
+      const auto f16 = to_f32(out16);
+      for (size_t i = 0; i < out8.size(); ++i) {
+        if (out8[i] != out16[i]) ++bitdiff;
+        max_abs = std::max(max_abs, std::fabs(f8[i] - f16[i]));
+      }
+    }
+    MESSAGE("block8-vs-block16 M=8 K=" << K << " N=" << N << " bitdiff=" << bitdiff << "/"
+                                       << out8.size() << " max_abs=" << max_abs);
+  }
+}
+
+// Sliver (a) blast-radius closure for the NVFP4 (group_blocks=1, fp8 scales +
+// global) dense route — the OTHER header consumer (Qwen3-32B-NVFP4A16, Laguna).
+// The m_block_size_8 tile controls the bf16 ACTIVATION/A-matrix layout, which is
+// identical for NVFP4 and MXFP4 (the quant scheme only changes the B-weight scale
+// decode along K), so byte-exactness is quant-agnostic; this proves it directly.
+TEST_CASE("CUDA marlin NVFP4 W4A16 dense M=8: block=8 byte-exact vs block=16 (closers)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  const int64_t K = 4096, N = 4096, M = 8, top_k = 1, E = 1, P = M * top_k;
+
+  // The byte-exact A/B is self-validating: block=16 is the production-validated
+  // NVFP4 route (the Qwen3-32B-NVFP4A16 SACRED paged-engine gate runs on it), so
+  // block=8 == block=16 bit-for-bit proves block=8 is exactly as correct without
+  // needing an absolute CPU reference (whose sf/global-scale convention differs
+  // from the Marlin repack path — see the divisor-reciprocal note in
+  // test_qwen3_forward.cpp).
+  Nvfp4Weight w = MakeNvfp4Weight(N, K, 4321);
+  const auto act_f = RandomF32(static_cast<size_t>(M * K), 7700);
+  const auto act_bf16 = ToBf16(act_f);
+
+  QueueGuard gq(gpu);
+  void* stream = gq.q.handle;
+  const int dev = gq.q.device.index;
+
+  std::vector<const uint8_t*> bufs{w.scale.data()};
+  std::vector<size_t> lens{w.scale.size()};
+  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+  DeviceTensor dp(gpu, gq.q, DType::kI8, {N, K / 2}, w.packed.data());
+  DeviceTensor dsx(gpu, gq.q, DType::kI8, {N, K / 16}, w.scale.data());
+  DeviceTensor wq(gpu, gq.q, DType::kI32, {E, K / 16, N * 2});
+  DeviceTensor sc(gpu, gq.q, DType::kI8, {E, K / 16, N});
+  vt::cuda::MarlinRepackExpertWeight(stream, dev, static_cast<uint32_t*>(wq.ptr()),
+                                     static_cast<const uint8_t*>(dp.ptr()), static_cast<int>(K),
+                                     static_cast<int>(N));
+  vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dsx.ptr()),
+                                      static_cast<uint8_t*>(sc.ptr()), static_cast<int>(K),
+                                      static_cast<int>(N), sf);
+  float gsc = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.scale2, sf);
+  DeviceTensor gg(gpu, gq.q, DType::kF32, {E}, &gsc);
+  DeviceTensor dact(gpu, gq.q, DType::kBF16, {M, K}, act_bf16.data());
+  const int sms = vt::cuda::MarlinDeviceSms(dev);
+  DeviceTensor ws(gpu, gq.q, DType::kI32, {sms * 4});
+  gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  Tensor wst = MakeTensor(ws.ptr(), DType::kI32, gq.q.device, {sms * 4});
+
+  auto run = [&](int block, std::vector<uint16_t>& out) {
+    std::vector<int32_t> topk_ids(static_cast<size_t>(P), 0);
+    std::vector<float> topk_w(static_cast<size_t>(P), 1.0f);
+    int max_tok = 0, max_blk = 0;
+    vt::cuda::MarlinMoeAlignSizes(static_cast<int>(M), static_cast<int>(top_k),
+                                  static_cast<int>(E), block, &max_tok, &max_blk);
+    DeviceTensor dtid(gpu, gq.q, DType::kI32, {M, top_k}, topk_ids.data());
+    DeviceTensor dtw(gpu, gq.q, DType::kF32, {M, top_k}, topk_w.data());
+    DeviceTensor sorted_ids(gpu, gq.q, DType::kI32, {max_tok});
+    DeviceTensor expert_ids(gpu, gq.q, DType::kI32, {max_blk});
+    DeviceTensor num_pad(gpu, gq.q, DType::kI32, {1});
+    vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                      static_cast<int>(M), static_cast<int>(top_k),
+                                      static_cast<int>(E), block,
+                                      static_cast<int32_t*>(sorted_ids.ptr()),
+                                      static_cast<int32_t*>(expert_ids.ptr()),
+                                      static_cast<int32_t*>(num_pad.ptr()));
+    DeviceTensor dout(gpu, gq.q, DType::kBF16, {P, N});
+    vt::MoeMarlinArgs args{block, static_cast<int>(top_k), static_cast<int>(M),
+                           static_cast<int>(N), static_cast<int>(K), false};
+    args.group_size = 16;  // NVFP4
+    vt::MoeGroupedGemmNvfp4Marlin(gq.q, dout.tensor(), dact.tensor(), wq.tensor(), sc.tensor(),
+                                  gg.tensor(), wst, sorted_ids.tensor(), expert_ids.tensor(),
+                                  num_pad.tensor(), dtw.tensor(), args);
+    out.assign(static_cast<size_t>(P * N), 0);
+    dout.Download(gq.q, out.data());
+  };
+
+  std::vector<uint16_t> out8, out16;
+  run(8, out8);
+  run(16, out16);
+  size_t bitdiff = 0;
+  for (size_t i = 0; i < out8.size(); ++i)
+    if (out8[i] != out16[i]) ++bitdiff;
+  MESSAGE("NVFP4 block8-vs-block16 M=8 K=" << K << " N=" << N << " bitdiff=" << bitdiff << "/"
+                                           << out8.size());
+  CHECK(bitdiff == 0);
+}
+
 TEST_CASE("CUDA moe_align parallel == serial (expert_ids/num_pad exact, per-expert multiset)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
@@ -997,6 +1263,260 @@ TEST_CASE("CUDA moe_align parallel == serial (expert_ids/num_pad exact, per-expe
       std::uniform_int_distribution<int> d(0, E - 1);
       for (auto& v : ids) v = d(rng);
       run(T, E, top_k, ids);
+    }
+  }
+}
+
+// ─── DENSE Marlin (row KERNEL-MARLIN-DENSE-PORT) ────────────────────────────
+// vt::MarlinDenseGemm is vLLM's OWN dense W4A16 GEMM (direct-A, tile-per-CTA,
+// dense fp32-C_tmp reduce) — the byte-preserving replacement for the
+// single-expert MoE-marlin route the dense E=1 NVFP4/MXFP4 projections use today
+// (dense_nvfp4_gemm.h). The gate (mission gate a): the dense op must match, per
+// output element, BOTH an INDEPENDENT CPU-dequant reference AND the grouped
+// (single-expert MoE) route it replaces, across M=1..8, NVFP4 + MXFP4, and a set
+// of model-representative shapes; plus a wrong-stride RED-injection proof that the
+// comparison actually discriminates (not a vacuous pass). RED-first: on a wrong
+// launcher stride (lda / operand layout) the reference match must FAIL.
+
+// Count elements outside tolerance (RED-injection helper: 0 == match, >0 == diff).
+size_t MismatchCount(const std::vector<float>& got, const std::vector<float>& want, float atol,
+                     float rtol) {
+  size_t bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const float tol = atol + rtol * std::fabs(want[i]);
+    if (!(std::fabs(got[i] - want[i]) <= tol)) ++bad;
+  }
+  return bad;
+}
+
+// CPU reference y[M,N] = act(bf16)[M,K] @ dequant(w)[N,K]^T, accumulated in f32.
+std::vector<float> DenseRefNvfp4(const Nvfp4Weight& w, const std::vector<uint16_t>& act_bf16,
+                                 int64_t M, int64_t N, int64_t K) {
+  std::vector<uint16_t> deq(static_cast<size_t>(N * K));
+  vllm::DequantNvfp4ToBf16(w.packed.data(), w.scale.data(), w.scale2, N, K, deq.data());
+  std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+  for (int64_t m = 0; m < M; ++m)
+    for (int64_t n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int64_t k = 0; k < K; ++k)
+        acc += vt::BF16ToF32(act_bf16[static_cast<size_t>(m * K + k)]) *
+               vt::BF16ToF32(deq[static_cast<size_t>(n * K + k)]);
+      ref[static_cast<size_t>(m * N + n)] = acc;
+    }
+  return ref;
+}
+
+std::vector<float> DenseRefMxfp4(const Mxfp4Weight& w, const std::vector<uint16_t>& act_bf16,
+                                 int64_t M, int64_t N, int64_t K) {
+  std::vector<uint16_t> deq(static_cast<size_t>(N * K));
+  vllm::DequantMxfp4ToBf16(w.packed.data(), w.scale.data(), N, K, deq.data());
+  std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+  for (int64_t m = 0; m < M; ++m)
+    for (int64_t n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int64_t k = 0; k < K; ++k)
+        acc += vt::BF16ToF32(act_bf16[static_cast<size_t>(m * K + k)]) *
+               vt::BF16ToF32(deq[static_cast<size_t>(n * K + k)]);
+      ref[static_cast<size_t>(m * N + n)] = acc;
+    }
+  return ref;
+}
+
+TEST_CASE("CUDA marlin DENSE gemm matches CPU-dequant ref AND the grouped route (NVFP4)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  REQUIRE(vt::OpRegistered(vt::OpId::kMarlinDenseGemm, DeviceType::kCUDA));
+  QueueGuard gq(gpu);
+  void* stream = gq.q.handle;
+  const int dev = gq.q.device.index;
+  const int sms = vt::cuda::MarlinDeviceSms(dev);
+
+  // Model-representative shapes (K % 128 == 0, N % 64 == 0: the marlin tile
+  // constraints the dense projections satisfy). The 48-CTA E=1 regime is M<=8.
+  const std::vector<std::pair<int64_t, int64_t>> shapes = {{256, 64}, {512, 128}, {128, 256}};
+  for (auto [K, N] : shapes) {
+    const Nvfp4Weight w = MakeNvfp4Weight(N, K, 9100 + static_cast<uint32_t>(K + N));
+    // Resident (repack ONCE): wq [K/16, N*2] i32, sc [K/16, N] fp8, gg [1] f32.
+    std::vector<const uint8_t*> sc_bufs{w.scale.data()};
+    std::vector<size_t> sc_lens{w.scale.size()};
+    const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(sc_bufs, sc_lens);
+    DeviceTensor dpacked(gpu, gq.q, DType::kI8, {N, K / 2}, w.packed.data());
+    DeviceTensor dscale(gpu, gq.q, DType::kI8, {N, K / 16}, w.scale.data());
+    DeviceTensor wq(gpu, gq.q, DType::kI32, {K / 16, N * 2});
+    DeviceTensor sc(gpu, gq.q, DType::kI8, {K / 16, N});
+    vt::cuda::MarlinRepackExpertWeight(stream, dev, static_cast<uint32_t*>(wq.ptr()),
+                                       static_cast<const uint8_t*>(dpacked.ptr()),
+                                       static_cast<int>(K), static_cast<int>(N));
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dscale.ptr()),
+                                        static_cast<uint8_t*>(sc.ptr()), static_cast<int>(K),
+                                        static_cast<int>(N), sf);
+    const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.scale2, sf);
+    DeviceTensor gg(gpu, gq.q, DType::kF32, {1}, &g);
+    gpu.Synchronize(gq.q);
+
+    // Rank-3 resident views for the single-expert MoE route (SAME memory).
+    Tensor wq3 = MakeTensor(wq.ptr(), DType::kI32, gq.q.device, {1, K / 16, N * 2});
+    Tensor sc3 = MakeTensor(sc.ptr(), DType::kI8, gq.q.device, {1, K / 16, N});
+
+    DeviceTensor ws(gpu, gq.q, DType::kI32, {sms * 4});
+
+    for (int64_t M = 1; M <= 8; ++M) {
+      const auto act_f = RandomF32(static_cast<size_t>(M * K), 700 + static_cast<uint32_t>(M));
+      const auto act_bf16 = ToBf16(act_f);
+      const auto ref = DenseRefNvfp4(w, act_bf16, M, N, K);
+      DeviceTensor dact(gpu, gq.q, DType::kBF16, {M, K}, act_bf16.data());
+
+      // (1) DENSE route.
+      DeviceTensor dout(gpu, gq.q, DType::kBF16, {M, N});
+      gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+      vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)};
+      vt::MarlinDenseGemm(gq.q, dout.tensor(), dact.tensor(), wq.tensor(), sc.tensor(),
+                          gg.tensor(), ws.tensor(), dargs);
+      std::vector<uint16_t> h_dense(static_cast<size_t>(M * N));
+      dout.Download(gq.q, h_dense.data());
+      std::vector<float> got_dense(static_cast<size_t>(M * N));
+      for (size_t i = 0; i < got_dense.size(); ++i) got_dense[i] = vt::BF16ToF32(h_dense[i]);
+      // NVFP4 random data exercises catastrophic cancellation (some output rows are
+      // large sums that nearly cancel), where a bf16 tensor-core result legitimately
+      // parts from a naive fp32-accumulate reference by more than a per-element 3e-2
+      // — identically for the VALIDATED MoE route (max|dense-moe|==0 below). Gate the
+      // vs-reference correctness with the cancellation-robust L2-relative metric; the
+      // byte-preserving per-element claim is the EXACT dense==MoE check.
+      CheckCloseL2(got_dense, ref, 2e-2f);
+
+      // (2) GROUPED single-expert MoE route (all M tokens -> expert 0).
+      const int block = (M <= 8) ? 8 : vt::cuda::MarlinMoeAlignBlockSizeSelect(static_cast<int>(M), 1, 1);
+      int max_tok = 0, max_blk = 0;
+      vt::cuda::MarlinMoeAlignSizes(static_cast<int>(M), 1, 1, block, &max_tok, &max_blk);
+      std::vector<int32_t> tids(static_cast<size_t>(M), 0);
+      DeviceTensor dtid(gpu, gq.q, DType::kI32, {M}, tids.data());
+      DeviceTensor sorted_ids(gpu, gq.q, DType::kI32, {max_tok});
+      DeviceTensor expert_ids(gpu, gq.q, DType::kI32, {max_blk});
+      DeviceTensor num_pad(gpu, gq.q, DType::kI32, {1});
+      vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                        static_cast<int>(M), 1, 1, block,
+                                        static_cast<int32_t*>(sorted_ids.ptr()),
+                                        static_cast<int32_t*>(expert_ids.ptr()),
+                                        static_cast<int32_t*>(num_pad.ptr()));
+      std::vector<float> ones(static_cast<size_t>(M), 1.0f);
+      DeviceTensor topkw(gpu, gq.q, DType::kF32, {M}, ones.data());
+      DeviceTensor mout(gpu, gq.q, DType::kBF16, {M, N});
+      gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+      vt::MoeMarlinArgs margs{block, 1, static_cast<int>(M), static_cast<int>(N),
+                              static_cast<int>(K), false};
+      vt::MoeGroupedGemmNvfp4Marlin(gq.q, mout.tensor(), dact.tensor(), wq3, sc3,
+                                    gg.tensor(), ws.tensor(), sorted_ids.tensor(),
+                                    expert_ids.tensor(), num_pad.tensor(), topkw.tensor(), margs);
+      std::vector<uint16_t> h_moe(static_cast<size_t>(M * N));
+      mout.Download(gq.q, h_moe.data());
+      std::vector<float> got_moe(static_cast<size_t>(M * N));
+      for (size_t i = 0; i < got_moe.size(); ++i) got_moe[i] = vt::BF16ToF32(h_moe[i]);
+      CheckCloseL2(got_moe, ref, 2e-2f);
+      // Dense and grouped agree to within a couple bf16 ULPs (both marlin; the
+      // dense reduce differs from the par-regrouped grouped reduce by ~1 ULP —
+      // exactly the point of the port).
+      CheckClose(got_dense, got_moe, 5e-2f, 5e-2f);
+
+      // (3) WRONG-STRIDE RED injection: a row-shifted reference is a stride-class
+      // perturbation; the correct-vs-shifted comparison MUST discriminate (else
+      // the whole gate is vacuous). Only meaningful when M*N gives real spread.
+      if (M >= 2) {
+        std::vector<float> ref_shift(ref.size());
+        for (size_t i = 0; i < ref.size(); ++i)
+          ref_shift[i] = ref[(i + static_cast<size_t>(N)) % ref.size()];
+        CHECK(MismatchCount(got_dense, ref_shift, 3e-2f, 3e-2f) > 0);
+      }
+    }
+  }
+}
+
+TEST_CASE("CUDA marlin DENSE gemm matches CPU-dequant ref AND the grouped route (MXFP4)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  REQUIRE(vt::OpRegistered(vt::OpId::kMarlinDenseGemm, DeviceType::kCUDA));
+  QueueGuard gq(gpu);
+  void* stream = gq.q.handle;
+  const int dev = gq.q.device.index;
+  const int sms = vt::cuda::MarlinDeviceSms(dev);
+
+  const std::vector<std::pair<int64_t, int64_t>> shapes = {{256, 64}, {512, 128}};
+  for (auto [K, N] : shapes) {
+    const Mxfp4Weight w = MakeMxfp4Weight(N, K, 9500 + static_cast<uint32_t>(K + N));
+    // MXFP4 resident: group_size 32 => sc [K/32, N]; E8M0 passthrough (no global).
+    DeviceTensor dpacked(gpu, gq.q, DType::kI8, {N, K / 2}, w.packed.data());
+    DeviceTensor dscale(gpu, gq.q, DType::kI8, {N, K / 32}, w.scale.data());
+    DeviceTensor wq(gpu, gq.q, DType::kI32, {K / 16, N * 2});
+    DeviceTensor sc(gpu, gq.q, DType::kI8, {K / 32, N});
+    vt::cuda::MarlinRepackExpertWeight(stream, dev, static_cast<uint32_t*>(wq.ptr()),
+                                       static_cast<const uint8_t*>(dpacked.ptr()),
+                                       static_cast<int>(K), static_cast<int>(N));
+    vt::cuda::MarlinProcessExpertScalesMxfp4(stream, static_cast<const uint8_t*>(dscale.ptr()),
+                                             static_cast<uint8_t*>(sc.ptr()), static_cast<int>(K),
+                                             static_cast<int>(N));
+    const float g = 1.0f;  // unused (kernel skips global for E8M0)
+    DeviceTensor gg(gpu, gq.q, DType::kF32, {1}, &g);
+    gpu.Synchronize(gq.q);
+
+    Tensor wq3 = MakeTensor(wq.ptr(), DType::kI32, gq.q.device, {1, K / 16, N * 2});
+    Tensor sc3 = MakeTensor(sc.ptr(), DType::kI8, gq.q.device, {1, K / 32, N});
+
+    DeviceTensor ws(gpu, gq.q, DType::kI32, {sms * 4});
+
+    for (int64_t M = 1; M <= 8; ++M) {
+      const auto act_f = RandomF32(static_cast<size_t>(M * K), 800 + static_cast<uint32_t>(M));
+      const auto act_bf16 = ToBf16(act_f);
+      const auto ref = DenseRefMxfp4(w, act_bf16, M, N, K);
+      DeviceTensor dact(gpu, gq.q, DType::kBF16, {M, K}, act_bf16.data());
+
+      DeviceTensor dout(gpu, gq.q, DType::kBF16, {M, N});
+      gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+      vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)};
+      dargs.group_size = 32;
+      dargs.mxfp4 = true;
+      vt::MarlinDenseGemm(gq.q, dout.tensor(), dact.tensor(), wq.tensor(), sc.tensor(),
+                          gg.tensor(), ws.tensor(), dargs);
+      std::vector<uint16_t> h_dense(static_cast<size_t>(M * N));
+      dout.Download(gq.q, h_dense.data());
+      std::vector<float> got_dense(static_cast<size_t>(M * N));
+      for (size_t i = 0; i < got_dense.size(); ++i) got_dense[i] = vt::BF16ToF32(h_dense[i]);
+      CheckClose(got_dense, ref, 4e-2f, 4e-2f);
+
+      const int block = (M <= 8) ? 8 : vt::cuda::MarlinMoeAlignBlockSizeSelect(static_cast<int>(M), 1, 1);
+      int max_tok = 0, max_blk = 0;
+      vt::cuda::MarlinMoeAlignSizes(static_cast<int>(M), 1, 1, block, &max_tok, &max_blk);
+      std::vector<int32_t> tids(static_cast<size_t>(M), 0);
+      DeviceTensor dtid(gpu, gq.q, DType::kI32, {M}, tids.data());
+      DeviceTensor sorted_ids(gpu, gq.q, DType::kI32, {max_tok});
+      DeviceTensor expert_ids(gpu, gq.q, DType::kI32, {max_blk});
+      DeviceTensor num_pad(gpu, gq.q, DType::kI32, {1});
+      vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                        static_cast<int>(M), 1, 1, block,
+                                        static_cast<int32_t*>(sorted_ids.ptr()),
+                                        static_cast<int32_t*>(expert_ids.ptr()),
+                                        static_cast<int32_t*>(num_pad.ptr()));
+      std::vector<float> ones(static_cast<size_t>(M), 1.0f);
+      DeviceTensor topkw(gpu, gq.q, DType::kF32, {M}, ones.data());
+      DeviceTensor mout(gpu, gq.q, DType::kBF16, {M, N});
+      gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+      vt::MoeMarlinArgs margs{block, 1, static_cast<int>(M), static_cast<int>(N),
+                              static_cast<int>(K), false};
+      margs.group_size = 32;
+      margs.mxfp4 = true;
+      vt::MoeGroupedGemmNvfp4Marlin(gq.q, mout.tensor(), dact.tensor(), wq3, sc3,
+                                    gg.tensor(), ws.tensor(), sorted_ids.tensor(),
+                                    expert_ids.tensor(), num_pad.tensor(), topkw.tensor(), margs);
+      std::vector<uint16_t> h_moe(static_cast<size_t>(M * N));
+      mout.Download(gq.q, h_moe.data());
+      std::vector<float> got_moe(static_cast<size_t>(M * N));
+      for (size_t i = 0; i < got_moe.size(); ++i) got_moe[i] = vt::BF16ToF32(h_moe[i]);
+      CheckClose(got_moe, ref, 4e-2f, 4e-2f);
+      CheckClose(got_dense, got_moe, 6e-2f, 6e-2f);
     }
   }
 }

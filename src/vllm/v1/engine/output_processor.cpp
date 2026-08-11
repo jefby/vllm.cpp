@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/output_processor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -52,6 +53,24 @@ RequestOutput RequestOutputCollector::get() {
     std::rethrow_exception(error);
   }
   RequestOutput output = std::move(*output_);
+  output_.reset();
+  return output;
+}
+
+std::optional<RequestOutput> RequestOutputCollector::get_for(
+    std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  const bool ready = ready_.wait_for(lock, timeout, [&] {
+    return output_.has_value() || error_ != nullptr;
+  });
+  if (!ready) return std::nullopt;
+  if (error_ != nullptr) {
+    std::exception_ptr error = std::move(error_);
+    error_ = nullptr;
+    lock.unlock();
+    std::rethrow_exception(error);
+  }
+  std::optional<RequestOutput> output(std::move(*output_));
   output_.reset();
   return output;
 }
@@ -159,8 +178,11 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
   // LogprobsProcessor (output_processor.py:225-228): engaged only when the
   // request asked for sample and/or prompt logprobs, so the default generate
   // path leaves it nullopt (inert — SACRED greedy path unchanged). Uses the
-  // same detokenize-gated tokenizer as the detokenizer (:222-223).
-  if (sp.logprobs.has_value() || sp.prompt_logprobs.has_value()) {
+  // same detokenize-gated tokenizer as the detokenizer (:222-223). The sample
+  // half reads upstream's `num_logprobs` PROPERTY, not the raw `logprobs`
+  // field, so a generative-scoring request (logprob_token_ids set, `logprobs`
+  // unset) engages the processor too.
+  if (sp.num_logprobs().has_value() || sp.prompt_logprobs.has_value()) {
     state.logprobs_processor =
         LogprobsProcessor::FromNewRequest(detok_tokenizer, sp);
   }
@@ -182,8 +204,10 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
 std::optional<RequestOutput> RequestState::make_request_output(
     const std::vector<int32_t>& new_token_ids,
     std::optional<FinishReason> finish_reason,
-    std::optional<std::string> stop_reason) {
-  // output_processor.py:272-331 (text path; pooling / parent_req deferred).
+    std::optional<std::string> stop_reason,
+    std::optional<std::vector<float>> pooling_output) {
+  // output_processor.py:272-331 (text + pooling; parent_req deferred for
+  // pooling — a pooling request is always n==1).
   const bool finished = finish_reason.has_value();
   const bool final_only = output_kind == RequestOutputKind::kFinalOnly;
 
@@ -240,7 +264,13 @@ std::optional<RequestOutput> RequestState::make_request_output(
     out_external_req_id = parent_req->external_req_id();
   }
 
-  return NewRequestOutput(out_external_req_id, std::move(outputs), out_finished);
+  RequestOutput ro =
+      NewRequestOutput(out_external_req_id, std::move(outputs), out_finished);
+  // ARCH-ONE-SURFACE ROW 6 (output_processor.py:319 pooling branch; recorded
+  // deviation: upstream returns a separate PoolingRequestOutput class — ours
+  // carries the pooled vector as an optional field on the ONE RequestOutput).
+  ro.pooling_output = std::move(pooling_output);
+  return ro;
 }
 
 RequestOutput RequestState::NewRequestOutput(
@@ -449,9 +479,10 @@ OutputProcessorOutput OutputProcessor::process_outputs(
       req_state.logprobs_processor->update_from_output(eco);
     }
 
-    // 4) Create and handle the RequestOutput (:650-666).
+    // 4) Create and handle the RequestOutput (:650-666). The pooled vector of
+    //    a finished pooling request rides through (ARCH-ONE-SURFACE ROW 6).
     std::optional<RequestOutput> request_output = req_state.make_request_output(
-        new_token_ids, finish_reason, stop_reason);
+        new_token_ids, finish_reason, stop_reason, eco.pooling_output);
     if (request_output.has_value()) {
       // streaming_input deferred (false) -> no finished=false override.
       if (req_state.queue != nullptr) {
@@ -564,6 +595,28 @@ std::vector<std::string> OutputProcessor::abort_requests(
     FinishRequest(req_state);  // erases the entry (invalidates it).
   }
   return request_ids_to_abort;
+}
+
+void OutputProcessor::rollback_requests(
+    const std::vector<std::string>& request_ids) noexcept {
+  for (const std::string& request_id : request_ids) {
+    auto request_it = request_states_.find(request_id);
+    if (request_it == request_states_.end()) continue;
+
+    const RequestState& state = *request_it->second;
+    auto external_it = external_req_ids_.find(state.external_req_id);
+    if (external_it != external_req_ids_.end()) {
+      std::vector<std::string>& internal_ids = external_it->second;
+      internal_ids.erase(
+          std::remove(internal_ids.begin(), internal_ids.end(), request_id),
+          internal_ids.end());
+      if (internal_ids.empty()) external_req_ids_.erase(external_it);
+    }
+    if (state.parent_req != nullptr) {
+      parent_requests_.erase(state.parent_req->request_id());
+    }
+    request_states_.erase(request_it);
+  }
 }
 
 std::vector<std::string> OutputProcessor::abort_all_requests(

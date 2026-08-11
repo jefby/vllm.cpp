@@ -752,6 +752,813 @@ is not token-exact). Row STAYS `ACTIVE`.
 
 ---
 
+## 14. W7-speed STRICT lever MEASURED — bf16 regime recovers 106→120/128, plateaus; device islands remain the residual (2026-08-07, `row/KIMI-LINEAR-STRICT-SPEED`)
+
+The recorded path to STRICT ("device islands + bf16 residual stream = the same work as
+speed") was implemented as three env-gated numeric knobs in `kimi_linear_device.cpp`
+(default OFF → the f32 vehicle is byte-identical, CPU gate `test_kimi_linear_forward`
+**13/13·656** in the CUDA binary) and MEASURED on GB10 (the full 48.9B model, the §12
+128-token gate vs the STRICT deterministic golden). Clean-from-`origin/main` CUDA build
+(`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_
+CUTLASS_DIR=…cutlass-4.5.0`, nvcc 13.0.88, Release, 14 GDN AOT symbols linked). Memory
+safe throughout every reload (min-avail ≥ 115 GiB, both flock locks, reclaim-wait, no
+reboot).
+
+### Knobs (`kimi_linear_device.cpp`)
+- `VT_KIMI_BF16_RESIDUAL` — carry the residual stream in bf16 like vLLM's
+  `fused_add_rms_norm` (residual stored bf16, block outputs bf16, RMSNorm variance over
+  the f32 pre-store sum). Implemented as in-place `CastBf16`→`CastF32` rounds at exactly
+  vLLM's rounding points (embed out, each block out, residual after each add) keeping f32
+  STORAGE so the islands still read f32 — byte-matching vLLM's fused-add order.
+- `VT_KIMI_BF16_ISLANDS` — round the host-fallback island INPUTS (KDA q/k/v/g1/beta,
+  NoPE-MLA q/kv/kpe) to bf16 (RNE) before the recurrence/softmax.
+- `VT_KIMI_ISLAND_F32ACC` — f32 (not f64) accumulation in the islands. **MEASURED NEGATIVE**,
+  kept as a documented-negative A/B knob.
+
+### Measurement (token match /128 vs the deterministic golden; STRICT required)
+| Config | env | /128 | verdict |
+|---|---|---|---|
+| control | (none) | **106** | reproduces §13 baseline exactly |
+| residual only | `BF16_RESIDUAL` | 106 | net-zero — SHUFFLES flips (fixes p2, BREAKS p3 into a `163586×` repeat loop) |
+| islands only | `BF16_ISLANDS` | 106 | fixes p2 but destabilizes p3 (repeat loop) — net-zero |
+| **residual + islands** | `BF16_RESIDUAL BF16_ISLANDS` | **120** | **BEST** — p0–p6 all 16/16 exact; only p7 flips |
+| + island-output bf16 | `…BF16_ISLANDS(out)` | 90 | **REGRESSION** (reverted) |
+| + f32 accumulation | `…ISLAND_F32ACC` | 91–106 | **NEGATIVE** (reverted from the ISLANDS path) |
+
+### Flip ledger / razor verdict (the deterministic golden arbitrates every flip)
+- The two levers INTERACT: island bf16-input rounding fixes p2 but destabilizes p3 into a
+  degenerate repeat (`163586×`); the bf16 residual stream then RE-stabilizes p3 (kills the
+  repeat). Together they make **p0–p6 all 16/16 token-exact** (was 6/8 → 7/8 fully exact).
+- The SOLE remaining divergence at 120/128 is **p7 position 8**: the golden deterministically
+  emits `18705`, our island emits `58084` (a genuine near-tie), then the greedy path cascades
+  (8/16 on p7). A single near-tie flip across the whole 8-prompt battery.
+- Further precision-"matching" (rounding the island OUTPUT to bf16 → 90; f32 accumulation →
+  91–106) is a COIN-FLIP that regresses, because it is not vLLM's ACTUAL GDN-Triton / FA2
+  kernel arithmetic — it just perturbs which near-ties flip. Host-precision-matching PLATEAUS
+  at 120/128.
+
+### Verdict + default
+**NO arm reaches STRICT** (best 120/128 is a DIVERGENCE; the golden is K=3 deterministic so
+STRICT — not the distributional gate — is required). Per parity-enablers, `VT_KIMI_DEVICE_
+COMPUTE` and all three knobs STAY **OFF** (a near-tie is not token-exact). Row STAYS `ACTIVE`.
+
+### The named residual — the device islands (why host-matching cannot close p7)
+The one principled path to STRICT is routing the two islands through vLLM's ACTUAL device
+kernels, but it is NOT a drop-in (the mission's own assessment, now proven by measurement):
+- **KDA:** vLLM's decay is **per-k-channel** `g[T,H,D]` (`kimi_gdn_linear_attn.py` +
+  `third_party/flash_linear_attention/ops/kda.py`), but our `vt::GdnDecode`/`GdnPrefill`
+  carry only a **per-HEAD scalar** decay `g/beta[T,Hv]` (`include/vt/ops.h:1797,1846`). So the
+  vendored GDN Triton-AOT cubins CANNOT express KDA — a NEW per-channel-decay GDN kernel
+  (`g[T,H,D]` + the `-exp(A_log)*softplus(f_b(f_a(x))+dt_bias)` gate) is required.
+- **NoPE-MLA:** needs the paged `mla::ForwardMlaAttentionBlock` (FA2) over the runner's het-KV
+  (the born-on-runner residual), not a host softmax.
+These are ALSO the speed levers — the correctness vehicle re-computes the WHOLE sequence every
+decode step (O(n²)) with a host Download/upload per KDA/MLA layer per step. That is why the
+measured tok/s is invariant to the numeric knobs.
+
+### Speed (HW-forced-indirect — vLLM cannot serve this model on one GB10 at bf16)
+Steady tok/s over 127 steps (single-load, medians, cold first-leg discarded): control **1.31**,
+islands **1.30**, resIsl **1.30** (first-step ~0.62 s, steady ~0.77 s/step). The extra bf16
+rounding casts cost ~0.15 s/step vs the §13 1.59 baseline; ALL configs are the same O(n²)
+full-recompute + host-island rate. **Honest bar:** the §12 oracle golden capture itself needed
+`gpu_memory_utilization=0.82` (~97.6 GiB) with only 15 GiB min-avail for a SINGLE-seq eager
+run — vLLM cannot SERVE Kimi-Linear-48B at bf16 on ONE GB10 with any KV headroom, so a direct
+`vllm bench throughput` arm is HW-infeasible; the comparison is recorded as HW-forced-indirect
+(our absolute 1.30 tok/s + the per-step GPU-active anchor). No isolated host-tail lever (grouped
+MoE seam, on-GPU sampling) moves the needle without the device-island + paged-incremental-decode
+rewrite, which is the SAME W7-speed residual. Scoped as the named follow-up, not forced.
+
+---
+
+## 15. PER-CHANNEL-DECAY KDA DEVICE KERNEL LANDED (2026-08-07, `row/KIMI-KDA-DEVICE-KERNEL`)
+
+The §14-named residual — "our `vt::GdnDecode`/`GdnPrefill` carry only a per-HEAD scalar decay
+`g[T,Hv]`, so a NEW per-channel-decay GDN kernel (`g[T,H,D]`) is required" — is now IMPLEMENTED
+as the additive device op **`vt::KdaGatedDeltaRule`**, the genuinely-net-new-vs-GDN primitive.
+
+**Grounding (file:line, BOTH sides @ pin 555967922).** KDA's decode path REUSES the exact GDN
+recurrence kernel — `fused_recurrent_kda` (`third_party/flash_linear_attention/ops/kda.py:109-146`)
+calls `fused_recurrent_gated_delta_rule_fwd_kernel` with `IS_KDA=True`
+(`ops/fused_recurrent.py:88-175`). The SOLE net-new numeric is the decay application: plain GDN
+does `b_h *= exp(b_g)` (per-HEAD scalar, `fused_recurrent.py:132-134`), KDA does
+`b_h *= exp(b_gk[None, :])` (per-K-CHANNEL, `:136-137`) — `g` is `[T,Hv,Dk]`, one log-decay per K
+channel of the value head's `[Dv,Dk]` state, broadcast across the Dv rows. Everything else
+(decay → predict → beta → rank-1 update → read-out, all `tl.float32` on bf16 loads) is byte-for-byte
+GDN's recurrence. The op is thus GdnPrefill's per-channel twin; the shared GDN kernels are UNTOUCHED
+(Qwen3.6 27B/35B gate byte-identical — `test_ops_gdn` 58/58·1825 unchanged).
+
+**Implementation (ours, additive).** OpId `kKdaGatedDeltaRule` + `KdaGatedDeltaRuleFn`
+(`include/vt/ops.h`); wrapper + per-channel-g validation (`src/vt/ops.cpp`); CPU
+`KdaHeadTokenStep`/`KdaGatedDeltaRuleKernel` (`src/vt/cpu/cpu_ops.cpp`, GdnHeadTokenStep with a
+per-`ki` decay vector); CUDA `KdaScanKernel` + `KdaGatedDeltaRuleKernelCuda` (`src/vt/cuda/cuda_gdn.cu`,
+GdnScanKernel staging the per-K decay in shared memory, +1 dk-array). Both dual-registered CPU+CUDA.
+
+**Unit gate (RED-first, `tests/vt/test_ops_kda_recurrence.cpp`) — 3/3·6 CPU-green:**
+(1) EQUIVALENCE — with `g` broadcast from a per-head scalar, the per-channel op reduces
+**BIT-IDENTICALLY** to the landed+gated `vt::GdnPrefill` (out & state exact-float-equal), tying the
+net-new op to a proven reference with zero new numerics; (2) PER-CHANNEL — distinct per-channel
+decay vs the from-first-principles f64 island reference (`KdaRecurrenceIsland` math) at documented
+f32 tolerance (atol 1e-4, rtol 3e-3); (3) VALIDATION — rejects per-head `g` and unset scale; plus a
+CPU↔CUDA parity case (GPU-pending). GDN untouched, `test_kimi_kda` 14/14, `test_kimi_linear_forward`
+13/13·656 unchanged.
+
+**Wiring (opt-in, default OFF).** `KdaRecurrenceIsland` (`kimi_linear_device.cpp`) gains a
+`VT_KIMI_DEVICE_KDA` branch: q_n/k_n/v (already device-resident) feed `vt::KdaGatedDeltaRule` with a
+fresh zero state + qsl=[0,T]; only the elementwise decay gate (`KdaDecayGate`) + beta = sigmoid(b)
+stay host (numerically stable; the numerically-sensitive object is the RECURRENCE). Requires
+`VT_KIMI_DEVICE_COMPUTE=1`. CPU whole-forward gate passes with the flag ON (`test_kimi_linear_forward`
+13/13·656, f32 device recurrence within the forward's rtol 5e-3 vs the f64 ref) — the WIRING is
+correct. Default OFF (parity-enabler) keeps the f64 host path as production.
+
+**Why this is the STRICT path (spec §14 razor).** §14 proved host-precision-matching PLATEAUS at
+120/128 because the f64 island is MORE precise than vLLM and coin-flips near-ties (f32-accumulation
+knob regressed 120→91-106). This op runs vLLM's ACTUAL f32-on-bf16 recurrence arithmetic on device,
+not a host approximation — the principled STRICT lever AND the speed lever (it is the per-step device
+recurrence the paged-incremental-decode rewrite needs).
+
+**GPU-VERIFIED + FULL-MODEL GATE MEASURED on GB10 (2026-08-07, sm_121a, clean Release CUDA build,
+Triton-AOT vendored, cutlass-4.5.0).** Kernel GPU-verify: `test_ops_kda_recurrence` **4/4·8 GREEN**
+on the CUDA binary (the CPU↔CUDA parity case confirms `KdaScanKernel` == the CPU kernel on Blackwell);
+GDN untouched `test_ops_gdn` 66/66·4242; `test_kimi_kda` 14/14; 23 KDA symbols linked. Full 48.9B
+128-token gate vs the §12 STRICT golden, single-load per config, memory-safe throughout (host RSS peak
+1.7 GiB, min-avail 21 GiB, freed cleanly between configs, NO reboot):
+
+| Config | env | /128 | tok/s | verdict |
+|---|---|---|---|---|
+| control (f64 host recurrence) | `DEVICE_COMPUTE=1` | 106 | 1.35 | reproduces §13/§14 baseline |
+| **device-KDA** | `DEVICE_COMPUTE=1 DEVICE_KDA=1` | **122** | **4.24** | **NEW BEST on BOTH axes** |
+| device-KDA + bf16 knobs | `…DEVICE_KDA=1 BF16_RESIDUAL BF16_ISLANDS` | 90 | 4.19 | REGRESSION (reverted) |
+
+**RESULT (the §14 thesis CONFIRMED).** The device recurrence — vLLM's ACTUAL f32-on-bf16 arithmetic —
+moves **106→122/128** (prompts 0-6 all 16/16; only p7 diverges at pos-6, `387` vs golden `11`, a comma
+near-tie) AND is **3.1× FASTER (1.35→4.24 tok/s)**. It beats BOTH the control (106) AND §14's
+host-precision best (120, which needed both bf16 knobs). It FIXES the p2 divergence the f64 host path
+had — because it runs the right arithmetic, not a coin-flip. The §14 bf16 knobs are now SUPERSEDED and
+COUNTERPRODUCTIVE (device-KDA + bf16 REGRESSES 122→90, reintroducing p3's `163586×` repeat loop) — they
+were tuned to compensate for the f64 host island's over-precision; on the already-correct device
+arithmetic they perturb the wrong way. The speed win is because the device recurrence kills the host
+Download/f64-recompute/upload round-trip and runs the O(T²) recurrence in parallel on the GPU.
+
+**Default + parity-enabler.** `VT_KIMI_DEVICE_KDA` STAYS OFF (122/128 is still a DIVERGENCE, not STRICT;
+parity-enablers flip only with the token gate green). But the result reframes the residual: it is now a
+SINGLE near-tie (p7 pos-6) and the recorded next brick is the clear path to STRICT + more speed.
+
+**NAMED residuals to STRICT (the p7 near-tie).** vLLM processes the PROMPT with the CHUNKED prefill
+kernel (`chunk_kda`), we still run the RECURRENT form over the whole sequence; and the 7 NoPE-MLA layers
+still use a host f64 softmax island. Closing p7 needs (c) the KDA chunked-prefill kernel family +
+(d) paged `mla::ForwardMlaAttentionBlock` for the NoPE-MLA layers + (e) paged-incremental decode
+(persistent KDA state + MLA-KV) to kill the remaining O(n²) recompute (more speed still). Options for
+(c) mirror-first: regen a Triton-AOT cubin from FLA's KDA kernels for sm_121a (`scripts/regen-triton-
+aot.sh`), or a native `chunk_kda` port. Row STAYS `ACTIVE`.
+
+---
+
+## 16. DEVICE NoPE-MLA attention lever MEASURED-NEGATIVE; STRICT still owed the ACTUAL FA2/chunk_kda kernels (2026-08-07, `row/KIMI-STRICT-CLOSE`, #107)
+
+The §15 residual (d) — "the 7 NoPE-MLA layers still use a host f64 softmax island … closing p7
+needs paged `mla::ForwardMlaAttentionBlock`" — was attempted in its device-COMPUTE form (the §15
+device-KDA pattern applied to the MLA half) and MEASURED-NEGATIVE on GB10. The one-brick STRICT-close
+did NOT land; the honest verdict re-confirms §14's razor.
+
+**Implementation (`kimi_linear_device.cpp`, additive, default OFF).** New knob `VT_KIMI_DEVICE_MLA` +
+helper `MlaAttnCoreDevice`: the NoPE causal softmax over per-head `[k_nope|k_pe(shared)]`/`v` runs
+through the shared device op `vt::Attention` (f32 online max-subtracted softmax — vLLM's FA2
+accumulation regime) instead of the f64 host `MlaSoftmaxIsland`. `vt::Attention` carries a single
+head-dim for q/k/v while MLA is asymmetric (`qk = qk_nope+qk_rope = 192`, `v = 128`), so the value is
+PADDED to `qk` with zeros — the weighted sum over the zero tail is 0, so `out[:, :, :v]` is byte-exact
+to the unpadded math (softmax weights depend only on `q·k`). q views `dq` directly as `[T,nah,192]`;
+key is built per `(t,h)` as `[k_nope | k_pe(broadcast)]`. Wired into both the f32 and bf16
+`MlaSoftmaxIsland` paths. MLA dims VERIFIED from the real 48.9B `config.json` (not the K3 numbers):
+`nah=32, qk_nope=128, qk_rope=64, v_head_dim=128, kv_lora=512, q_lora=None`; 7 full-attn/MLA layers
+(`full_attn_layers=[4,8,12,16,20,24,27]`), 20 KDA.
+
+**Unit gate (RED-first, CPU) GREEN.** `test_kimi_linear_forward` **14/14·825** (was 13/13·656) —
+NEW case (g2) `KimiMlaAttnCoreDevice` (pad-V + `vt::Attention`) == a from-first-principles f64
+causal-softmax reference at the Kimi MLA geometry (rtol 3e-3). RED-first verified: a perturbed scale
+fails 108 assertions. Env-gated whole-forward runs green (`VT_KIMI_DEVICE_MLA=1` alone and with
+`VT_KIMI_DEVICE_KDA=1`, 14/14·825). Same on the GB10 CUDA binary (210 GDN + 23 KDA syms linked).
+
+**Full 48.9B GB10 gate — MEASURED NEGATIVE (single-load per config, `flock $HOME/gpu.lock`, min-avail
+21 GiB, no reboot; the golden is the §12 STRICT `greedy_ids.npy`).**
+
+| Config | env (all `VT_KIMI_DEVICE_COMPUTE=1`) | /128 | tok/s | verdict |
+|---|---|---|---|---|
+| control (device-KDA) | `DEVICE_KDA=1` | 122 | 4.24 | reproduces §15 EXACTLY (p0-p6 16/16, p7 10/16) |
+| **+ device-MLA** | `DEVICE_KDA=1 DEVICE_MLA=1` | **109** | **3.89** | **REGRESSION both axes** |
+
+**Why negative (the §14 razor, re-proven).** device-KDA WORKS (106→122) because the recurrence is the
+SAME algorithm as vLLM's decode kernel, just f32-on-bf16 — it matches. But vLLM's MLA prefill uses
+**FA2** (a specific flash tiling/reduction order); `vt::Attention`'s plain f32 online-softmax is the
+right MATH but a DIFFERENT reduction ORDER, so — exactly like §14's host-precision-matching plateau —
+it COIN-FLIPS near-ties: it BREAKS p3 16/16→3/16 (into the same `163586×` degenerate repeat the §14
+bf16 knobs caused) while p7 stays diverged at 10/16. And it is SLOWER (4.24→3.89): the per-`(t,h)`
+key/value build copies + the 192-dim pad-V waste add overhead to the O(n²) recompute path. An
+approximation of vLLM's kernel is not enough — only the ACTUAL kernel matches.
+
+**Verdict + default.** `VT_KIMI_DEVICE_MLA` STAYS **OFF**, kept as a documented-MEASURED-NEGATIVE A/B
+knob (parity-lever precedent: §14's `ISLAND_F32ACC`/output-bf16). device-KDA (122/128, 4.24 tok/s)
+remains the best config, itself default OFF (122 ≠ STRICT). Row STAYS `ACTIVE`.
+
+**STRICT residual, sharpened by this measurement.** p7 (and now the coin-flip class generally) needs
+vLLM's ACTUAL kernels, NOT a device approximation: (c) the **chunk_kda** prefill kernel family
+(`chunk_kda_scaled_dot_kkt` + `recompute_w_u` + `chunk_gla_fwd_o_gk` + `fused_kda_gate_chunk_cumsum`,
+FLA `ops/kda.py`) — mirror-first via a Triton-AOT regen for sm_121a (`scripts/regen-triton-aot.sh` +
+new `triton_kernels/*.py`), the spec's named prime suspect; (d) the paged
+`mla::ForwardMlaAttentionBlock` (FA2) for the 7 NoPE-MLA layers — NOT the `vt::Attention` approximation
+tried here; (e) **paged-incremental decode** — coupled with (d) because it needs a decode/paged
+attention op (`query_len ≠ key_len`), which `vt::Attention` cannot express; it kills the O(n²)
+full-recompute (the current 4.24 tok/s is the recompute rate). Each is a substantial multi-kernel
+brick, not a one-shot; recorded as the named follow-on.
+
+---
+
+## 17. chunk_kda PREFILL AOT PORT — kernel set + pinned-config record + regen recipe (Phase-1 spike, 2026-08-07, `row/KIMI-CHUNK-KDA-AOT`)
+
+The §15/§16 STRICT residual (c) — "vLLM processes the PROMPT with the CHUNKED `chunk_kda`
+kernel, we still run the RECURRENT form; a different reduction order coin-flips the p7
+near-tie" — is here scoped, grounded, and DE-RISKED to the point of mechanical execution.
+This section is the **AOT regen recipe + pinned-config record** the mission asks for.
+
+**Phase-2** moves them into `triton_kernels/`, adds the declarations below to
+`cmake/TritonAOTKernels.cmake`, regenerates the sm_121a cubins
+(`scripts/regen-triton-aot.sh`), wires the `vt::KdaChunkPrefill` op, and runs the gates.
+
+### 17.1 The EXACT forward-only kernel set (`chunk_kda_with_fused_gate` → `_fwd`, file:line @ 555967922)
+The prefill driver is `kimi_gdn_linear_attn.py:141` → `chunk_kda_with_fused_gate`
+(`kda.py:1492`) → `chunk_kda_with_fused_gate_fwd` (`:1416`) →
+`_chunk_kda_fwd_with_cumulative_g` (`:1306`). The kernel chain, in launch order:
+
+| # | Step | FLA kernel(s) `kda.py:line` | New/Reuse |
+|---|---|---|---|
+| 1 | fused decay-gate + chunk-local cumsum·RCP_LN2 | `kda_gate_cumsum_fwd_kernel` `:1182-1254` | **NEW** |
+| 2 | per-channel-gated K·Kᵀ + q·kᵀ (A, Aqk), inter | `chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter` `:521-618` | **NEW** |
+| 3 | …same, intra | `chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra` `:627-715` | **NEW** |
+| 4 | invert the strictly-lower-tri A (WY solve) | `solve_tril` / `merge_16x16_to_64x64_inverse_kernel` | **REUSE `gdn_tril_h32`** |
+| 5 | recompute W, U (+ kg) per-K-channel | `recompute_w_u_fwd_kernel` `:817-957` | **NEW** (KDA per-channel, ≠ GDN `wy_fast.py`) |
+| 6 | chunked hidden-state scan (h, v_new, final) | `chunk_gated_delta_rule_fwd_h` (`chunk_delta_h.py`, imported `:19`) | **REUSE `chunk_delta_h.py`, NEW pin** |
+| 7 | GLA-style output with per-K gk decay | `chunk_gla_fwd_kernel_o` `:1019-1123` | **NEW** |
+
+So **5 genuinely-new Triton kernels** (steps 1,2,3,5,7) + **1 new PIN of an existing .py**
+(step 6: `chunk_delta_h.py` recompiled with `USE_GK=1, USE_EXP2=1, USE_G=0`, ≠ the GDN
+`gdn_deltah` pin `USE_G=1, USE_GK=0, USE_EXP2=0`) + **1 pure reuse** (step 4:
+`gdn_tril_h32`, byte-identical signature). The decode path is UNCHANGED — it stays the
+#104 recurrent `vt::KdaGatedDeltaRule` (mirroring vLLM's own prefill=chunk / decode=recurrent
+split). Backward kernels are NOT owed (forward-only inference).
+
+### 17.2 Pinned-config record (Kimi KDA shapes: H=32, Hg=32, K=V=128, BT=64, BC=16, NC=4)
+Autotune metaparams cannot be expressed in AOT, so each is PINNED. `num_warps`/`num_stages`
+are **correctness-invariant** (they change tiling/pipelining, not the numeric result), pinned
+mirroring the GDN precedent; the shape pins (BK/BV/BD/BC/NC) follow FLA's driver-fixed values
+and heuristic lists. Dtypes MIRROR FLA's exact buffer choices (bf16 activations/intermediates;
+fp32 for gk-cumulative / A / Aqk / recurrent-state) — **Phase-2 confirms each against the
+`vt::KdaChunkPrefill` buffer contract before regen**.
+
+| base | staged .py | kernel | BK | BV | BD | warps | stages | grid |
+|---|---|---|---|---|---|---|---|---|
+| `kda_gate_cumsum` | kda_gate_cumsum.py | `kda_gate_cumsum_fwd_kernel` | — | — | 64 | 4 | 2 | `2,NT,32` |
+| `kda_kkt_inter` | chunk_kda_kkt.py | `…intra_sub_inter` | 64 | — | — | 4 | 3 | `NT,16,32` |
+| `kda_kkt_intra` | chunk_kda_kkt.py | `…intra_sub_intra` | 128 | — | — | 4 | 2 | `NT,4,32` |
+| `kda_wu` | recompute_w_u_kda.py | `recompute_w_u_fwd_kernel` | 64 | 64 | — | 4 | 3 | `NT,32,1` |
+| `kda_deltah_h32` | chunk_delta_h.py (reuse) | `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` | — | 64 | — | 4 | 3 | `2,NH,1` |
+| `kda_gla_o` | chunk_gla_o.py | `chunk_gla_fwd_kernel_o` | 64 | 64 | — | 4 | 3 | `NT,2,32`† |
+
+†`kda_gla_o` grid is `(cdiv(V,BV), NT, H)` = `(2, NT, 32)`; expressed as `2,NT,32` with `NT`
+the trailing carrier. **Scalar-constant pins baked as literals** (Triton AOT mis-packs fp32
+scalars — see `chunk_o.py` note 3): `scale = K**-0.5` (kkt ×2, gla_o); softplus `beta=1.0`,
+`threshold=20.0`, `cumsum_scale=RCP_LN2` (gate_cumsum); `DOT_PRECISION="ieee"` (wu).
+
+### 17.3 The regen recipe — `cmake/TritonAOTKernels.cmake` declarations to ADD (Phase-2)
+Signatures use the vendored `*dtype:align` / scalar / constexpr form. `NT`/`NH` are the
+trailing grid carriers. Insert inside `vllm_triton_aot_declare_all()` after the GDN WY block:
+```
+# KDA chunk-prefill family (Kimi-Linear; H=32). Mirrors the GDN WY pins.
+_vllm_triton_aot_declare(kda_gate_cumsum kda_gate_cumsum.py kda_gate_cumsum_fwd_kernel 4 2
+  "2,NT,32"
+  "*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 64, 1, 1")
+_vllm_triton_aot_declare(kda_kkt_inter chunk_kda_kkt.py chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter 4 3
+  "NT,16,32"
+  "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 64, 4, 1")
+_vllm_triton_aot_declare(kda_kkt_intra chunk_kda_kkt.py chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra 4 2
+  "NT,4,32"
+  "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 128, 1")
+_vllm_triton_aot_declare(kda_wu recompute_w_u_kda.py recompute_w_u_fwd_kernel 4 3
+  "NT,32,1"
+  "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 0, 1, 1")
+_vllm_triton_aot_declare(kda_deltah_h32 chunk_delta_h.py chunk_gated_delta_rule_fwd_kernel_h_blockdim64 4 3
+  "2,NH,1"
+  "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 32, 128, 128, 64, 64, 0, 1, 1, 1, 1, 1, 1")
+_vllm_triton_aot_declare(kda_gla_o chunk_gla_o.py chunk_gla_fwd_kernel_o 4 3
+  "2,NT,32"
+  "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 1")
+```
+`kda_deltah_h32` note: the arg order is `k,v,w,v_new,g,gk,h,h0,ht,cu_seqlens,chunk_offsets,
+T,NH,H,Hg,K,V,BT,BV,USE_G,USE_GK,USE_INITIAL_STATE,STORE_FINAL_STATE,SAVE_NEW_VALUE,
+IS_VARLEN,USE_EXP2` — vs the GDN `gdn_deltah` the alignment marker MOVES from `g`(now dead,
+`*fp32`) to `gk`(now used, `*fp32:16`), `Hg` flips 16→32 (KDA has no delta-rule GQA), and the
+flag triple flips to `USE_G=0,USE_GK=1,…,USE_EXP2=1`. Steps 4 (`gdn_tril_h32`) and 6
+(`chunk_delta_h.py`) need NO new .py file — reuse the vendored source.
+
+### 17.4 The `vt::KdaChunkPrefill` op design (Phase-2 wiring, mirrors `cuda_gdn.cu` GdnPrefill)
+A new additive op routing PROMPT-length KDA (`query_len == key_len`, the prefill step) through
+the six cubins; decode (`query_len==1`) stays `vt::KdaGatedDeltaRule` (#104). Orchestration
+(exactly `_chunk_kda_fwd_with_cumulative_g`): allocate per-`(T,H,·)` scratch —
+`g_cum[T,H,128] f32`, `A/Aqk[T,H,64] f32`, `A_inv[T,H,64] bf16`, `w[T,H,128] bf16`,
+`u[T,H,128] bf16`, `kg[T,H,128] bf16`, `h[NT,H,128,128] bf16`, `v_new[T,H,128] bf16`, then
+launch (1) gate_cumsum → g_cum; (2)+(3) kkt → A,Aqk; (4) `gdn_tril_h32_default` → A_inv;
+(5) wu(A_inv,gk=g_cum) → w,u,kg; (6) `kda_deltah_h32_default`(k=kg,w,u,gk=g_cum,h0=zeros,
+ht=state) → h,v_new,final_state; (7) gla_o(q,v_new,g=g_cum,A=Aqk,h) → out. `cu_seqlens=[0,T]`,
+`chunk_indices`/`chunk_offsets` from `prepare_chunk_indices`. Loader/launcher per the vendored
+`std::call_once(load_gdn_*)` + `*_default(stream, …)` pattern (`cuda_gdn.cu:4594-4740`).
+Dispatch guard: fire only when q/k/v are the pinned Kimi KDA geometry (H=32,K=V=128) and
+`VLLM_CPP_TRITON`; else fall back to the recurrent island. The prefill/decode SPLIT mirrors
+vLLM's `kimi_gdn_linear_attn.py:233-268` (decode `fused_recurrent_kda`, prefill
+`chunk_kda_with_fused_gate`).
+
+### 17.5 Gate plan (Phase-2, RED-first)
+1. **Unit** (`tests/vt/test_ops_kda_chunk_prefill.cpp`): (a) the chunk op == the recurrent
+   `vt::KdaGatedDeltaRule` (#104) to the documented chunked-vs-recurrent reduction-order delta
+   (NOT bit-exact — different order; assert the p-th token argmax stable, or an rtol band); (b)
+   vs the #173 host refs (`kimi_kda.cpp` `KdaDecayGateChunkCumsum` etc.) per intermediate; (c)
+   if feasible, an **FLA-python golden** captured on the oracle venv at Kimi shapes as the direct
+   oracle (the chunked result should match FLA's own `chunk_kda` output). RED-first: perturb a
+   pin/scale, see it fail.
+2. **Full 48.9B GB10 correctness gate** (re-park worker FIRST): 128 vs the §12 STRICT golden with
+   `VT_KIMI_DEVICE_KDA=1` **+ chunk-prefill ON**. Target **STRICT** (close the p7 prefill-order
+   near-tie).
+3. **Speed ladder — ours-vs-vLLM at MATCHED config (USER 2026-08-07: the success bar is MEET
+   vLLM SPEED; the §14/§16/#107 "HW-forced-indirect" framing is SUPERSEDED).** vLLM demonstrably
+   RUNS Kimi-Linear-48B on ONE GB10 — the §12 golden capture used it at `gpu_memory_utilization
+   =0.82`, single-seq, eager. So measure both arms at that EXACT recipe on the SAME prompts:
+   (a) OUR arm — steady decode tok/s + prefill TTFT with `DEVICE_KDA=1` + chunk-prefill; (b) the
+   **vLLM arm at the §12 launch config** (single-seq, eager, util 0.82) — steady decode tok/s +
+   prefill TTFT. Report the ladder as a MEASURED ours/vLLM ratio, not an indirect statement.
+   **OOM-REBOOT PROTOCOL (util 0.82 with 91.5 GiB weights is the tightest vLLM config ever run on
+   this box — treat as reboot-risk):** run the vLLM arm SEQUENTIAL after our runs; `local-ai-worker`
+   PARKED; `sudo drop_caches` before wall-clock; **PRE-WARM FlashInfer's autotune in a throwaway
+   start at TINY util FIRST** (cold autotune at high util is a recorded OOM-reboot trigger); memory
+   monitor MANDATORY; ONE attempt — if it OOMs, record the attempt honestly and do NOT retry at
+   higher risk. `flock` both GPU locks; single-load steady-state.
+4. On STRICT **and** ≥ vLLM speed at matched config: default flips per parity-enablers with proofs;
+   model-matrix row moves. Below vLLM on any axis = an open gap (a MEASURED distance-to-bar), not done.
+
+### 17.6 Status
+**Phase-1 (this spike) DONE**: kernel set enumerated + classified; 5 harness bodies authored
+(verbatim FLA ports, AOT-adapted) + staged; pinned-config record + regen recipe committed; the
+`vt::KdaChunkPrefill` op + gate plan specified. **NOT YET**: regen (Phase-2 — coupled to the
+op's confirmed buffer dtypes), the C++ op, and the numeric gates. Row STAYS `ACTIVE`. No STRICT
+verdict is claimed here.
+
+---
+
+## 18. chunk_kda PREFILL PHASE-2 LANDS + MEASURED: op correct (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) vehicle REGRESSES 122→102 — the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, #111)
+
+Phase-2 executes §17 end-to-end on GB10 (sm_121a). The `chunk_kda` prefill kernel family
+is regenerated, vendored, wired through the new op `vt::KdaChunkPrefill`, unit-gated
+RED-first, and run on the full 48.9B model against the §12 STRICT golden. **VERDICT: the op
+is CORRECT (unit-validated) but does NOT reach STRICT in the current O(n²)-recompute island —
+it REGRESSES 122→102/128 — because chunk-every-step ≠ vLLM's prefill=chunk / decode=recurrent
+split. The recurrence (device-KDA, §15) at 122/128 remains best. The op + the regen are the
+validated, reusable prefill half of the named real lever (e) paged-incremental decode.**
+
+### AOT regen (§17.1-§17.3) — DONE, all 6 arches, reproducible
+The 5 harness kernels moved into `triton_kernels/`; the 6 §17.3 declarations added to
+`cmake/TritonAOTKernels.cmake` (contract) + `CMakeLists.txt` (`add_triton_kernel`, byte-identical
+manifest lines). Regenerated the sm_121a cubins **and all 5 sibling arches** (sm_80/86/89/90a/100a)
+via `scripts/regen-triton-aot.sh -DVLLM_CPP_TRITON_VENDORED_ARCH=<arch>` (Triton 3.6.0, per-arch
+`cuda:CC:32`; ptxas is Triton's bundled one so a single GB10 cross-compiles every arch). **Triton
+3.6 rejected the plain-float module globals** (SOFTPLUS_BETA/THRESHOLD/RCP_LN2, DOT_PRECISION) that
+the Phase-1 harness baked — fixed to the `tl.constexpr(...)` INSTANTIATION form (the annotation form
+is unsupported for module globals); the regen ITSELF caught this (Phase-1 was only py_compile-clean).
+**Reproducibility VERIFIED per arch: only the new `kda_*` artifacts + the MANIFEST change; every
+existing GDN cubin is byte-identical** (so regenerating all arches did not perturb the gate models).
+`scripts/check-triton-aot-drift.sh` GREEN (rc=0) across all 6 arches; the CUDA-build configure-time
+drift guard also GREEN.
+
+### The op (§17.4) + wiring — DONE, builds -Werror clean
+`vt::KdaChunkPrefill` (OpId `kKdaChunkPrefill`): the exact `_chunk_kda_fwd_with_cumulative_g` 6-launch
+order (`kda_gate_cumsum` → `kkt_inter`+`kkt_intra` → `gdn_tril_h32` REUSE → `kda_wu` → `kda_deltah_h32`
+→ `kda_gla_o`), with the bf16 casts, `chunk_indices`/`chunk_offsets` build, and per-step scratch
+alloc/free (`cuda_gdn.cu` `KdaChunkPrefillKernelCuda`/`LaunchKdaChunkPrefill`). Takes the RAW gate
+projection g1 + a_log + dt_bias (kda_gate_cumsum fuses the gate on-device); beta=sigmoid(braw) is the
+only host elementwise. Dispatch guard fires only at the pinned Kimi geometry (H=32, Dk=Dv=128), baked
+scale, T>1, dt_bias present, `VLLM_CPP_TRITON`+`VT_KDA_CHUNK_TRITON`; else a device-gate+recurrence
+fallback. CPU reference (fuse gate → proven recurrence), dual-registered. Wired into the island via
+`VT_KIMI_DEVICE_KDA_CHUNK` (prefill T>1 → chunk; decode T==1 → the #104 recurrence — vLLM's own split),
+default OFF. `cuda_gdn.cu.o` compiles -Werror clean on sm_121a; full CUDA build 444/444 (kimi-linear-gen
++ tests), disk-safe (18G free throughout). runner-routing/fusion/model-checklist/protocol checks GREEN.
+
+### Unit gate (§17.5.1) — RED-first GREEN on GB10
+`tests/vt/test_ops_kda_chunk_prefill.cpp` (2/2·4): (a) CPU chunk == recurrence fed the fused gate,
+BIT-FOR-BIT; (b) CUDA — the 6 cubins vs the recurrence over an accumulating 3-chunk state: **mean_abs
+= 4.68e-5** (the chunk path tracks the f32 recurrence), while a perturbed-gate reference (a_log+1.0)
+diverges to **3.38e-3 = 72×** (RED case has teeth). GDN untouched (`test_ops_gdn` 66/66·4242),
+`test_ops_kda_recurrence` 4/4·8. So the 6-kernel orchestration is numerically CORRECT off the model.
+
+### Full 48.9B GB10 gate (§17.5.2) — chunk REGRESSES 122→102/128
+Single-load per config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB,
+NO reboot. Golden = the §12 STRICT `greedy_ids.npy`.
+
+| Config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1`) | /128 | tok/s | first-step | verdict |
+|---|---|---|---|---|---|
+| control (recurrence) | — | **122** | 4.24 | 0.547s | reproduces §15/§16 EXACTLY (p0-p6 16/16, p7 10/16) |
+| **+ chunk-prefill** | `DEVICE_KDA_CHUNK=1` | **102** | 4.08 | 0.522s | **REGRESSION** (p3 16→3, p6 16→11, p7 10→8) |
+
+**Why it regresses (the honest root cause).** The op is unit-correct (4.68e-5 vs the recurrence), but
+the island is the O(n²) full-recompute vehicle: at every decode step it re-processes [0, prompt+t] as
+ONE chunk-prefill from zero state. vLLM instead chunk-prefills the PROMPT once, then RECURRENT-decodes
+each token on the persistent state. The chunk kernels' bf16 reduction order differs from the recurrence
+by ~5e-5/layer — negligible per layer, but across 20 KDA layers × the greedy cascade it flips more
+near-ties than the recurrence does. Crucially, the recurrence (control) matches vLLM's DECODE (both
+recurrent for t>0) — which is why control's 122 > chunk's 102; the chunk only matches vLLM's PREFILL
+(t=0). Applying chunk to the decode steps too is NOT vLLM's arithmetic there. This is the §14 razor
+re-confirmed at the kernel level: an approximation of the wrong reduction structure coin-flips.
+
+### THE vLLM SPEED LADDER (§17.5.3) — matched config (util 0.82, triton MoE, eager, single-seq)
+vLLM arm run SEQUENTIAL after our arms (worker parked, `drop_caches`, memory-monitored, ONE attempt at
+the config that succeeded; a first attempt died on a driver PATH bug — FlashInfer's sampling JIT could
+not spawn `ninja` — NOT an OOM, box freed cleanly; fixed + re-run), the EXACT §12 recipe (the one that
+captured the golden safely). vLLM loaded at util 0.82 with **min-avail 15 GiB, NO reboot** (matches §12).
+
+| arm | tok/s | note |
+|---|---|---|
+| **vLLM** (util 0.82, triton MoE, eager, seqs=1) | **~21 median** (25.3 cold-discarded) | 16-token AGGREGATE (prefill+decode); paged incremental decode |
+| ours — recurrence (device-KDA) | **4.24** | STEADY decode over 127 steps |
+| ours — + chunk-prefill | **4.08** | STEADY; slower (more work/step, still O(n²)) |
+
+vLLM per-prompt 16-token aggregate: [0.55 (p0 COLD, discarded), 25.87, 16.94, 25.31, 17.44, 16.86,
+25.35, 25.58] tok/s — bimodal by prompt length (longer prompt → more prefill → lower aggregate). NOTE:
+vLLM 0.25.0's `RequestOutput.metrics` per-token times were NOT populated on this path, so TTFT could
+not be isolated and the vLLM number is the 16-token AGGREGATE (prefill amortized) — vLLM's TRUE steady
+decode is ≥ this, so the gap is a FLOOR. **ours/vLLM ≈ 0.20 — vLLM is ~5× faster on decode**, now a
+MEASURED distance (not the §14 "HW-forced-indirect" framing). Expected: ours is the O(n²) host-
+orchestrated FULL-RECOMPUTE (the 4.24 tok/s IS the recompute rate — it re-runs the whole sequence every
+step); vLLM is paged incremental decode. Closing this is the SAME paged-incremental-decode lever that
+closes STRICT (coupled). Neither of our levers closes it: chunk (4.08) is marginally SLOWER than the
+recurrence (4.24) because the 6-cubin chunk does more work per step over the growing sequence (still
+O(n²)). Ours prefill/TTFT proxy = first-step 0.52-0.55 s; vLLM prefill not isolable from this arm.
+
+### Verdict + default (parity-enablers)
+NO arm reaches STRICT (chunk 102 is a DIVERGENCE, worse than control's 122). Per parity-enablers,
+`VT_KIMI_DEVICE_KDA_CHUNK` STAYS **OFF** (a regression is not a flip); `VT_KIMI_DEVICE_KDA` also STAYS
+OFF (122 ≠ STRICT, K=3-deterministic golden). device-KDA (122/128, 4.24 tok/s) remains the best config.
+Row STAYS `ACTIVE`.
+
+### The real residual, now sharpened AND de-risked
+Closing p7 (and matching vLLM's decode) needs (e) **paged-incremental decode**: chunk-prefill the
+prompt ONCE (this validated `vt::KdaChunkPrefill` is exactly that prefill half) + RECURRENT-decode
+each token with a PERSISTENT KDA state (a decode/paged op, query_len≠key_len) — which ALSO kills the
+O(n²) recompute (the 4.24 tok/s is the recompute rate), so it is the STRICT lever AND the big speed
+lever, coupled. The `chunk_kda` kernels + the op are the reusable, GB10-validated prerequisites; the
+remaining brick is the persistent-state decode wiring + the paged NoPE-MLA (§16 residual d). The
+chunk-every-step measurement PROVES the recompute vehicle cannot host the chunk lever — it must be
+paged-incremental.
+
+---
+
+## 19. PAGED-INCREMENTAL DECODE IMPLEMENTED + CPU byte-exact state-carry gated; GB10 Gate A/B + speed re-measure OWED (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`)
+
+<!-- state: 2026-08-07 -->
+
+The §18 named real lever (e) — paged-incremental decode — is now IMPLEMENTED as the additive
+device path `KimiLinearModel::ForwardPrefillIncremental` + `ForwardDecodeStepIncremental`
+(`kimi_linear_device.cpp`) over a persistent `KimiDecodeCache` (`kimi_linear.h`). It replaces the
+O(n²) recompute vehicle (`ForwardDeviceCompute` re-runs [0..prompt+t] every step — the 4.24 tok/s
+rate) with vLLM's decode regime: PREFILL the prompt ONCE, then advance ONE token per step from the
+CARRIED state.
+
+### The state-carry wiring (file:line, `src/vllm/model_executor/models/kimi_linear_device.cpp`)
+- **`KimiDecodeCache`** (`include/vllm/model_executor/models/kimi_linear.h`): host-resident f32
+  per-layer state (GB10 unified pool: the up/download is a cheap memcpy). Per KDA layer:
+  `conv_q/k/v` short-conv taps [proj*(K-1)] + `recurrent` [nh*hd*hd]. Per NoPE-MLA layer: growing
+  `kv` [T*kvw] + `kpe` [T*qr] latent-KV. Sizes at 48.9B: KDA state 40 MiB + conv 8 MiB + MLA-KV
+  ~2 MiB at T≈36 — inside the §13 budget.
+- **KDA state carry** — `KdaRecurrenceIslandInc`: `vt::KdaGatedDeltaRule`'s `state [1,nh,hd,hd]`
+  is READ-IN (carried, `cs.Copy` from `rec_state`) / final-WRITTEN (`dstate.Download` → `rec_state`).
+  Prefill uses the CHUNK path (`vt::KdaChunkPrefill`, `VT_KIMI_DEVICE_KDA_CHUNK=1`, ht=state) or the
+  recurrence (byte-exact vs `ForwardDeviceCompute`'s device-KDA path); decode always the recurrence
+  (T==1). This IS vLLM's prefill=chunk / decode=recurrent split (`kimi_gdn_linear_attn.py:233-268`).
+- **KDA conv carry** — `ConvSiluInc`: `vt::CausalConv1dFwd` reads the carried taps
+  (`has_initial_state=1`, decode) / captures the final K-1 taps (`cs.Download` → `state`) — the
+  mamba conv-decode carry.
+- **NoPE-MLA KV carry** — `MlaLayerDeviceBf16Inc` appends each token's projected `kv[kvw]`/`kpe[qr]`
+  to the growing cache; `MlaSoftmaxIslandInc` runs the SAME f64 causal-softmax over the cache with
+  query at global position `base_pos+t` attending `[0 .. base_pos+t]` (query_len=T, key_len grows).
+- **Body** `DeviceForwardBodyBf16Incremental`: byte-for-byte the `DeviceForwardBodyBf16` residual
+  stream, KDA/MLA layers swapped for their `…Inc` state-carrying forms. `base_pos=0` prefill /
+  `cache.seq_len` decode.
+
+### Why byte-exact vs recompute (the Gate A claim)
+The KDA recurrence is a pure ORDERED fold; splitting it at the prompt boundary and carrying the state
+is exact (step P from a fresh [0..P] run == step 1 from the carried S_P). The short conv carries its
+K-1 tap window (mamba decode, exact). Each cached MLA token's KV is a per-ROW projection independent
+of the batch dimension, and the causal softmax reduces over `s` ascending in the SAME order — so the
+incremental decode-step is byte-identical to a fresh full-recompute at the same numeric config. The
+harness `--incremental` at `VT_KIMI_DEVICE_KDA=1` therefore must reproduce ForwardDeviceCompute's
+tokens (Gate A); Gate B is the same at `VT_KIMI_DEVICE_KDA_CHUNK=1` (vLLM's prompt order — the p7
+suspect finally in the right vehicle).
+
+### Gates
+- **CPU byte-exact state-carry gate GREEN** (the Laguna W6 pattern): `test_kimi_linear_forward`
+  **15/15·875** (was 14/14·825) — NEW case (l) `paged-incremental: decode == full-recompute`: the
+  prefill-once + carried decode-step logits are byte-identical (Close 1e-5) to a fresh full-sequence
+  prefill of the growing sequence at each step, with identical greedy tokens (50 assertions). Both
+  paths run the same `vt::KdaGatedDeltaRule` / `vt::CausalConv1dFwd` / f64 softmax, so the gate is a
+  pure WIRING proof (any divergence = a state-carry/cache-append bug). Clean CPU build, no regressions.
+### GB10 MEASURED (2026-08-07, full 48.9B, single-load per config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored; golden md5 `bfa5bdbf…` == the §12 STRICT battery; load ~120s, host RSS PEAK 1.7 GiB, min-avail 18-21 GiB, NO reboot)
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1`) | /128 | tok/s | first-step | note |
+|---|---|---|---|---|---|
+| recompute | (recompute vehicle) | **122** | 4.23 | 0.498s | reproduces #111/§15/§16 EXACTLY (p0-p6 16/16, p7 10/16) |
+| incremental + recurrence-prefill | `--incremental` | 120 | 16.63 | 0.640s | p0-p6 16/16; p7 flips 10→8/16 (GPU near-tie) |
+| **incremental + chunk-prefill** | `--incremental DEVICE_KDA_CHUNK=1` | **122** | **18.87 / 19.03** | 0.54-0.62s | **token-IDENTICAL to recompute (all 128, incl. p7 got byte-exact)** |
+
+- **Gate A (token identity) — PASS for the chunk-prefill config.** `incremental + chunk-prefill` is
+  byte-token-identical to `recompute` across ALL 128 tokens (p7 `got` string exact-equal), confirming
+  the state-carry wiring on GPU. The recurrence-prefill config matches recompute on p0-p6 (112 tokens)
+  and flips ONLY the p7 near-tie (10→8/16) — the GPU projection-GEMM M-dimension tiling (M=P prefill /
+  M=1 decode picks a different cuBLAS kernel) perturbing the single documented near-tie, exactly the
+  §14/§16 coin-flip class; NOT a wiring bug (the CPU gate is byte-exact and 112/128 tokens match).
+- **Gate B (STRICT) — NOT reached, 122/128.** Chunk-prefill (vLLM's PROMPT order) in the RIGHT
+  vehicle (prefill-once + recurrent-decode) reproduces recompute's 122/128 EXACTLY — it does **not**
+  close p7. This HONESTLY REFUTES the #111 hypothesis that "the p7 suspect finally tested in the right
+  vehicle" would reach STRICT: p7 is an INTRINSIC near-tie (§13/§14 root cause — our f32-accurate
+  forward vs the golden's deterministic bf16 top-1 at a comma boundary: golden pos-6 `11`, ours `387`),
+  not a chunked-vs-recurrent prompt-order artifact.
+- **SPEED — the headline win.** Paged-incremental decode (chunk-prefill) = **18.9-19.0 tok/s steady**
+  (2 runs) vs the O(n²) recompute **4.23 tok/s** = **4.5× faster**, and **0.90× of vLLM ~21** (the
+  #111 16-token AGGREGATE floor) — the MEASURED 5× decode gap (0.20×, #111) is closed to ~1.1×. It
+  kills the O(n²) recompute exactly as designed: per step it runs the projections/MoE for 1 token
+  (decode) instead of [0..prompt+t]. Caveat: vLLM ~21 is a prefill+decode aggregate (its true steady
+  decode is ≥ that), so the honest residual is the projection GEMVs + host orchestration per step
+  (ranked next levers: grouped-MoE via the shared seam, on-GPU sampling — unmeasured here).
+
+### Default
+`--incremental` is opt-in (harness flag); `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (122/128 ≠ STRICT; the
+golden is K=3 deterministic so STRICT — not the distributional gate — is required). The paged-incremental
+path is the validated 4.5× speed lever, opt-in until STRICT lands. Row STAYS `ACTIVE`.
+
+### vLLM MECHANISM grounding (coordinator directive — mirror, don't reconstruct; `vllm-src` @ `a4e3cb4`, 0.26.x)
+The state-carry design MIRRORS vLLM's ACTUAL Kimi implementation, not just FLA:
+- **`kimi_gdn_linear_attn.py` `_forward` (lines ~296-440).** State = `(conv_state, recurrent_state)` =
+  `constant_caches`, indexed by `non_spec_state_indices_tensor`; conv split q/k/v via `conv_state.chunk(3)`.
+  **Prefill** (`num_prefills>0`): `causal_conv1d_fn(..., conv_states=conv_state_q, has_initial_state=…,
+  cache_indices=state_indices, query_start_loc=…)` then `recurrent_state[zero_idx]=0` /
+  `initial_state=recurrent_state[idx]` / `chunk_kda_with_fused_gate(raw_g=g1, beta, A_log, g_bias=dt_bias,
+  initial_state=…, output_final_state=True, use_qk_l2norm_in_kernel=True, cu_seqlens=…)` →
+  `recurrent_state[idx]=last_recurrent_state`. **Decode** (`else`): `causal_conv1d_update(conv_state_q, …)`
+  + `fused_kda_gate(g1, A_log, g_bias=dt_bias)` + `fused_recurrent_kda(initial_state=recurrent_state,
+  ssm_state_indices=…)`. Our `KdaChunkPrefill` (raw g1+A_log+dt_bias, state in/final-out), `KdaGatedDeltaRule`
+  (decode from carried state), and `ConvSiluInc` (has_initial_state carry) are a 1:1 mirror of this.
+- **Hybrid coexistence — `kimi_linear.py`.** KDA state is a MambaSpec group
+  (`get_mamba_state_shape_from_config` → `MambaStateShapeCalculator.kda_state_shape`, :620); the 7 NoPE-MLA
+  layers use `MultiHeadLatentAttentionWrapper`/`MLAModules` (:249-263) with their own latent-KV pages. The
+  two coexist as the het-KV two-group topology our `MakeKimiLinearKVCache` declares (§3). MoE = `FusedMoE`
+  (`KimiMoE`, :153) with the shared expert fused.
+- **Deliberate divergences (our single-seq e2e vehicle vs vLLM's paged runner), noted not accidental:**
+  (1) STORAGE — we carry state in a host `KimiDecodeCache` (one slot/layer, single seq); vLLM carries it in
+  the paged mamba-state slot cache (`state_indices`, batched). The MECHANISM is identical; the paged-runner
+  integration (into the shared GDN mamba-state group qwen3_5 uses) is the named born-on-runner residual.
+  (2) conv decode — vLLM's specialized `causal_conv1d_update`; we reuse `CausalConv1dFwd` T=1 + has_initial
+  (numerically equal, CPU-gate byte-exact). (3) L2-norm — vLLM fuses `use_qk_l2norm_in_kernel=True`; we run
+  `vt::L2Norm` before the recurrence (same math). (4) MLA — vLLM paged-FA2 (absorbed); we materialized-MHA
+  host softmax over the expanded cache (the §16 born-on-runner paged-FA2 residual).
+
+### DECODE COST DECOMPOSITION (nsys `cuda_gpu_kern_sum`, OUR incremental decode, chunk-prefill config, 99 decode steps; same-tool)
+The residual is enumerated by tracing OUR decode (safe; memory-controlled). The vLLM-live-nsys at util
+0.82 is a MEASURED box-safety violation — vLLM reserves 95-98 GiB + nsys buffers (~2 GiB) on the 119 GiB
+pool; #111's un-traced 0.82 run already sat at exactly the 15 GiB min-avail floor, so nsys pushes BELOW the
+LIFE-CRITICAL floor — so it was NOT run (per the safety mandate; the coordinator's "do not retry higher"
+protocol). It is not needed: our decode is 90% the SAME `internal::gemvx::kernel<bf16,float,float>` cuBLAS
+symbol vLLM's batch-1 projections call, so the split is structurally shared.
+
+| bucket | GPU-time % | kernels |
+|---|---|---|
+| **projection GEMVs/GEMMs** | **~90%** | `internal::gemvx::kernel<bf16,float,float>` 71.2% (57,144 inst) + cutlass bf16 WMMA GEMM 14.2%+1.1%+ more gemvx 2.0%+0.7% — the q/k/v/o/gate/up/down/kv/router/lm_head + per-expert MoE projections |
+| CastBf16 (per-GEMM act→bf16) | 3.0% | `CastBf16Kernel` (95,710 inst) — our f32 residual stream costs a bf16 cast per GEMM; vLLM keeps bf16 |
+| KDA recurrence | 2.3% | `KdaScanKernel` (1,980 inst = ~20 KDA layers × 99 steps ✓ decode=recurrent) |
+| norms/glue | ~4% | RmsNorm/RmsNormGated/L2Norm |
+| MoE glue (router+silu+combine) | 2.3% | `MoeRouterGroupedTopK` 1.4% + `MoeSiluMul` 0.8% + `MoeCombine` 0.1% |
+| KDA conv | 0.7% | `CausalConv1dFwdReg` (6,000 inst) |
+| chunk-prefill (once) | ~0.0% | `chunk_gated_delta_rule_fwd_kernel_h` 20 inst = PREFILL only (confirms prefill=chunk / decode=recurrent IN VIVO) |
+
+**What this says (the coordinator's question).** Killing the O(n²) recompute ALONE reaches parity-class:
+~90% of the decode is the IDENTICAL cuBLAS `gemvx`/cutlass GEMM kernels vLLM uses for batch-1 — cuBLAS-parity
+by definition (the Laguna [[laguna-gap-is-gpu-compute-not-host]] finding), IRREDUCIBLE for batch-1 weight
+streaming. NO single lever is heavily load-bearing beyond O(n²): the MoE grouping is NOT the gap (router+
+silu+combine glue = 2.3%; the expert GEMMs are memory-bound GEMVs whether looped or grouped at batch-1),
+KDA is 3%. GPU is ~85% busy in decode; the closable residual is (a) ~15% host-orchestration idle (the island
+host round-trips + per-expert host dispatch) and (b) the 3% CastBf16 (a bf16 residual stream, which is ALSO
+the p7-STRICT lever). So the last ~10% vs vLLM is diffuse host-side + the bf16 regime, not a missing kernel.
+
+### The residual after this brick
+The speed lever LANDS (0.20×→0.90×, GEMV-parity); STRICT does NOT (p7 the sole intrinsic near-tie, 122/128).
+Both remaining threads point at ONE lever: a **bf16 residual stream end-to-end** (vLLM's regime) — it removes
+the 3% CastBf16 + the f32↔bf16 island round-trips (speed) AND matches vLLM's bf16 rounding (the p7 near-tie
+/ STRICT). Plus the paged-FA2 MLA decode (§16 residual d). Row STAYS `ACTIVE` until GB10 Gate B (STRICT) +
+the last ~10% speed land.
+
+---
+
+## 20. bf16-STREAM CLOSE + PRODUCTION RUNNER FOLD (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, #113 follow-on)
+<!-- state: 2026-08-07 -->
+
+The #113 follow-on double-close: (1) the §19-named **bf16 residual stream end-to-end** (the ONE
+lever both verdicts point at — STRICT via matching vLLM's bf16 rounding on p7, speed via killing
+the 3% CastBf16 + f32↔bf16 round-trips) and (2) the **paged-FA2 MLA decode** (§16 residual d) —
+PLUS a coordinator-directed **production runner fold** (the born-on-runner MUST-route seam): fold
+Kimi's decode onto `ModelRegistry::Forward` so `/v1/completions` serves it at the fast rate, not
+just the `examples/kimi_linear_gen` CLI.
+
+### 20.1 bf16 residual stream (residual #1) — MEASURED-NEGATIVE / REFUTED (`VT_KIMI_BF16_STREAM`, default OFF)
+The partial §14 `VT_KIMI_BF16_RESIDUAL` knob (RoundDevBf16 rounding f32 STORAGE in place) was
+SUPERSEDED by a STRUCTURAL bf16 stream, mirroring `deepseek_v2.cpp:479-615`
+(`DeepseekV2Model::ForwardBody`/`RunLayer`, byte-exact vs the vLLM oracle): `hidden`/`res`/normed-
+`dhn`/block-outputs are bf16 `DBuf`s; `vt::FusedChain(kFusedAddRmsNormStd)` carries the bf16
+add+RMSNorm (the CPU/CUDA kernel rounds the residual store to bf16 and computes the RMSNorm variance
+over that bf16-rounded sum — vLLM's ACTUAL `fused_add_rms_norm` order, `cpu_ops.cpp:326-332`, NOT
+§14's f32-pre-store-sum). Impl (`kimi_linear_device.cpp`): `StreamDType()`/`Bf16Stream()`; `GemmBf16`
+elides the per-GEMM `CastBf16` when the act is already bf16; `AddRmsNormS` builds a LOSSLESS bf16 norm
+weight (CUDA `RmsNorm`/`FusedChain` require `weight.dtype==x.dtype`, cuda_ops.cu:452,3480); `ToStream`
+rounds each block output; the MoE per-expert gather strides in the stream dtype. Applied IDENTICALLY
+to `DeviceForwardBodyBf16` (recompute) + `…Incremental` (paged decode). CPU tiny gate: 15/15·875 with
+the knob OFF (byte-identical); with it ON, case-(l)'s 1e-5 logit tolerance trips (19 tiny assertions)
+but the greedy-TOKEN check (incremental==recompute) STILL PASSES — the state-carry wiring is correct,
+the 1e-5 tol is just too tight for bf16.
+
+**GB10 FULL 48.9B 128-gate — MEASURED NEGATIVE (single-load/config, `flock $HOME/gpu.lock`,
+`drop_caches`, min-avail 18G, NO reboot; §12 golden md5 `bfa5bdbf…`; CONTROL reproduces §19 EXACTLY
+3×):**
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1 DEVICE_KDA_CHUNK=1`, `--incremental`) | /128 | tok/s |
+|---|---|---|---|
+| CONTROL (f32 stream) | — | **122** | 18.9-19.0 |
+| **+bf16 stream** | `BF16_STREAM=1` | **4** | 19.8 |
+| bf16 stream, recompute+f64-island (diagnostic, no device-KDA, non-incremental) | `BF16_STREAM=1` | **5** | 1.47 |
+
+**REFUTED on BOTH axes.** The bf16 residual stream REGRESSES 122→4/128 — the KDA recurrence
+DESTABILIZES into degenerate REPEAT LOOPS (p1 `15383,387,15383,387…`, p2 `220,16,25,220,16,25…`,
+p4 `220,2466,25…`), the §14/§15 "bf16 destabilizes KDA" pathology, now confirmed STRUCTURALLY. The
+diagnostic (recompute+f64-island, the closest analog to §14's BF16_RESIDUAL=106) collapses to 5/128
+because the STRUCTURAL stream computes the RMSNorm variance over the bf16-ROUNDED residual (vLLM-
+faithful) — EVEN LESS stable than §14's f32-variance approximation; both bf16 variants sit far below
+the f32 control's 122. **No speed win:** 18.9→19.8 is within noise (the removed CastBf16 is a memory-
+bound decode's ~3% that overlaps the GEMVs; the added `ToStream` + bf16-norm-weight casts offset it).
+This REFUTES the §19 hypothesis that "a bf16 residual stream closes p7 AND wins speed." Combined with
+§14 (host-precision plateau 120), §15 (device-KDA 122), §16 (device-MLA 109), §18 (chunk-every-step
+102): **p7 is an INTRINSIC near-tie; 122/128 @ 18.9 tok/s (0.90× vLLM) is Kimi-Linear's coherent
+best; STRICT is NOT reachable by residual-precision OR device-island approximation — only by vLLM's
+ACTUAL fused kernels via the full runner fold (§20.3).** The knob STAYS as a documented-MEASURED-
+NEGATIVE A/B (default OFF), per the §14/§16 precedent.
+
+### 20.2 paged-FA2 MLA decode (residual #2) — the MLA HALF of the runner fold (§20.3c)
+The incremental `MlaSoftmaxIslandInc` host f64 softmax (D2H `dq` + H2D `out` per NoPE-MLA layer per
+step) is a per-step host round-trip (part of the ~15% decode host-idle, §19). The principled fix is
+the paged device decode attention over the runner's MLA `attn_kv` group — i.e. `ForwardMlaAttentionBlock`
+run IN the runner (§20.3c), NOT a CLI-only device MLA (the coordinator's "don't build more CLI-only
+machinery"). Grounded in DeepSeek-V2's MLA decode (`mla::ForwardMlaAttentionBlock` / `vt::MlaDecodeAttention`,
+the geometry cousin; Kimi dims §16: nah=32, qk=192, v=128, NoPE ⇒ identity RoPE, no q-lora, scale
+qk**-0.5). NOTE §16 already MEASURED the WHOLE-sequence `vt::Attention` approximation NEGATIVE
+(122→109), so the decode must use vLLM's ACTUAL FA2 tiling (the paged MLA op), not an approximation.
+
+### 20.3 production runner fold (coordinator directive; ARCH-ONE-SURFACE req 4) — SCOPED, ENABLING-BLOCKED
+`KimiLinearModel::ForwardDevice` (the runner forward, bound at `kimi_linear_registry.cpp:87`)
+`KimiLinearModel::ForwardDevice` (the runner forward, bound at `kimi_linear_registry.cpp:87`)
+today routes the full model to `ForwardDeviceCompute` — the O(n²) recompute (4.24 tok/s) — and
+`(void)attn_meta;(void)attn_kv;` (`kimi_linear_device.cpp`), so the SERVER serves at the slow
+rate; the fast paged-incremental path is CLI-only. The fold routes Kimi's decode through the
+runner's prefill/decode phase (`attn_meta`) + the het-KV groups the runner already declares
+(`MakeKimiLinearKVCache`: MLA latent `attn_kv` + KDA MambaSpec `gdn_state`). ENABLING PREREQUISITE
+(measured this campaign): Kimi's `config.json` has **NO `layer_types`** (the KDA/full-attn split
+lives in `linear_attn_config.{kda_layers,full_attn_layers}`), AND Kimi lacks the qwen3_5 `linear_num_
+key_heads`/`linear_key_head_dim`/… fields the runner derives GDN geometry from. So the runner **ABORTS
+on Kimi's KV setup TODAY**: with the KDA MambaSpec group declared, `gdn_group_id_>=0`, and the
+`VT_CHECK(mamba_spec->shapes == {conv_dim,conv_state_len},{Hv,Dv,Dk})` at **`runner.cpp:489-493`**
+compares Kimi's `{12288,3},{32,128,128}` against the config-derived `{0,0},{0,0,0}` → HARD FAIL.
+MEASURED-by-reading, not run (a server smoke would need the 91.5 GiB load). The fold's landing points
+(file:line): (a) synthesize `layer_types` + source the GDN geometry from `linear_attn_config`
+(`runner.cpp:464-493` + config parse) so the runner allocates the two groups without aborting;
+(b) a Kimi KDA-paged block (`vt::KdaChunkPrefill` prefill / `vt::KdaGatedDeltaRule` decode + conv
+gather/scatter over `gdn_state` slots keyed by `non_spec_state_indices` — NOT `GdnBlockPaged`,
+which is per-HEAD-scalar `vt::GdnDecode`); (c) a NoPE-MLA-paged block via `ForwardMlaAttentionBlock`
+(identity-RoPE, NoPE scale) over the paged MLA `attn_kv` (= residual #2 runner-side); (d) bind the
+paged forward in `ForwardDevice`. Gates: engine token-identity (paged-engine == CLI-incremental,
+then vs the §12 STRICT golden) + a `/v1/completions` server smoke (streamed, coherent, rate
+consistent with the CLI 18.9 tok/s). This is the `ARCH-ONE-SURFACE` req 4 (a capability is DONE only
+when `include/vllm.h` exposes it; the CLI is a thin client). It is a substantial multi-brick, runner-
+touching integration (the shared qwen3_5 GDN path — regression risk to the gate models) — NOT one-
+campaign-completable to production quality; SCOPED here as the named born-on-runner residual.
+
+### 20.4 Status — bf16-stream REFUTED; runner fold SCOPED (ARCH-ONE-SURFACE req 4)
+- **bf16 residual stream (20.1): MEASURED-NEGATIVE / REFUTED** on GB10 (122→4/128, repeat-loop
+  destabilization; no speed win). The §19 "bf16 stream closes p7 + wins speed" hypothesis is
+  refuted. Knob kept default-OFF, documented-measured-negative (§14/§16 precedent).
+- **STRICT (128/128): NOT reachable** by any residual-precision or device-island lever tried
+  (§14-§20). p7 is an INTRINSIC near-tie; **122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best.**
+- **SERVER runner fold (20.3): SCOPED, enabling-blocked** — the runner aborts on Kimi's KV today
+  (`runner.cpp:489-493`); the fold is the named born-on-runner residual with the file:line landing
+  points above. NOT landed this campaign (multi-brick, runner-touching, gate-model regression risk).
+- Row STAYS `ACTIVE` on the SERVER fold + the last 0.10× speed (both need vLLM's ACTUAL kernels via
+  the paged fold — the same lever, coupled). The STRICT thread is CLOSED as a definitive near-tie.
+
+---
+
+## 21. ROW 7 — FOLDED ONTO THE SHARED PAGED RUNNER; engine==CLI 128/128 IDENTITY, golden 122/128 PROFILE PRESERVED (2026-08-07, `row/KIMI-RUNNER-FOLD`, #122)
+<!-- state: 2026-08-07 -->
+The §20.3-scoped production runner fold LANDS (ARCH-ONE-SURFACE ROW 7, task #281): Kimi-Linear's
+decode runs THROUGH `ModelRegistry::Forward` on the runner's OWN paged state, the engine/server
+serve it at the paged-incremental class of rate, and `examples/kimi_linear_gen` is a thin
+public-ABI client (`vllm.h` + `vllm::shared`).
+
+### The bricks (file:line)
+- **B1 — KV enablement** (`src/vllm/transformers_utils/hf_config.cpp`): `LoadHfConfig` synthesizes
+  `layer_types` + the GDN-group geometry (`linear_num_key/value_heads`, `linear_key/value_head_dim`,
+  `linear_conv_kernel_dim`) from Kimi's nested `linear_attn_config` (configs/kimi_linear.py:34-148,
+  1-indexed `kda_layers`), so the §20.3 runner ABORT (the MambaSpec check against config-derived
+  {0,0},{0,0,0}) is gone and the per-layer loop allocates 20 KDA state groups + 7 MLA latent pages.
+  ADDITIVE: explicit-field configs (qwen3_5) never enter the branch; `runner.cpp` UNTOUCHED.
+- **B2 — KDA-paged block** (`kimi_linear_device.cpp` `KdaLayerPagedBf16`): `vt::KdaChunkPrefill` for
+  fresh prefills (vLLM's prompt path; `VT_KIMI_PAGED_KDA_CHUNK=0` A/B) / `vt::KdaGatedDeltaRule`
+  (T==1) for decode + continuing prefills over the paged `gdn_state` group keyed by
+  `non_spec_state_indices` (GdnStateGather/Scatter); conv taps via `CausalConv1dFwd` (varlen) /
+  `CausalConv1dUpdate` (decode) in vLLM's `conv_state.chunk(3)` [q|k|v] row layout. NOT per-head
+  `GdnBlockPaged` — KDA's per-K-channel decay needs the KDA ops; the shared GDN kernels untouched.
+- **B3 — NoPE-MLA-paged block**: latent rows written through `vt::ConcatAndCacheMla` at
+  `attn_meta.slot_mapping` (bf16 pages — vLLM's cache dtype; the KDA conv cache dtype now also
+  follows `ResolveKvCacheDType`, mirroring `kda_state_dtype`'s cache-dtype override). TWO arms:
+  **PRODUCTION = `mla::ForwardMlaAttentionBlock`** — vLLM's ACTUAL absorbed-MQA decode / FA2
+  prefill, identity-RoPE (cos=1/sin=0), scale qk^-0.5, load-time `AbsorbKvBProjBf16` into new
+  `MlaResidentWeights::w_uk_t/w_uv` (`VT_KIMI_PAGED_MLA_FA2`, default ON — GB10-ruled below); the
+  DIAGNOSTIC arm (`=0`) is the exact f64 softmax island over kv_b-up-projected paged rows, the
+  CPU fold-identity vehicle.
+- **B4 — ONE SURFACE**: the registry loader loads the bf16-RESIDENT tower through the engine
+  (`ModelFactory::stage_on_load`: queue selected BEFORE the load — CUDA context first + per-tensor
+  stage-and-release, the §13 recipe; `model_loader.cpp` queue branch, additive); ENG-ASYNC-SCHED W4
+  honored (`ForwardPaged` embeds `device_token_ids` — the async device mirror leaves host ids
+  deliberately stale; missing this was a measured GB10 9/128 divergence, RED-first CPU-pinned);
+  `vllm_complete_tokens` (ABI v13) — pre-tokenized completion returning generated ids;
+  `examples/kimi_linear_gen` REWRITTEN as a thin `vllm.h` client; example-abi-allowlist kimi row
+  REMOVED (merged ratchet 8, with #123's two minimax removals); the CLI-incremental REFERENCE leg preserved as the env-gated
+  `tests/vllm/models/test_kimi_linear_fold_gate.cpp` (VT_KIMI_MODEL_DIR/VT_KIMI_GOLDEN_DIR).
+
+### Gates (GB10 dgx.casa, /dev/shm CUDA build — CUTLASS 4.5.0 + FA2 + Triton AOT sm_121a; golden md5 `bfa5bdbf`; flock both locks, drop_caches, worker parked, min-avail ≥ 21G, NO reboot)
+- **CPU**: `test_kimi_linear_paged` 8/8·206 — (a) runner allocates Kimi's het-KV groups from a REAL
+  config.json; (b) paged-runner tokens == CLI tokens (f32 AND production bf16 caches); (b2)
+  `ForwardPaged` logits BYTE-EQUAL the CLI logits at every step (real GDN builder; mutation-RED on
+  dropped ssm scatter / zeroed decode state / dropped conv scatter / dropped MLA cache write); (b3)
+  `device_token_ids` over stale host ids; shared-MLA-arm greedy == exact-arm greedy + f32-page
+  rejection; batched-prefill distinct KDA slots; (c) 2-request slot isolation. `test_hf_config`
+  17/17·180, `test_capi` 35/35·290 (ABI v13 case mutation-verified), full ctest **351/351**.
+- **SACRED (re-run AFTER the fold, same build)**: 35B `test_qwen36_paged_engine` **2/2·315 PASS**;
+  27B `test_qwen27_paged_engine` **1/1·235 PASS** — the shared GDN/runner path is untouched.
+- **Gate A — fold identity (the binding §20.3 gate)**: reference leg (CLI-incremental,
+  §19-winning config, via `test_kimi_linear_fold_gate`) reproduces §19 EXACTLY — **122/128 @
+  18.93 tok/s** (p7 10/16, got-string byte-equal to §19). Engine leg (thin ABI client →
+  `vllm_engine_load` + `vllm_complete_tokens`, FA2 arm): **ENGINE == CLI 128/128 BYTE-IDENTICAL**
+  — p0-p6 16/16 vs golden AND p7's full 16-token got-string equal to the CLI's
+  (`276,6315,7275,382,2512,2470,387,658,18705,58084,824,2234,397,73874,2366,16626`). vs the
+  golden: **122/128 — the SAME near-tie profile** (≥122 bound MET, no drop).
+- **The FA2-default ruling (measured, 2 arms)**: FA2 arm 122/128 == the golden profile → DEFAULT ON
+  (vLLM's actual kernels + parity-enablers-ship-as-defaults). The diagnostic exact-island arm
+  measured **111/128** — the §19-documented GPU M-dimension-tiling near-tie class (re-up-projecting
+  the whole prefix at M=S vs the CLI's M=T append-time GEMM): p7 flips TOWARD golden (16/16!), p4
+  one flip that recovers, p2's token-1 flip cascades 0/16. NOT a paging bug (CPU byte-exact; FA2
+  shares every projection + cache write). Kept as the documented diagnostic arm.
+- **The async-mirror catch (round 1)**: the first engine run DIVERGED 9/128 — `ForwardPaged`
+  embedded the host `token_ids` the DEFAULT-ON async device mirror deliberately leaves STALE for
+  decode rows. Fixed by honoring `device_token_ids` (the qwen3_5 DeviceTokenIdsScope contract);
+  CPU-pinned RED-first. Models outside qwen3_5/kimi still ignore this field — flagged as a
+  repo-wide audit residual.
+- **SPEED**: the SERVER stream is the cleanest production-surface anchor — **48 tokens / 2.52 s =
+  19.0 tok/s wall** (including prefill + first-request warmup ⇒ a LOWER bound on steady decode),
+  i.e. the fold PRESERVES the §19 paged-incremental class (CLI reference 18.93 reproduced;
+  **~0.90× the #111 vLLM ~21 floor**). The example's two-length diffs read lower (N=64: 16.9
+  async / 16.1 sync; N=16: 9.8-11.5) because their long leg runs FIRST and cold — one-time CUDA
+  warmup pollutes the subtraction; recorded as a measurement caveat, not a regression. ≥ vLLM ~21
+  is still NOT met; the residual levers: device KDA decay gate + beta (kill the per-step host
+  islands ForwardPaged kept from the CLI), grouped MoE via the shared seam, decode CUDA graph.
+- **Tokenizer enablement (server surface)**: Kimi ships tiktoken-only; converted to
+  `tokenizer.json` via `transformers` `TikTokenConverter` (encode round-trip verified vs the slow
+  remote-code tokenizer) — staged as `~/kimi-linear-engine-dir` (snapshot symlinks + the converted
+  tokenizer). A shippable-converter residual is noted.
+- **Server smoke (`/v1/completions` through `examples/server`, the ONE-SURFACE deliverable)**:
+  PASS — model listed (`/v1/models`), STREAMED completion coherent ("The capital of France is" →
+  " Paris. The …", 48 tokens / 2.52 s = **19.0 tok/s streamed wall** — consistent with the CLI
+  18.93 class), non-streamed haiku coherent, greedy `finish_reason: length`, usage populated.
+- **vLLM same-session re-measure: ABORTED — BOX REBOOT.** The #111-precedented config (oracle
+  venv, util 0.82, no tracing) loaded 20/20 shards then hard-rebooted the box at torch.compile/
+  graph capture (min-avail had sat at the 15-17G floor) — reproducing §19's measured box-safety
+  finding. NOT retried per the safety mandate; the denominator remains the #111 recorded ~21
+  floor (same prompts/workload). Box recovered clean; worker auto-restored.
+
+### Status
+Row `ACTIVE`: ROW 7 fold LANDED — engine/server surface serves Kimi via the shared paged runner at
+122/128-profile fidelity; STRICT remains CLOSED (§20, intrinsic near-tie); the speed residual is
+now the last open thread (server surface ~19.0 tok/s wall vs vLLM ~21, ~0.90×; levers: per-step
+host-island removal (device decay gate + beta), MoE grouped GEMM through the shared seam, decode
+CUDA graph).
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope

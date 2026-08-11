@@ -26,6 +26,12 @@ namespace vllm {
 class GgufFile;
 class SafetensorsFile;
 struct ForwardLogits;
+// BACKEND-DISTRIBUTED-TP TP-W1: the per-rank tensor-parallel handle (comm +
+// rank), defined in tensor_parallel.h. Forward-declared so the shared registry
+// seam does not pull the TP/communicator headers; a LoadedModel carries an
+// optional BORROWED pointer to it, set only when tp_size>1 (null = single-GPU,
+// byte-identical).
+struct TensorParallel;
 struct GdnStateCache;
 struct PagedKvCache;
 struct Qwen3_5DenseWeights;
@@ -55,6 +61,17 @@ struct ModelInfo {
   bool is_hybrid = false;
   bool has_inner_state = false;
   bool supports_multimodal = false;
+  // Mirror of the SupportsTranscription protocol
+  // (vllm/model_executor/models/interfaces.py:1110-1118):
+  // `supports_transcription` marks an ASR-capable arch;
+  // `supports_transcription_only` marks one with NO text-generation path
+  // (interfaces.py:1118 `supports_transcription_only: ClassVar[bool]`), which
+  // the entrypoints use to refuse-by-task: LoadedEngine::FromModelDir rejects
+  // such an arch with a message pointing at the transcription entry points
+  // (vllm_transcribe / /v1/audio/transcriptions), mirroring how vLLM excludes
+  // "generate" from supported_tasks for them.
+  bool supports_transcription = false;
+  bool supports_transcription_only = false;
   std::string_view score_type = "bi-encoder";
 };
 
@@ -103,6 +120,15 @@ class LoadedModel {
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
 
+  // ARCH-ONE-SURFACE ROW 6: the model-owned Pooler of a POOLING model — the
+  // mirror of upstream `VllmModelForPooling.pooler` (as_embedding_model wires
+  // `self.pooler = DispatchPooler.for_embedding(...)`, adapters.py:248-257).
+  // Non-null iff the registration's info.is_pooling_model; the GPU runner
+  // builds its PoolingRunner over exactly this pooler (the mirror of
+  // gpu/model_runner.py:368-369 `PoolingRunner(self.model)`). Default null:
+  // every text-generation model is byte-identical.
+  virtual const class Pooler* pooler() const { return nullptr; }
+
   // ── SPEC-MTP I5d-pre: typed access to the MTP draft, without breaking the
   //    type-erasure of this base. Only the concrete Qwen3.5 dense/MoE
   //    LoadedModel (which owns the target Qwen3_5DenseWeights/Qwen3_5MoeWeights)
@@ -115,6 +141,16 @@ class LoadedModel {
 
   // Whether this concrete model can hold MTP draft weights and build the draft.
   virtual bool supports_mtp_draft() const { return false; }
+
+  // Whether this concrete model can capture the DFlash/DSpark AUX MULTI-TAP —
+  // the residual stream at the draft's `target_layer_ids`, written into
+  // `ForwardInput::aux_tap` as [T, H x taps]. Both block drafters CONDITION on
+  // that tap, so a target without it produces a speculative engine that dies
+  // mid-run ("missing target aux multi-tap") rather than at load. Found exactly
+  // that way: the first DSpark e2e ran against classic-dense `Qwen3ForCausalLM`,
+  // which has no tap, and the engine threw on the first propose. Default false;
+  // the Qwen3.5/3.6 dense + MoE forwards override it.
+  virtual bool supports_aux_multi_tap() const { return false; }
 
   // Retain the checkpoint's loaded `mtp.*` draft weights (the 15/19 BF16 tensors
   // LoadQwen3_5MTP produced) inside the concrete model so the draft can be built
@@ -129,12 +165,23 @@ class LoadedModel {
   virtual std::unique_ptr<Qwen3_5MTPModel> BuildMtpDraft(
       const HfConfig& config) const;
 
+  // ── BACKEND-DISTRIBUTED-TP TP-W1: per-rank tensor-parallel handle ──────────
+  // The optional TP group (comm + rank) this model instance runs under. BORROWED
+  // (owned by the executor/runner for this instance's lifetime), set only when
+  // tp_size>1; null on the single-GPU path so tp-aware layers take the
+  // whole-tensor, byte-identical branch (tensor_parallel.h: null ⇒ tp_size()==1
+  // ⇒ every collective a no-op, parallel_state.py:638 bypass). Consumed by
+  // TP-W2's forward/loader plumbing; here it is the carrier only.
+  const TensorParallel* tensor_parallel() const { return tensor_parallel_; }
+  void set_tensor_parallel(const TensorParallel* tp) { tensor_parallel_ = tp; }
+
  protected:
   explicit LoadedModel(const ModelRegistration& registration)
       : registration_(registration) {}
 
  private:
   const ModelRegistration& registration_;
+  const TensorParallel* tensor_parallel_ = nullptr;
 };
 
 // MM-ENGINE-FORWARD: one multimodal (vision/audio-language) forward step's
@@ -253,6 +300,11 @@ struct ModelFactory {
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
+  // ROW 7 (kimi-linear.md §20.3): the loader wants a `ModelSource::load_queue`
+  // selected BEFORE the weights load — the GB10 recipe (CUDA context first, then
+  // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
+  // Default false: every existing arch's engine load path is byte-identical.
+  bool stage_on_load = false;
 };
 
 struct ModelRegistration {

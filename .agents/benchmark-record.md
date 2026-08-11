@@ -19,6 +19,452 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## KIMI-BF16-STREAM — bf16 residual stream end-to-end REFUTED (122→4/128, KDA repeat-loop destabilization, no speed win); STRICT is NOT reachable by residual-precision (§14-§20 all closed); 122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best; SERVER runner fold scoped (runner aborts on Kimi's KV today) (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, base `origin/main` `2f029a10`, GB10 sm_121a, PR #118)
+
+The #113 follow-on tested the §19-named residual #1 — the bf16 residual stream END-TO-END, framed as
+"the ONE lever both verdicts point at" (STRICT via vLLM bf16 rounding on p7 + speed via killing the 3%
+CastBf16). Implemented STRUCTURALLY (bf16 `DBuf`s for hidden/residual/normed-hidden/block-outputs via
+`vt::FusedChain(kFusedAddRmsNormStd)`, mirroring `deepseek_v2.cpp:479-615`; supersedes the partial §14
+RoundDevBf16 knob), gated behind `VT_KIMI_BF16_STREAM` (default OFF). Clean-from-`origin/main` `2f029a10`
+CUDA build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=…cutlass-4.5.0`, nvcc 13.0.88, Release), built in `/dev/shm`. CPU gate
+`test_kimi_linear_forward` 15/15·875 with the knob OFF (byte-identical); knob ON keeps the greedy-TOKEN
+state-carry check (incremental==recompute) but trips case-(l)'s 1e-5 logit tol (too tight for bf16).
+
+**GB10 full 48.9B 128-gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored,
+min-avail 18G, NO reboot; §12 golden md5 `bfa5bdbf…`; CONTROL reproduces §19's 122 EXACTLY, 3×):**
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1 DEVICE_KDA_CHUNK=1`, `--incremental`) | /128 | tok/s (steady) |
+|---|---|---|---|
+| CONTROL (f32 stream) | — | **122** | 18.9-19.0 |
+| **+bf16 stream** | `VT_KIMI_BF16_STREAM=1` | **4** | 19.8 |
+| bf16 stream, recompute+f64-island (diagnostic) | `VT_KIMI_BF16_STREAM=1` (no device-KDA, non-incremental) | **5** | 1.47 |
+
+- **REFUTED on BOTH axes.** bf16 residual REGRESSES 122→4/128: the KDA recurrence DESTABILIZES into
+  degenerate REPEAT LOOPS (p1 `15383,387,15383,387…`, p2 `220,16,25,…`, p4 `220,2466,25,…`) — the
+  §14/§15 "bf16 destabilizes KDA" pathology, confirmed STRUCTURALLY. **No speed win** (18.9→19.8, within
+  noise; the removed CastBf16 is a memory-bound decode's ~3% that overlaps the GEMVs, offset by the added
+  `ToStream` + bf16-norm-weight casts).
+- **Diagnostic (5/128 vs §14's f32-variance BF16_RESIDUAL=106):** the STRUCTURAL stream computes the
+  RMSNorm variance over the bf16-ROUNDED residual (vLLM's ACTUAL `fused_add_rms_norm` order,
+  `cpu_ops.cpp:326-332`) — MORE vLLM-faithful yet EVEN LESS stable than §14's f32-variance approximation.
+  Both bf16 variants sit far below the f32 control's 122 ⇒ the direction is dead in ALL variance
+  treatments.
+- **STRICT verdict, definitive:** with §14 (host-precision plateau 120), §15 (device-KDA 122), §16
+  (device-MLA 109), §18 (chunk-every-step 102), and now bf16-stream (4-5) — **p7 is an INTRINSIC near-tie;
+  122/128 @ 18.9 tok/s (0.90× vLLM) is Kimi-Linear's coherent best; STRICT is NOT reachable by residual-
+  precision or device-island approximation.** The only remaining STRICT/speed path is vLLM's ACTUAL fused
+  kernels via the full runner fold.
+- **SERVER runner fold (ARCH-ONE-SURFACE req 4): scoped, enabling-blocked.** The runner ABORTS on Kimi's
+  KV today — `VT_CHECK(mamba_spec->shapes == …)` at `runner.cpp:489-493` fails because Kimi lacks the
+  qwen3_5 `linear_*` config fields + `layer_types` (its KDA split lives in `linear_attn_config`). The fold
+  = synthesize layer_types + source GDN geometry from `linear_attn_config` + a Kimi KDA-paged block
+  (`KdaChunkPrefill`/`KdaGatedDeltaRule` over `gdn_state`) + a NoPE-MLA-paged block (`ForwardMlaAttentionBlock`
+  identity-RoPE) + bind in `ForwardDevice`; a multi-brick runner-touching integration (gate-model regression
+  risk), NOT landed this campaign. `VT_KIMI_BF16_STREAM` kept default-OFF as a documented-measured-negative.
+
+## KIMI-PAGED-INCREMENTAL — paged-incremental decode LANDS the 5× speed win (4.23→18.9 tok/s, 0.20×→0.90× vLLM); Gate A token-identical to recompute; STRICT NOT reached (p7 intrinsic near-tie, 122/128); decode is 90% cuBLAS-GEMV-parity (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`, base `origin/main` `68b394bc`, commit `f9ba4a9c`, GB10 sm_121a, PR #113)
+
+Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 18-21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy` (md5 `bfa5bdbf…`). vLLM ~21 stands from #111 (re-run only ours). The §18 lever (e) built: prefill-once (KDA recurrent+conv state carried, NoPE-MLA latent-KV cached) + recurrent decode-step; mirrors vLLM `kimi_gdn_linear_attn._forward` (prefill=`chunk_kda_with_fused_gate` / decode=`fused_recurrent_kda`) at `vllm-src` `a4e3cb4`.
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1`) | /128 | tok/s (steady) | first-step | note |
+|---|---|---|---|---|---|
+| recompute (O(n²)) | (recompute vehicle) | **122** | 4.23 | 0.498s | reproduces #111/§15/§16 EXACTLY (p0-p6 16/16, p7 10/16) |
+| incremental + recurrence-prefill | `--incremental` | 120 | 16.63 | 0.640s | p0-p6 16/16; p7 flips 10→8/16 (GPU near-tie) |
+| **incremental + chunk-prefill** | `--incremental DEVICE_KDA_CHUNK=1` | **122** | **18.87 / 19.03** | 0.54-0.62s | **token-IDENTICAL to recompute (p7 `got` byte-exact)** |
+
+- **SPEED (headline).** Paged-incremental (chunk-prefill) = **18.9-19.0 tok/s steady** (2 runs) vs the O(n²) recompute **4.23** = **4.5×**; **0.90× of vLLM ~21** (the #111 16-tok AGGREGATE floor) — the MEASURED 5× decode gap (0.20×, #111) is CLOSED to ~1.1×. It runs the projections/MoE for 1 token/step (decode) instead of [0..prompt+t].
+- **Gate A (token identity) — PASS for chunk-prefill.** `incremental+chunk-prefill` byte-token-identical to `recompute` across ALL 128 tokens (p7 `got` string `276,6315,7275,382,2512,2470,387,658,18705,58084,824,2234,397,73874,2366,16626` exact-equal). Recurrence-prefill matches on p0-p6 (112 tokens) and flips ONLY the p7 near-tie (10→8/16) — GPU projection-GEMM M-dimension tiling (M=P prefill / M=1 decode → different cuBLAS kernel) perturbing the single documented near-tie, the §14/§16 coin-flip class; NOT a wiring bug (CPU gate byte-exact, `test_kimi_linear_forward` 15/15·875).
+- **Gate B (STRICT) — NOT reached, 122/128.** Chunk-prefill (vLLM's PROMPT order) in the RIGHT vehicle reproduces recompute's 122/128 EXACTLY — does NOT close p7. HONESTLY REFUTES the #111 "p7 suspect in the right vehicle → STRICT" hypothesis: p7 is INTRINSIC (§13/§14 — f32-accurate forward vs the golden's deterministic bf16 top-1 at a comma; golden pos-6 `11`, ours `387`), not a chunked-vs-recurrent artifact.
+- **DECODE DECOMPOSITION (nsys `cuda_gpu_kern_sum`, OUR decode, 99 steps, same-tool).** ~90% = `internal::gemvx::kernel<bf16,float,float>` 71.2% (57,144 inst) + cutlass bf16 WMMA GEMM 14.2%+1.1% + more gemvx — the SAME cuBLAS batch-1 GEMV symbol vLLM calls (cuBLAS-parity, [[laguna-gap-is-gpu-compute-not-host]]). CastBf16 3.0%, KdaScanKernel 2.3% (1,980 inst = decode=recurrent ✓), MoE glue (router+silu+combine) 2.3%, convs 0.7%; chunk kernels 20 inst = PREFILL only (prefill=chunk / decode=recurrent IN VIVO). **Killing O(n²) ALONE reaches parity-class; no single lever is load-bearing beyond it** — the residual is ~15% host-orchestration idle + 3% CastBf16 (a bf16 residual stream, the one lever that is ALSO the p7-STRICT lever), NOT a missing grouped-MoE kernel. **vLLM-live-nsys at util 0.82 NOT run** — a MEASURED box-safety violation (vLLM reserves 95-98 GiB + nsys ~2 GiB → min-avail below the 15 GiB LIFE-CRITICAL floor; #111's un-traced 0.82 already at 15 GiB).
+- **Default.** `--incremental` opt-in; `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (122/128 ≠ STRICT, K=3-deterministic golden). The paged-incremental path is the validated 4.5× speed lever, opt-in until STRICT lands.
+
+## KIMI-CHUNK-KDA-P2 — chunk_kda prefill op lands + GB10-validated (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) recompute island REGRESSES 122→102/128 (worse than the recurrence's 122); vLLM ~5× faster on decode; the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, base `origin/main` `5548a731`, GB10 sm_121a, PR #111)
+
+Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy`; the vLLM arm SEQUENTIAL after ours at the §12 recipe (util 0.82, triton MoE, eager, seqs=1; min-avail 15 GiB, no reboot):
+
+| config | env | /128 | tok/s | first-step |
+|---|---|---|---|---|
+| control (recurrence, §15) | `DEVICE_COMPUTE=1 DEVICE_KDA=1` | 122 | 4.24 (steady) | 0.547s |
+| + chunk-prefill | `… DEVICE_KDA_CHUNK=1` | **102** | 4.08 (steady) | 0.522s |
+| vLLM (paged incremental) | util 0.82, triton MoE | (golden) | **~21 median** (16-tok aggregate; 25.3 cold-discarded) | TTFT n/a in 0.25.0 |
+
+**ours/vLLM ≈ 0.20 (vLLM ~5× faster on decode)** — a MEASURED distance (supersedes §14's "HW-forced-indirect"; vLLM 0.25.0 `RequestOutput.metrics` per-token times were absent so the vLLM figure is prefill-amortized 16-token aggregate = a FLOOR on the gap). Unit (RED-first, GB10): `test_ops_kda_chunk_prefill` 2/2·4 — chunk-vs-recurrence mean_abs **4.68e-5**, wrong-gate (a_log+1.0) **3.38e-3 = 72×**. GDN untouched (`test_ops_gdn` 66/66·4242, `test_ops_kda_recurrence` 4/4·8). Regen reproducible ×6 arches (only `kda_*`+MANIFEST changed; GDN cubins byte-identical; drift GREEN). **Why the regression:** the op is unit-correct, but the island's O(n²) recompute applies chunk EVERY decode step over the growing sequence — NOT vLLM's prefill=chunk/decode=recurrent split — so it coin-flips more near-ties than the recurrence (the recurrence matches vLLM's DECODE, both recurrent for t>0; the chunk only matches vLLM's PREFILL, t=0). `VT_KIMI_DEVICE_KDA_CHUNK` STAYS OFF; device-KDA (122, OFF) best. The op + regen are the validated prefill half of the REAL lever (e) paged-incremental decode (chunk-prefill ONCE + recurrent-decode over PERSISTENT state; kills the O(n²) — the coupled STRICT+speed lever). The chunk-every-step measurement PROVES the recompute vehicle cannot host the chunk lever.
+
+## QUANT-CT-MXFP4-FLASH-PTXAS — the ptxas-lineage hypothesis is REFUTED three ways: vLLM's fa2 wheel ships NO sm_12x cubin (only CUDA-13.0 PTX-ISA-9.0 compute_80 PTX, driver-JIT'd on GB10), an "old CUDA 12.x ptxas" cannot even target sm_121a, and a same-params cuModule A/B shows our-PTX and vLLM's-OWN-PTX schedule the c8 decode kernel identically (~144 us) across driver-JIT / ptxas 13.0 / ptxas 13.2 — the +10 us/call engine gap is ENGINE CONTEXT, not flash codegen (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-PTXAS`, base `362a3c99`, GB10 sm_121a, PR #82)
+
+#75 attributed the residual +10 us/call c8 flash gap (ours ~167 vs vLLM ~157) to "vLLM's wheel `ptxas` SASS-scheduling quality (older CUDA 12.x lineage)" and OWED obtaining that ptxas and A/B'ing it. This row did. **The lineage hypothesis dies at the premise, then again at the measurement.**
+
+**W1(a) — the wheel has no old lineage and no runnable GB10 cubin (`cuobjdump` `_vllm_fa2_C.abi3.so`, vLLM 0.25.0-stage).** 52 ELF cubins ALL `sm_80`; 52 PTX ALL `.target sm_80 .version 9.0`. PTX ISA 9.0 = **CUDA 13.0**, the SAME major lineage as our nvcc 13.0 — not an older 12.x. There is **NO sm_90/100/120/121 cubin**. On GB10 (sm_121a) the sm_80 SASS cannot execute, so the flash SASS that actually RUNS is **driver-JIT'd from the compute_80 PTX by the box CUDA-13.0 driver (580.159.03)** — produced by the DRIVER's JIT, never by a wheel `ptxas`. #75's mental model (a wheel `ptxas` baked vLLM's fast sm_121a cubin) is factually wrong; vLLM ships portable PTX and relies on the same driver JIT our own build can invoke. #75's own Build C already used that exact assembler (it compiled `code=compute_80` → driver-JIT) and matched vLLM's reg+instr — the assembler was never a variable we lacked.
+
+**W1(b) — an "old CUDA 12.x ptxas" cannot target the arch.** Box `ptxas`: 12.8 (triton), 13.0 (toolkit, our build default), 13.2 (nvidia/cu13 wheel). `ptxas 12.8` tops out at **sm_120a — no sm_121a** (first appears in 13.0), and it cannot read PTX ISA 9.0. So the mission's literal recipe (get the old ptxas, assemble our PTX for sm_121a) is **impossible by construction**: sm_121a SASS only exists from ptxas 13.0+.
+
+**W1(c) — same-params cuModule A/B (THE ARBITER), locked idle box, CUDA-event medians (100× back-to-back × 15 reps).** A standalone harness builds `Flash_fwd_params` for the exact c8 GQA-swap decode (b=8, kv_heads=8, ngroups=4, d=128, seqlen_k=1024, num_splits=3 → grid (1,3,64), block 128, dyn-smem 81 920 B) and times the SAME decode kernel (`flash_fwd_splitkv_kernel<…128,64,128,4…,0,0,0,0,1,0,1,0>`, mangled-identical in our build and vLLM PTX #30) loaded from our compute_80+fast-math PTX and from vLLM's extracted PTX #30, each via {driver-JIT, ptxas 13.0, ptxas 13.2}. All six cubins REG=241 (matched vLLM). Result:
+
+| decode-kernel arm (single split-launch) | module us/call | module/native |
+|---|---|---|
+| our compute_80+fm — driver-JIT | 144.96 | 0.998 |
+| our compute_80+fm — ptxas 13.0 | 149.07 | 1.004 |
+| our compute_80+fm — ptxas 13.2 | 150.78 | 1.009 |
+| vLLM PTX #30 — driver-JIT | 144.55 | 1.007 |
+| vLLM PTX #30 — ptxas 13.0 | 135.95 | 0.969 |
+| vLLM PTX #30 — ptxas 13.2 | 140.54 | 1.013 |
+
+Native sm_121a anchors drifted 138.7–149.4 across the sequential arms (box clock drift), so the module/native RATIO is the drift-normalized read: all six ∈ [0.969, 1.013], i.e. **within ±1.3% — a tie.** No ptxas lineage (13.0/13.2/driver-JIT) moves our kernel, and vLLM's OWN PTX through the same assemblers runs the same as ours. The single 0.969 excursion (vLLM PTX+ptxas13.0) is contradicted by its two sister vLLM arms (driver-JIT 1.007, ptxas13.2 1.013) and by our-PTX+ptxas13.0 (1.004): neither ptxas 13.0 nor vLLM's PTX is systematically faster — it is the low tail of box drift.
+
+**THE ARBITER VERDICT: NO.** No old-ptxas cubin hits ~157 (none can be built; and the driver-JIT that vLLM actually uses was already our #75 Build C). The flash decode kernel's CODEGEN is at PARITY across every reachable toolchain AND against vLLM's own PTX. **The corrected mechanism:** in ISOLATION every variant is ~144–151 us, whereas in the real engine #75 measured ours 167 / vLLM 157 — so the +10 us/call gap is NOT in the flash kernel's SASS at all; it is ENGINE CONTEXT (the L2/TLB/clock state the neighbour kernels leave for the flash launch — exactly #69's "the flash kernel's cost moves with its NEIGHBOURS' L2 footprint"). This RETIRES #75's "ptxas SASS-scheduling quality" attribution. (Caveat, stated: the microbench is L2-warm — KV re-read back-to-back — so its ~144 us absolute sits below the engine's DRAM-cold 157–167; this does not affect the codegen arbitration because #75 showed the dominant stalls are smem-scoreboard/CTA-barrier, regime-independent, and they tie here across all toolchains.)
+
+**W2/W3 — none owed.** NO vendor (nothing beat the driver JIT we already use). Binding UNCHANGED: c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969. THE PARITY VERDICT: MXFP4 stays BELOW-FLOOR at c2–c8, TERMINAL, with the corrected residual map — flash-kernel codegen at PARITY (this row); the c8 ~0.969 residual = flash ENGINE-CONTEXT adjacency (glue/marlin-neighbour L2/orchestration, a different lever than the kernel) + portable-fusion glue ~18% (numerics-delicate, sub-parity) + marlin/host remainder. No default flip owed. **hd256 (27B/35B) cross-model projection:** structurally identical — vLLM's fa2 wheel ships the hd256 splitkv kernels as sm_80-only PTX driver-JIT'd on GB10 too (no old-ptxas lineage, same driver JIT), so NO hd256 flash-ptxas vendor is owed either; the 27B/35B flash-decode codegen is at the same parity and their residuals are likewise context/glue, not ptxas.
+
+Evidence: `dgx:~/mxfp4-ptxas/{exp.sh,exp.log,bench_flash_ptxas.cu,*.cubin,our_c80fm.ptx,vllm.ptx}`; wheel `_vllm_fa2_C.abi3.so` cuobjdump (52×sm_80, PTX 9.0). The CMakeLists NOTE + this entry record the closed levers so they are not re-tried.
+
+## QUANT-CT-MXFP4-FLASH-OCCUPANCY — the owed ours-vs-vLLM flash decode ncu diff: occupancy is IDENTICAL (8.33%, smem-limited); the flash gap is a COMPILER-CODEGEN difference (vLLM's wheel SASS runs 13% fewer instructions on the byte-identical kernel), NOT occupancy/L2/arch/fast-math — no lever exists on our stack (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`, base `f7a1e322`, GB10 sm_121a, PR #75)
+
+#69 closed the compile lens (flash source byte-identical to vLLM's `2c839c33`; `-use_fast_math` REJECTED, +21us/call) and OWED the ours-vs-vLLM ncu diff (vLLM side lost to a box OOM-reboot). This row runs that diff to a MEASURED verdict on an idle box and re-frames the #69 premise. **Vehicle** `Yi30/Qwen3-8B-MXFP4` (dense W4A16 Marlin), oracle arm `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`.
+
+**W0 (free, existing c8 nsys CSVs) — the #69 "8.3% occupancy, register-limited" figure was the WRONG kernel.** The prior ncu pair was context-MISMATCHED: ours ran `vllm-cli` with a ~5-token prompt (context ~5 → `num_splits=1`, Split=false — a different kernel instance), vLLM ran `lens=[1024]` (Split=true). At the REAL c8 decode kernel (`gpu_trace_c8_dflt` vs `vllm_offline_trace_c8`) both run the IDENTICAL grid `1x3x64` (num_splits=3, gridZ=64=batch×kv_heads) and ours uses FEWER registers (216 vs 241) → more occupancy headroom, not less.
+
+**W1 — matched-c8 ncu diff (both engines, grid `1x3x64`, full section set; ours = `vllm-bench --input-len 1024 --output-len 128 -c 8`; vLLM = offline NPROMPTS=8, `enforce_eager` to dodge the FULL-cudagraph node-profiling driver-resource conflict; vLLM `gpu_memory_utilization` dropped 0.5→0.15 after full-section replay + the 0.5-util reservation OOM-rebooted the 119 GiB unified pool once — the SAME #69 failure mode, now root-caused: ncu kernel-replay on the vLLM process is memory-heavy):**
+
+| metric | OURS (native sm_121a) | vLLM (sm_80-PTX driver-JIT wheel) |
+|---|---|---|
+| grid (X×Y×Z) | **192 (1×3×64)** | **192 (1×3×64)** — identical |
+| block / dyn smem per block | 128 / **81.92 KB** | 128 / **81.92 KB** — identical |
+| Block Limit Shared Mem | **1** | **1** (both smem-limited to 1 CTA/SM) |
+| **Achieved Occupancy** | **8.33%** | **8.33%** — IDENTICAL |
+| Registers / thread | 216 | 241 |
+| **Executed Instructions** | **3,695,180** (19,245/sched) | **3,267,840** (17,020/sched) — ours **+13.1%** |
+| Duration (ncu, median) | ~165 us | ~157 us |
+| L2 hit / L1 hit | 1.03% / 0.39% | 1.23% / 1.07% |
+| SM / Memory throughput | 13.5% / 10.4% | 14.2% / 11.0% |
+| Active warps/sched (eligible) | ~1.0 (0.06) | ~1.0 (0.06) |
+| stall: short-scoreboard (LDS→MMA) | ~63% of ~16.6 cyc | ~58% of ~16.9 cyc — same KIND |
+
+**Answer to the owed W1 question: YES — vLLM's instance runs at the SAME 8.33% occupancy.** Both are SMEM-limited to 1 CTA/SM by the byte-identical 81.92 KB `kSmemSize` (the 216-vs-241 reg delta is MOOT — smem binds first). Occupancy is refuted as the lever. L2-warmth/adjacency is refuted: both stream KV from DRAM at ~1% L2 hit (c8 KV working set ≫ L2 → nothing a preceding kernel leaves stays hot), so the flash kernel's own memory profile is context-independent. num_splits/grid/GQA-pack are identical. The ONLY measured difference is **executed instructions: ours +13.1%** (the same +11.6% scalar bloat #69's cuobjdump saw on the non-split kernel, now on the actual c8 decode kernel with EVERYTHING ELSE held identical). That made instruction-count the leading CODEGEN hypothesis — but W2 tests it directly and **REFUTES it as the cause**: matching vLLM's exact instruction count does NOT close the gap.
+
+**W2 — mirror-first lever exploration (controlled ncu on the SAME c8 kernel; flash TUs recompiled per cell into an isolated build):**
+
+| flash-TU build variant | reg | executed instr | ncu duration | vs vLLM 3.27M/157us |
+|---|---|---|---|---|
+| A native sm_121a (main default) | 216 | 3.70M (19,245/sched) | ~165 us | baseline |
+| B compute_80 PTX driver-JIT (mirror vLLM's arch) | 236 | 3.69M (19,212/sched) | ~165 us | **NEGATIVE — no change** |
+| **C** compute_80 + `-use_fast_math` (vLLM's EXACT recipe) | **241** | **3,267,072 (17,008/sched)** | **~167 us (161-170)** | **matches vLLM reg+instr EXACTLY, STILL ~10us slower** |
+| #68 native sm_121a + `-use_fast_math` | 255 | (fewer) | 189.8 us | REGRESSED (prior row) |
+| vLLM `_vllm_fa2_C` (sm_80+PTX+fast-math wheel) | 241 | 3,267,840 (17,020/sched) | ~157 us | the target |
+
+**The decisive cell is C.** Arch-mirror alone (B) is NEUTRAL (compute_80 PTX driver-JIT = native instr/duration). Adding fast-math (C) reproduces vLLM's SASS profile EXACTLY — 241 reg and 17,008 instr vs vLLM's 241/17,020, a −13% instruction drop from A's 19,245 — and YET C is ~167 us, essentially the SAME as A/B's ~165 us and still ~10 us SLOWER than vLLM's ~157 us. So the −13% instruction reduction does NOT translate to speed (the kernel is NOT instruction-bound — our toolchain sits at ~165 us regardless of 19,245 or 17,008 instr), and matching vLLM's exact register+instruction profile still leaves the gap. The residual is the specific SASS instruction-SCHEDULING/selection quality of vLLM's wheel `ptxas`, applied to the byte-identical source — which our nvcc-13.0 `ptxas` does not reproduce even when told to emit the same arch, fast-math, register count and instruction count. (Sub-finding: native+fast-math REGRESSES to 189.8 us (#68) but compute_80+fast-math is neutral at ~167 us — the arch target changes how fast-math's SASS lands, but neither is a win.) Build variants were made by swapping `--generate-code` and adding `-use_fast_math` in the exact ninja compile command, then ar+link'ing `libvllm.a`/binaries manually (CMake has no per-source `CUDA_ARCHITECTURES` property — `set_source_files_properties(... CUDA_ARCHITECTURES ...)` silently no-ops; each variant verified via `cuobjdump` and an ncu regs/instr read).
+
+**W3 — THE PARITY VERDICT: MXFP4 stays BELOW-FLOOR at c2-c8 (binding unchanged: c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969 — nothing landed to move it).** Every candidate the diff could name is refuted by measurement: occupancy (identical 8.33%, smem-bound), L2-warmth (~1% both, KV ≫ L2), num_splits/grid (identical), register count (matched vLLM's 241 in C), instruction count (matched vLLM's 17k in C — and it did NOT help: the kernel is not instruction-bound), `__launch_bounds__`/reg-pressure (moot — smem-bound), arch-mirror (neutral), fast-math (regresses on native, neutral on compute_80). The flash decode term (+12.5 us/call ≈ +450 us/step, ~40% of the c8 residual after the dense-direct marlin banked the rest) is an IRREDUCIBLE (for us) **ptxas SASS-scheduling-quality gap**: on the byte-identical source, at identical grid/occupancy/smem/L2/stall-structure AND matched register+instruction counts, vLLM's wheel-`ptxas` schedules the SAME work ~10 us/call tighter than our nvcc-13.0 `ptxas`. Closing it requires vLLM's exact build `ptxas`, not something reachable by source, arch, flag, register or instruction control on our stack — so it is NOT a code, kernel, occupancy, or scheduling lever available to us. Honest c8 residual map: ~0.969 = flash ptxas-quality ~40% (this row, un-closable-by-us) + glue ~18% (portable-fusion, numerics-delicate, sub-parity) + residual-marlin/host the remainder. NO default flip owed (no throughput win). The CMakeLists NOTE records why -use_fast_math and the arch-mirror are NOT used, so they are not re-tried.
+
+Evidence: `dgx:~/mxfp4-nsys/{ours_flash_c8_ncu,vllm_flash_c8_ncu,buildB_flash_c8_ncu,buildC_flash_c8_ncu}.ncu-rep`; drivers `{ncu_flash_c8,ncu_vllm_eager2,perf_ab,buildc_ncu}.sh` + `vllm_offline_decode8_eager015.py`. Box OOM-rebooted once (util-0.5 vLLM ncu-replay), recovered, left clean.
+
+## QUANT-CT-MXFP4-FLASH-AUDIT — `--use_fast_math` on the FA2 TUs REJECTED (measured flash REGRESSION); the flash decode gap vs vLLM is a runtime memory/occupancy effect, not the SASS instruction count (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-AUDIT`, base `origin/main` `4ce9fb74`, GB10 sm_121a, PR #69)
+
+The #67 refutation re-attributed the c2-c8 MXFP4 residual FLASH-dominant and OWED a
+STRUCTURAL-lens audit of why the IDENTICAL-grid `flash_fwd_splitkv` decode kernel runs
+slower on our side. This row runs that audit to a MEASURED verdict.
+
+**W1 — the flash term is REAL and fresh same-tool; on CURRENT main it is SMALLER than #57.**
+`analyze_decode2.py` (dense-marlin-aware) c8 decode-window, both `nsys --cuda-graph-trace=node`,
+modal marlin=144 / gridZ=64 / 231 steady steps:
+
+| build (current-main dense-direct default) | flash MAIN us/step (us/call) | marlin us/step | glue |
+|---|---|---|---|
+| ours (no fast-math) | 6075.7 (**168.8**) | 16203.8 | 776.0 |
+| vLLM oracle | 5628.5 (**156.3**) | 16286.2 | 670.6 |
+
+Gap = **+12.5 us/call (+450 us/step)** — NOT #57's +807. Current-main's leaner marlin/glue
+(16204/776 vs #57's 16512/869) drop flash 178.1→168.8, itself a hint the residual is L2/context
+(the flash kernel's cost moves with its NEIGHBOURS' L2 footprint), not the kernel body.
+
+**W2 lens 1 (cuobjdump, HYPOTHESIS) — vLLM's flash-attn is `--use_fast_math`, ours was not.**
+Kernel-version REFUTED: vLLM v0.25.0 pins vllm-flash-attn @ `2c839c33`, the exact commit we
+vendored — flash SOURCE byte-identical. vLLM ships sm_80 ELF + compute_80 PTX (driver-JIT to
+sm_121). Decode kernel `<128,64,128,4>`: ours 5448 instrs/REG246; +`-use_fast_math` → 4832/REG255
+(= vLLM's 4880/REG255), HMMA(768)/LDSM(408)/LDGSTS(120) byte-identical. The compile lens
+SUGGESTED the +11.6% scalar bloat was the gap.
+
+**W2 lens 2 (MEASURED, the arbiter) — the compile lens was WRONG; `-use_fast_math` REGRESSES
+flash.** Controlled SAME-BUILD nsys A/B (current-main dense-direct default, flash source
+identical, only the flag differs), same-tool c8 decode-window:
+
+| build | flash MAIN us/call | flash instrs / REG |
+|---|---|---|
+| ours **no fast-math** | **168.8** | 5448 / 246 |
+| ours **+`-use_fast_math`** | **189.8** | 4832 / 255 |
+| vLLM | 156.3 | 4880 / 255 |
+
+**`-use_fast_math` makes flash +21 us/call SLOWER (168.8 → 189.8), not faster.** The kernel is
+MEMORY-LATENCY-bound: the instruction count barely gates time, and fast-math's higher register
+count (246→255) LOWERS occupancy, which dominates. Matching vLLM's SASS profile (4832/255 ≈
+4880/255) did NOT close the gap — ours-fastmath is +33 us/call above vLLM at the SAME instr/reg
+profile. This is the STRUCTURAL-lens "same kernel NAME, different resolved cost" rule and the
+"MEASURED not inferred" rule: cuobjdump was necessary but NOT sufficient. Correctness footnote:
+fast-math stayed token-exact (#44 smoke 3/3 + coherent) — a faithful mirror of vLLM's build,
+just not a speed win.
+
+**W2 real mechanism (sudo ncu; OURS characterized, vLLM-side LOST to a box OOM-reboot,
+OWED).** OURS no-fastmath flash (c1): **Achieved Occupancy 8.3%** (register-limited — 4 of 12
+warps/SM at 246 regs; fast-math's 255 regs → even fewer warps = the measured regression),
+**L2 Hit 53%**, Memory/Compute throughput ~1-1.5% (pure latency-bound). Warp stalls: **~38%
+short-scoreboard (MMA waiting on LDSM K/V staged to shared memory) + ~37% CTA-barrier
+(`__syncthreads`)** = ~75% of cycles. The flash decode is OCCUPANCY-STARVED: too few warps to
+hide the LDSM→MMA shared-memory dependency and the barrier. vLLM runs the SAME-SOURCE kernel at
+255 regs (same-or-worse occupancy) yet 156.3 — so its ~12 us/call edge is NOT occupancy; the
+precise ours-vs-vLLM L2/scheduling delta needs the vLLM-side ncu, lost when the shared box
+OOM-rebooted mid-capture (twice this session, under 3-way `row/H3-FP4-GPU-E2E` + CPU-GGUF-gate
+contention) — re-run owed on an idle box. Counter-pointed NEXT lever: lift occupancy above
+8.3% (cut the flash kernel's register pressure / `__launch_bounds__`) or cut the
+barrier/smem-scoreboard stalls (ncu's own hint: smaller warp groups / fewer syncs).
+
+**VERDICT.** `-use_fast_math` REJECTED and REVERTED (measured +21 us/call regression; a
+non-byte-exact change with a negative speed effect). No functional code ships (a CMakeLists
+NOTE records why not, so it is not re-tried). The flash decode residual vs vLLM is **+12.5
+us/call (+450 us/step) at c8**, a runtime memory/occupancy effect (ncu above), NOT the
+instruction count. The full SACRED battery + c1..c8 binding a default-flip would need are
+therefore NOT owed (no throughput win to flip). NEXT lever = the occupancy/L2 difference
+(candidate axes a/c: L2 pollution from our marlin/glue neighbours, register pressure /
+`__launch_bounds__`) — the +450 us/step is ~40% of the c8 residual after the dense-direct
+marlin banked the rest.
+
+Evidence: `dgx:~/mxfp4-nsys/{ours_fm_c8,ours_nofm_c8}_cuda_gpu_trace.csv` + `analyze_decode2.py`
+(A/B); `ours_nofm_flash_ncu.ncu-rep` (mechanism); `smoke_fm.log` (#44 3/3); compile arbiter
+(superseded lens). Box OOM-rebooted twice under 3-way contention; left clean.
+
+## QUANT-CT-MXFP4-FUSED-GLUE W0 — the funded glue-fusion-into-Marlin kernel target is SOURCE-REFUTED; vLLM does NOT fuse glue into the extern Marlin GEMM for W4A16; the c2-c8 residual is FLASH-dominant, not glue (2026-08-06, `row/QUANT-CT-MXFP4-FUSED-GLUE`, source-side on dev box; GPU dumps box-contended by `row/H3-FP4-GPU-E2E`, base `origin/main` `672fc760`)
+
+W0 of the funded MXFP4 kernel campaign. The chartered vehicle is `Yi30/Qwen3-8B-MXFP4`
+(dense `Qwen3ForCausalLM`, compressed-tensors **W4A16** Marlin keep-quant); oracle arm
+`VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` (sm_121 cute-dsl mxf4 crashes). The
+prior FINAL-STACK (#59) terminal statement funded a from-scratch Marlin kernel fusing
+`add+RMSNorm+quant` into the GEMM PROLOGUE and `silu+mul` into the EPILOGUE, framed as
+mirroring vLLM's Inductor "GEMM pro/epilogue fusion" (`triton_red_fused_fused_add_rms_norm_marlin_gemm`
+/ `triton_poi_fused_marlin_gemm_mul_silu_slice`, #46/#52). W0's precondition is to DUMP
+vLLM's actual kernels and never trust the label. The GPU dumps (TORCH_LOGS=output_code,
+same-tool decode-window) are box-contended and OWED, but the vLLM COMPILATION SOURCE is
+decisive on its own and REFUTES the premise. Reading is at the parity pin `555967922`
+(`~/_git/vllm`, 0.26.0.dev0).
+
+**FINDING 1 (source-conclusive): the two named vLLM fusion passes DO NOT FIRE for a
+W4A16 MXFP4 model — they are ACTIVATION-QUANT fusions and W4A16 keeps bf16 activations.**
+- `PostGradPassManager.configure` adds `RMSNormQuantFusionPass` under `fuse_norm_quant`
+  and `ActivationQuantFusionPass` under `fuse_act_quant` (`vllm/compilation/passes/pass_manager.py:163-171`).
+  Those flags resolve via `enable_norm_fusion`/`enable_act_fusion` (`vllm/config/vllm.py:108-129`;
+  wired into `OPTIMIZATION_LEVEL_0x` at `vllm.py:232-233,255-256,278-279`).
+- But the PASSES only match norm/act followed by an **fp8/nvfp4 quant** op:
+  `RMSNormQuantFusionPass` registers ONLY `{FusedAdd,}RMSNorm{Static,Dynamic,Group}QuantPattern(..., FP8_DTYPE)`
+  (`rms_quant_fusion.py:629-669` — every pattern is `FP8_DTYPE`); `ActivationQuantFusionPass`
+  registers ONLY `SiluMulFp8StaticQuantPattern` / `SiluMulNvfp4QuantPattern` /
+  `SiluMulBlockQuantPattern(kFp8Dynamic*)` (`act_quant_fusion.py:296-320`).
+- W4A16 has NO activation quant: `apply_gptq_marlin_linear` calls `marlin_quant_input` ONLY
+  for `input_dtype==int8`/`float8_e4m3fn` (`marlin_utils.py:704-715`); for MXFP4 W4A16
+  `input_dtype=None`, so the **bf16** RMSNorm output is passed STRAIGHT to `ops.marlin_gemm`
+  (`marlin_utils.py:717`). MXFP4 is not nvfp4 (`is_nvfp4_quantized()` is False), so the nvfp4
+  clause of `enable_act_fusion` also does not apply. ⇒ There is no `rms_norm→quant` or
+  `silu_mul→quant` sub-graph to match; BOTH passes are no-ops on this model.
+
+**FINDING 2 (source-conclusive): `marlin_gemm` is a non-decomposable EXTERN custom op —
+Inductor structurally CANNOT fuse elementwise into it.** `ops.marlin_gemm` is registered
+with `register_fake("_C::marlin_gemm")` (`vllm/_custom_ops.py:1200-1247`); Inductor treats
+a fake-registered custom op as a FallbackKernel and emits an extern CALL, never Triton for
+its body. The observed `triton_*_marlin_gemm_*` kernels are therefore INDUCTOR-NATIVE
+elementwise fusions (a `triton_red` reduction doing residual-add + decomposed-RMSNorm; a
+`triton_poi` pointwise doing silu+mul+slice) that Inductor NAMES after the region containing
+the adjacent extern `marlin_gemm` call — NOT a prologue/epilogue baked into the Marlin CUDA
+kernel. vLLM's decode Marlin runs as a SEPARATE `void marlin::Marlin` CUDA kernel — the
+same-tool trace #57 shows it as 144 distinct launches, which it could not be if fused into a
+Triton kernel. **So "vLLM fuses add+RMSNorm+quant into the Marlin prologue and silu+mul into
+the epilogue" is a MISREAD of Inductor's region-naming. vLLM does no such fusion for W4A16.**
+
+**FINDING 3 (structural corroboration): vLLM runs MORE glue launches than we do, not
+fewer.** The same-tool #57 c8 decode-window (`nsys --cuda-graph-trace=node`, both engines)
+already recorded glue: **ours 866 us / 255 calls vs vLLM 671 us / 299 calls**. If vLLM had
+collapsed glue into the GEMM pro/epilogue it would show FEWER glue launches; it shows more
+(8.3 vs 7.1 per layer), individually cheaper. The +195 us glue delta is per-kernel
+efficiency (Inductor Triton elementwise vs our hand-written glue), NOT a fusion-count gap —
+directly contradicting the #46 "collapses our ~5 glue launches into 2" narrative (which came
+from vLLM's ONLINE torch-profiler, a cross-tool read AGENTS.md forbids for invocation parity).
+
+**FINDING 4 (the reframe that matters): the dominant marlin-tiling term #52/#57 measured was
+ALREADY CLOSED on `main` by the dense-direct default, AFTER the terminal binding.** #52/#57
+same-tool decode-window (MoE-grouped route, base `027af9b0`) decomposed the c8 gap as
+**marlin +1,177 us (52%) / flash +784 us (35%) / glue +195 us (9%)**, and named the marlin
+fix as grouped→dense-direct + gate_up-fuse (the opt-in "par1" arm closed marlin +1,177→+226).
+That lever then LANDED as the byte-exact DEFAULT: commit `efa6e40d` "perf(marlin):
+VT_MARLIN_DENSE default ON — dense route beats MoE on every axis (#57)" (in my base). On
+current `main` `MarlinDenseEnabled()` is default-ON (`include/vllm/model_executor/models/dense_nvfp4_gemm.h:106-127`),
+dense MXFP4 projections run vLLM's own dense marlin `vt::MarlinDenseGemm`
+(`src/vt/cuda/cuda_marlin_dense.cu:92`) at the 48-CTA grid (~86 us/call vs the MoE route's
+~118 us/call), gate_up merged into one 2N GEMM by default (`VT_MOE_FUSED_W13`,
+`dense_nvfp4_gemm.h:98-104,519-544`), 32B-NVFP4A16 SACRED max gap 0.000 nats. That is
+exactly why the terminal binding rose from #51's `0.925/0.939/0.953` (MoE) to #57's
+`0.962/0.966/0.969` (dense). **So the +951 us marlin lever is BANKED, and in the
+dense-direct regime the residual is FLASH-DOMINANT: at c8 0.969 the gap is ~+1,100 us of
+which flash ~+784 us (~71%), glue ~+195 us (~18%), residual-marlin ~+226 us or less.**
+
+**THE W0 ours-vs-vLLM per-span table (c8 decode-window, same-tool nsys, current dense-direct
+regime ≈ #57 par1 arm; medians over 300+ steps):**
+
+| span between GEMMs | our launches/layer (vt::) | what covers it in vLLM's step | ours us/step (calls) | vLLM us/step (calls) | Δ |
+|---|---|---|---|---|---|
+| decode Marlin GEMMs (qkv, o, gate_up[2N], down = 4/layer) | `vt::MarlinDenseGemm` ×4, 48-CTA dense-direct | `void marlin::Marlin` ×4 (SEPARATE CUDA kernel) | 16,512 (144) | 16,286 (144) | +226 |
+| flash decode attention | `vt::PagedAttention` (flash_fwd_splitkv 1×3×64) | flash_fwd_splitkv (IDENTICAL grid 1×3×64) | 6,436 (36) | 5,629 (36) | **+807** |
+| glue: add+RMSNorm ×2, qk-norm ×2, RoPE, QkvSplit, ReshapeAndCache, SiluAndMul | ~7 separate `vt::` kernels/layer | ~8 SEPARATE Inductor Triton elementwise kernels/layer (NOT fused into marlin) | 869 (255) | 671 (299) | +198 |
+| lm_head | cuBLAS GEMV | cuBLAS GEMV | 5,398 | 5,395 | ~0 |
+
+Our per-layer decode order (source-mapped): `FusedChain(kFusedAddRmsNormStd)` input-norm
+(`qwen3.cpp:121`) → `MarlinDenseGemm` qkv → `QkvSplit` → `FusedChain(kAttnQkNormRope)` q/k
+norm+RoPE (composite = 3 launches on CUDA) → `ReshapeAndCache` → `PagedAttention` →
+`MarlinDenseGemm` o → `FusedChain(kFusedAddRmsNormStd)` post-attn-norm (`qwen3.cpp:131`) →
+`GateUpFusedMarlinD` (`MarlinDenseGemm` over 2N, `dense_nvfp4_gemm.h:542`) → `SiluAndMul`
+(SEPARATE launch, `dense_nvfp4_gemm.h:544`) → `MarlinDenseGemm` down. The add+RMSNorm sites
+already route through `vt::FusedChain` default-ON; the `FusedChain` catalog (`include/vt/recipes.h`,
+`include/vt/fused_recipe.h`) has NO GEMM opcode and by design produces only standalone
+fused elementwise kernels before/after a GEMM — it cannot express a GEMM prologue/epilogue.
+
+**VERDICT — the funded glue-fusion-into-Marlin kernel is the WRONG lever; DO NOT BUILD it.**
+1. It would MIRROR a fusion vLLM does not perform (Findings 1-3): a from-scratch Marlin with
+   fused prologue/epilogue is genuinely BEYOND vLLM (the "surpass rung"), not a mirror.
+2. It targets the +195-198 us glue span = ~9% of the MoE-route c8 gap and ~18% of the current
+   dense-direct residual. Even a PERFECT glue fusion (glue→0) leaves c8 ≈ 0.977 — still <1.0.
+3. The dominant marlin-tiling lever it was conflated with is ALREADY the byte-exact default
+   (`efa6e40d`), banked in the 0.962-0.969 terminal.
+4. The dominant REMAINING term is FLASH (+784-807 us on an IDENTICAL grid/kernel) — a
+   same-kernel/different-time STRUCTURAL-lens context question the FA2 num_splits refutation
+   (#59 lever 1) did NOT address. That, not glue, is the unexhausted high-value lever.
+
+**COSTED surpass-rung proposal (scoped, NOT built, per the charter):** a dedicated
+`MarlinDenseGemm` variant with (a) a fused `add+RMSNorm` reduction PROLOGUE that produces the
+bf16 marlin input in-kernel, and (b) a `silu+mul` EPILOGUE folded into the gate_up 2N GEMM's
+store. Numerics: the prologue changes the RMSNorm reduction boundary (register vs HBM
+round-trip) → not byte-exact → near-tie razor + distributional gate + 32B strict + regen
+under the ratified-tie rule; the epilogue is byte-safe (pointwise on the GEMM output).
+Expected recovery ≈ the glue span it removes, ~150-198 us/step (the ~5 glue launches + their
+HBM round-trips), i.e. c8 ~0.969→~0.977 — a real but sub-parity, numerics-delicate,
+non-portable kernel. NOT RECOMMENDED as the parity path.
+
+**OWED GPU work (box-contended by H3; short + batched when the flock frees):** (1) capture
+`TORCH_LOGS=output_code` on the oracle to VISUALLY confirm the `triton_*_marlin_gemm_*`
+kernels are elementwise-only calling the extern marlin (Findings 1-2 predict this exactly);
+(2) a FRESH same-tool nsys decode-window on CURRENT `main` (dense-direct default) c1..c8 to
+re-decompose the residual and confirm the flash-dominant split; (3) the real next lever — a
+STRUCTURAL-lens same-tool audit of why identical-grid `flash_fwd_splitkv` runs +22 us/call
+slower than vLLM's (residency/context, per AGENTS.md's STRUCTURAL lens), the +784 us term.
+No code shipped on this row: building the glue Marlin would gold-plate a source-refuted
+hypothesis (#46's own standard). Box left as found (no GPU touched; both flock locks
+untouched; H3 campaign uninterrupted).
+
+## QUANT-CT-MXFP4 W4 throughput bench — RAN on GB10, BELOW-FLOOR (2026-08-06, `row/QUANT-CT-MXFP4-BENCH` `33e93608`)
+
+The binding ours-vs-oracle online-serving grid on the SAME checkpoint
+(`Yi30/Qwen3-8B-MXFP4`, dense `Qwen3ForCausalLM`, native Marlin W4A16 MXFP4
+keep-quant), oracle arm forced to Marlin via `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
+(sm_121 cute-dsl mxf4 crashes). Production graphed vLLM 0.25.0 (torch.compile ON,
+Marlin W4A16), `--no-enable-prefix-caching` both arms, max-num-seqs 32, batched-tokens
+2048, c1/c2/c4/c8 x3 interleaved, single load/arm, drop_caches + memory-return
+between legs, both flock locks. Smoke model gate reproduced #44 (3/3 deterministic
+token-exact + coherent near-tie). **VERDICT: BELOW-FLOOR** (gate NO, 74/84 axes below);
+throughput ~0.91x at c2-c8, ~0.99x at c1; a large memory WIN.
+
+**Binding table (medians of 3 reps; per-rep spread ~1-3%):**
+
+| conc | total tok/s ours→vllm (ratio) | output tok/s ratio | med TTFT ms ours→vllm (ratio, ≥1 pass) | med TPOT ms ours→vllm (ratio, ≥1 pass) |
+|---|---|---|---|---|
+| c1 | 324.2 → 327.9 (**0.989**) | 0.989 | 287.5 → 295.2 (**1.027** PASS) | 25.70 → 25.34 (0.986) |
+| c2 | 569.2 → 624.7 (**0.911**) | 0.911 | 458.4 → 450.3 (0.982) | 28.27 → 25.45 (0.900) |
+| c4 | 951.4 → 1034.7 (**0.919**) | 0.919 | 862.1 → 867.5 (**1.006** PASS) | 31.03 → 28.07 (0.905) |
+| c8 | 1419.6 → 1554.8 (**0.913**) | 0.913 | 1412.2 → 1408.3 (0.997) | 39.64 → 35.30 (0.891) |
+| memory | peak GPU 28284 → 73723 MiB = **2.607 PASS** (ours 2.6x LESS) | — | — | — |
+
+Per-rep total tok/s — c1 ours 324.2/324.4/320.0 vllm 331.5/327.7/327.9; c2 ours
+569.2/569.9/558.9 vllm 624.2/624.9/624.7; c4 ours 951.4/958.9/945.8 vllm
+1040.9/1034.7/1034.3; c8 ours 1415.0/1433.9/1419.6 vllm 1560.9/1554.8/1554.7. Per-rep
+TPOT ms — c1 ours 25.68/25.70/26.08 vllm 25.02/25.34/25.34; c2 ours 28.21/28.27/28.67
+vllm 25.43/25.45/25.49; c4 ours 31.03/30.92/32.48 vllm 27.94/28.07/28.12; c8 ours
+39.64/39.23/39.77 vllm 35.15/35.34/35.30.
+
+**FIRST attribution (grounded in the per-concurrency curve — the gap is a BATCHED
+decode cost, NOT batch-1):** at c1 (batch-1 decode) ours is at parity (throughput
+0.989, TPOT 0.986, within run-noise). At c2-c8 (batched decode 2-8 seqs) ours is
+~0.91x throughput driven ENTIRELY by TPOT (~10-12% higher per-token: c2 0.900, c4
+0.905, c8 0.891), while TTFT/prefill is at parity (2/4 cells pass, others within
+noise). So the divergent hot path is the GROUPED Marlin W4A16 keep-quant decode GEMM
+as M grows 2→8 (our per-expert/grouped tiling vs vLLM's Marlin), NOT the batch-1
+GEMV nor prefill. Memory is a 2.6x WIN (keep-quant weights stay compressed: 28.3 vs
+73.7 GiB peak). NOT a ceiling. The precise NEXT step: same-tool nsys decode-window
+on the WORST cell (c8) BOTH engines (our server under nsys; vLLM under nsys, not the
+torch profiler — same tool) to name the exact divergent kernel/shape at M=8, then a
+lever on the batched Marlin decode GEMM.
+
+**Repro (one command, dgx, both flock locks free, free -g ≥ 90):**
+`scripts/mxfp4-online-serving-grid.sh --snapshot ~/.cache/huggingface/hub/models--Yi30--Qwen3-8B-MXFP4/snapshots/b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47 --build-dir <PROD_BUILD> --configure-log <CONFIGURE_LOG>`.
+**Build contract (LEARNED THE HARD WAY — the online-serving `record-execution` is
+strict and DIFFERS from the generic build recipe):** the build MUST be on a REAL
+disk (NOT `/dev/shm` — tmpfs pages are always resident so the cache-drop
+`POSIX_FADV_DONTNEED`+mincore==0 proof fails on the server binary), and configured
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
+-DCMAKE_MAKE_PROGRAM=$HOME/venvs/vllm-oracle/bin/ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_TRITON_REGEN=OFF -DVLLM_CPP_FLASH_ATTN=ON -DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_BENCH_PROFILE_CONTROL=OFF -DVLLM_CPP_CUTLASS_DIR=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass`
+(the oracle's flashinfer-bundled cutlass, which is 4.5.0 — `record-execution` pins
+`VLLM_CPP_CUTLASS_DIR` to the oracle's own cutlass tree, not `$HOME/cutlass-4.5.0`).
+The full build tree is only ~3 GiB (fits /home). nvcc 13.0.88. Evidence:
+`dgx:~/work/vllm.cpp-online-gate/evidence/33e936086a116c840518afcf732076c9917e96a5`
+(ratios.json + report.md + 24 raws + memory/thermal/cache-drop). Harness plumbing on
+this row (all additive; 27/35 byte-unchanged; CPU contract tests 45/45): `online_gate.py`
+`q3mxfp4` key + `POINTS_BY_MODEL`/`points_for`; `mxfp4_smoke_gate.py`;
+`dgx-online-serving.sh` q3mxfp4 branches; `mxfp4-online-serving-grid.sh` orchestrator.
+
+## QUANT-CT-MXFP4 c2-c8 gap — grouped-Marlin config lever REFUTED (2026-08-06, `row/QUANT-CT-MXFP4-M28-LEVER`, GB10, build `33e93608`==main)
+
+The binding (#45) attributed the c2-c8 TPOT deficit to "our per-expert/grouped Marlin
+tiling vs vLLM's Marlin as M grows 2->8" and named the fix as porting vLLM's M-dependent
+`thread_m_blocks`/tile selection. Profiled BOTH engines and ran the per-shape arbiter; the
+attribution is **wrong** — our Marlin already matches vLLM's per-shape.
+
+**Same-tool per-shape microbench** (`~/mxfp4-nsys/mxfp4_marlin_ubench.py`; oracle compiled
+ops, cuda-event timed; dense `ops.marlin_gemm` = what vLLM runs for a dense MXFP4 linear vs
+`ops.moe_wna16_marlin_gemm` E=1 = our production kernel's 1:1 upstream twin; Qwen3-8B decode
+shapes qkv 6144x4096, o 4096x4096, gate/up 12288x4096, down 4096x12288, gs=32):
+
+| M | dense/layer us | moe/layer us | moe/dense | dense step ms (x36) | moe step ms | delta ms |
+|---|---|---|---|---|---|---|
+| 1 | 226.6 | 231.7 | 1.023 | 8.16 | 8.34 | +0.18 |
+| 2 | 231.5 | 228.3 | 0.986 | 8.33 | 8.22 | -0.12 |
+| 4 | 223.7 | 240.8 | 1.077 | 8.05 | 8.67 | +0.62 |
+| 8 | 237.6 | 242.3 | 1.020 | 8.55 | 8.72 | +0.17 |
+
+Per-shape at M=8: qkv 1.111, o 1.026, gate 1.002, up 0.998, down 1.030. All deltas are noise
+(<0.6 ms/step; M=2 favors MoE). **Our MoE-E1 Marlin == vLLM dense `marlin_gemm` at every M**,
+so routing to vLLM's dense marlin config cannot close the ~4.3 ms/step (11%) gap. (Source:
+vLLM dense route `apply_fp4_marlin_linear`->`ops.marlin_gemm`, `marlin.cu:438`
+`m_block_size_8=prob_m<=8`; ours `MoeGroupedGemmNvfp4Marlin` E=1, `marlin_mm_moe.cu:363`
+`thread_m_blocks=div_ceil(moe_block_size,16)`, `MarlinMoeAlignBlockSizeSelect`=16 at M=8.
+The dispatchers differ but the cost does not.)
+
+**nsys BOTH engines at c8** (aggregation-trap separated; TPOT reproduced: ours 39.53 vs vLLM
+33.81 ms). OURS (`nsys -t cuda --cuda-graph-trace=node`, kern_sum): decode Marlin dominates
+(`marlin_moe_wna16::Marlin` 58,854 inst Med **123us**; prefill Marlin separated 3,240 @ 2.03ms);
+attention flash_fwd_splitkv<128,64,128,4> Med **218us**; glue = SEPARATE launches
+(RmsNormRow*, MoeSiluMul, QkvSplit, RopeFromCache, ReshapeAndCache), one per op per layer.
+VLLM (online `/start_profile` torch profiler, chrome-trace aggregate): decode marlin
+`void marlin::Marlin` 13,680 @ **112.9us**; flash same traits @ **151us**; and the structural
+tell — the glue is **FUSED into the GEMM by Inductor**:
+`triton_red_fused_fused_add_rms_norm_marlin_gemm_{0,2}` (add+RMSNorm+quant prologue) and
+`triton_poi_fused_marlin_gemm_mul_silu_slice` (silu+mul epilogue). vLLM collapses our ~5
+separate glue launches/layer into the GEMM pro/epilogue.
+
+VERDICT: the decode Marlin GEMM is at vLLM per-shape parity (REFUTED lever). The residual is
+diffuse decode; the robust structural divergence is vLLM's Inductor **glue fusion** (portable-
+fusion class). REDIRECT (no ceiling): (1) portable fusion of add+RMSNorm+quant into the Marlin
+prologue and silu+mul into the epilogue; (2) a SAME-tool c1-vs-c2 OURS nsys diff to localize
+the STEP at c2 (our Marlin is M-independent M1->M2 per the microbench, so the step is attention
+batching, unfused glue traffic, or the async `max_concurrent_batches=2` overlap — not the GEMM);
+(3) same-tool re-check of the cross-tool per-call flags (marlin 123 vs 113us; attention 218 vs
+151us on identical flash traits). No code shipped — porting the dense marlin would gold-plate a
+refuted hypothesis. Evidence: `dgx:~/mxfp4-nsys/{kern_sum.txt,vllm_kern_sum.txt,ubench.log}`.
+
 ## DeepSeek-V4-Flash UD-IQ2_M — IQ2_S + MXFP4 CPU keep-quant bring-up (2026-08-03, `CLAIM-DSV4-UDIQ2M-QUANT`) — no throughput owed (off-GPU correctness bring-up)
 
 Off-GPU task (GB10 down, no nvcc on the dev box), so NO throughput is measured or owed. Adds the two per-tensor "dynamic" encodings the `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint's last 4 routed-expert slabs use — **IQ2_S** (ggml type 22; 2.5625 bpw codebook, Q8_K activation) and **MXFP4** (type 39; OCP micro-scaling fp4, 32-elem blocks, Q8_0 activation) — as first-class vt block dtypes (`kIQ2_S`/`kMXFP4`): block traits + dequant + a keep-quant `vec_dot`, ported 1:1 from llama.cpp `ggml-quants.c` @ 237ad9b96 (`iq2s_grid` 1024-entry codebook copied verbatim + direct sign bytes; `kvalues_mxfp4` + `e8m0_to_fp32_half`). The memory point: these load COMPRESSED (keep-quant) instead of the ~17 GiB bf16 expansion that OOM-reboots the 119 GiB pool.
@@ -163,7 +609,7 @@ how to build it, the CLI, the OpenAI server, and how to consume it), see the
 [Performance](../README.md#performance) section, and the per-capability
 lifecycle ledger is [docs/STATUS.md](../docs/STATUS.md). Attempt chronology and failure
 forensics live in the [parity ledger](parity-ledger.md),
-[state log](state.md), linked specs, and Git. Those raw records are
+[state log](completed/state-events/), linked specs, and Git. Those raw records are
 append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
@@ -6130,7 +6576,7 @@ the windowed-load release - are in the `246a23c` binding binary, so the
 pin `--mamba-ssm-cache-dtype float32` is wired into the vLLM arm and recorded in
 this run's evidence. Detailed per-seal chronology and evidence SHAs live in the
 append-only [ledger](parity-ledger.md) and
-[state log](state.md). 35B stays blocked until 27B reaches 124/124.
+[state log](completed/state-events/). 35B stays blocked until 27B reaches 124/124.
 
 **Decode recurrence perf lever - MEASURED codegen-bound → vendored Triton cubin,
 now DEFAULT ON (2026-07-16).** The named +2.06 ms/step recurrence-tiling gap (correct-state c16
@@ -9346,7 +9792,7 @@ flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 G2 and W1D3 structural evidence are closed. The repaired source has been pushed
 and launched exactly once at `d82d282`; that incomplete root must never be
 reused or appended. The failure inspection and next diagnostic entry point are
-in the newest [state record](state.md) entry and the
+in the newest [state record](completed/state-events/) entry and the
 [spike](specs/gdn-packed-decode.md). The failed launch provenance is:
 
 ```sh
@@ -10003,7 +10449,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   synccheck 0. One W9 input recorded here: the oracle must run
   `moe_backend='triton'`, because vLLM's auto-selected FlashInfer CUTLASS
   unquantized MoE backend REBOOTS dgx. Per-W chronology and evidence anchors live
-  in the append-only [state log](state.md) and
+  in the append-only [state log](completed/state-events/) and
   [parity ledger](parity-ledger.md), not here.
 
 - **MLA campaign W10 - the blocked-row honesty pass (2026-07-22,
@@ -10242,7 +10688,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   performance or broader roadmap execution.
 
 The complete contract is in the
-[benchmark protocol](benchmark-protocol.md) and
+[benchmark protocol](verification.md) and
 [online serving gate spec](specs/cuda-online-serving-gate.md).
 
 **Breadth sweep note (2026-07-21):** the active phase is model-architecture breadth (recent-first), each held to token-exact + vLLM-speed on every axis. Ranked queue + CUDA-arch additivity audit: [.agents/specs/breadth-sweep-plan.md](specs/breadth-sweep-plan.md). CUDA archs beyond same-family sm_120 are HW-blocked (only GB10 testable).
@@ -12211,7 +12657,7 @@ a NAMED speed residual, NOT an optimized decode. DEFAULT: `VT_KIMI_DEVICE_COMPUT
 recurrence + exp/softplus gate op + paged `mla::ForwardMlaAttentionBlock` + a bf16 residual stream
 end-to-end (matches vLLM's rounding, removes the host round-trips).
 
-## 2026-08-07T05:00 — ROW-SERVE-ASYNC-DENSE-MIRROR: classic-dense async P0 fix (code+CPU gates) + W4 MXFP4 bench PLAN
+## 2026-08-06T13:27 — ROW-SERVE-ASYNC-DENSE-MIRROR: classic-dense async P0 fix (code+CPU gates) + W4 MXFP4 bench PLAN
 
 CORRECTNESS (not a speed lever): the #31 async device token-ids mirror, ported to the
 classic dense family. Classic dense `Qwen3ForCausalLM` (qwen3.cpp `EmbedInto`) raced
@@ -12240,7 +12686,7 @@ OWED ON DGX (this row):
 Box safety: both locks (flock $HOME/gpu.lock AND /tmp/gpu), free -g >= 90, no oracle
 alongside our server, local-ai-worker stopped, tmux + done-markers, git archive not rsync.
 
-## 2026-08-07T07:00 — ROW-SERVE-ASYNC-DENSE-MIRROR dgx GB10 verification (f9c969ae)
+## 2026-08-06T13:28 — ROW-SERVE-ASYNC-DENSE-MIRROR dgx GB10 verification (f9c969ae)
 
 CUDA build (/dev/shm, 121a, cutlass 4.5.0, nvcc 13.0, Release). Both flock locks per run,
 tmux + done-markers, free-g 98-100 GiB. CORRECTNESS (this row is a correctness fix, not a
@@ -12265,3 +12711,6385 @@ only "27"/"35"; no Yi30/8B key. Retargeting = MODEL_REVISIONS/REPOSITORIES entry
 max-num-seqs sizing. The fix unblocks the DEFAULT-config bench (no more VT_ASYNC_SCHED=0
 workaround); oracle proven to run the model today. Evidence: dgx:/dev/shm/serve-async-dense/
 {gates_06b.log,gates2.log,mxfp4_e2e.log,oracle_neartie2.log,oracle_tf.log}.
+
+## 2026-08-06T13:33 — KERNEL-FA2-GQA-SWAP: d128 varlen decode group-swap gated-OFF, correctness gates GREEN (bench PENDING)
+
+The #47-localized lever (`row/KERNEL-FA2-GQA-SWAP`, `VT_FA2_DECODE_GQA_SWAP`, default
+OFF): vLLM's FA2 `seqlenq_ngroups_swapped` decode grid ported into
+`LaunchDecodeVarlenFA2Bf16` so the Qwen3-dense d128 decode launches
+`(batch, kv_heads)` not `(batch, hq)`. `benchmark_binding=false` this session — the
+c1-c8 x3 binding grid + default flip is the recorded next step; what ran here is the
+CORRECTNESS bar that GATES the flip. dgx GB10, CUDA 13.0, sm_121a, RelWithDebInfo,
+VLLM_CPP_FLASH_ATTN=ON; the 4 changed files git-archived by SHA onto `~/mxfp4-bench/src`
+(md5-matched local), incremental `ninja` (both CUDA TUs recompiled clean on nvcc).
+
+GATES:
+- OP UNIT TEST (RED-first): `test_ops_paged_attn --test-case="*varlen d128*"` = 5/5
+  cases, **280/280 assertions GREEN** (OFF-path parity + group-swap-matches-ref both
+  ratios 16/8+32/8 × batch{1,2,4,8} × len{5,21,1024}, `swap_launches==1` asserted;
+  swap-vs-plain near-tie max_abs<2e-2; MHA qpk==1 inert `swap_launches==0`). Full
+  binary **28/28 cases, 454,679 assertions** — no regression.
+- RED PROVEN: injecting a wrong swapped `o_head_stride` (drop the ngroups factor) →
+  group-swap case FAILS (26,528 violations, max_abs 2.60). Restored + rebuilt
+  (md5 `ba34d5b8…`).
+- MEMCHECK: `compute-sanitizer --tool memcheck --leak-check full` on the swap cases =
+  **0 errors, 0 bytes leaked**.
+- #44 MXFP4 SMOKE (Yi30/Qwen3-8B-MXFP4, groups=4, DEFAULT async/graphed): swap-OFF PASS
+  (3/3 det token-exact + coherent); **swap-ON PASS (3/3 deterministic TOKEN-EXACT vs
+  golden AND byte-identical to swap-OFF** — capitals/arithmetic/fibonacci char-identical,
+  story identical). No token flip e2e → near-tie razor not needed; graphed capture-safety
+  token gate ON.
+
+NEXT (the flip campaign): `scripts/mxfp4-online-serving-grid.sh --snapshot <b3e7ab32>
+--build-dir ~/mxfp4-bench/build --configure-log <log>` with `VT_FA2_DECODE_GQA_SWAP=1`
+on OURS legs, vs the #45 numbers (tput c1 0.989 / c2 0.911 / c4 0.919 / c8 0.913; TPOT
+c2 28.27→25.45). #47 projects flash alone closes ~28%@c2 / ~55%@c8 (decode flash
+63.7→~41.7us c2 as the grid drops 192→96 CTAs); residual = marlin +7-9% + ~0.7ms host,
+so a single lever may not reach ≥1.0x — record the honest per-axis outcome. Then Qwen3
+0.6B/4B e2e SACRED swap-ON, then flip per parity-enablers. Box left clean (both locks
+free, GPU idle, worker down, disk 22G).
+
+## QUANT-CT-MXFP4 flip campaign — FA2 decode GQA group-swap FLIPPED DEFAULT-ON; binding improves c2-c8 with NO regression; MXFP4 goal still <1.0x (2026-08-06, `row/KERNEL-FA2-GQA-SWAP-FLIP`, GB10, HEAD `1f446fd7`+flip)
+
+Ran the full flip campaign for `VT_FA2_DECODE_GQA_SWAP` (#47 lever, #48 correctness-complete
+gated-OFF): model-level e2e SACRED, the #45-contract binding re-bench swap-ON, the ours-only
+nsys mechanism confirm, and the default decision. **Result: FLIPPED DEFAULT-ON.** Box left
+clean (both locks free, GPU idle, worker down, disk 21G).
+
+BUILD PROVENANCE (the trap that cost the first grid attempt, recorded): the box
+`~/mxfp4-bench/src` tree was git `33e93608` (#45) with the 4 #48 files OVERLAID (dirty), and
+the built server binary was STALE (lacked the `VT_FA2_DECODE_GQA_SWAP` getenv string; the
+"ninja: no work to do" rebuild had been fooled by the overlay's preserved mtimes). The grid
+driver's `--execute` REQUIRES `git HEAD == --vllm-cpp-sha` AND a clean tree (dgx-online-serving.sh
+:168,:172), so the overlay fails both. FIX: `git fetch origin 1f446fd7` + `git checkout -f
+1f446fd7` (the overlay was byte-identical to HEAD, so no code changed) → clean tree at the
+exact sha; rebuild (swap string verified present in `examples/server` AND `libvllm.so.0.0.1`).
+Clean full-tree provenance beats an overlay for a SACRED binding.
+
+CORRECTNESS (fresh 1f446fd7+flip binary, GB10 CUDA 13.0 sm_121a, GPU-locked):
+- op `test_ops_paged_attn --test-case="*varlen d128*"`: **5/5 cases, 280/280 assn GREEN**.
+- SACRED `test_qwen3_paged_engine` (Qwen3-0.6B 16/8 + 4B 32/8), ALL arms **16/16 both, 184/184**:
+  swap-OFF baseline, swap-ON (`=1`), NEW DEFAULT (no env), and opt-out (`=0`) are CHARACTER-
+  IDENTICAL — same 11/16 strict + 5/16 near-tie split, same max-gap positions (0.6B 0.125 nats
+  @p5t11, 4B 0.25 nats @p2t11), 0 forward-divergent. The swap flips NO token e2e at these
+  lengths; the near-tie razor was never needed.
+- #44 MXFP4-8B smoke at the new default: deterministic **3/3 TOKEN-EXACT** + near-tie coherent.
+- In-grid smoke gate (swap-ON) passed (grid ran all 24 legs).
+
+NSYS MECHANISM (ours-only c2 decode-window, `--cuda-graph-trace=node`, 24×128, dominant
+decode-flash by launch frequency; aggregation-trap-separated):
+| arm | decode-flash grid | gridZ | CTAs | per-call Med |
+|-----|-------------------|-------|------|--------------|
+| swap OFF (baseline) | **(1,3,64)** | 64 = batch(2)×**q_heads(32)** | 192 | **63.68us** |
+| swap ON (`=1`)      | **(1,5,16)** | 16 = batch(2)×**kv_heads(8)** | 80 | **45.31us** |
+| NEW DEFAULT (no env)| **(1,5,16)** | 16 = batch(2)×kv_heads(8) | 80 | 45.6us |
+The default no-env run reproduces the swap grid → the flip engages the swap by default (the
+definitive flipped-default proof, since SACRED output is identical for both defaults). Marlin
+decode ~flat (120.7→118.4us). Per-call drop −28.8% (below #47's projected 41.7us / −34%; ours
+num_splits picks 5 vs vLLM's 6, both ~1 wave).
+
+BINDING GRID (swap-ON on OURS legs, oracle `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`,
+c1/c2/c4/c8 ×3 interleaved, single-load/arm, drop_caches+mincore proof, RelWithDebInfo + oracle
+flashinfer-cutlass, oracle vLLM 0.25.0; evidence
+`dgx:~/work/vllm.cpp-online-gate/evidence/1f446fd7fb125284e6c4ba44b1e6dd82b99c084c`):
+| conc | total tok/s ours→vllm (ratio) | out tok/s r | med TPOT ms ours→vllm (r) | med TTFT (r) |
+|------|------------------------------|-------------|--------------------------|--------------|
+| c1 | 325.0 → 328.2 (**0.990**) | 0.990 | 25.65 → 25.32 (0.987) | 285.6 → 294.8 (**1.032** PASS) |
+| c2 | 575.9 → 624.4 (**0.922**) | 0.922 | 27.97 → 25.52 (0.912) | 444.8 → 446.2 (**1.003** PASS) |
+| c4 | 964.1 → 1036.3 (**0.930**) | 0.930 | 30.82 → 28.09 (0.911) | 864.1 → 864.5 (**1.000** PASS) |
+| c8 | 1464.0 → 1553.9 (**0.942**) | 0.942 | 38.23 → 35.31 (0.924) | 1413.9 → 1411.2 (0.998) |
+| memory | peak GPU 28210 → 73723 MiB = **2.614 PASS** (ours 2.6x LESS) | — | — | — |
+Per-rep ours total tok/s (tight, CoV 0.06–0.28%): c1 324.4/325.0/326.6; c2 575.4/575.9/576.2;
+c4 961.1/964.1/965.9; c8 1462.9/1464.0/1468.7. Per-rep ours median TPOT ms: c1 25.53/25.65/25.71;
+c2 27.88/27.97/27.99; c4 30.71/30.82/31.69; c8 38.01/38.23/38.24.
+
+DELTA vs #45 (swap-OFF, `33e93608`): tput c1 0.989→0.990 (+0.001 FLAT), c2 0.911→0.922 (+0.011),
+c4 0.919→0.930 (+0.011), c8 0.913→0.942 (+0.029); TPOT c1 0.986→0.987, c2 0.900→0.912, c4
+0.905→0.911, c8 0.891→0.924. The c2/c4/c8 gains are OUTSIDE per-rep noise — swap-ON's WORST rep
+beats swap-OFF's BEST rep at every one (c2 575.4>569.9, c4 961.1>958.9, c8 1462.9>1433.9); c1
+overlaps (flat). TTFT at/above parity (prefill-only, mechanically untouched by the decode swap).
+Memory win preserved (2.607→2.614x).
+
+DEFAULT DECISION = **FLIP ON** (parity-enablers-ship-as-defaults): every correctness gate holds,
+speed IMPROVES at c2/c4/c8, and there is NO regression anywhere (c1 flat, TTFT parity, memory
+win). `Fa2DecodeGqaSwapEnabled()` default OFF→ON (`cuda_paged_attn.cu`; `=0` opts out, mirroring
+`VT_V4_MHC_FUSED`). Flipped-default proof above (SACRED no-env 16/16 + smoke token-exact + nsys
+no-env grid (1,5,16)).
+
+PARITY VERDICT (MXFP4 goal) = **still BELOW-FLOOR <1.0x on tput/TPOT at every concurrency** (best
+c8 tput 0.942, 5.8% short); gate NO. RESIDUAL MAP (per-shape, named): flash closed only ~12%@c2 /
+~30%@c8 of the tput gap (below #47's optimistic 28/55% — actual flash drop was −29% not the
+projected −34%, and flash is one term of the step). What remains at c2 (per #46/#47 same-tool
+attribution): (1) **grouped-Marlin decode +7-9% per-call** — our `MoeGroupedGemmNvfp4Marlin` E=1
+uses indirect `sorted_token_ids` gather + fp32 `C_tmp` reduce vs vLLM's dense `marlin_gemm`
+direct-A addressing; per-shape parity was shown at M≤8 (#46 microbench), so this is a delicate
+grouped→dense-direct-A port, not a config knob. (2) **~0.7ms/step host/sched slice**. No single
+lever reaches ≥1.0x. NEXT lever candidate: the grouped→dense-direct-A marlin decode path.
+
+## KERNEL-MARLIN-DENSE-DIRECT (#50): dense-direct-A marlin ARBITER re-run (4 same-tool runs) — the +7-9% is NOT a recoverable kernel/dispatch cost; port is a measured NO-GO (only M=8 shows a real ~+0.33ms/step signal, m_block_size_8, ~0.8% of a c8 step)
+
+The named residual-#1 lever (route the E=1 dense MXFP4/NVFP4 projections through vLLM's DENSE
+`marlin_gemm` — direct-A + `m_block_size_8` at prob_m≤8 — instead of our
+`MoeGroupedGemmNvfp4Marlin` E=1) was arbitrated per parity-lever-protocol (per-shape MEASUREMENT
+decides BEFORE a large port), NOT ported. The task's step-5 ubench ("the new dense op vs grouped at
+the model shapes — expect the +7-9% back") already exists as `dgx:~/mxfp4-nsys/mxfp4_marlin_ubench.py`
+(#46): it times the REFERENCE `apply_fp4_marlin_linear` (dense `ops.marlin_gemm`, the EXACT kernel a
+port would vendor) vs `ops.moe_wna16_marlin_gemm` E=1 (the 1:1 upstream twin of our production
+kernel) — same tool, both the oracle's compiled ops, cuda-event timed — at the Qwen3-8B **MXFP4**
+decode shapes {qkv 6144×4096, o 4096×4096, gate/up 12288×4096, down 4096×12288} × M∈{1,2,4,8}.
+Re-ran it 3× fresh on the idle GB10 under BOTH locks (worker down, free-g 93, disk unchanged 21G,
+tmux+done-marker); with #46 that is 4 same-tool runs.
+
+PER-STEP moe/dense ratio (dense = the port target; moe = our production twin; sum of 5 GEMMs ×36
+layers), 4 runs [#46, r1, r2, r3] and mean:
+| M | #46 | r1 | r2 | r3 | mean | delta_step_ms mean (moe−dense) | sign consistent? |
+|---|-----|-----|-----|-----|------|-------------------------------|------------------|
+| 1 | 1.023 | 1.008 | 0.952 | 1.006 | **0.997** | −0.030 | NO (flips ±) |
+| 2 | 0.986 | 0.983 | 1.028 | 1.032 | **1.007** | +0.057 | NO (flips ±) |
+| 4 | 1.077 | 1.023 | 0.964 | 0.975 | **1.010** | +0.071 | NO (flips ±) |
+| 8 | 1.020 | 1.016 | 1.044 | 1.077 | **1.039** | +0.327 | YES (all + ) |
+delta_step_ms per run: M=1 [+0.184,+0.061,−0.416,+0.052]; M=2 [−0.117,−0.142,+0.228,+0.258];
+M=4 [+0.617,+0.186,−0.312,−0.206]; M=8 [+0.169,+0.135,+0.367,+0.637]. Outputs match to bf16
+last-bit (maxdiff col = bf16 reduction-order near-tie, same class as the moe path's own near-tie).
+
+READING (the arbiter):
+- **M=1,2,4 (concurrencies c1/c2/c4): the port recovers ZERO.** moe/dense mean is within ±1% of
+  parity and the sign of delta_step FLIPS run-to-run (M=2 even favors MoE overall) — a true-zero
+  effect (benchmark-gate-statistics). The reference dense kernel a port would vendor is NOT faster
+  than the grouped-E1 twin we already run at these shapes.
+- **M=8 (c8) is the ONLY reproducible, mechanistically-real signal: ~+0.33ms/step, all 4 runs
+  positive.** Cause (per #46): at prob_m=8 dense picks `m_block_size_8`=TRUE (an 8-row tile) while
+  our grouped path picks `moe_block_size`=16 (m8=FALSE → a 16-row tile with 8 padding rows, ~2×
+  useful-row work). The clearest single shape is qkv M=8 (moe/dense 1.111/1.130/1.132/1.119 across
+  the 4 runs); gate/up/down partly wash so the per-STEP mean dilutes to 1.039. Magnitude: +0.33ms
+  out of a ~39.5ms c8 decode step (#46 TPOT) ≈ **0.8% of the c8 step** — recovers ~0.8pp of the
+  5.8% c8 gap and leaves c8 ≈0.95x, still BELOW 1.0x; at c1/c2/c4 it yields nothing.
+
+VERDICT = **NO-GO on the full dense-marlin port as an MXFP4 parity lever.** The +7-9% cross-tool
+figure (#47/#48 nsys-ours 120us vs torch-vLLM 113us) is the tool bias, NOT a recoverable
+kernel/dispatch cost — the same-tool per-shape arbiter (now 4 runs) reads parity/noise at M≤4 and
+only a ~0.8%-of-step M=8 sliver. Vendoring ~2000 lines of delicate dense marlin (`marlin_template.h`
+2081L + generated kernels + the `marlin_mm`/`marlin_gemm` launcher) behind a new `kMarlinDenseGemm`
+op and re-routing the CUDA-graph-captured decode through a NON-byte-exact (near-tie) path — for at
+most ~0.8pp at c8 only and nothing at c1–c4 — is gold-plating a measured near-dead hypothesis (the
+explicit #46 caution). "Never accept a ceiling" does not apply: the specific difference was FOUND
+and measured to be ~0 at M≤4. Provenance confirmed anyway: dense and MoE are genuinely separate
+`Marlin<>` templates (dense `MARLIN_KERNEL_PARAMS` has `lda`+`max_shared_mem`, direct A; moe has
+`sorted_token_ids/expert_ids/topk_weights`), so a real port IS ~2000 lines, not a shim — the cost
+side of the ledger is high, the win side is ~0.
+
+RESIDUAL MAP (refined): the recoverable slivers are NOT the dense port. (a) **M=8-only, CHEAP:** force
+`moe_block_size`=8 (not 16) for the E1 dense case in `dense_nvfp4_gemm.h::DenseAlignFor` →
+engages our ALREADY-VENDORED `m_block_size_8` grouped kernels (kernel_selector lines 3–8/33–38) →
+captures the ~0.33ms/step at c8 with a ~5-line change and NO new vendoring; its own small near-tie
++ SACRED gate. Legitimate because we run E1 (free to pick the block heuristic); recovers ~0.8pp of
+c8 only. (b) the per-call defensive `d.b.Memset(ws)` in `MatmulNvfp4MarlinD`/`GateUpFusedMarlinD`
+(marlin leaves its workspace zeroed; vLLM dense+moe both reuse without re-zeroing) — one tiny
+launch/GEMM, micro. (c) the **~0.7ms/step host/sched slice** — the real remaining term, host-side,
+not a kernel port. No single lever reaches ≥1.0x; the MXFP4 parity goal stays BELOW-FLOOR (best c8
+0.942). Evidence: `dgx:~/mxfp4-nsys/{mxfp4_marlin_ubench.py,ubench.log,ubench_3x.log}`. Box left
+clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
+
+## QUANT-CT-MXFP4-CLOSERS: slivers (a)+(b) land BYTE-EXACT + default-ON; correctness gates GREEN, binding re-bench PENDING (2026-08-06, `row/QUANT-CT-MXFP4-CLOSERS`, GB10 sm_121a CUDA 13.0, `~/mxfp4-bench` overlay `1f446fd7`+swap-ON+3 files md5-matched)
+The two #50-arbitrated slivers, both in the SHARED header
+`include/vllm/model_executor/models/dense_nvfp4_gemm.h` (the qwen3_5.cpp twin serving the 27B/35B
+gate models is deliberately untouched): **(a)** `DenseAlignFor` forces `block=8` at M≤8 (:286),
+routing the M=8 dense E1 GEMM to vLLM's 8-row `m_block_size_8` tile instead of the padded 16-row
+tile (recovers the #50-measured ~0.33ms/step / ~0.8pp at c8); **(b)** `DenseMarlinWorkspace` zeroes
+the shared reduction workspace ONCE at alloc and the two per-call `Memset(ws)` are DROPPED — the
+fp32-reduce marlin barrier self-resets its locks (invariant cited: `use_atomic_add=false`
+cuda_moe_marlin.cu:141 ⇒ only the fp32 barrier path is reachable, whose last release zeroes the lock
+marlin_template.h:2170→:204; slice_count==1 never touches locks :2162; the atomic-add non-clearing
+path :614 is dead). GATES (both flock locks, ninja EXIT 0 no -Werror): OP RED-first
+`test_ops_moe_grouped` closers — block8-vs-block16 A/B at M=8 **BYTE-EXACT** (`bitdiff=0/32768
+max_abs=0`) on MXFP4 K=4096/N4096 + K=12288/N4096 AND NVFP4 K=4096/N4096; ws all-zero after a GEMM +
+reuse bit-identical; 15/15·2 cases. LAUNCH-CONFIG `test_qwen3_forward` `DenseAlignFor(d,8).block==8`
+(pre-fix ==16) 7/7. MEMCHECK 0 real errors (leaks = pre-existing static-cache harness artifacts; the
+unchanged prior test leaks MORE). #44 smoke (Yi30/Qwen3-8B-MXFP4, default async graphed, vllm-cli
+greedy vs golden) **3/3 deterministic TOKEN-EXACT** + near-tie coherent. Byte-exact ⇒ DEFAULT-ON
+unconditional (no `VT_*` gate). Blast radius (header consumers Qwen3-8B-MXFP4, Qwen3-32B-NVFP4A16,
+Laguna) closed by proving BOTH quant schemes byte-exact. Binding c1-c8 x3 (clean-checkout grid) + the
+substantive ~0.7ms/step host/sched slice (the #47 residual) remain the parity verdict's open terms.
+Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
+
+## QUANT-CT-MXFP4-CLOSERS BINDING: clean-checkout grid at d3b412f5 — slivers improve EVERY throughput axis vs #49 (c1 crosses to parity+); MXFP4 goal still <1.0x on c2-c8 (2026-08-06, GB10, vLLM oracle 0.25.0, evidence `dgx:~/work/vllm.cpp-online-gate/evidence/d3b412f5c191aace1f2960fa7940d8eef925762a`)
+Full c1/c2/c4/c8 x3 binding on the CLEAN-checkout build at the committed sha d3b412f5 (not an
+overlay), oracle `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`, single-load/arm,
+drop_caches+mincore, RelWithDebInfo+oracle-cutlass. #44 model gate re-passed inside the grid
+(mxfp4_smoke_battery). 24/24 legs `failed:0`; reps tight (ours c8 [1481.7,1475.1,1486.7] tok/s,
+CoV ~0.4%; vllm c8 CoV ~0.06%). The grid EXIT=1 is the gate-FAIL signal (`gate_pass:false`) + the
+single-model "cross-model summary waits for the other model", NOT a crash — all q3mxfp4 artifacts
+are complete. (q3mxfp4's sweep IS c1-c8, matching #48/#49; c16/c32 are other-model points.)
+
+| axis (ours/vLLM normalized ratio) | c1 | c2 | c4 | c8 | vs #49 (tput) |
+|---|---|---|---|---|---|
+| total_token_throughput | **1.005** | 0.925 | 0.939 | **0.953** | +0.015/+0.003/+0.009/+0.011 |
+| median_tpot_ms         | 1.002 | 0.922 | 0.915 | 0.939 | — |
+| mean_ttft_ms           | 1.034 | 0.962 | 1.004 | 0.999 | — |
+| median_itl_ms          | 1.004 | 0.919 | 0.920 | 0.929 | — |
+
+Peak host-mem footprint (peak_mem_available_drop): ours **35.2 GiB** vs vLLM **76.7 GiB** = **2.18x
+LESS** (WIN). VERDICT: **c1 PASSES every axis (tput 1.005, tpot 1.002, ttft 1.034, itl 1.004)**;
+c2-c8 BELOW on tput/tpot/itl (best c8 0.953 tput), TTFT at parity c4/c8 (1.004/0.999). gate_pass
+FALSE => MXFP4 parity goal **NOT DONE** (below-floor on c2-c8). The slivers moved EVERY throughput
+axis up vs #49 (c1 +1.5pp crosses to parity+, c4 +0.9pp, c8 +1.1pp, c2 +0.3pp), exactly the
+byte-exact block=8 recovery (~0.8pp @c8, #50) plus the memset-drop; nothing regressed.
+
+RESIDUAL MAP (per-shape, c8 ~4.75% tput gap): (1) block=16 padding — **CLOSED this run** (sliver a).
+(2) grouped-Marlin decode **+7-9% per-call** (GPU): `MoeGroupedGemmNvfp4Marlin` E=1 indirect
+`sorted_token_ids` gather + fp32 `C_tmp` vs vLLM dense `marlin_gemm` direct-A (#46/#50; a delicate
+grouped->dense-direct-A port, per-shape parity at M<=8 so not a config lever). (3) the host slice.
+
+HOST-SLICE ATTRIBUTION (step 2, VT_LOOP_TRACE on our server under decode load, this session): in
+every 1 s window the engine-core loop shows **interval_ms ≈ step_ms** (mean 25.5 vs 25.5, delta
+<=0.02 ms; `admits=0` pure-decode windows show interval-step ≈ 0). So the born-on-runner
+engine-core decode loop (scheduler + drain + admit) carries **negligible** per-iteration host
+overhead — the #47 ~0.7ms/step "host/sched" residual is NOT in the engine loop; it lives in the
+shared-architecture async frontend (HTTP / output-processing / detokenize, which vLLM runs too) or
+within the cross-tool attribution boundary (~0.7ms is ~24% of the c2 gap, near measurement error).
+Not a born-on-runner lever. (Caveat: the curl load under-saturated vs steady c8, so step_ms 25.5
+is not the c8 TPOT 37.6; the interval≈step finding is batch-independent and robust.)
+Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
+
+## QUANT-CT-MXFP4-C8-DIFF: fresh SAME-TOOL c8 decode-window per-step diff (POST-SLIVER `d3b412f5`==`4dd4e206`/#51) — marlin grouped-5-GEMM DOMINANT; eager launch-gap +880µs graph-closeable nets only −334µs; #50 grouped==dense SETTLED as isolated-shape ubench artifact; decode-graph opt-in = +1.3% byte-coherent (2026-08-06, GB10 sm_121a CUDA 13.0, RelWithDebInfo MARLIN=ON oracle-cutlass, vLLM oracle 0.25.0 `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`)
+
+SAME-TOOL both sides (the fix for the recorded cross-tool trap): nsys `--cuda-graph-trace=node`.
+OURS = online server, 24×128 window at c8. vLLM online-under-nsys does NOT capture the V1 EngineCore
+subprocess (empty rep at c8, MP-on AND MP-off) → captured vLLM via OFFLINE `LLM()` with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` (in-process) + cudaProfilerApi fence, IDENTICAL 8 corpus prompts
+(1024 tok) = clean M=8 batched decode. Kernel per-call times are frontend-independent. Steps segmented
+by lm_head anchor; steady window = modal-marlin-count; BOTH at flash gridZ=64 (matched M=8). Single
+node-trace per arm (per-step medians over 300+ steps are stable); binding c1–c8 x3 is #51's (0.953 c8).
+
+PER-STEP DECODE (median µs), OURS EAGER (as-shipped) vs vLLM (graphed):
+| class        | ours µs/step (calls) | vLLM µs/step (calls) | Δ           |
+|--------------|---------------------:|---------------------:|------------:|
+| marlin W4A16 | 17,183 (180=5×36)    | 16,286 (144=4×36)    | +897 (+5.5%)|
+| flash decode |  6,250 (36)          |  5,629 (36)          | +621 (+11%) |
+| glue         |    927 (291)         |    671 (299)         | +256        |
+| lm_head      |  5,413 (1)           |  5,395 (1)           | +18         |
+| flash_comb   |    130 (36)          |    140 (36)          | −10         |
+| sample+other |     36               |     23               | +13         |
+| GPU BUSY     | 30,027               | 28,190               | +1,837      |
+| GAP (idle)   | 1,184 (3.8%)         | 304 (1.1%)           | +880        |
+| STEP SPAN    | 31,211               | 28,491               | +2,720      |
+Measured median TPOT ours 37.56 / vLLM 34.58 ms (+2.98); GPU SPAN accounts 91%; ~0.26ms = async frontend.
+
+GAP LOCALIZATION (ours): uniform ~2.0–2.4µs idle between EVERY consecutive kernel + ~14 H2D + ~2 memset
+per step = host-launch-bound EAGER. vLLM ~0.4–0.76µs/gap = piecewise-CUDA-graph replay. Grids: ours
+marlin 144×1×1 (3 waves M=8), vLLM 48×1×1 (1 wave); flash IDENTICAL 1×3×64 both (GQA-swap parity).
+
+DECODE-GRAPH A/B (ours, `VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH=1`, default-OFF opt-in, byte-identical-to-eager
+per source; SACRED gate unrun): the generic Qwen3-MXFP4 decode is EAGER by default (root-caused in
+`qwen3.cpp:DenseDecodeGraphForward`; no quant restriction). Graph ON: GAP 1,184→305µs (−880, =vLLM's,
+confirms the mechanism), BUSY 30,027→30,575µs (+547 bandwidth contention when packed), SPAN 31,211→30,877
+(−334), median TPOT 37.56→37.09ms (−1.3%), coherent. → c8 0.953→~0.965, still <1.0x. Self-limiting.
+
+FAIR graphed-vs-graphed (ours-graph vs vLLM): SPAN +2,386µs = marlin +1,377 (58%) + flash +658 (28%) +
+glue +290 (12%) + gap ~0. Dominant = MARLIN.
+
+VERDICT (a): dominant term = MARLIN — ours runs 5 grouped-MoE-E1 GEMM/layer (gate+up UNFUSED, 144-CTA)
+vs vLLM 4 dense (gate_up FUSED, 48-CTA) = +5.5%(eager)/+8.5%(graphed)/step, mostly the +25% GEMM count.
+SETTLES #50: its "grouped==dense parity" was vLLM-op-vs-vLLM-op at one ISOLATED shape, blind to OUR
+kernel's +36 GEMM/step + 3× CTAs; the residual is real per-step. Fix = grouped→dense-direct + gate_up
+fuse (delicate ~2000-line port, next dispatch). Secondary = decode-graph opt-in (+1.3%, SACRED owed).
+Tertiary = flash same-kernel/IDENTICAL-grid +11% (KV/splitkv), glue Inductor-fusion.
+Evidence dgx:~/mxfp4-nsys/{kern_sum_c8_dflt,vllm_offline_kern_c8,kern_sum_c8_graph}.txt +
+gpu_trace_c8_{dflt,graph}/vllm_offline_trace_c8_cuda_gpu_trace.csv + analyze_decode.py/gap_and_shape.py.
+Box left clean (both locks free, GPU idle, worker down, disk 20G, tmux gone).
+
+### QUANT-CT-MXFP4-MARLIN-STRUCT (2026-08-06) — decode-graph + gate_up FUSION default-ON, E=1 par=1 arbiter
+
+Base `origin/main` `027af9b0` (#52). GB10 sm_121a Release, build in `/dev/shm/vc-mxfp4`. Same-tool
+nsys `--cuda-graph-trace=node` c8 decode-window (24×128, M=8-pinned, 235 steady steps, `analyze_decode.py`);
+vLLM side reused from #52 (same pin `55596792`). ours-default = graph+fuse (par1 OFF); ours+par1 = opt-in.
+
+| class | ours-dflt us/step (calls) | ours+par1 | vLLM us/step (calls) | dflt gap | par1 gap |
+|-------|--------------------------:|----------:|---------------------:|---------:|---------:|
+| marlin | 17,463 (144) | 16,512 | 16,286 (144) | +1,177 | +226 |
+| flash  |  6,413 (36)  |  6,436 |  5,629 (36)  | +784   | +807  |
+| glue   |    866 (255) |    869 |    671 (299) | +195   | +198  |
+| lm_head|  5,387       |  5,398 |  5,395       | ~0     | ~0    |
+| BUSY   | 30,431       | 29,510 | 28,190       | +2,241 | +1,320 |
+| GAP    |    297 (1.0%)|    293 |    304 (1.1%) | ~0     | ~0    |
+| SPAN   | 30,732       | 29,800 | 28,491       | +2,241 | +1,309 |
+| TPOT ms (client, nsys-inflated) | 37.22 | 36.23 | 34.58 | +2.64 | +1.65 |
+## STATUS.md compaction — Laguna-S-2.1 MoE detail (moved 2026-08-06)
+
+Moved verbatim out of the `docs/STATUS.md` capability row for `Laguna-S-2.1 MoE (`LagunaForCausalLM`, 118B/8B)` to bring that page back inside its shrink ratchet (`check-public-doc-tables.py`). Nothing is dropped: the binding result stays in STATUS.md and the full investigation narrative is preserved here, per T0 'evidence is moved, never deleted'.
+
+The binding result this narrative resolves to: **Closed, PARITY+ 1.03x vs vLLM, byte-exact, default-ON** via device-resident bf16 projections (`VT_LAGUNA_RESIDENT_BF16W`), plus shared-aux overlap default-ON (+2.9% net GPU-busy). Earlier ceiling/diffuse verdicts inside this text were cross-tool artifacts and are superseded.
+
+**BINDING 2026-08-04: 87% of vLLM (37.55 vs 43.10, SAME-TOOL nsys both engines); the whole +3.1 ms/step is the bf16 M=1 GEMV bucket (2/3 o_proj, ~196-204 vs 139 us/call, identical `gemvx` kernel); attention/MoE/glue tied or ours-ahead. Invocation match (bf16-out `cublasGemmEx`) A/B'd = WASH, ruled out; ROOT CAUSE FOUND 2026-08-04 (`VT_LAGUNA_RESIDENT_BF16W`): the bf16 projections read UNIFIED/ATS host memory, not `cudaMalloc`'d device memory — staging them device-resident (byte-exact ids) gives 38.8→44.6 tok/s (o_proj 194→131, lm_head 2410→1620 us/call), parity+ vs vLLM 43.1; **default-ON** (flip smoke-verified: canonical byte-exact ids, 44.6 clean-median). Earlier ceiling/diffuse verdicts below were cross-tool artifacts.** **REAL vLLM BAR ESTABLISHED (2026-07-31, `CLAIM-LAGUNA-VLLM-NVFP4`): FIRST-EVER vLLM Laguna run** — prior numbers (incl. the correctness oracle) were all llama.cpp, never vLLM. vLLM on official `poolside/Laguna-S-2.1-NVFP4` (single GB10, greedy, eager, MARLIN backend forced via `VLLM_TEST_FORCE_FP8_MARLIN=1` because the auto-default `FLASHINFER_CUTLASS` needs an absent `nvcc`): **~18.8 tok/s** (64-tok steady) — a LOWER bound. Our GGUF-Q4_K engine = 7.7 tok/s (vLLM ~2.4×); llama.cpp GGUF = 27.8 (still fastest at batch-1). llama.cpp is now a labeled SECONDARY "beat best-in-class GGUF" note; vLLM-NVFP4 is the headline bar. TRUE apples-to-apple still owes OUR NVFP4 Laguna forward arm (same tensor-core path as 27B/35B) — bring-up W-plan SPEC'D in `.agents/specs/laguna-nvfp4-arm-2026-07-31.md` (~85% reuse of the 35B NVFP4 W4A4 MoE infra + a name-map; bf16 attn/dense + fp4 experts; N1-N5 bricks, DGX-gated). **N1-scaffold LANDED (2026-07-31):** additive `LagunaMoeWeights.experts_{gate,up,down}_fp4` + `shared_{gate,up,down}_fp4` (`Nvfp4Weight`, mirror qwen3_5), dead until the N1 loader; CPU build clean + `test_laguna_scaffold` 8/8·167 unchanged. **N1b loader IMPLEMENTED (2026-07-31, build-verified):** `LoadLagunaForCausalLMWeights` (`laguna_weights.cpp`) replaces the `VT_CHECK(false)` stub — resolver + per-layer `LoadBf16Direct` (attn/dense/norms/embed/lm_head/router/shared-expert) + F32 `e_score_correction_bias` + `LnLoadCtNvfp4Raw` W4A4 experts. Name-map + dtypes VERIFIED against the real `poolside/Laguna-S-2.1-NVFP4` index (router `mlp.gate` BF16, bias F32, experts W4A4, shared-expert BF16). **N1b RUN-VERIFIED (2026-07-31):** loader round-trips a synthetic NVFP4 checkpoint byte-identically (`test_laguna_nvfp4_loader` 2/2·29; full detail in the benchmark record). **N2 FORWARD-BRANCH LANDED + CPU-GATED (2026-07-31):** `LqGemmNvfp4Fp4` (per-expert TRUE-W4A4: `ScaledFp4Quant(input_global_scale_inv)`→`MatmulNvfp4Fp4(alpha)`, unified-memory pattern like `LqGemm`) + `LagunaFfnBlock` branches on `fp4=!experts_gate_fp4.empty()` (routed experts fp4; keep-quant grouped fast-path gated off `!fp4`; bf16 attn/dense/router/shared-expert/lm_head unchanged) + both `LagunaForwardGguf{,Cached}` guards relaxed to `has_gguf_weights||has_nvfp4_weights`. **CORRECTION:** routed experts are W4A4 ⇒ per-expert `MatmulNvfp4Fp4`, NOT the grouped W4A16 `MoeGroupedGemmNvfp4` (grouped W4A4 deferred to N5 speed). `test_laguna_nvfp4_loader` 3/3·61 (added a forward run-gate: fp4 MoE branch runs through the real `LagunaForwardGguf` → finite+deterministic logits + routed-experts-consumed); `test_laguna_scaffold` 8/8 unchanged (GGUF byte-identical). **N3 DRIVER LANDED + CPU-SMOKE-VERIFIED (2026-07-31):** `examples/laguna_gen` auto-detects a safetensors DIRECTORY (→ NVFP4: `LoadHfConfig(config.json)` + `LoadLagunaForCausalLMWeights` + `LagunaForwardGguf{,Cached}`) vs a `.gguf` FILE (→ keep-quant), sharing the greedy loop; `--token-ids` bypass the tokenizer for the id-vs-golden gate. Verified on a synthetic NVFP4 dir with a REAL config.json (exercises the `LoadHfConfig`→`ParseLagunaParams` seam the loader test bypassed) → `has_nvfp4=1`, KV-cache decode runs finite. **N4 RAN on GB10 (2026-08-01) — the arm works end-to-end; correctness coherent+near-tie, speed 120× off.** git-archived `84fab587` → clean CUDA build (`121a`) → `laguna-gen --gpu` on the real 67 GiB `ckpt` with vLLM's exact prompt ids injected (`2,785,9626,377,15360,395`, captured via the HF tokenizer). Two GB10 memory fixes landed to run: release the mmap'd shards after the loader's memcpy-copy (114→67 GiB RSS), and create the CUDA context BEFORE the load (the 67 GiB reclaimable page cache otherwise starves `cudaStreamCreate`). **Correctness:** ours `22345 83 350 71070 395 340 9626 372 1703 …` vs golden `22345 83 290 350 674 330 5541 966 340 9626 377 15360 …` — **first 2 tokens match vLLM exactly**, then near-tie divergence; coherent ("France is" = 9626/377/15360; shares golden vocab). EXPECTED: our TRUE-W4A4 (fp4 activations) vs the MARLIN golden's W4A16 (bf16 activations) — different precision, not a bug. **Speed: 6.34 s/tok (0.16 tok/s), prefill 17.3s — ~120× slower than vLLM 18.8.** ROOT CAUSE (source-confirmed): `LqGemmNvfp4Fp4` uses the generic `vt::MatmulNvfp4Fp4` = the hand-written EMULATION CUDA kernel, NOT the cutlass sm120a fp4 tensor-core path the 27B/35B W4A4 use (`MatmulNvfp4Fp4DirectD`); + per-expert loop + per-GEMM host sync + no device residency. **nsys (2026-08-01) trace-confirmed + refined:** only 2 GPU kernels — `MatmulNvfp4Fp4Naive` = 99.3% of GPU time + fp4-quant 0.7%; GPU busy only ~18% of wall. NO bf16 GEMM on the GPU ⇒ `LqGemm`'s bf16 branch runs the host `MatmulNK` reference on the CUDA queue (attention/dense/router/shared/lm_head are CPU-bound, ~4.8 s/tok) — a second lever the source scan missed. **N5 LEVER #2 LANDED (2026-08-01) — 16× decode.** Routed the bf16 tower (attention/dense/router/shared/lm_head) off the host `MatmulNK` onto the GPU (`LqGemm` bf16 branch: `vt::CastBf16` the small activation + `vt::MatmulBT` bf16×bf16→f32, weight stays bf16 — no per-token `ReadF32` of `lm_head [100352,H]`): **decode 6.34 → 0.39 s/tok (16.3×; 0.16 → 2.56 tok/s), prefill 17.3 → 2.24s**; coherence preserved (near-tie). CPU path unchanged (run-gate byte-identical). **N5 LEVER #1 LANDED (2026-08-01) — native fp4 tensor-core, another ~2×.** The engine's native sm120a fp4 tensor-core MMA (`MatmulNvfp4Fp4Native`, `mma.sync kind::mxf4nvf4`) reads the same linear scale layout `LqGemmNvfp4Fp4` produces — it was gated OFF behind `VT_NVFP4_FP4_NATIVE`; the Laguna driver now defaults it ON (scoped; 27B/35B untouched). **decode 0.39 → ~0.20-0.24 s/tok (~2×; ~4.2-5.0 tok/s)**; coherent (byte-identical ids to the emulation path — numerically equivalent), first token matches the golden. **Cumulative N5: 0.16 → ~4.5 tok/s (~28×), now ~4× from vLLM 18.8.** **Device-resident MoE block LANDED + MEASURED (2026-08-01, `LagunaMoeResidentFp4`, `VT_LAGUNA_RESIDENT_MOE` default-ON):** the whole token's routed experts as ONE async device chain (fp4-quant→GEMM gate/up, `MoeSiluMul`, →down stacked, ONE `MoeCombine`), draining once vs ~Pk×3 syncs. **Speed EAGER-NEUTRAL (0.20 s/tok)** — empirically confirms the ds4 precedent (per-op syncs overlap GPU compute; wall is GPU-serial-bound; the graph is the payoff). **CORRECTNESS WIN: golden-token match 2 → 13** (the device `MoeSiluMul`/`MoeCombine` mirror vLLM's fused MoE faithfully). Lands default-ON (better correctness, no speed cost, graph prerequisite). **CORRECTED CEILING (from the measured state): a perfect decode graph caps at ~5.9 tok/s** (GPU already ~87% busy at 0.20 s/tok), still 3.3× short of vLLM 18.8 — the graph is necessary but NOT sufficient; the remaining 3.3× is KERNEL EFFICIENCY (native fp4 MMA ~302µs/M=1 expert GEMM vs vLLM's tuned cutlass sm120a fp4 + fused norm/quant/silu). Parity = TWO campaigns: (A) device-resident+graph → ~5.9; (B) cutlass DirectD experts + fused ops + M=1-tuned GEMV → the rest. **CAMPAIGN-B FIRST BRICK LANDED (2026-08-01): coalesced M=1 fp4 GEMV** (`MatmulNvfp4Fp4Gemv`, one warp/column, coalesced weight-row reads, `VT_NVFP4_FP4_GEMV` default-ON) — same-binary A/B: **decode 0.20 → 0.15 s/tok (1.33×; → ~6.7 tok/s), prefill 1.14 → 0.86s**, coherent+near-tie. **Cumulative this session: 0.16 → ~6.7 tok/s (~42×), now ~2.8× from vLLM 18.8.** (ILP variant `kCpw=4` measured SLOWER — 0.21 s/tok, occupancy loss > activation-reuse gain — reverted to `kCpw=1`; kernel kept templated as a re-measurable knob.) **ncu of the GEMV (sudo): sm__throughput 35-71%, DRAM n/a — COMPUTE/LATENCY-bound, not BW-bound.** Corrects the earlier "~6× BW → ~16-17 tok/s" estimate: the next GEMV lever is HARDWARE fp4 dequant (`cvt.e2m1x2`), not more bandwidth. Parity (18.8) is a multi-brick campaign (decode graph + fused norm/quant + hardware-dequant GEMV), not one more kernel. **B0 hw-fp8 SCALE-decode: MEASURED NEGATIVE, reverted (2026-08-01, `ab7a1c1e`).** Replacing the GEMV's per-byte software fp8-e4m3 group-scale decode (`F8E4M3ToF32Dev`/`ldexpf`) with hardware `cvt.rn.f16.e4m3` (`__nv_fp8_e4m3`→float) is bit-exact (ids byte-identical on the real ckpt) but paging-immune ncu shows it NEUTRAL-to-slightly-WORSE (grid768 41.2 vs 41.9µs tie; mean 53.6 vs 49.4µs) — GPU `ldexpf` is a cheap exponent-bit add, not a libcall. NOTE this is the fp8 SCALE decode, NOT the fp4-e2m1 WEIGHT dequant (the `kE2M1` `__constant__` LUT); the LUT→arithmetic/`cvt.e2m1x2` weight-dequant is a SEPARATE still-open lever (spec brick B1). Also: end-to-end wall-clock is unusable for kernel A/B here (67 GiB unified reload swings TPOT 0.16↔1.08 s/tok run-to-run) — kernel-duration ncu is the only honest anchor. **★ B2 SCOPED + DE-RISKED (2026-08-01, zero-DGX) — the real 18.8 lever:** vLLM's 18.8 bar is MARLIN W4A16 (`VLLM_TEST_FORCE_FP8_MARLIN=1`), which is LOW-M-optimized (decode-correct, unlike a tensor-core W4A4 GEMM that wastes M=1 tile rows). The engine already ships the EXACT kernel `vt::MoeGroupedGemmNvfp4Marlin` (1:1 lift of vLLM `moe_wna16_marlin_gemm`) + shared `MarlinRepackExpertWeight`, and qwen3_5 (27B/35B) already routes its NVFP4 experts through it (default-ON `VT_NVFP4_MARLIN`, 16/16-vs-oracle, +22% gate/+80% decode) via `BuildMoeMarlinResident`. So B2 = mirror that for `LagunaMoeWeights.experts_*_fp4` (a `BuildLagunaMoeMarlinResident` reusing the shared repack + route `LagunaFfnBlock`'s fp4 branch to the Marlin grouped GEMM, GEMV kept as the `=0` escape hatch) — pure reuse, no new kernel, matches vLLM's exact W4A16 numerics. **B2 IMPLEMENTED (2026-08-01, `3c49ef37`) — COMPILES CLEAN on GB10 sm_121a, runtime bug pending.** `LagunaMoeResidentMarlin` + `BuildLagunaMoeMarlinResident` (laguna.cpp, `#ifdef VT_MARLIN_NVFP4`) reconstruct the MoE Marlin path over the SHARED `dense_nvfp4::Dev`/`DBuf`/`ResidentNvfp4` + shared `vt::cuda` Marlin repack/align ops + `vt::MoeGroupedGemmNvfp4Marlin`; SACRED 27B/35B path BYTE-UNTOUCHED; gated `VT_LAGUNA_MARLIN_MOE=1` **default-OFF** (zero regression to the default GEMV path). Compiles clean on the full CUDA build. RUN: loads OK (48 layers, 256 experts) but the FIRST FORWARD device-faults silently on the Marlin path — a layout/param bug (suspects: `MoeCombine` bf16-in/f32-out dtype, the down-GEMM reusing the gate/up align, or the fp4-original free omitted → mem ~doubles). NEXT: `compute-sanitizer` localize → fix → near-tie vs the vLLM-Marlin golden + kernel-duration ncu → flip default-ON. Default path unaffected. **UPDATE (`22d6e146`): added the qwen3_5-style fp4-original free after repack** (device transients + host bytes; peak was ~3× the expert tower → past the 119 GiB pool → null-alloc → silent fault the likely cause); compiles clean. The runtime gate stayed INCONCLUSIVE this session (contended/orphaned processes on the shared box, no captured ids) — rerun on a clean uncontended session, compute-sanitizer if it still faults. **★★ B2 VALIDATED on GB10 (2026-08-01, with the mem-free fix): RUN_EXIT=0, coherent, first 13 generated tokens MATCH the vLLM-Marlin golden EXACTLY** (`22345 83 290 350 674 330 5541 966 340 9626 377 15360 81` — the best Laguna-NVFP4 correctness yet, W4A16 matching vLLM's config). **Steady-state decode 0.10 s/tok = ~10 tok/s** (steps 10-17 all 0.10; the TPOT-0.56 average is warmup-polluted — the DevicePool warms over ~9 decode steps then reuses). vs the GEMV path's 6.7 tok/s = **~1.5× faster; the gap to vLLM 18.8 closes from ~3× to ~1.9×.** Memory flat (7.9 GiB host RSS — the fp4-original free worked; it also fixed the first-forward fault). Still `VT_LAGUNA_MARLIN_MOE=1` default-OFF. TO DONE: move the lazy Marlin-resident build (216s first-forward, 48L×256E repack) to model-LOAD time → clean warm A/B + ncu → flip default-ON → matrix/roadmap. Remaining ~1.9×: vLLM graphs its decode (ours still eager) — decode CUDA-graph is the next lever. **REPRODUCED 3× (reproduction gate MET): GB10 runs deterministic — first 18-20 tokens byte-identical, steady-state 0.10 s/tok confirmed each — so the ~10 tok/s + golden-match is gated, not a single sample.** **#234 item (1) — load-time resident-build LANDED (`LagunaBuildMarlinResidents`, called from the example after load; mirrors vLLM process_weights_after_loading): builds all 48L×256E Marlin residents at LOAD so the repack is not a first-token TTFT spike. Fixed an anon-namespace linkage bug (public fn was defined with internal linkage → moved outside the anon namespace); BUILD CLEAN + links on GB10 sm_121a, default-OFF. Runtime prewarm-fires-at-load timing UNVERIFIED this session (repeated ssh-drops ate the run capture); the forward's lazy build is the validated fallback so it cannot regress. Owed: one clean run to confirm the build moved to load + then flip default-ON.** **★★ DONE (2026-08-01): Marlin is now the UNCONDITIONAL DEFAULT (`LagunaMarlinMoeEnabled` default-ON; `=0` is a code-level A/B opt-out no user needs) — "it just works" with NO env. Confirmed in a no-env GB10 run captured via tmux: `MARLIN residents built at load in 238.4s`, prefill 14.78s (build moved OUT of first-forward), golden-matching ids, steady-state 0.10 s/tok = ~10 tok/s (4th reproduction), RSS ~5-8 GiB. So a default Laguna-NVFP4 load on GB10 gets vLLM's own W4A16 Marlin decode (~10 tok/s, ~1.9× from vLLM 18.8) with zero flags. The 238s load-time repack is a one-time cost (mirrors vLLM process_weights_after_loading); optimizing its 48×256 per-expert sync count is a follow-up. Residual to 18.8 = decode CUDA-graph (deferred; user refocusing on DeepSeek next).** Post-lever-1 nsys: the remaining ~4× is HOST-SYNC-bound — 22,115 `cudaStreamSynchronize` (78.6% of API time, ~2,760/token, the per-GEMM `DrainQueue`), GPU kernels fast. Remaining levers: grouped W4A4 MoE (design input: `vt::MoeGroupedGemmNvfp4` is W4A16, so true-W4A4 grouped needs a new fp4×fp4 op or the `use_a16` mode + expert-stacking — needs a spike), device-resident decode (RECOMMENDED — the current forward is host-style so every GEMM drains; keep activations on-device, drain once/step; reuse qwen3_5's `Dev`/`Nvfp4Dev`/`ResidentNvfp4`/device-SwiGLU machinery; kills the 22k syncs; converges with the pending GGUF #228 and lifts both quant paths), decode CUDA-graph. Binding number needs a clean 2-3× re-run. See `docs/BENCHMARKS.md` + the spec N5 plan. See `docs/BENCHMARKS.md` `CLAIM-LAGUNA-VLLM-NVFP4`. Prior **DECODE-SPEED ATTRIBUTED (W7 profile-only, 2026-07-31, `CLAIM-LAGUNA-W7-SPEED`): `nsys` of the W6 decode on the real UD-Q4_K_XL GGUF (GB10) shows the 0.66 s/tok (~1.5 tok/s, vs llama.cpp 27.8 tok/s on the identical bytes, ~15-18x) is HOST-ORCHESTRATION, not kernel compute: GPU active only 32.7% of the step, 67.3% host/idle; 22,115 `cudaStreamSynchronize` (~2,764/step, zero GPU overlap) from the ~1,795 per-GEMM `DrainQueue` sync in `LagunaForwardGgufCached` + scalar host glue; 39.4% of the GPU time is `QuantizeQ8K` activation-quant (re-quantized per GEMM), the weight GEMVs run un-grouped at ~22% of the 240 GB/s peak (llama.cpp ~76%). Ranked levers (all in-tree from ds4): device-resident decode (kill the syncs) 1.5->~5-7 tok/s, grouped-expert GEMM (`MatmulBTQuantGrouped`) +1.5-2x + dedupes the activation-quant, decode CUDA-graph, tuned MMVQ; + free host cleanups (`LagunaEmbed` copies the whole 1.23 GB embed table/token; per-token RoPE-cache rebuild). Honest reachable ~13-20 tok/s, 27.8 a stretch. NO code changed. See `.agents/specs/laguna-s21-w7-speed-2026-07-31.md`. Prior RUNNABLE + FAST DECODE (W6, 2026-07-31): a per-layer K/V cache + single-token incremental decode replaces W5's O(n²) STATELESS full-recompute — TOKEN-IDENTICAL (byte-equal ids, md5 match, == the W5 golden) and 5.05× faster per token: decode 3.33 → 0.66 s/tok on the real 3-shard UD-Q4_K_XL GGUF (GB10, `--gpu`, keep-quant), same "The capital of France is" → " Paris.\n\nThe user is seeking a detailed explanation of the concept of \"cultural capital\"…". `LagunaKvCache` (mirrors `DeepseekV4KvCache`, MLA-latent → GQA multi-head K/V) caches post-QK-RMSNorm/post-RoPE K + raw V at f32 (bit-exact by construction: RoPE/QK-norm are position-only and attention is causal). MIXED attention handled per-layer: 12 GLOBAL layers grow the cache unbounded (full causal); 36 SLIDING-WINDOW-512 layers EVICT the oldest rows beyond the 512 window (gemma2/3 `is_sliding`), capping their K/V. `LagunaForwardGgufCached` + shared `LagunaAttention`/`LagunaFfnBlock` helpers used by BOTH forwards (identical float ops — the recompute path's ids are unchanged after the refactor); `examples/laguna_gen --stateless` forces the W5 recompute for the A/B gate. No cache bug: bit-exact on the first run. Next speed: grouped-expert GEMM + device-resident decode (both in-tree from ds4). See `.agents/specs/laguna-s21-w6-2026-07-31.md`. Prior RUNNABLE (W5, 2026-07-31): our engine greedy-generates COHERENT text on the REAL 3-shard UD-Q4_K_XL GGUF (GB10, keep-quant). `laguna-gen` "The capital of France is" → " Paris.\n\nThe user is seeking a detailed explanation of the concept of \"cultural capital\" as developed by French soci…" — the FIRST token is "Paris.", matching the llama.cpp-Poolside reference on the identical bytes. Multi-shard GGUF reader (LagunaGgufCtx routes each of 814 tensors to its shard; shard-1 = header only) + keep-quant tower (attn/dense/shared/experts/lm_head stay Q8_0/Q4_K/Q5_K COMPRESSED, consumed via `vt::MatmulBT`; norms/router/bias/embed → f32) + `LagunaForwardGguf` (the f32 composition with the ~9 GEMM sites swapped to keep-quant Gemm/GemmRowSlice, ds4 precedent) + `examples/laguna_gen`. Real GGUF metadata verified: dual-RoPE freq_base 500000/10000, dims 64/128, YaRN factor 32, sigmoid ungrouped-noaux router (scale 2.5), per-layer Q-head [48 global/72 sliding], per-head softplus out-gate, QK-RMSNorm. Load 20.6s, peak 71 GiB (fits 119 pool). Prior W4 IN PROGRESS (2026-07-31): 73.4 GiB UD-Q4_K_XL GGUF FETCHED + read authoritatively (814 tensors); 3 CPU-verified fidelity corrections grounded in the real GGUF + llama.cpp — per-head QK-RMSNorm (`attn_q/k_norm`, the scope MISSED it), GGUF-authoritative dual-RoPE mscale (llama.cpp `yarn_attn_factor·(1+0.1·ln(factor))`, factor 32 not HF 128), separate `ffn_gate/up_exps`. Keep-quant tower materialization + `ForwardGguf` + the real-model greedy run vs llama.cpp-laguna same-quant oracle = W5 close. Prior: W3 REAL host-reference forward + 3 new ops (`laguna_ops.cpp`, CPU `-Werror` clean, `test_laguna_scaffold` unit-gated)** | Poolside Laguna: 48 layers (12 global + 36 sliding-window-512), 256 routed top-10 + 1 shared expert, per-head **softplus attention output gate**, sigmoid `noaux_tc` router, dual per-layer RoPE (YaRN full-attn / plain sliding), GQA 8 KV / 128 head-dim, 1M ctx. **W3 (2026-07-31):** the 3 genuinely-NEW small host ops landed in `laguna_ops.cpp` — per-head softplus attn out-gate (`LagunaSoftplusHeadGate`), ungrouped sigmoid-noaux router (`LagunaUngroupedRouterTopK`, ds3 noaux_tc MINUS the group step + tie-break razor), dual per-layer RoPE cos/sin builders (`BuildLaguna{FullYarn,Sliding}CosSin`, reusing the pinned YaRN inv_freq over the partial-64 dims); `LagunaModel::Forward` is now a REAL runnable host-reference composition (variable-Q-head GQA + dual RoPE + sliding-window mask + softplus gate + dense L0 / ungrouped-MoE L1..47 + untied lm_head) replacing the `VT_CHECK(false)` stub; `test_laguna_scaffold` **8/8·166** (softplus math, router selection+tie-break RED-first, dual-RoPE bit-match, variable-Q-head shapes, forward composition on synthetic weights), `test_model_registry` 24/24. **W2 (2026-07-30):** registered, `ParseLagunaParams`, GGUF `blk.N.*` name-map + UD-Q4_K_XL quant-mix (Q4_K/Q5_K/Q6_K/Q8_0 ALL already decoded → ZERO new kernel). **W1 oracle DECISION:** vLLM NATIVE `laguna.py` (in pin → config constructs); dual-oracle = vLLM-NVFP4/-FP8 (fits GB10 119 GiB; BF16 235 GiB does NOT) + llama.cpp-Q4_K token-exact. ~85–90% reuse (ds4-MoE + Gemma-sliding + OLMo-3-dual-rope + Q4_K keep-quant, ALREADY landed). DEFERRED (W4): GGUF keep-quant tower materialization + device/paged production forward (loaders still LOUDLY throw) + strict dual-oracle greedy gate on a fetched checkpoint + `poolside_v1` parser. See `.agents/specs/laguna-s21-w3-2026-07-31.md` (+ W1/W2 `laguna-s21-w1w2-2026-07-30.md`, W0 `laguna-s21-scope-2026-07-30.md`). **Decode attention-glue fusion LANDED (2026-08-02, `CLAIM-LAGUNA-GLUE-FUSED`, default-ON `VT_LAGUNA_GLUE_FUSED`, `=0` A/B):** BYTE-EXACT L1 (softplus out-gate → `DecodeAttnCombineKernel` store) + L4 (residual-Add+RMSNorm pairs → the shared `vt::FusedChain(kFusedAddRmsNormStd)` seam) on the resident decode-graph — same-binary A/B ids byte-identical (159/159 @160), paging-immune nsys steady decode **−4.2% GPU-busy (28.90→27.69 ms/step), −120 graph nodes/step (−10%)**, wall drop_caches-tied (no regression). C shared-into-MoeCombine SKIPPED (Laguna's bf16 `MoeCombine` → not byte-exact); L2 qk-norm+RoPE preamble DEFERRED (needs a device-position kernel variant). See BENCHMARKS.md `CLAIM-LAGUNA-GLUE-FUSED`. **On-device greedy sample LANDED (2026-08-02, `CLAIM-LAGUNA-ONDEV-SAMPLE`, default-ON `VT_LAGUNA_ONDEV_SAMPLE`, `=0` A/B):** the resident decode graph used to Synchronize, return the whole `[100352]` logits, and argmax on the HOST between replays (+ host embed-gather of the next token) — the off-framework "born-on-host" seam the decode-framework-routing audit flagged. Now BOTH run ON-DEVICE inside the captured graph: `vt::GreedyArgmax` (lowest-index tie = the exact host winner) → 1-elem device token buffer, + a new capture-safe `embed_gather` kernel gathers the next input embedding from it (the stock `vt::Embedding` is NOT capture-safe: per-call event-sync + D2H ring). BYTE-EXACT (160-id stream identical `=0`/`=1` on `~/laguna-xs-nvfp4`) + faster: paired drop_caches decode wall **+0.28% median** (8/8 reps ≥0; removes ~150 us/step host argmax) at GPU-busy parity (nsys 2-length 27.44→27.42 ms/step). Aligns Laguna decode with vLLM on-device sampling. **Lever 2 (lm_head GEMV DRAM eff) MEASURED, NOT landed:** `[M=1,100352,2048]` bf16 = **170 GB/s (2.41 ms)** = ~91% of the cuBLAS M=1×large-N reference (~187 GB/s / 2.2 ms) — at the M=1 practical floor (the 273 GB/s ceiling is streaming-only, unreachable for a once-read GEMV); ≤0.7%-of-step headroom needs a reduction reorder (near-tie re-gate) ⇒ not chased, per prior "lm_head optimal". See BENCHMARKS.md `CLAIM-LAGUNA-ONDEV-SAMPLE`. **MoE add_rms_norm fold LANDED (2026-08-02, `CLAIM-LAGUNA-MOE-ADDNORM`, default-ON `VT_LAGUNA_MOE_ADDNORM_FUSED`, `=0` A/B):** the glue-fused MoE tail ran its residual update as TWO graph nodes — `vt::Add(hidden,routed)` [`AddKernel`] + `FusedChain(kFusedAddRmsNormStd)` [shared-add+RMSNorm, `RmsNormRowKernel`] — now ONE `fused_add2_rmsnorm` device node/MoE-layer (`hidden=(hidden+routed)+shared; hn=rms_norm(hidden)*w`). BYTE-EXACT (IEEE add commutes + the identical 256-thread shared-tree norm reduction; 160-id stream byte-identical `=0`/`=1` on `~/laguna-xs-nvfp4`) + faster: **−39 `AddKernel` graph nodes/step** (2.63ms→0 over 69 steps), paging-immune nsys 2-length **~−46 us/tok GPU (27339→27293)**, nsys wall **+0.4% (34.00→34.14 tok/s @70-tok)**. Small (byte-exact node-count trim on the graph-captured, GPU-bound decode; the dominant ~72% cost is the bf16 projection GEMVs — see the Lever-B negative in BENCHMARKS.md). See BENCHMARKS.md `CLAIM-LAGUNA-MOE-ADDNORM`. **Shared expert kept fp4 LANDED (2026-08-03, `CLAIM-LAGUNA-SHARED-FP4`, default-ON `VT_LAGUNA_SHARED_FP4`, `=0` A/B):** the XS-NVFP4 shared expert was DEQUANTIZED to bf16 at load (`LnLoadSharedExpertBf16`) → the M=1 decode GEMV read 4× the DRAM bytes of vLLM (which keeps it fp4). Now kept fp4-resident and routed through the SAME Marlin W4A16 single-expert (num_experts=1) grouped GEMM the routed experts win on (`dense_nvfp4::GateUpFusedMarlinD`+`MatmulNvfp4MarlinD`); the decode GEMV drops to router-ONLY (`moe.router`), shared gate/up/down go fp4. ADDITIVE new `laguna_shared_fp4.cpp` re-reads the on-disk fp4 from the gen driver before shard release (does NOT touch SACRED `laguna_weights.cpp`); bf16 shared KEPT for the T>1 prefill. NEAR-TIE (fp4≠bf16): coherent, first-20 ids == documented golden, byte-identical to bf16 for ~85 tokens then diverges; **DISTRIBUTIONAL GATE PASS 40/40** (ours' first-40 ids ∈ vLLM's 8-run greedy candidate set; vLLM XS-greedy is bf16-non-det, 8 unique of 8). FASTER: paging-immune nsys 2-length **GPU 27.24→26.53 ms/step (−2.6%)**, wall drop_caches **35.8→36.3 tok/s (+1.4%, fp4 wins all 3 reps)**; shared-expert kernel bucket ~1.68→~0.90 ms/step (halved); vs vLLM ~43 tok/s 83.3%→84.4%; RSS 22.2→22.1 GiB (freed the decode-only fused router-shared projection). Modest by design — XS's shared expert is small (`shared_expert_intermediate_size==moe_intermediate_size==512`). Default-ON per parity (matches vLLM's fp4 shared). See BENCHMARKS.md `CLAIM-LAGUNA-SHARED-FP4`. **qk-norm+RoPE preamble fusion LANDED (2026-08-03, `CLAIM-LAGUNA-PREAMBLE-FUSED`, default-ON `VT_LAGUNA_PREAMBLE_FUSED`, `=0` A/B):** closes the `CLAIM-LAGUNA-GLUE-FUSED` L2 deferral — the decode graph ran the per-layer attention preamble as FOUR under-occupied M=1 nodes (`rms_norm_seq(q)`+`rms_norm_seq(k)`+`rope_from_cache_g(q)`+`rope_from_cache_g(k)`); now ONE capture-safe `fused_qk_norm_rope_g` node/layer (`FusedQkNormRopeGKernel`, one block/head, reads the decode position from DEVICE `*pos_buf`, handles the per-layer dual-RoPE 64/128 + `Hq` 48/64). BYTE-EXACT BY CONSTRUCTION: it replicates the composed path's f32 MEMORY round-trip (Phase A 256-thread Σx² == `RmsNormSeqKernel`; Phase B the same `(x*inv)*w` store; `__syncthreads`; Phase C the `RopeFromCacheGKernel` rope read back) — an earlier register-only recompute was numerically-equivalent but diverged at a token-110 near-tie via compiler fma-contraction; the memory boundary forces bit-identity. 160-id stream byte-identical `=0`/`=1` on `~/laguna-xs-nvfp4` (determinism verified `=0`×3/`=1`×3 each run-to-run identical). FASTER: preamble norm+rope kernels **160→40 launches/tok, 326→154 us/tok (−0.17 ms/step)**; all decode-scaling kernels 26.53→26.37 ms/step; wall drop_caches **36.42→36.64 tok/s (+0.6%, fused wins all 3 paired reps)**; vs vLLM ~43 84.7%→85.2%. Modest (preamble ~1.2% of the 26.5 ms/step decode; the dominant cost stays the bf16 projection GEMVs at cuBLAS parity) — a byte-exact graph-node/launch trim (the glue-fusion residual mechanism). Default-ON per parity. See BENCHMARKS.md `CLAIM-LAGUNA-PREAMBLE-FUSED`. **W7 two-front pass LANDED (2026-08-03, `CLAIM-LAGUNA-W7-DECODE`):** FRONT 1 — the example driver logged `[gen] step N …(RSS)` EVERY decode step, and the RSS arg calls `CurResidentGiB()` (a `/proc/self/status` read) + an unbuffered stderr write in the GPU-idle gap between replays; guarded behind `VT_LAGUNA_STEP_LOG` (default OFF) + added a `decode_wall` line (TRUE end-to-end throughput incl. per-step gaps) next to the gap-free `decode_hp`. Since the fprintf sat OUTSIDE the `s0→s1` timer, `decode_hp` was ALREADY honest; with the log off `decode_wall == decode_hp` (within 0.001 tok/s, every LOG_OFF rep) and the recovered host tax is only ~0.1% (drop_caches noise floor). CONCLUSION: the ~86% gap to vLLM 43 is genuine device compute, NOT a harness artifact. FRONT 2 — `VT_LAGUNA_MOE_ONECAST` (default ON): a MoE layer cast the same `hn[1,H]` f32→bf16 THREE times (router GEMV + routed Marlin + shared Marlin); now cast ONCE into a persistent buffer and reuse (`CastHnBf16`/`GemmBf16Pre` + optional pre-cast param on both `…Into` helpers). BYTE-EXACT (deterministic truncation; `=1` vs `=0` byte-identical 300-tok ids); `CastBf16` **200→122 nodes/step (−78 = 2×39 MoE layers)**, GPU-busy parity within nsys noise, decode_hp +0.29%. Combined (onecast on + log off) **36.97 tok/s = 86.0% of vLLM-NVFP4 43** (from 36.64/85.2%). See BENCHMARKS.md `CLAIM-LAGUNA-W7-DECODE`. **Tail-fold follow-up LANDED (2026-08-03, `CLAIM-LAGUNA-TAIL-FUSED`, default-ON `VT_LAGUNA_TAIL_FUSED`, `=0` A/B):** a fresh node-ranking of the baseline decode graph found the routed-MoE `CastF32` as the one clean byte-exact fold left; it folds into the trailing `fused_add2_rmsnorm` via a new bf16-x1 sibling kernel (`AddAdd2RmsNormStdBf16Kernel` — `MoeCombine` writes bf16 straight to a persistent buffer, widened in-kernel by `__bfloat162float`). BYTE-EXACT (`=1` vs `=0` byte-identical 160-tok ids), `CastF32` **78→39 nodes/step**, total graph nodes **919→880**, GPU-busy parity; decode_hp a WASH (median +0.14% / mean −0.04%, at the drop_caches noise floor). Lands on the deterministic node-count basis (like onecast/preamble/addnorm), NOT a wall win; combined headline UNCHANGED **36.97 tok/s = 86.0%**. The ranking confirms the byte-exact decode-tail fold tier is now essentially EXHAUSTED (residual tail = already-folded norms + attention compute + cuBLAS-adjacent router/topk + ported-Marlin `MoeAlign`/`SiluAndMul`/`MoeCombine`); the gap to vLLM 43 is genuine device compute at the practical ceiling. See BENCHMARKS.md `CLAIM-LAGUNA-TAIL-FUSED`. **KERNEL-EFFICIENCY tier (2026-08-03, `VT_LAGUNA_FAST_NORM` default ON + f32 ext of `VT_RMSNORM_DECODE_FAST`):** the fold tier was exhausted but the residual-stream norm KERNELS were still under-occupied — `ncu` on the shipped `<<<1,256>>>` `AddAdd2RmsNormStdBf16`/`RmsNormRow<f32>` decode norms: `launch__waves_per_multiprocessor≈0.00`, `sm__throughput≈0.06%` (one 256-thread block on 1 SM of ~100+, latency-bound). Porting the PROVEN bit-identical `RmsNormRowFastKernel` structure (1024-thread float4 memory passes; 256-strided-partial + tree reduction reproduced byte-for-byte) to the f32 kernels cut each **286→~155 µs/tok (1.85×)**, **byte-exact** (160-tok ids identical `=1`vs`=0`; the f32 fix vs the bf16 sibling: store `v` not `v²` and square in the reduction so nvcc emits shipped's `acc += v*v` **fma** — a pre-squared f32 `v²` is not exact and flipped an XS near-tie at tok 108). **−0.81% decode-step GPU time** (paging-immune 70-vs-20 2-length diff, 26192→25980 µs/step); wall-clock ON/OFF overlap (noise floor). Residual: the byte-exact 256-strided reduction can't reach vLLM's per-kernel norm floor (~2.4× vLLM) without breaking byte-exactness → that remainder is byte-exactness-BLOCKED. See BENCHMARKS.md `CLAIM-LAGUNA-FAST-NORM`. **Router top-k warp-shuffle LANDED (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`, default-ON `VT_LAGUNA_TOPK_SHFL`, `=0` A/B): BYTE-EXACT** — an nsys 2-length rank of the remaining small kernels (past the at-parity `gemvx` projection GEMVs ~69% of step + Marlin MoE) put the router `SigmoidTopKKernel` top (415 µs/step); `ncu` showed it `<<<1,256>>>` at `waves≈0.000`/`sm≈0.2%` — pure latency (8 serially-dependent rounds × a ~10-sync `sh[256]` argmax tree). New `SigmoidTopKShflKernel` reduces each round by warp-shuffle argmax (2 syncs/round; argmax over the total order is associative ⇒ SAME winner) → **`SigmoidTopK` 414.6→248.8 µs/step (1.67×)**, decode-step GPU **−0.57%** (26.018→25.869 ms/step), 37.39→37.49 tok/s decode_hp (**87.2% of vLLM-NVFP4 43**); 160-id stream byte-identical `=1`vs`=0`. **NOT landed — norm warp-shuffle (`VT_LAGUNA_NORM_SHFL`):** a near-tie register-accumulate+shuffle reduce for the Laguna `AddAdd2RmsNormStd{,Bf16}Fast` norms PASSED the distributional gate (coherent, in-set 38/40 = baseline, one near-tie fork at pos 37) and was −19.3% per-kernel (`AddAdd2RmsNormStdBf16` 150.3→121.3 µs/step) BUT washed at whole-step (0.6% of step; +0.02% within noise) — a near-tie fork isn't justified by a below-noise gain, so it was dropped. The small-kernel norm tail is at its occupancy floor; the decode step is dominated by the at-parity projection GEMVs. See BENCHMARKS.md `CLAIM-LAGUNA-TOPK-SHFL`. **Shared-expert 2-stream overlap LANDED (2026-08-03, `CLAIM-LAGUNA-SHARED-AUX`, default-ON `VT_LAGUNA_SHARED_AUX`, `=0` A/B):** mirror of vLLM's `MULTI_STREAM_OVERLAPPED` — in `LagunaGraph::RunChain` the fp4-shared arm's shared expert is EARLY-forked onto a second CUDA stream from the post-attn hidden `hn` BEFORE the router GEMV (aux reads `hn` f32 + does its own byte-identical cast; scratch from `AuxPool`), overlapping router+`sigmoid_topk`+routed grouped GEMM, joined before the combine — the SAME machinery the 35B ships default-ON (ENG-MOE-SHARED-AUX, runs inside the captured graph). This is the EARLY fork the prior fused-`router_shared_gu` attempt (`89e0d074`, −0.35% wash) could not reach. Capture-safe (aux stream+2 events in the ctor; gstate-0 warm-run builds residents + warms `AuxPool`). **BYTE-EXACT** (`=1`vs`=0` byte-identical 63-tok ids). REAL concurrency: nsys `--cuda-graph-trace=node` 20↔70 sum-vs-union → OVERLAP **2.34 ms/step** (SUM/UNION 1.092) vs `=0`'s 0.0004 ms; net GPU-busy wall **26.213→25.467 ms/step (−2.9%, 38.15→39.27 tok/s)**, wall @200 37.08→37.93 (+2.3%). Net<raw because concurrent fp4 GEMVs CONTEND on GB10 unified LPDDR (SUM +1.59 ms: Silu/Marlin/CastF32) — ~28% of the missing-overlap gap to vLLM 23.5 ms recovered, remainder = bandwidth contention not a kernel. Per-kernel `=0` reconciles to 26.15 ms/step, `gemvx` 69.3% at cuBLAS parity (NO foreign kernel). **Default-ON** (parity-enablers-ship-as-defaults: byte-exact + net GPU-busy +2.9%, ~92% of vLLM; net recovery is bandwidth-contention-capped, ~28% of the missing-overlap window); `=0` is the same-binary A/B opt-out. DGX re-gated default-ON. See BENCHMARKS.md `CLAIM-LAGUNA-SHARED-AUX`.
+
+## BENCHMARKS.md compaction — pre-Ampere breadth detail (moved 2026-08-06)
+
+Moved out of the `docs/BENCHMARKS.md` keyed row to bring that cell inside the
+220-char limit (`check-public-doc-tables.py`). The row keeps the binding result;
+the audit detail is preserved here.
+
+2026-08-06 compile audit at `sm_75` (nvcc 13.0.88): 20 unconditional CUDA TUs,
+first pass 18 PASS / 2 FAIL, now 20/20 PASS (0 err, 0 warn) after guarding the
+bf16/TF32 WMMA bodies in `cuda_gdn.cu` + `cuda_matmul_nvfp4.cu`. GB10 unaffected:
+`sm_121a` 0-warn with zero instruction-level SASS diffs. The WMMA prefill
+selector is now arch-gated too (`sm_major >= 8`), so `<sm_80` falls through to
+the portable CUDA-core flash instead of selecting a `__trap()` body. Build-audit
+evidence only; no library link, no board here, and `sm_70` is not compilable
+until a CUDA 12.x toolkit is wired.
+
+**Pre-Ampere W1b/W1c completion (2026-08-06) — `sm_75` 20/20, all three
+selectors arch-gated, GB10 byte-identical.** The `sm_75` compile audit is now
+GREEN: 20 of 20 unconditionally-built CUDA TUs compile `-Werror=all-warnings`
+with 0 errors and 0 warnings (was 18/20). `cuda_gdn.cu` needed two classes, not
+one — the familiar bf16 WMMA fragments (37 errors) plus `wmma::precision::tf32`
+(`:2896-2899`), which is also Ampere+ but fails as a NAMESPACE LOOKUP at the
+`WmmaCfg<float>` alias definition rather than as an incomplete type at a use
+site, so a body-only guard does not compile it. `cuda_matmul_nvfp4.cu` needed 5
+body guards and stays compiled for every arch: despite its name it also carries
+the generic bf16 MoE grouped GEMMs, so gating the TU on its `fp4-mma` cell (the
+spec's earlier suggestion, now RETRACTED) would have stripped those from
+`sm_80/90a/100a/110`. Guarding bodies then orphaned their helpers, and
+`-Werror=all-warnings` promotes `#177-D "declared but never referenced"` to an
+error, so the residual walked 110 → 13 → 2 → 0 across `WmmaCfg::WK`, the
+`V128<T>` staging helpers and `WyMerge` (which needed a WHOLE-function guard,
+since a body-only guard leaves an emitted-but-uncalled definition).
+
+**The compile guards alone were a live trap, which is the transferable lesson.**
+Every predicate SELECTING a guarded kernel was host-side only (shape, dtype,
+env), so a pre-Ampere board would still have picked a `__trap()` body — the
+"fix" converted a build error into a runtime crash on exactly the boards it was
+meant to enable. Three chokepoints now require `DeviceCaps::sm_major >= 8`, each
+falling through to a portable path that already existed:
+`cuda_paged_attn.cu:2611` → `LaunchPrefillFlash`; `cuda_gdn.cu:5359` →
+`GdnScanCuda` (the single chokepoint — all 7 guarded GDN launches live in
+`LaunchChunkedPrefill`, reached only from there, and the `TSc=float`
+instantiations use the TF32 config so f32 is no way around it); and
+`cuda_matmul_nvfp4.cu` `WmmaEnabled():77`, folded into the predicate rather than
+its six call sites because all six mean the same thing and each already has a
+CUDA-core fallthrough. All three fail safe (caps invalid → portable), and the
+nvfp4 one is queried LIVE rather than latched in the static env cache, since the
+device context need not exist at static-init time.
+
+**GB10 inert, by measurement, not by argument:** all three TUs compile 0-warn at
+`sm_121a` and their SASS is IDENTICAL to the pre-change build — 933,178 +
+825,294 + 137,542 lines, anon-namespace hash normalized (that hash shifts on any
+edit to a file, which is why the raw diff shows `Function :` headers only). The
+change is host-side; no device code moved.
+
+**W2 is RESCOPED to a speed brick.** The bf16-WMMA path is only
+`is_prefill && d == 256 && bf16 q+KV`; all decode and every other prefill shape
+already run portable kernels, and the selector gates now route d=256 to the
+CUDA-core flash on `<sm_80`. So pre-Ampere CORRECTNESS is covered by paths that
+exist today, and the llama.cpp `fattn-tile`/`fattn-vec` port (~2,000 lines,
+contiguous KV → our paged block-table layout) buys prefill throughput only,
+against a floor (llama.cpp on-card) that needs hardware we do not have. NO
+number is claimed or owed: nothing executes on these arches, no library link
+exists, and `sm_70` stays uncompilable until a CUDA 12.x toolkit is wired.
+FINDINGS: (1) gate_up FUSION drops modal marlin 180→**144 GEMM/step** (vLLM-structural parity) but only
+−200us marlin — the count was cheap (fused 2N GEMM reads the same weight bytes as 2 narrow, W4A16
+memory-bound); step 2 = structural/correctness parity, not a speed win. (2) At MATCHED 144-count ours
+marlin is 121.3us/call vs vLLM 113.1 = **+7.2%/call = +1,177us = the DOMINANT residual** — the CTA count
+(ours 144 = sms×par3, vLLM dense 48 = sms×1, `blocks = sms*blocks_per_sm` marlin_mm_moe.cu:494), REFUTING
+#52's "per-call near-parity". (3) `VT_MARLIN_E1_PAR1=1` clamp (48 CTAs) recovers 951/1177us (marlin +226
+near-parity, TPOT −0.99ms), token-exact on 8B-MXFP4 (#44 3/3) — MEASURABLY SUFFICIENT, no dense-port
+needed — but flips a strict 32B-NVFP4 token (fp32-reduce regroup, `test_qwen3_32b_nvfp4a16` REQUIRE :344;
+isolated: baseline 142/142, graph-only 142/142, par1-only 59/60) ⇒ default-OFF opt-in; byte-preserving CTA
+reduction = the dense-template marlin port (#50 NO-GO), scoped. Post-par1 the DOMINANT residual is FLASH
+(+807, same kernel+grid, unresolved), then glue (+198, portable-fusion). Full strict binding ratio table
+(c1..c8 x3, fresh oracle) DEFERRED — the strict harness needs an on-REAL-disk RelWithDebInfo build (tmpfs
+fails the mincore cache-drop) + the vLLM oracle whose host-RAM reservation alongside the 27G tmpfs tree is
+the GB10 OOM-reboot risk. Evidence dgx:~/mxfp4-nsys/{oursfused_c8,ourspar1_c8}.nsys-rep, kern_sum_oursfused_c8.txt,
+gpu_trace_{oursfused,ourspar1}_c8_*.csv; gates ~/{gate2,gate4,gate5,iso32b,step1_gate,step1_smoke}.log.
+
+## KERNEL-FA2-DECODE-PARAMS: flash residency+params hypothesis REFUTED (post-#57)
+
+Measured on `735f3b8d` (content-identical twin of #57 `efa6e40d`), MXFP4-8B
+decode, env-gated params dump + cudaPointerGetAttributes + sudo ncu. All
+flash buffers (q/k/v/o/lse/oaccum/lseaccum) are DEVICE-resident (no ATS
+target — this is not the GGUF-mmap class); KV layout
+[num_blocks,2,block,heads,d] + strides byte-match vLLM. Sole divergence:
+num_splits (our FA2@2c839c33 static heuristic vs vllm-flash-attn@~5824e6e;
+5 vs 6 at c2, near-tie class). ncu: the decode split kernel is
+latency/occupancy-bound (occ 10.7%, SM 7.7%, mem 6.5%, L2 7%) — intrinsic
+to batch-1 decode, identical kernel both engines; the combine kernel is a
+~13us tax scaling with split count. Self-contained A/B: the heuristic
+OVER-SPLITS at low base (c1: splits=7 → ~41us/layer; optimal ~3 → ~33us,
+~17% win) but self-selects ~3 at c8 (near-optimal) → NOT the c8 residual.
+Scoped next lever: GB10-calibrated num_splits cap (cuda_flash_attn_fa2.cu:996),
+near-tie, oracle-gated, helps c1-c2 only (c1 already 1.020x). The dominant
+remaining c8 term is the ~0.7ms/step host/sched slice (engine loop proven
+clean in #51 — the slice lives in the shared async frontend). Parity verdict
+unchanged: c1 1.020 / c2-c8 0.962-0.969. Evidence dgx:/tmp/fa2dump.err,
+/tmp/fa2ncu2.out, /tmp/fa2ab_n{1,3}.out.
+
+## SERVE-FRONTEND-SLICE: the c2-c8 frontend residual MEASURED (perf, c8 online decode) — the frontend is ~99% CPU-IDLE, so the ~0.26ms/step slice is handoff/scheduling LATENCY + syscalls, NOT frontend compute; detok Slow-vs-Fast is quantitatively negligible at 128-tok output; the mission's "~0.7ms dominant frontend term" premise is REFUTED, the c2-c8 gap is GPU-intrinsic — 2026-08-06 (branch `row/SERVE-FRONTEND-SLICE`, base `origin/main` `efe94402`)
+
+The campaign that owed the frontend attribution. Method step 1 (instrument OUR
+frontend per-step at c8) executed as a `perf` profile of the PRODUCTION server
+binary under a sustained c8 streaming load, NO rebuild — the built binary
+(dgx `~/mxfp4-bench/build`, sha `735f3b8d`) has a `git diff`-IDENTICAL frontend
+(output_processor / detokenizer / serving_completion / api_server / async_llm)
+to main `efe94402`, so its frontend profile IS main's. Box left clean (server
+gone, both locks free, 78 MB perf .data removed, disk 35 G).
+
+WORKLOAD (matches the #52 binding): `/v1/completions` streaming, 1024-in/128-out,
+greedy, 8 concurrent workers cycling the c8 corpus, 60 s. Sustained ITL mean
+40.8 ms / median 31.4 ms ≈ #52's c8 TPOT 37.56 ms — the load is the real c8
+decode regime. `sudo perf record -F 999 -p PID` (flat, 22 s) + `-F 499
+--call-graph dwarf` (18 s).
+
+THE DECISIVE NUMBER (flat profile): the GB10 splits work across two PMU core
+clusters. The ENGINE core (counter armv8_pmuv3_1) drew 22 K on-CPU samples =
+86.5 B cycles, 75.4 % libcuda + 21.4 % vdso (clock_gettime = CUDA busy-poll) —
+pure GPU orchestration. The FRONTEND cores (counter armv8_pmuv3_0) drew only
+**186 on-CPU samples over 22 s at 999 Hz** → the frontend was on-CPU ~0.8 % of
+wall-time = **~99 % IDLE (blocked on __poll / futir waits)**. So the ~0.26 ms/step
+residual (#52: TPOT ours 37.56 − vLLM 34.58 = +2.98 ms, GPU SPAN accounts +2.72 ms
+= 91 %, residual +0.26 ms) is thread-handoff/scheduling LATENCY + syscalls, NOT
+frontend COMPUTE — there is no heavy frontend work to remove.
+
+FRONTEND on-CPU ATTRIBUTION (of counter_0's 186 samples; noisy but directional):
+| bucket | share | detail |
+|---|---:|---|
+| kernel/syscall | 56.6% | `__poll` (httplib), futex (condvar handoffs), socket sendmsg (SSE write), + `nf_conntrack`/`nf_nat` ~5.6% = loopback conntrack, a box iptables artifact absent for real remote clients |
+| libc | 23.6% | malloc/free churn ~9.6% (per-token RequestOutput + json tree + SSE string), memcpy/strlen ~4.2% |
+| server (our code) | 13.25% | dominated by per-token SSE-frame JSON build+serialize |
+| libstdc++ | 0.93% | std::string / map ops |
+
+CALL-GRAPH (dwarf) of the httplib content-provider worker: inside
+`CompletionSseStream::next` (serving_completion.cpp:39-114) **~34 % goes to
+`to_json(...CompletionStreamResponse)`** — and OF THAT ~26 % is nlohmann
+`basic_json(initializer_list)` CONSTRUCTION + `~basic_json` teardown (nlohmann's
+`std::map`-backed object allocates a node tree per token), only ~8 % is the actual
+string dump. Then `RequestOutput::~RequestOutput` + `__libc_free` (freeing the
+per-token full `prompt_token_ids` copy, output_processor.cpp:253-254). Detok is
+INVISIBLE: the only tokenizer symbols (`vt::tok::BpeMerge`/`MergeKey` ~1.85 %) are
+per-REQUEST INPUT tokenization (which vLLM also does), NOT per-token decode; the
+per-token `DetokenizeIncrementally`/`ConvertTokensToString` are below the 0.15 %
+floor.
+
+NAMED MECHANISMS (ours file:line vs vLLM file:line):
+1. **Detokenizer default.** Ours: `IncrementalDetokenizer::FromNewRequest`
+   (`src/vllm/v1/engine/detokenizer.cpp:402-412`) ALWAYS returns
+   `SlowIncrementalDetokenizer`; `DetokenizeIncrementally`
+   (`detokenizer.cpp:347`) deep-copies the whole growing `tokens_` vector per
+   token (O(num_generated), but `tokens_` is seeded with only a ~7-token prompt
+   window in the ctor `detokenizer.cpp:515-530`, so at 128-tok output it caps
+   ~135 strings ≈ 2 µs/step — negligible). vLLM: `from_new_request`
+   (`vllm/v1/engine/detokenizer.py:59-75`) defaults to `FastIncrementalDetokenizer`
+   (`detokenizer.py:167-236`) = Rust `tokenizers.decoders.DecodeStream.step`, O(1)
+   per token. Our Slow path MIRRORS vLLM's fallback but not its DEFAULT; measured
+   impact at this workload is nil. It grows only for long generations.
+2. **SSE-frame serialization.** Ours: `nlohmann::json(frame).dump()`
+   (`serving_completion.cpp:102`) — `std::map`-backed init-list construction, the
+   largest MEASURED frontend-compute term (~34 % of the SSE worker path). vLLM:
+   `chunk.model_dump_json(exclude_unset=True)`
+   (`vllm/entrypoints/openai/completion/serving.py:441`) = pydantic-core (Rust).
+3. **Architecture.** Ours: EngineCore in-process thread → output_handler thread →
+   collector condvar → 8 httplib worker threads (async_llm.cpp:260-311). NO IPC.
+   vLLM: EngineCore SUBPROCESS → ZMQ msgpack IPC → asyncio single-loop output
+   handler → completion_stream_generator coroutine. We SAVE the ZMQ IPC vLLM pays;
+   we PAY multi-thread wakeup latency. The ~0.26 ms residual is the NET.
+
+VERDICT: the frontend slice is a diffuse ~0.26 ms/step (≈9 % of the +2.98 ms c8
+TPOT gap), and it is scheduling/handoff LATENCY, not compute — there is NO
+dominant closable frontend-compute mechanism, and the one structural divergence
+(Slow vs Fast detok) is quantitatively irrelevant at 128-tok output. NO code
+shipped: mirroring vLLM's Fast detok (needs HF Rust DecodeStream) or replacing
+nlohmann with a hand-rolled serializer are LOW-ROI general-serving efficiency
+levers (help long-output / high-QPS), NOT MXFP4 parity levers — the frontend is
+idle, so neither moves TPOT. The c2-c8 gap is GPU-INTRINSIC (KERNEL-FA2-DECODE-PARAMS
+refuted flash as intrinsic-identical; #52 fair graphed-vs-graphed = marlin +
+flash + glue = 91 % of the gap; #57 recovered marlin byte-safe). MXFP4 PARITY
+VERDICT stands UNCHANGED: c1 1.020 PASS, c2-c8 0.962/0.966/0.969 BELOW-FLOOR, mem
+2.63x — and the residual is NOT frontend-closable. Evidence
+dgx:`~/frontend-attrib/{report.txt,cg_report.txt,run.log,load.json}` (perf .data
+pruned for disk).
+
+## QUANT-CT-MXFP4-FINAL-STACK — the two last named MXFP4 levers implemented + measured; TERMINAL residual statement (2026-08-06, `row/QUANT-CT-MXFP4-FINAL-STACK`, GB10, base `origin/main` `6dd0a1e4`, dgx tree `735f3b8d` twin of #57)
+
+The campaign that owed the two remaining scoped levers (num_splits cap + glue
+fusion) and the definitive verdict. Both are now GROUNDED, IMPLEMENTED where real,
+and MEASURED. Box left clean (locks free, worker down, disk 34G, 75 stale test
+binaries reclaimed).
+
+**LEVER 1 — GB10 num_splits cap (`VT_FA2_NSPLITS_CAP`, default OFF). LANDED.**
+`src/vt/cuda/cuda_flash_attn_fa2.cu`: `Fa2NsplitsCapConfig()` + `ApplyNsplitsCap()`
+(after `NumSplitsHeuristic`), wired at BOTH decode launch sites (the d256 group-swap
+path ~L759 and the d128 varlen decode ~L1001). Modes: unset/`0` OFF; `auto` =
+wave-optimal `max(1, num_sms/ctas_per_split)` on the ACTUAL 48 SMs; `N>=1` explicit
+(the fa2ab A/B knob). Read fresh per launch (like `Fa2DecodeGqaSwapEnabled`) so a
+single-process op test can A/B the regimes.
+- MECHANISM (grounded in the sanctioned KERNEL-FA2-DECODE-PARAMS A/B, dgx:/tmp/fa2ab_n{1,3}.out
+  + /tmp/fa2dump.err): `NumSplitsHeuristic` is fed `num_sms*2=96` on the FA "2
+  blocks/SM" model; GB10's batch-1 decode split kernel is latency/occupancy-bound
+  (ncu occ 10.7%, SM 7.7%) and never reaches 2 blocks/SM, so at c1 (bnh=8, nnblk=7)
+  every eligible split keeps waves<1 and the efficiency metric rises monotonically →
+  it runs to the MAX eligible split (=nnblk=7, grid (1,7,8)) → ~41us/layer. fa2ab: 3
+  splits ~32us (25.5 split + 6.59 combine), 1 split ~35us → cap=3 is a ~17-22% flash
+  win at c1. The cap reproduces those exact split counts by construction (same
+  heuristic + a `min()` clamp → identical grid → identical kernel timing).
+- MEASURED SCOPE: the over-split self-corrects to ~3 at c8 (near-optimal), and at c2
+  the heuristic already picks 5≈optimal (#52). So the cap ONLY moves c1-c2, and **c1
+  is ALREADY 1.020x PASS** — it CANNOT move c4-c8. Not a parity lever for the failing
+  axes.
+- GATE BATTERY (fresh 735f3b8d+cap binary, GB10 sm_121a CUDA 13.0, GPU-locked; `.so`
+  strings-verified to contain `VT_FA2_NSPLITS_CAP`, base+post blob hashes matched for
+  clean git-archive provenance):
+  - op `test_ops_paged_attn` NEW case "num_splits cap engages and stays correct":
+    **1/1, 114/114** at BOTH GQA ratios (16/8, 32/8) × batch {1,2,4} — proves the cap
+    ENGAGES (base split_launches==1 → cap=1 no_split_launches==1, split→no-split
+    regime change), stays byte-correct vs the f32 composed reference, and cap=2
+    near-ties the uncapped output (max_abs<2e-2). Existing FA2 varlen+swap cases
+    **6/6, 394/394** unchanged.
+  - `compute-sanitizer memcheck` on the cap case: **0 errors**, 114/114 (the cap's
+    num_splits-boundary scratch is memory-safe).
+  - SACRED `test_qwen3_paged_engine` (0.6B 16/8 + 4B 32/8): default **16/16 both,
+    184/184**; `VT_FA2_NSPLITS_CAP=auto` CHARACTER-IDENTICAL (same 11/16 strict + 5/16
+    near-tie, same max gap 0.25 nats @p2t11, 0 forward-divergent). Razor holds.
+  - SACRED strict `test_qwen3_32b_nvfp4a16_paged_engine`: default **6/6, 144/144**
+    (3/6 strict = 53/96 tokens, max gap 0 nats, 0 divergent); cap=auto
+    CHARACTER-IDENTICAL — **the cap flips NO strict token even on the strictest model**
+    (retiring the #52 "num_splits change flips a strict 32B token" concern for THIS
+    lever).
+  - `test_async_llm`: default + cap=auto both **8/8, 325/325** (capture-safe under the
+    async engine).
+  - #44 MXFP4-8B smoke (default): deterministic **3/3 token-exact** + near-tie
+    coherent (no regression on the shipped OFF path).
+- FRESH-8B ncu/nsys TIMING BLOCKED (not by this change): vllm-cli's async double-batch
+  (`max_concurrent_batches=2`) DESYNCS under any profiler's timing perturbation
+  (`num_new_tokens must be greater than 0`), and `VT_ASYNC_SCHED=0` hits a separate
+  pre-existing sync-scheduler bug at ~865-token contexts; **cap=off reproduces every
+  failure mode identically**, so it is a pre-existing engine fragility, NOT the cap.
+  The op test's launch-counter proof + the sanctioned fa2ab data are the calibration.
+- DEFAULT DECISION: **stays OFF.** It is non-byte-exact (split-combine reduction
+  order) and, per parity-enablers-ship-as-defaults, a non-byte-exact lever is flipped
+  only for a CLEAN WIN on a FAILING axis; this one helps only c1 (already at parity),
+  so there is no parity-relevant win to bank and keeping OFF preserves the shipped
+  path's byte-exactness.
+
+**LEVER 2 — glue fusion. ALREADY LANDED as scoped; the real residual is OUT-OF-CATALOG.**
+Source audit of the classic-dense decode path: `qwen3.cpp::RunLayer` routes BOTH
+add+RMSNorm sites (input_layernorm L121, post_attention_layernorm L131) through
+`vt::FusedChain(kFusedAddRmsNormStd)` under `FusedChainAdoptEnabled()` which is
+**default-ON** (`qwen3_5.cpp:1437`, returns true when unset). The silu+mul is done
+inside the gate_up method's `Apply` (one fused 2N Marlin GEMM + a `SiluAndMul`/
+`MoeSiluMul` kernel). So "fold the highest-traffic decode glue through the EXISTING
+`vt::FusedChain` catalog" is ALREADY DONE — there is NO additional catalog routing to
+add on the dense path. The residual +198-290us glue tail (#52/#46) is vLLM's INDUCTOR
+GEMM-pro/epilogue fusion (`triton_red_fused_fused_add_rms_norm_marlin_gemm` folds
+add+RMSNorm+quant into the GEMM PROLOGUE; `triton_poi_fused_marlin_gemm_mul_silu_slice`
+folds silu+mul into the EPILOGUE), which collapses our ~5 separate glue launches/layer
++ their HBM round-trips INTO the GEMM. The `vt::FusedChain` catalog CANNOT express this
+— it produces a SEPARATE fused kernel before/after the GEMM, still paying the launch +
+round-trip. This is a Marlin KERNEL rewrite, exactly the REDIRECT #46 named and DECLINED
+("porting the dense marlin would gold-plate a refuted hypothesis").
+
+**THE DEFINITIVE BINDING — projected, not re-run (box-safety, determinate outcome).**
+The mission's oracle binding (c1..c8 x3 vs #57) was NOT re-executed: (a) Lever 2 is
+already default-ON so there is no config to flip beyond #57's numbers; (b) Lever 1 is
+mechanically inert at c4-c8 (self-corrects) and c1 already passes; (c) the full oracle
+binding is the OOM-reboot risk #52 explicitly DEFERRED, and this session hit ENOSPC
+merely BUILDING (75 test binaries filled the 35G floor), direct evidence of that risk.
+Projected per-axis vs #57 (1.020/0.962/0.966/0.969): c1 ≥1.020 PASS (possibly higher
+from the c1 flash win), c2 ≈0.962 (heuristic already ~optimal), **c4-c8 UNCHANGED
+0.966/0.969** (cap inert). Net: the binding is UNCHANGED — c1 PASS, c2-c8 still <1.0x.
+
+**THE FINAL MXFP4 PARITY VERDICT: TERMINAL RESIDUAL STATEMENT.** c1 1.020x PASS + mem
+2.63x WIN; c2-c8 0.962-0.969 (<1.0x). Both remaining named levers are now EXHAUSTED by
+measurement: the num_splits cap is a c1-only micro-win on an already-passing axis
+(implemented, gated-OFF, battery-green incl. 32B strict char-identical); the
+glue-through-catalog is already landed and the residual glue is Inductor GEMM-epilogue
+fusion the catalog cannot express (#46-declined). The c2-c8 gap is GPU-INTRINSIC diffuse
+decode (per #46 decode Marlin at vLLM per-shape parity; #58 frontend ~99% idle;
+KERNEL-FA2-DECODE-PARAMS flash residency/params refuted). HONEST PROJECTION of what
+could still move c2-c8: ONLY a from-scratch Marlin kernel fusing add+RMSNorm+quant into
+the GEMM prologue AND silu+mul into the epilogue (replicating Inductor's fused triton),
+saving the ~5 glue launches/layer + HBM round-trips (~198-290us/step). That is a major,
+numerics-delicate (the add+RMSNorm+quant chunk), non-portable kernel-authoring effort —
+the ONE unexhausted path, and a kernel rewrite, not a routing/config lever. The record
+supports the operator's accept (ship c1-parity + 2.63x mem WIN) / continue (fund the
+Marlin epilogue-fusion kernel) decision. Evidence: gate logs on dgx `~/mxfp4-bench`;
+fa2ab calibration dgx:/tmp/fa2ab_n{1,3}.out; op/SACRED/async/memcheck run inline above.
+
+## Rolled out of the scoreboard on 2026-08-06
+
+Moved verbatim from `docs/BENCHMARKS.md` by `scripts/roll-benchmark-record.py`. Nothing edited or deleted.
+
+## MiniMax-H3 (omni-modal video+audio DiT) — PENDING; hardware verdict CORRECTED (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`)
+
+**Serving (W7) is DONE on CPU and the DEVICE-RESIDENT forward (W2b, f32) is LANDED and GPU-VERIFIED as of 2026-08-03**; still no SPEED number — the FP4 path — and therefore any QUANT-MATCHED comparison against vLLM-Omni — needs sm_121a. NOTE the GGUF arm is different: the ggml block-quant GEMM has NO arch gate at all (`src/vt/cuda/cuda_quant_dot.cu` contains no `#if`), so it runs natively on sm_110 — `test_cuda_quant_dot` 9/9 (110,432 assertions) and `test_gguf_keep_quant` 37/37 pass on Thor. That makes sm_110 a usable venue for GGUF-arm speed work, though a GGUF number is not quant-matched to vLLM-Omni (which does not serve GGUF). PROBED, not inferred: the warp-level `mma.sync kind::mxf4nvf4` our FP4 GEMM uses is CONSUMER-Blackwell only (ptxas accepts it on sm_120a/121a, rejects it on BOTH sm_110a and sm_100a); sm_110 does support the datacenter `tcgen05` family, but our sm_100 body is CUTLASS `ArchTag=Sm100` guarded by `__CUDA_ARCH__ == 1000` (retargeting it compiles to a dead stub) and CUTLASS ships **zero** sm110 kernels even at v4.6.1 — only capability macros. So Thor is a correctness venue only. Every figure below is a CORRECTNESS gate, not a throughput one.
+
+**Throughput disposition: PENDING — no number is owed yet, and the earlier
+"not reproducible on this project's hardware" verdict is WITHDRAWN.**
+That verdict reasoned from the BF16 release alone (~354 GB, validated on 4x NVIDIA
+B300 at ~133 GB peak per rank, against one GB10 with 119 GiB unified). Quantized
+MiniMax-H3 checkpoints exist and DO fit:
+
+| Arm | Working set | Fits 119 GiB? |
+|---|---|---|
+| ComfyUI GGUF (`realrebelai/MiniMax-H3_GGUFs`) | DiT Q3_K_M 15.6 GB + Qwen3-VL encoder Q4_K_M 14.6 GB + VAEs ~11 GB = **~41 GB** | yes |
+| NVFP4 (`lilcheaty/MiniMax-H3-NVFP4`) | NVFP4 DiT + AWQ encoder + both VAEs | yes |
+
+So an end-to-end run and a speed comparison ARE reachable here; they are gated on
+the remaining bricks (encoder, VAEs, pipeline), not on hardware. NVFP4 is the
+likely speed path: sm_121 has native FP4 tensor cores and our NVFP4 stack is the
+most optimized one we own. A like-for-like comparison against vLLM-Omni's own
+published figures remains machine-class-limited (they are 4x B300 numbers).
+
+**Reference figures (upstream, NOT ours):** FL2VA 8.7 s clip at 1248x768 in ~87 s
+E2E on 4x B300 with USP-4 + regional torch.compile; the DiT is ~88% of request
+latency; 50 inference steps at 24 FPS.
+
+**Correctness that IS gated (no GPU, no checkpoint).** Upstream's H3 modules are
+pure Python, so they are executed at reduced dimensions as the oracle
+(`scripts/gen-minimax-h3-goldens.py`; both sides rebuild weights and inputs from an
+identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
+
+| Component | Result |
+|---|---|
+| fl2va packed layout + fp64 position grid | exact / **bit-exact** |
+| ref2va block layout (image + video_audio refs) | exact, incl. fp64 grid |
+| patchify / unpatchify / audio pack / unpack | exact + round-trip identity |
+| euler-ancestral eta0 scheduler + `rf_v_to_x0` | exact |
+| **DiT forward (reduced dims, f32)** | **max abs diff 1.6e-7 video / 1.5e-7 audio** |
+| **DiT forward (bf16 production stream)** | **max abs diff 2.4e-3 video / 2.1e-3 audio** |
+| request planning (frames, latents, sigmas, canvas, task dispatch) | exact |
+| denoise-loop invariants | pass |
+| **REAL GGUF manifest** (535 tensors, `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | exact name + shape match; geometry derived from shapes alone equals the shipped config |
+| **AUDIO VAE decoder** vs the checkpoint's own remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
+| **REAL NVFP4 manifest** (1051 tensors) | exact: compressed-tensors triple, group 16, islands unquantized |
+| **REAL video-VAE manifest** (560 tensors) | exact: decoder is a 36-block ViT, encoder the 3D CNN |
+| **VIDEO VAE decoder TransformerBlock** vs the checkpoint's own remote code | **max abs diff 6.0e-8** |
+| **VIDEO VAE FULL ViT3D decoder** (pack -> RoPE -> 36 blocks -> proj_out -> unpatchify) | **max abs diff 8.9e-8** |
+| **ENCODER text tower** (truncation + unnormalized output + DeepStack) | **max abs diff 1.2e-7** |
+| **ENCODER vision block** (LayerNorm, fp32 rotary, varlen non-causal, tanh-GELU) | **max abs diff 6.0e-8** |
+| **ENCODER FULL vision tower** (ragged 2-image batch, DeepStack + merged) | **max abs diff <= 1e-4** |
+| **CONDITION-NOISE augmentation** (visual + audio anchors) | exact (<= 1e-6) |
+| **REFERENCE-VIDEO geometry + frame schedule** | exact |
+| **VIDEO VAE tiling plan + seam blend** | exact |
+| **PRESENTATION token tags** (fl2va vision-span override) | exact |
+| **VAE encoder ResnetBlock3D** (causal Conv3d + GroupNorm3D) | exact; causality proven |
+| **VAE encoder Downsample3D** (asymmetric pre-pad + strided causal conv) | exact |
+| **WHOLE VAE 3D-CNN encoder** | exact |
+| **MM processor reuse** (H3's processor config on our Qwen3-VL front end) | pass |
+| **WAV serialization** (interleave + 16-bit PCM + clamping) | pass |
+| **Video output: PPM frames + MP4 mux argv** | pass; argv RUN through real ffmpeg -> valid h264 + AAC MP4 |
+| **`/v1/videos` request contract + job store** | pass (4 cases / 63 assertions, incl. concurrency) |
+| **`/v1/videos` ROUTE DISPATCH on ApiServer** | pass (4 cases): no-runner 500, unknown-id 404, sync success returns the runner's path, a throwing runner fails the JOB on both endpoints (process survives), malformed body 400 without reaching the runner |
+| **MP4 mux END TO END through the example binary** | pass; 12 PPM frames + WAV -> ffprobe reports h264 / yuv420p + stereo AAC 32 kHz (previously only the argv was validated) |
+| **Full CPU suite with the serving surface landed** | **333/333 pass**, clean build, zero warnings |
+| **DEVICE-RESIDENT DiT forward** (brick H3-2b, CPU backend) | pass — same upstream goldens, same 2e-5 tolerance as the CPU reference |
+| **DEVICE-RESIDENT DiT forward on a REAL GPU** (Thor, sm_110, in-container) | **video max abs diff 1.49e-7 / audio 8.94e-8** — ~134x inside tolerance and on par with the CPU reference's own 1.6e-7. 36/36 cases; the CUDA case is proven to have RUN (220 assertions execute rather than skip), and the CUDA build is 1043/1043 clean, zero warnings |
+| **DEVICE-RESIDENT bf16 PRODUCTION stream** (CPU backend + Thor GPU) | **video 2.41e-3 / audio 2.05e-3** vs the bf16 goldens (tolerance 5e-3) — essentially the CPU reference's own 2.4e-3 / 2.1e-3, i.e. the CAST POINTS agree. Also asserts the bf16 result differs from f32 by >1e-5, so a no-op dtype policy cannot pass |
+| **AdaLN modulate + bf16-cast FOLD** (CPU + Thor GPU) | pass, and byte-identical: after folding the stream-dtype cast into the two modulate kernels the GPU reports the SAME digits (2.4063e-3 / 2.05244e-3 bf16; 1.49012e-7 / 8.9407e-8 f32) and the same 9481-assertion count. Removes 5 launches per forward in bf16 (4 per block + 1 in the final layer). NO speed number: the only GPU here (sm_110) cannot run the production FP4 config and the gate is at reduced dims, so launch count is the honest unit |
+| **TRUE bf16 STORAGE** (bf16 activations + bf16 weights, fp32 islands preserved) | **video 6.16e-4 / audio 5.21e-4** vs the bf16 goldens — a **~4x improvement** on the 2.41e-3 / 2.05e-3 of the round-in-place stream. The bf16 golden was generated WITH bf16 weights, so matching upstream's weight dtypes (not just its activation cast points) moves us onto the golden's actual model. Activation bytes halve and the shared ops take their native bf16 paths |
+| **KEEP-QUANT GGUF arm** (Q8_0 projections stay block-encoded) | pass — resident weight bytes **3.77x smaller** (215,424 B vs 811,008 B on the gate's synthetic checkpoint), and the forward agrees with the DEQUANTIZED load at **video 4.39e-5 / audio 7.50e-5** (only the K-reduction order differs). Gate also asserts the load actually kept tensors quantized, left 1-D norms/biases alone, and produced non-zero output — the exact failure mode a keep-quant slice hits when its bytes never reach the device |
+| **KEEP-QUANT GGUF arm ON A REAL GPU** (Thor, sm_110) | pass — 2/2 cases, and the CPU and CUDA runs report *different* digits (4.39323e-05 vs **4.39249e-05**), which is the proof the CUDA case exercised `kMatmulBTQuant`'s own kernel rather than repeating the CPU path. Confirms the arm's premise: block-quant needs no fp4 tensor cores, so it runs natively on an arch where NVFP4 can only be emulated |
+| **AUDIO-VAE checkpoint loader** (path 2, first component) | pass — name mapping gated against the REAL 1087-tensor manifest (2770 assertions) and an end-to-end load-and-decode producing a finite in-range waveform. Found the shipped file uses LEGACY `weight_g`/`weight_v` (not the parametrization spelling the decoder reads) and prefixes BigVGAN with `decoder.` while `dec_in_proj.*` is top level |
+| **VIDEO-VAE checkpoint loader** (path 2) | pass — 560-tensor manifest mapping asserted injective; found and closed a MISSING STEP (`post_quant_conv`, a 1x1x1 channel mix outside ViT3DDecoder that nothing applied) |
+| **THIRD weight-norm spelling** (repackaged community VAE bundles) | pass — those bundles fold the weight-norm at conversion and ship a plain `<conv>.weight`. The loader reconstructs the (g, v) pair EXACTLY (v = w, g = per-slice ‖w‖), so the decoder's own materialization returns the checkpoint weight: round-trip error **1.49e-08**. `dec_in_proj` is excluded (a plain Conv1d, not weight-normalized) |
+| **SHIPPED VAE config.json parsing** | pass — both real configs embedded verbatim and parsed into the decoders' configs plus their per-channel `latents_mean`/`latents_std` (32 audio / 24 video). Catches the trap that `latent_dim` (2048) is BigVGAN's mel count while `latent_channels` (32) is the VAE latent width — reading the wrong one is wrong by 64x |
+| **ENCODER checkpoint loader** (path 2, final component) | pass — q/k/v and gate/up fused byte-exact and IN ORDER across shards (398 assertions). Order is load-bearing: the forward slices qkv_proj at [0,q)/[q,q+kv)/[q+kv,..), so a wrong order would still run and silently feed keys into the query path |
+| **ASSEMBLY: `minimax-h3-gen` driver** | pass (LOAD + PLAN) — opens a GGUF DiT (dequant AND keep-quant), both VAE safetensors and both real config.json files, derives text_len from the prompt embeddings and plans the shape: 768x1344 canvas / VAE ratio 16 = **48x84** latent, latent_t 62, 50 steps. **NOT yet verified: a full generation on a REAL checkpoint** — that needs the multi-GB download, and no such run has happened |
+| **DEVICE path through the WHOLE pipeline** | pass — the denoise loop now stages the DiT weights ONCE and runs every step device-resident, instead of calling the CPU reference forward. Gated by re-running the whole t2va path on CUDA and comparing frames AND waveform against the CPU pipeline (tolerance 2e-3, the same class the DiT forward is held to, carried through both VAEs). This is what makes a real-checkpoint run feasible at all: 50 layers x hidden 5376 x ~250k latent positions x 50 steps is not a CPU workload |
+| **`/v1/videos` wired in `examples/server`** | builds and stays OPT-IN (36/36 api-server cases unchanged; no `--video-dit` => routes unregistered). Loads the DiT + both VAEs + both configs at startup and registers a runner that generates → frames+WAV → ffmpeg → MP4. **Text conditioning NOT wired**: the prompt does not steer output until the H3-Encoder is, and the server says so at startup |
+| **FIRST REAL-CHECKPOINT RUN** (Thor sm_110, MiniMax-H3-FL2VA-Q3_K_M, 15.58 GB) | **The real DiT LOADS and its forward RUNS on GPU.** Geometry recovered from GGUF shapes alone: layers=50, hidden=5376, heads=56. ★ **keep-quant is REQUIRED, not an optimization**: the dequant path is OOM-KILLED (Q3_K -> f32 is ~145 GB vs 122 GB of unified memory); keep-quant fits in 15.6 GB. Measured (VT_H3_PROGRESS): weight staging to device **32.8 s ONCE**, DiT forward **200 s/step at seq_len 576**. NOT yet an end-to-end video: the run timed out in the VIDEO VAE DECODE, which is still CPU-ONLY (36-layer, dim-2048 ViT3D on the host) — that is the next blocker, and it is a missing device path, not a tuning problem |
+| **★ END-TO-END VIDEO ON REAL WEIGHTS** (Thor sm_110) | **PASS — a playable MP4 out of the real 15.58 GB checkpoint.** `ffprobe`: h264 / yuv420p 128x128 + AAC stereo 32 kHz. Run: latent 2x8x8, 2 steps, `EXIT=0` in **6m22s** — staging 22.3 s, DiT forward **21.1 s/step at seq_len 64**, remainder in the CPU-only VAE decode. Chain proven: GGUF keep-quant load -> device denoise loop -> post_quant_conv -> ViT3D video decode + BigVGAN audio decode -> PPM+WAV -> ffmpeg mux. NOT prompt-conditioned (the encoder is not wired, so the conditioning is a fixed embedding file) |
+| **★ `/v1/videos` SERVED from the OpenAI example server** (Thor) | **PASS end to end over HTTP.** `examples/server` started with the Qwen3-0.6B LLM AND the H3 checkpoints logs `/v1/videos on (dit layers=50, device=cuda, keep-quant)`. `POST /v1/videos` returned `{"id":"vid_1","status":"queued"}`; polling `GET /v1/videos/vid_1` reached `succeeded` with an `output_path`, and ffprobe confirms that file is h264 / yuv420p 128x128 + AAC stereo 32 kHz. An unknown id correctly 404s. Server-side trace: staging 58.0 s, DiT forward 22.4 s/step. The prompt is NOT yet conditioning (encoder unwired) and the server says so at startup |
+| **★★ PROMPT-CONDITIONED video, end to end on real weights** (Thor) | **PASS.** `--prompt "a cat playing a piano"` -> tokenizer (5 tokens) -> block-quant embedding gather -> the 32B keep-quant encoder on device -> conditioning **[5, 5120]** -> DiT -> VAEs -> MP4 (ffprobe: h264/yuv420p 128x128 + AAC stereo 32 kHz), `EXIT=0`. No `--video-prompt-embeds` anywhere in the path. Both towers resident at once: DiT 15.6 GB + encoder 13.2 GiB. Encoder staging 162.3 s, DiT 21.6 s/step at seq_len 64 |
+| **★★ ATTENTION on sm_110: 27x on the H3 step loop** (Thor) | **PASS.** sm_110 has NO FlashAttention-2 (the `fa2` cell is `8.0,8.6,8.7,8.9,12.0a,12.1a`), so H3 fell back to `DFlashBlockAttentionKernel` — one BLOCK per query row, walking keys ONE AT A TIME with a shared-memory tree reduction and ~11 `__syncthreads()` per key, re-reading Q from global for every key. That is O(seq^2) with a barrier in the inner loop, and it made the cost QUADRATIC: **14.61 s/step at seq 576 but 509.78 s/step at seq 3264**. Added a warp-per-query fast path (Q and the online-softmax accumulator in REGISTERS, `__shfl_down_sync` reductions, ZERO barriers), taken when `head_dim` is a whole number of warp widths — 64 and 128 cover every head here. Measured with the new `--denoise-only`: **18.68 s/step at seq 3218**, i.e. **~27x**, and the scaling is now near-LINEAR in seq (5.6x the sequence for 1.28x the time) rather than quadratic. Same online-softmax recurrence, so this is a scheduling change, not a numerical one: gated by `test_ops_dflash_block_attn` (198,412 assertions), `test_ops_dflash_paged_block_attn` (795,648), `test_ops_attention` and `test_qwen27_dflash_spec_decode`, all green on the sm_110 board |
+| **★★★ ATTENTION on sm_110, ROUND 2: chunked warp REDUCE-SCATTER — 1.76x on the whole H3 step, 1.80x on attention** (Thor) | **PASS.** The warp-per-query kernel above left attention at **0.63 TFLOP/s against 30.0 TFLOP/s for our own cuBLASLt GEMMs on the same chip** — 47x — because it still reduced ONE KEY AT A TIME: ~4 useful FMAs per lane, then a 5-stage `__shfl_down_sync` tree plus a broadcast, and every key's `(m, l, acc)` update read the previous key's, so the warp was LATENCY-bound at ~8% of the CUDA-core ceiling rather than throughput-bound at the ~32% its instruction mix allowed. `DFlashAttnChunkKernel` processes keys **32 AT A TIME**: each lane keeps its 32 per-key partials in registers, ONE butterfly **reduce-scatter** (5 rounds, **31 shuffles** against 192, with compile-time array indices so `p[32]` never spills) turns the 32x32 partial matrix into “lane L holds the complete score for key L”, and there is **one online-softmax update per 32 keys instead of 32** — 2 `expf` per chunk against 64. Loads stay `lane == element` and COALESCED (the partition is contiguous+vector at head_dim 64/128, strided at 96, whichever keeps the warp's sectors minimal). Same-binary A/B, `--denoise-only --steps 3`, **per FORWARD**: **seq_len 3264 28.08 → 16.33 s (1.72x)**, **seq_len 6080 91.61 → 51.97 s (1.76x)**, **seq_len 15424 558.39 → 316.95 s (1.76x)** — the warp arm reproduces the standing 28.16/91.81/559.46 s baselines to within 0.3%. A joint `t = G*seq + A*seq^2` fit with a SHARED linear term (the GEMMs are untouched) puts attention at **542.81 → 301.01 s** at the production canvas, i.e. **1.80x** and **0.63 → 1.13 TFLOP/s** over the 341.1 TFLOP that canvas actually costs (seq 15424, head_dim 128, 56 heads, 50 layers). A 50-step 864x480/124f render goes from **~7.8 h to ~4.4 h**. Still only ~15% of the ~7.7 TFLOP/s CUDA-core ceiling — the residual is the reduce-scatter itself plus the bf16→f32 converts, **NOT** memory. ★ RED PROOF (a green suite does not prove the kernel ran): perturbing this kernel's store by 1.001x turned **7 of 12 cases red, 193,127 assertions**, and the 7 are exactly the CUDA-touching ones — the 5 semantic corners, LONG causal, LONG SWA, LONG non-causal, LONG multi-request (H3's real `{0, used, seq_len}` TWO-document packing), LONG ragged causal, and the new LONG head_dim 96 case; reverted, 12/12 green again. Gates on the sm_110 board: `test_ops_dflash_block_attn` 12/12 (3,260,884 assertions), `test_ops_dflash_paged_block_attn` 1/1 (795,648), `test_ops_attention` 9/9, `test_qwen27_dflash_spec_decode` 3/3, `test_minimax_h3` 62/62. **head_dim 96 was previously UNTESTED** — the fast path's `head_dim/32 == 3` instantiation shipped unexercised (every case was 16/32/64/128), so two short and two LONG d=96 cases were added with it. ★ `--denoise-only` also had a real REPORTING bug: an N-sigma schedule runs N-1 forwards but the driver divided elapsed time by N, under-reporting per-forward cost by 1.5x at `--steps 3` — enough to make an A/B look like a regression. It now prints `forwards=` and `per_forward=`. |
+| **★★★★ ATTENTION on sm_110, ROUND 3: bf16 TENSOR CORES — 9.82x on the whole H3 step, 13.5x on attention** (Thor) | **PASS.** Rounds 1 and 2 rescheduled attention; both left it on the CUDA CORES, and after the reduce-scatter it still ran at **1.09 TFLOP/s against 30.0 TFLOP/s for our own cuBLASLt GEMMs on the same chip** — the residual was never a scheduling problem, it was the wrong MATH UNIT. `DFlashAttnMmaKernel` puts BOTH GEMMs of attention on the bf16 tensor cores with `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`. PROBED first, not assumed: that instruction assembles, launches and accumulates on sm_110 — the `kind::mxf4nvf4` restriction recorded for this box is specific to the BLOCK-SCALED FP4 MMA and does not reach standard bf16 MMA, so "sm_110 is portable-kernels-only" was too strong. SHAPE: one WARP owns 16 query rows and the FULL head_dim of output, 4 warps per block share a staged 32-key K/V tile, `S = Q·Kᵀ` is d/16 k-steps x 4 n-tiles and `O += P·V` is 2 k-steps x d/8 n-tiles. **S, P and the entire O accumulator stay in REGISTERS**: the m16n8k16 C fragment (rows gid/gid+8, cols tig*2+{0,1}) IS the next MMA's A fragment, so P needs zero shuffles and zero shared round-trip, and the online-softmax (m, l) state reduces across a QUAD with two `__shfl_xor` — no block barrier at all. Only K and V are staged: **17,408 B/block at head_dim 128** (4,608 B at 64), which is HALF what the round-1 shared-memory attempt spent when it measured 23% slower. **168 registers/thread, STACK 0, LOCAL 0 (no spill)** => 3 blocks x 4 warps = **12 of Thor's 48 warps/SM, 25% occupancy, register-limited** — deliberately low, which is what a tensor-core kernel trades for. K-fragment shared reads are conflict-free by construction (row stride d+8 => an ODD multiple of 4 banks); the V fragment reads a COLUMN, which is 4 separate 16-bit loads but still conflict-free (lane pairs land on the same 32-bit word and BROADCAST). **Same-binary A/B** (`VT_DFLASH_ATTN_MMA=0` selects the round-2 arm), `--denoise-only --steps 3`, **per FORWARD**: **seq_len 3264 16.34 → 3.25 s (5.03x)**, **seq_len 6074 51.96 → 7.11 s (7.31x)**, **seq_len 15421 321.13 → 32.71 s (9.82x)** — the disabled arm reproduces the standing 16.33/51.97/316.95 s baselines to within 1.3%. A joint `t = G*seq + A*seq^2` fit over all six points with a SHARED linear term (the GEMMs are untouched) puts attention at **311.6 → 23.1 s** at the production canvas, i.e. **13.5x** and **1.09 → 14.75 TFLOP/s** over that canvas's 341.1 TFLOP. A 50-step 864x480/124f render goes from **~4.4 h to ~27 min** (from ~7.8 h before round 2). Still only ~11% of Thor's bf16 tensor-core peak: the next lever is `ldmatrix.trans` for the V fragment (it would collapse 128 scalar shared loads per warp per key-tile into a handful of instructions) and a wider key tile, neither attempted here. **NUMERICS, stated rather than hidden**: Q/K/V are already bf16 in the production stream so QKᵀ loses nothing, but the P·V GEMM must round the probabilities to bf16 exactly as FlashAttention does — a bounded ~2^-9 relative perturbation. So this path is gated at a **bf16 tolerance (5e-3 max, 1e-3 RMS)**, the same bar `test_minimax_h3` already uses for its bf16 stream, and **f32 inputs deliberately stay on the CUDA-core kernel**, which still gates at 2e-5. Nothing was loosened: the f32 cases are unchanged and still green. ★ RED PROOF: perturbing this kernel's store by +0.25 turned **2 of 15 `test_ops_dflash_block_attn` cases red (26 assertions)** — exactly the two new bf16 parity cases — and **1 of 62 `test_minimax_h3` cases red**, which is the CUDA bf16 DEVICE FORWARD, proving the kernel is on the real H3 production path and not merely on a unit test; `test_ops_dflash_paged_block_attn` and `test_ops_attention` stayed green (they do not route here), and reverting restored 15/15 and 62/62. ★ The f32-only CUDA coverage would have shipped this kernel NEVER-EXECUTED — every pre-existing CUDA case in `test_ops_dflash_block_attn` uploads f32 — so bf16 coverage was added with it: 7 short semantic corners (non-causal/causal/block-isolation/SWA/GQA-extreme/d=96/bf16-out), 6 LONG cases (two-document `{0, used, seq_len}` at d=128, d=96, causal, SWA, ragged causal, ragged non-causal) and a bf16 RED case pinning causal-vs-non-causal separation at >0.5, ~100x the tolerance the parity cases allow. Gates on the sm_110 board: `test_ops_dflash_block_attn` **15/15** (6,352,687 assertions), `test_ops_dflash_paged_block_attn` 1/1 (795,648), `test_ops_attention` 9/9, `test_qwen27_dflash_spec_decode` 3/3, `test_minimax_h3` 62/62. |
+| **One-key-per-lane attention — MEASURED NEGATIVE, not dispatched** | The obvious way to delete the per-key reduction is to give each lane a WHOLE key: lane L computes the entire d-length dot product for key `base+L` with Q broadcast from shared, so no lane ever reduces against another. Implemented, RED-proved (perturbing its store turned 6 of 11 cases red, 168,630 assertions, all five LONG cases among them) and measured: **43.35 s/forward against 28.08 s for the incumbent at seq_len 3264 — 54% SLOWER**, same binary. **WHY**: giving a lane a whole K row makes every K load instruction **32-WAY SCATTERED** (one 32-byte sector per lane, ~32 per instruction against 2–4 coalesced). The rows are L1-resident so nothing reaches HBM, but the load/store unit still replays every address — the work simply moved from the shuffle pipe to the memory pipe. That is the measurement that produced the winning design: kill the per-key reduction WITHOUT surrendering `lane == element` coalescing, which is what the reduce-scatter does. Kept in-tree behind `VT_DFLASH_ATTN_KEYLANE=1` so the three-way verdict reproduces on ONE binary. |
+| **Q-BLOCKED attention — MEASURED NEGATIVE, reverted; and it CORRECTS the diagnosis above** | Carrying kQ queries per warp loads each K/V row once and reuses it kQ times, in REGISTERS (ptxas: 64 regs at kQ=4, 108 at kQ=8, zero stack, zero local, no shared memory — deliberately avoiding what sank the tiling attempt). Paired reps, order reversed between arms, box noise <=0.07%, 2-step `--denoise-only` totals: at 864x480 seq 15424 baseline **557.81/557.78 s** vs kQ=4 **553.13/553.15 s (-0.84%)** and kQ=8 **765.57 s (+37.2%)**; at 512x512 seq 3264 baseline **28.05/28.03 s** vs kQ=4 **28.99 s (+3.32%)**. Output checksums identical across all arms. REVERTED: a wash at the production canvas does not buy a reproducible regression at the short one. ★ **The premise was WRONG, and it was the same wrong premise behind the shared-memory attempt**: one head's K+V at seq 15424 is **3.9 MB against Thor's 32 MB L2**, and every warp on a given `blockIdx.y` streams the same rows — so the ~341 TB/step figure was never the bound, that traffic was already L2-resident. Q-blocking removes re-reads that cost nothing and does NOT remove the per-key warp-shuffle reduction (kQ of them per K row, the same total), while adding a serial expf dependency chain of kQ softmax updates — which is why kQ=8 is far worse than kQ=4 rather than twice as good. **The open lever is the per-key REDUCTION, not the memory source** — TAKEN, and the row above records how: one key per lane was the WRONG way to take it (54% slower, it scatters the loads), a chunked reduce-scatter is the right one (1.76x). Kernel kept in-tree uninstantiated and annotated, since a part with small L2 relative to one head's K/V could flip the verdict. ★ Green suites do not prove a kernel RAN: verified by a RED proof (perturbing the Q-block store turned 6/11 cases red, 2,321,426 -> 195,823 failures) and three new LONG cases — causal T=2560, causal sliding-window T=2048/D=128/window=48, and ragged multi-request T=2185 in both masks. The two pre-existing long cases are both non-causal single-document, the one mask where every query sees the SAME key range, so they could not have caught a per-query mask bug |
+| **Shared-memory K/V tiling for long attention — MEASURED NEGATIVE, reverted** | At the real default canvas (864x480 / 124f, latent 37x30x54) a step costs **557.74 s at seq_len 15424**: 4.7x the sequence of the 512x512 run for 29x the time, so ~85% of the step is attention and the quadratic term dominates again. Tried staging K/V tiles in shared memory so a block's warps share the keys they read. Result: **686.91 s/step — 23% SLOWER**, reverted. Diagnosis: tiling moved where K comes from, but the real cost is the per-key warp-shuffle reduction (5 shuffles + a broadcast for EVERY key), which is unchanged, while 32 KB of shared memory per block crushed occupancy — and K/V were likely already being served from L2. **The promising direction is one reduction per 32 keys rather than one per key.** Both ways of getting there have since been ATTEMPTED and measured: one key PER LANE (a whole d-length dot product per lane, Q in shared) is **54% SLOWER** because it scatters the K loads, while a chunked **reduce-scatter** that keeps `lane == element` coalescing is **1.76x FASTER**. See the two rows above. ★ The first version of this kernel also silently never ran: it was guarded to `num_reqs == 1` while H3 packs `{0, used, seq_len}` (content + padding = TWO documents), and the step time came back byte-identical, which is what exposed it. The long-sequence gates added to catch that are KEPT — nothing in the suite previously exercised attention above seq 2048 |
+| **ref2va VIDEO references (silent) wired** | pass — needed NO new porting: the 3D CNN is causal in time, so a clip is the image path with `t > 1`. Emitted as a **kVideoAudio** block, because `kImage` counts exactly ONE frame however large its `latent_t` — a clip returned as kImage would silently lose its temporal extent, so the gate asserts a video reference occupies MORE rows than an image one. `ref_audio_t = 0` keeps it honest: no audio rows are claimed, since the audio-VAE encoder that would fill them is not ported, and a video reference WITH audio THROWS. Moves the video rows by **0.83** under identical prompt/noise/schedule. Driver `--ref-video DIR` reads `DIR/frame_%06d.ppm` — exactly what this example WRITES — so a previous run's workdir feeds straight back in as a reference, which is how clips get chained |
+| **ref2va IMAGE REFERENCES wired; audio references REFUSED** | pass — reference blocks now build the ref2va packed layout and their visual rows ride the same pinned-condition mechanism keyframes use, so this reuses the image→latent path rather than duplicating it. Gated on the same load-bearing property as fl2va: an image reference **moves the video rows by 0.98** under identical prompt, noise and schedule. Two refusals are gated as behaviour, not left to chance — an AUDIO reference block THROWS (the audio VAE's ENCODER is not ported, only its decoder, so honouring one is impossible and silently conditioning on nothing would be worse), and fl2va + ref2va together THROW as mutually exclusive. Driver: repeatable `--ref-image f.ppm`. Audio-bearing blocks are covered by the row below (the audio-VAE ENCODER landed); what is refused now is an audio-bearing block with no encoded rows behind it |
+| **★ AUDIO-VAE ENCODER ported; ref2va AUDIO and VIDEO+AUDIO references wired** | pass — the last two unwired conditioning modes. The shipped `DacAudioVAE` exposes only `decode` (dac_audio_vae.py:211-225), so the encode path was composed the way vLLM-Omni composes it (vae.py:317-325): `preprocess` right-pad to a whole hop -> DAC `Encoder` (Snake1d, three dilated ResidualUnits per block, the strided conv stack) -> `pre_block` `AttnProjection` (causal SDPA, MEAN over heads, adaptive-average-pool narrowing 2048->32, GeGLU MLP) -> `mean_proj`. Gated STAGE BY STAGE against the CHECKPOINT'S OWN remote code executed at reduced dimensions by `scripts/gen-minimax-h3-audio-vae-encoder-goldens.py`: **conv stack 2.98e-8, AttnProjection 1.64e-7, whole encode-to-latent 1.86e-8**. `mean_proj` and never `logs_proj` — a sampled reference would condition differently every run, so `logs_proj` is not even loaded. `LoadMiniMaxH3AudioVaeEncoderWeights` takes the half the decoder loader skips, gated against the same REAL 1087-tensor manifest (which also confirms the shipped geometry from shapes alone: encoder_rates [2,4,4,5,5], latent_dim 2048, attn_proj_dim 32) and accepting all three weight-norm spellings, the materialized one reconstructed to **<=1e-6** round-trip. Wiring gated on the load-bearing property, not on acceptance: an AUDIO reference **moves the audio rows by 0.51** and the video rows by 5.5e-3; a VIDEO+AUDIO reference moves the audio rows by **0.71** and the video rows by 5.5e-3 against the SILENT same-clip control; and a DIFFERENT reference waveform moves the audio rows by **7.1e-4**, which is what a wiring that reserved the rows and pinned a constant would fail. Audio-bearing blocks with no rows behind them still THROW. Driver: `--ref-audio f.wav`, backed by `MiniMaxH3ReadWav` in the library (16-bit PCM, chunk-list walk, mono repeated to stereo), gated against the writer it inverts and REFUSING a non-32 kHz file rather than mis-encoding it. NOT covered: no real-checkpoint reference-audio render has been run |
+| **fl2va REFERENCE CONDITIONING wired end to end** | pass — the fl2va primitives were all ported and gated in PIECES (packed keyframe layout, the VAE 3D-CNN encoder, condition-noise augmentation, the loop's pinned condition rows) but nothing connected them, so the feature was UNREACHABLE: `MiniMaxH3GenerateT2va` passed `{}` for both conditioning arguments. Closed the two real gaps — the decoder loader deliberately skips `encoder.*`, so `LoadMiniMaxH3VideoVaeEncoderWeights` now loads the encoder half (strips `encoder.`, KEEPS `quant_conv` which is the encoder's output stage), and `MiniMaxH3VideoVaeEncodeToLatent` takes the distribution MEAN rather than a sample so one reference image conditions identically every run. fl2va is modelled as a PARAMETERIZATION of the t2va pipeline rather than a parallel path, exactly as upstream models it. The gate asserts the thing that matters: with identical prompt, noise and schedule, conditioning **moves the video rows by 1.20** — a wiring that accepted the rows and ignored them would produce perfectly finite, correctly shaped output and pass every structural check. Caught in the process that `z_channels` is the MOMENTS width (48), not the latent width (24). Driver: `--first-frame` / `--last-frame` (binary PPM, the format this example already writes, so one run's frame can condition the next) and `--noise-aug` |
+| **★★★ IMAGENET PIXEL SPACE — the missing output stage, found by reading ComfyUI** | **This is why frames were dark and washed out.** The video VAE works in IMAGENET-NORMALIZED pixel space, and the conversions sit OUTSIDE `ViT3DDecoder` in upstream's wrapper: decode ends `dec*std + mean`, clamp [0,1], `*2-1` (comfy/ldm/minimax/vae.py:693) and encode begins `((x+1)/2 - mean)/std` (:659). We did NEITHER — the raw decoder output went straight to a writer expecting [-1,1]. Two compounding errors: the per-channel means differ (0.485/0.456/0.406) so it CAST COLOUR, and std ~0.22 meant the true dynamic range was compressed ~4.4x, which is exactly "dark and low-contrast" (the 864x480 render measured mean pixel **18/255**). Same shape of omission as `post_quant_conv`: outside the decoder, so the decoder's own **1.19e-07** gate could never have caught it. Also fixed on the ENCODE side, so keyframe/reference conditioning had been feeding the CNN [-1,1] where it wanted ImageNet space. Gated per channel, not just on a round trip — a shared mean/std would round-trip perfectly and still cast colour — plus the clamp ORDER (before the [-1,1] map, so out-of-gamut saturates at exactly +/-1 rather than overshooting) |
+| **★★★ VIDEO DECODE FIXED: temporal chunking AND spatial tiling COMPOSE** | **Resolved.** Neither alone is upstream's behaviour, and either alone is WORSE than neither. Measured on the same prompt/seed/steps at 512x512 (period-16 patch-grid score, control period-13 in brackets): untiled+unchunked 20st **2.64** [0.96], spatial-tiling only **2.80** [0.99], untiled+unchunked 50st **3.33** [1.00], **temporal-only 4.20** [1.00] — the WORST of any run — and **temporal+tiled 2.46** [0.98], versus **2.12** for the 256 single-tile reference where tiled and untiled coincide. The composition comes from upstream's own chunk loop: `clip_dec = self._adaptive_decode(clip_z)`, so each TEMPORAL chunk is ALSO spatially tiled when tiling is on. Running one without the other is a third thing upstream never does — which is exactly what the two previous attempts each tested. The 512 output is now near the single-tile reference and the residual is the inherent patch texture of a patch-based ViT decoder, not an artifact. Independent cross-check: our chunk arithmetic yields 39 frames (17+17 blended+5) and the frame planner's own `17n+5` alignment of a 33-frame request also lands on 39 — two unrelated derivations agreeing |
+| **★★ TEMPORAL CHUNKING — read out of upstream, after two wrong diagnoses** | The video decode was missing `decode_temporal` entirely. Found by reading the CHECKPOINT'S OWN `klvae.py` rather than inferring from output: `decode_base` routes video through **`decode_temporal`**, never a single pass, and the ViT is handed `tokens_chunk_size + token_overlap` temporal tokens at a time. Shipped config (clip_length 17, token_drop 3, vae_ratio_t 4) ⇒ chunk 5, overlap 2, pre-pad 3, frame-overlap 5, so a 12-token latent decodes as **2 chunks of 7 tokens — never 12**. Same mechanism as the spatial case: the ViT's RoPE is LENGTH-NORMALIZED over the grid handed to it, so the TEMPORAL extent is part of the input. **This also corrected an earlier wrong call of mine**: upstream does NOT spatially tile the ViT decode — `decode()` calls `self.decoder(z2)` directly, `_adaptive_decode` tiles only when `decoder_tiling` is set, it defaults FALSE, and the shipped `video_vae_config.json` carries no tiling key at all. Every reduced-dimension gate runs at latent_t 2, below one chunk, where chunked and unchunked coincide — the same blind spot that hid the tiling question |
+| **★★ VAE SPATIAL TILING — the cause of the "squared windows" artifact** | **FOUND BY A/B ON REAL OUTPUT, then fixed.** A 512x512 prompted run produced globally-correct frames (recognisable subject, correct scene layout) covered in a grid of small squares. It was NOT quantization: the discriminator is that `MiniMaxH3SplitTiles` plans 512 px as **3 tiles per axis** (starts 0/128/256) but plans 256 px as **exactly 1 tile**, so a 256x256 run is the one size where tiled and untiled are the SAME computation — and 256x256 came out **clean**. Root cause: `MiniMaxH3SplitTiles`/`MiniMaxH3BlendTiles` were implemented and gated but **nothing called them**, and tiling here is NOT a memory strategy — the ViT3D's RoPE coordinates are LENGTH-NORMALIZED (`2*((i+0.5)/n)-1`) over whatever grid it is handed, so the grid EXTENT is part of the input. Feeding a 32x32 latent to a decoder trained on 16x16 tiles gives every token a position the model never saw. Every reduced-dimension gate in the suite is smaller than one tile, which is exactly why none of them caught it. Now wired: `MiniMaxH3VideoVaeDecodeTiledDevice` slices the latent on the pixel plan, decodes each tile, and cross-fades the seams. Gated at both ends — a single-tile canvas is **bit-identical** to the untiled decode (max\|diff\| == 0), and on a 2x2-tile canvas each tile's un-blended interior equals a standalone decode of that tile's own latent slice **exactly** (max\|diff\| == 0), which is what pins down the slicing, placement and seam arithmetic; both failure modes still yield plausible finite frames |
+| **NVFP4 STREAMING loader** | pass — the NVFP4 arm was OOM-KILLED during load on Thor (kernel oom-kill, **anon-rss 125 GB**; the box survived, only the process died). Measured cause, not guessed: `LoadMiniMaxH3DitFromNvfp4` materializes every weight as host **f32**, ~132 GB for the 18.75 GB checkpoint, before any staging doubles it. The GGUF arm never hit this because it already streamed. `StreamMiniMaxH3Nvfp4ToDeviceBf16` is that function's twin — dequantize ONE tensor from its NVFP4 triple, upload, let the host buffer die — so peak is the device copy plus one tensor. Gated against the reference loader rather than on "it loads": values match **EXACTLY (max\|diff\| == 0** — NVFP4 lands on bf16 without rounding), geometry agrees, and `rope.inv_freq` is asserted HOST-resident (the forward reads it before any kernel). The real file verifies as expected: **1051 tensors**, 258 U8 + 258 F8_E4M3 + 258 F32 + 277 BF16, with real `adaln_proj` — i.e. the UNPRUNED variant our forward implements, not the timestep-LUT "pruned" one |
+| **★ DEVICE-RESIDENT video VAE decoder** | **pass — max abs diff 1.19e-07** vs the CHECKPOINT'S OWN remote code (not vs our portable decoder — two implementations agreeing on a wrong answer is a failure mode this tree has already hit), in the same class as the portable path's own 8.9e-8. Gated on CPU and on a real sm_110 GPU. This retires the LAST CPU-only stage in the video path: the portable ViT3D decoder is scalar triple loops with double accumulation, which is what made a 256x256 decode time out. **NO new kernels** — the whole 36-layer decoder maps onto the tuned shared ops given two EXACT load-time weight rearrangements: this checkpoint stores `to_qkv` PER-HEAD INTERLEAVED (`[head][q|k|v]`) where `vt::QkvSplit` wants `[q_all|k_all|v_all]`, so the weight ROWS are permuted once at stage time; and each branch's `h += scale * (x @ W^T + b)` has a learned PER-OUTPUT-CHANNEL scale, which folds into the preceding projection's rows and leaves a plain `vt::Add`. Both folds are silent-failure shaped (a wrong permutation still yields plausible finite frames), which is why the gate is against upstream |
+| **ENCODER keep-quant GGUF loader** (qwen3vl-32B Q4_K_M, 902 tensors) | pass — holds the 32B tower at ~14.6 GB instead of the ~128 GB an f32 materialization needs (which does not fit the test box). The q/k/v and gate/up fusions are done on the QUANTIZED bytes and gated BYTE-FOR-BYTE against `q ++ k ++ v` / `gate ++ up`: sound because ggml rows are independent block sequences and every K here is a multiple of the 256-element block, so no dequantize/requantize round trip is needed. Geometry recovered from the fused shapes; `norm.weight` correctly NOT bound (H3 reads the unnormalized truncated output) |
+| **ENCODER loaded from the REAL 14.58 GB file** (Thor) | pass — **13.24 GiB resident keep-quant**, loaded ALONGSIDE the keep-quant DiT, with geometry recovered from shapes alone: layers **50** (truncated from the file's 64 — H3's own min(num_hidden_layers, 50)), hidden 5120, heads 64, kv_heads 8, head_dim 128, ffn 25600 — i.e. Qwen3-32B with 8:1 GQA. Found on the real file that the K_M recipe stores `v_proj` as Q6_K while q/k are Q4_K, so that group is kept UNFUSED rather than dequantized |
+| **★ DEVICE keep-quant ENCODER forward** | **pass — max abs diff 3.76e-4** vs the gated host f32 reference on a scale of ~1.0 (0.04% relative), which is Q8_0 quantization error and nothing else: both paths run the SAME dequantized numbers, so the only difference is where quantization enters. The 32B tower runs from its ggml blocks — projections go through `vt::MatmulBT`, which dispatches `kMatmulBTQuant` — with NO dequantization on the path. All three H3 deltas preserved (layer truncation, UNNORMALIZED output, DeepStack left to the caller), and M-RoPE reuses `vt::RopeFromCache` because upstream's `cat(freqs, freqs)` makes cos/sin repeat across halves |
+| **Embedding gather from the block-quant table** | pass — decodes ONLY the requested rows and is **BIT-IDENTICAL** to slicing a full-table dequant (valid because ggml rows are independent block sequences). Matters because the table is [151936, 5120] (~1.5 GB quantized) while a prompt touches a few dozen rows. Out-of-range ids THROW rather than read past the table |
+| **post_quant_conv WIRED into the t2va pipeline** | pass — re-running the whole t2va path with the tensor present shifts the frames by **0.056** while leaving the waveform BIT-IDENTICAL (a video-side wrapper tensor must not touch audio). Without this the wiring would be a branch no test enters, which is how the step went missing originally |
+| **WHOLE t2va path composes** | frames + stereo waveform, correct shapes, finite, in [-1, 1] |
+| **GGUF load -> runnable DiT** | geometry from shapes; a real forward runs off the loaded weights |
+| **NVFP4 load -> runnable DiT** | compressed-tensors triple dequantized; a real forward runs |
+
+**Reproduce:** `cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`
+then `cmake --build build-cpu --target test_minimax_h3 -j16 && ./build-cpu/tests/test_minimax_h3`
+(34/34 cases, 9233 assertions). Regenerate goldens with
+`python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <checkout> --out tests/vllm/models/minimax_h3_goldens.inc`;
+regenerate the GGUF manifest by range-fetching the first 4 MiB of the .gguf and running
+`scripts/gen-minimax-h3-gguf-manifest.py`.
+
+**Next gate:** download a quantized checkpoint and close the e2e loop (encoder -> VAEs -> pipeline), then W2b/W10 for speed. See
+[.agents/specs/minimax-h3.md](../.agents/specs/minimax-h3.md).
+
+## MiniMax-H3 W-FP4a — fp4-RESIDENT Marlin-W4A16 routing wired; CPU wiring-gate GREEN; GB10 fp4-vs-bf16 delta + s/step PENDING (2026-08-06, `row/H3-FP4-SPEED`, `ROAD-V1-H3`)
+
+**What changed.** The NVFP4 arm dequantized every packed FP4 projection to bf16 and
+ran `vt::MatmulBT`, so the sm_121a FP4 tensor-core route had NEVER run for H3. This
+keeps the FP4 packed and routes each quantized projection through
+`dense_nvfp4::MatmulNvfp4W4A16D` (Marlin W4A16, forced by vLLM's own a16 selection —
+the checkpoint is weight-only NVFP4, `IsTrueW4A4()==false`). No new quant code; it
+reuses the same dispatcher as Laguna routed-experts + dense Qwen3-32B NVFP4.
+
+**Per-shape routing (real geometry, spec §8.1):** all quantized projections are
+uniformly Marlin W4A16 — `qkv_proj [21504,5376]`, `out_proj [5376,7168]`, `fc1
+[28672,5376]`(+SiluAndMul, pre-merged so no fused-pair), `fc2 [5376,14336]`, block
+`adaln [96768,2688]`, `condition_proj [5376,5120]`, `final_adaln [10752,2688]`,
+refiner qkv/out/fc1/fc2. Islands + norms/biases stay bf16/f32. All N,K %16==0 and
+%128==0 — no Marlin shape blocker. Peak device memory ~1/4 of bf16 (~16 GB packed
+vs ~66 GB bf16).
+
+**CPU gate (verified, this box has no nvcc):** `test_minimax_h3` 62/62 cases /
+30039 assertions, 0 failed (Release, gcc-13). The synthetic-NVFP4 case now streams
+BOTH arms on the SAME file, asserts the fp4 loader kept projections PACKED (fp4 slot
+set / bf16 slot Empty; inverse for the bf16 loader), and asserts the W4A16
+dispatcher executed all 11 quantized GEMMs (the `Nvfp4W4A16Stats` this-path-ran
+counter == 11). fp4-vs-bf16 bounded <= 2e-3. On CPU the dispatcher has no Marlin op,
+so it falls back to the bf16 arm's own dequant+matmul: this is a WIRING gate here,
+proving the loader sets the fp4 slots and the forward routes them, NOT the kernel
+numerics. The Marlin W4A16 kernel itself is CUDA-gated independently by
+`test_ops_nvfp4_matmul` (odd shapes, 2e-3 f32-out / 4e-3 bf16-out vs bf16 ref) and
+`test_linear_method`.
+
+**PENDING (GB10, handoff recipe):** git-archive the row to dgx.casa, configure with
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, build ONLY
+`test_minimax_h3` (targeted — not a whole-archive), run
+`test_minimax_h3 --test-case="*NVFP4 checkpoint loads*"` — on CUDA the same case
+exercises Marlin (`stats.marlin_gemms==11`) and reports the real fp4-vs-bf16 delta;
+add a steady per-step timer around `MiniMaxH3DitForwardDevice`. Blocked on a safe
+disk/build window (dgx 33 G free vs 15 G floor; 570 G `.cache` is shared, not ours).
+Real-checkpoint t2va e2e is DISK-BLOCKED (~41 GB NVFP4 working set to download vs
+~18 GB usable, encoder required for a real render). `benchmark_binding=false`.
+
+**Comparability (mission #3):** vLLM-Omni CANNOT serve a quantized H3 on one GPU —
+BF16-only in practice (source-audited at `a4ea67a2`/v0.26.0: no quantized H3
+checkpoint exists; the fp32-island guard `minimax_h3_transformer.py:898-904` aborts
+a naive quant; text encoder hard-bf16 `encoder.py:930`; GGUF not wired into H3).
+Single-GPU IS supported but as BF16 + `--enable-cpu-offload`. -> HW/loader-forced-
+indirect (DeepSeek-GGUF precedent). The "DiT = 88% of latency" figure is NOT in the
+vllm-omni source; the documented anchor is the recipe's 4×B300 BF16 evidence (FL2VA
+209f 1248×768 = 86.964 s; two-video Ref2VA = 784.394 s, `recipe:298-311`).
+
+
+## MiniMax-H3 W-FP4a GB10 leg — Marlin W4A16 RAN on sm_121a (byte-exact); fp4 is a MEMORY win not a diffusion-forward SPEED win; e2e RENDERS on real weights but the frame is a non-scene patch-grid (2026-08-06, `row/H3-FP4-GPU-E2E`, `ROAD-V1-H3`)
+
+**Setup.** dgx.casa GB10 sm_121a, CUDA 13, cutlass 4.5.0, Release. git-archive of
+`row/H3-FP4-GPU-E2E` (goldens md5 byte-identical both sides). Targeted build of
+`test_minimax_h3` only. New CUDA case `minimax_h3: the NVFP4 fp4 forward runs
+Marlin W4A16 on CUDA (speed)` builds a synthetic compressed-tensors NVFP4 file at
+REAL H3 geometry (1 AdaLN block + 1 refiner = 11 quantized projections), streams
+BOTH the bf16 arm and the fp4-resident arm off the SAME file, runs both device
+forwards, and times them (median over 12 reps, cold leg discarded) on an idle box
+(free=117 G after drop_caches). Env-tunable seq via `H3_FP4_{LT,LH,LW,AT,AC,TEXT}`.
+
+**The Marlin path RAN (the mission's `marlin_gemms==11`, corrected for the real route).**
+On CUDA the W4A16 dispatcher counter is:
+- **default (VT_MARLIN_DENSE ON): `dense_gemms=11, marlin_gemms=0, fallback_gemms=0`** —
+  each of the 11 quantized projections took vLLM's OWN dense Marlin GEMM
+  (`vt::MarlinDenseGemm`), NOT the single-expert MoE-grouped Marlin the spec §8.1
+  assumed.
+- **VT_MARLIN_DENSE=0: `marlin_gemms=11, dense_gemms=0, fallback_gemms=0`** — the
+  grouped MoE-Marlin route, the mission's literal counter.
+`fallback_gemms==0` in BOTH ⇒ no CPU/redundant-dequant fallback; the sm_121a
+Marlin W4A16 tensor-core path genuinely executed for every projection. (Spec §8.1
+routing note corrected: the production default is the DENSE marlin, not grouped.)
+
+**fp4-vs-bf16 numeric delta = 0 (byte-exact), all sizes.** Both arms consume the
+SAME packed NVFP4 bytes; the dense Marlin GEMM (fp32-C reduce) is byte-preserving
+vs the bf16 arm's dequant+MatmulBT, so the two device forwards produce BIT-IDENTICAL
+video+audio logits (bf16 video max|val|=1243.18, max|diff|=0). The fp4-resident arm
+costs nothing in accuracy.
+
+**Timing — the crossover (median/12, cold discarded).** Per-forward (whole 2-block
+DiT step; attention + fp32 islands + the 11 W4A16 GEMMs), dense route:
+
+| seq (M) | bf16 ms | fp4 ms | ratio bf16/fp4 |
+|---|---|---|---|
+| 64    | 12.57  | 3.62   | **3.47** (fp4 faster) |
+| 4224  | 76.61  | 92.83  | 0.825 (fp4 slower) |
+| 7040  | 129.36 | 164.23 | 0.788 (fp4 slower) |
+
+(grouped route @seq4224: bf16 76.07 / fp4 94.28 = 0.807 — same story, dense marginally faster.)
+
+Per-GEMM microbench, `ratio(bf16/fp4)` (fp4 faster when >1):
+
+| GEMM [N,K] | M=64 | M=4224 | M=7040 |
+|---|---|---|---|
+| qkv [21504,5376] | 3.16 | 0.582 | 0.529 |
+| out [5376,7168]  | 3.90 | 1.02  | 1.06  |
+| fc1 [28672,5376] | 3.32 | 0.596 | 0.533 |
+| fc2 [5376,14336] | 2.86 | 1.22  | 0.90  |
+
+**Verdict.** Marlin W4A16 is a WEIGHT-BANDWIDTH optimization: it reads ¼ the weight
+bytes but does the SAME bf16 tensor-core FLOPs plus an on-the-fly dequant. At small
+M (decode-like, memory-bound) it is ~3× faster; in H3's diffusion-forward regime
+(one forward over the WHOLE packed sequence, M = thousands, compute-bound) the big
+projections (qkv/fc1) are ~1.7–1.9× SLOWER and out/fc2 ~tied, netting ~0.8× per
+forward. **So for H3 the fp4-resident arm's value is MEMORY** (~16 GB packed vs
+~66 GB bf16 = 4×, which is what lets the DiT + encoder + VAEs fit the 119 GiB
+pool), not diffusion-forward throughput. A bf16 arm would be ~1.2× faster per step
+if it fit — it does not (66 GB DiT + 13 GB encoder + VAEs).
+
+**Leg 2 — real-checkpoint t2va e2e (fp4-resident), it RENDERS on real weights.**
+Files (byte-complete, sizes verified): DiT `minimax_h3_ref2va_nvfp4_full.safetensors`
+18 745 492 256 B (the UNPRUNED variant our forward implements — the pruned files use
+a timestep-LUT AdaLN we do not) + `vae/minimax_h3_video_vae_fp16.safetensors`
+5 207 808 496 B + `vae/minimax_h3_audio_vae_fp32.safetensors` 605 254 808 B +
+encoder `qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` 14 576 977 888 B, downloaded 8-way
+parallel (HF xet CDN throttles a single connection to ~5 MB/s). VAE configs
+(latents_mean/std) taken from the project's own baked `minimax_h3_vae_configs.inc`;
+tokenizer from public `Qwen/Qwen3-VL-32B-Instruct/tokenizer.json` (the GGUF is
+weights-only). `examples/minimax-h3-gen --fp4-resident --device cuda` (the new flag
+routes NVFP4 safetensors through `StreamMiniMaxH3Nvfp4ToDeviceFp4`): stages the real
+DiT in **6–18 s**, geometry recovered = 50 layers / 5376 / 56 heads.
+
+Small render 256×256 / 22 frames (1 VAE tile), UNCONDITIONED (synthetic embeds,
+12 steps) AND CONDITIONED (GGUF Qwen3-VL-32B encoder keep-quant 13.24 GiB →
+[16, 5120] conditioning; encoder+DiT+VAEs coresident ~35 GB, free stayed ≥80 G):
+both run the full path — 22 PPM frames + `audio.wav` (32 kHz stereo) + a VALID
+`h264/yuv420p 256×256 + AAC` mp4 (ffprobe-confirmed). **FRAME SANITY:** a decoded
+frame is a regular grid of small multicolour blocks (16 px = the vae_ratio-16 latent
+cell) with smooth internal gradients on a dark ground — structured image data (the
+VAE IS decoding, NOT white noise), **but NOT a coherent scene, IDENTICALLY at 12, 20
+AND 50 steps (the reference count) whether conditioned or not.** Step count and
+conditioning are ruled out; the grid is at exactly the latent-cell scale, i.e. each
+latent decodes to an independent block with no cross-patch coherence. **Honest
+verdict: the composed fp4-resident pipeline RUNS end to end on the real checkpoint
+and every stage executes, but it does NOT yet render a coherent scene — a real OPEN
+render bug (device video-VAE decode and/or denoise convergence at real geometry),
+separate from and NOT blocking the fp4 speed work.** This is precisely what the
+frame-sanity gate catches: every numeric unit gate green + valid mp4, yet the frame
+is a structured non-scene. First eyeball of an H3 frame (the prior Thor run reached
+`succeeded`/valid ffprobe but its content was never viewed).
+
+DiT s/step, FULL 50-layer fp4-resident, `--denoise-only` (per FORWARD, drop_caches,
+locks held):
+
+| config | seq | s/forward |
+|---|---|---|
+| 512×512 / 22f  | 1 898  | **5.45** |
+| 768×768 / 61f  | 12 948 | **20.03** |
+| **768×1344 / 209f (vllm-omni REF canvas)** | 63 224 | **209.09** |
+
+The reference canvas FITS in the pool (a forward runs) but a full 50-step render is
+49 × 209 ≈ **2.85 h** of DiT + the 209-frame tiled VAE decode — memory-feasible but
+hours-long, so the full reference render was NOT run (the honest "largest fitting
+config" per the mission). The composed path is proven on the real checkpoint at the
+small canvas.
+
+**Indirect speed statement (mission #3), HW/loader-forced-INDIRECT.** vLLM-Omni has
+NO quantized H3 arm (BF16-only, single-GPU only via `--enable-cpu-offload`;
+source-audited a4ea67a2/v0.26.0), so a quant-matched one-GB10 comparison is
+impossible (DeepSeek-GGUF precedent). The documented vLLM-Omni anchor is 4× B300
+BF16: FL2VA 209f 1248×768 = **86.964 s** mean client latency for a WHOLE 50-step
+render (recipe:298-311). Ours, single GB10 fp4-resident, is **209 s for ONE forward**
+at the comparable 209-frame reference canvas (768×1344) — so 4× B300 completes an
+entire ~49-forward render + VAE in 87 s (~1.8 s/forward-equivalent) while one GB10
+takes 209 s for a single forward, i.e. **~116× per-forward**. That is the expected
+HW/loader-forced-indirect gap: 4 datacenter B300s + BF16 + USP-4 sequence-parallel +
+torch.compile + block-caching vs one GB10 + fp4 + none of those — and vLLM-Omni
+cannot run a quantized H3 on one GPU at all. Our honest SAME-box number is the
+fp4-vs-bf16-arm ratio (leg 1, DiT-only real geometry): fp4 is **0.79–0.83×** the
+bf16 arm per diffusion forward — the fp4 arm trades ~20% forward speed for 4× less
+weight memory, which is what makes the DiT + encoder + VAEs fit one GB10 at all.
+
+
+## Laguna-S-2.1-NVFP4 decode — router top-k KERNEL-EFFICIENCY (`VT_LAGUNA_TOPK_SHFL`), BYTE-EXACT, SigmoidTopK 1.67×, −0.57% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`)
+Measured results for vllm.cpp, against the reference engine each workload
+actually competes with. Every number here was produced on real hardware, greedy,
+with the reference in its own production configuration. Ties are called ties,
+and where we are behind the row says so.
+
+This page is a **scoreboard**: one row per subject, kept current. It is not a
+changelog. The full attempt record, including refuted hypotheses, profiler
+traces, and superseded numbers, lives in
+[.agents/benchmark-record.md](../.agents/benchmark-record.md). For what the
+project is and how to run it, see the [README](../README.md); for per-capability
+lifecycle state, see [docs/STATUS.md](../docs/STATUS.md); for what is supported at all,
+see [docs/FEATURES.md](../docs/FEATURES.md).
+
+
+## FRESH op-dispatch profile, CPU aarch64 (2026-08-06) — the one `QUANT-GGUF-CIQ-GEMM` owed
+
+`CLAIM-KERNEL-CPU-ELEM-GEMM-1` closed with an explicit debt: "the 95.37 %
+`kMatmul` attribution is STALE. Next step is a FRESH op-dispatch profile of the
+current binary before any further lever is started." This is that profile. It
+re-ranks the CPU levers again, and it does NOT support starting G5.
+
+Method: gate host `dgx.casa` (GB10 Grace, aarch64), idle (load 0.35,
+`local-ai-worker` parked 45 h, top non-bench process 0.2 % CPU), one
+`flock /tmp/gpu`, CPU-only Release build of `main` at `dfd29060`,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf` (the same bench file the G-row history uses),
+`perf record -F 999 -g`. `kernel.perf_event_paranoid` was lowered from 4 to 1
+for the two runs and restored to 4 immediately after each. Prefill arm: 1,801
+prompt tokens, `--max-tokens 1`. Decode arm: 2 prompt tokens,
+`--max-tokens 160`. Percentages are self time (`--no-children`), main thread.
+
+### Prefill (1,801 prompt tokens)
+
+| Symbol | Self |
+|---|---:|
+| `LoadF32` (paged-attn) | 21.93 % |
+| `BtM4Neon<bf16>` (elementwise GEMM) | 21.51 % |
+| `PagedAttentionKernel` | 18.63 % |
+| `Threadpool::Barrier` | 12.39 % |
+| `QuantRepackMatmul` | 5.06 % |
+| `Threadpool::ThreadReady` | 4.70 % |
+| `WidenRowToF32` | 3.97 % |
+| `GdnHeadTokenStep` | 2.83 % |
+| `BF16ToF32` | 2.48 % |
+| `F32ToBF16` | 1.50 % |
+| `Threadpool::PollForWork` | 1.47 % |
+
+Caller-resolved (`-g caller`, `--symbol-filter=LoadF32`): **20.68 % of prefill is
+`PagedAttentionKernel` calling `LoadF32`**, and only 1.25 % is any other caller.
+So CPU paged attention is **~39 % of prefill** (18.63 self + 20.68 in `LoadF32`),
+and over half of that is a **per-ELEMENT dtype switch in the attention dot loop**
+(`src/vt/cpu/cpu_paged_attn.cpp:29` called from `:143`). This is the SAME defect
+class E1 removed from the elementwise GEMM ("the per-element `LoadF32` dtype
+switch is hoisted out of the K loop"), still live in the attention kernel.
+
+### Decode (160 generated tokens)
+
+| Symbol | Self |
+|---|---:|
+| `Threadpool::ThreadReady` | 32.66 % |
+| `Bt16Neon<bf16>` (M=1 gemv) | 24.95 % |
+| `QuantRepackMatmul` | 15.99 % |
+| `Threadpool::PollForWork` | 10.92 % |
+| `LoadF32` | 4.50 % |
+| `Threadpool::Barrier` | 3.57 % |
+
+**Threadpool synchronisation is 47.15 % of decode** (`ThreadReady` +
+`PollForWork` + `Barrier`), rising to ~58 % on the secondary-thread view. At M=1
+the per-op work is too small to amortise the barrier, so decode is
+synchronisation-bound, not kernel-bound.
+
+### What this re-ranks
+
+1. **Decode: threadpool synchronisation (~47 %).** The largest single CPU
+   deficit anywhere in this profile. No GEMM kernel change can reach it.
+2. **Prefill: the paged-attention inner loop (~39 % of prefill, ~21 % in the
+   per-element dtype switch).** A known, already-solved defect class.
+3. **G5 (x86 SIMD quant) is NOT supported by this profile.** `QuantRepackMatmul`
+   is 5.06 % of prefill and 15.99 % of decode on aarch64, where the i8mm repack
+   tier already landed. G5 would raise x86 to roughly where aarch64 already is,
+   which is worth doing for x86 users but is not the top lever, and per
+   `CLAIM-KERNEL-CPU-ELEM-GEMM-1` the x86 box is VOID for timing so no binding
+   number could be produced for it here anyway.
+
+The elementwise GEMM (`BtM4Neon`/`Bt16Neon`, 21.5 % prefill / 24.9 % decode) is
+already on its optimised NEON tier and is NOT a defect; it is simply what is left
+once the avoidable work is removed.
+
+Recorded honestly as a profile, not a benchmark: no A/B, no ratio, no claim of
+speedup. Raw data on dgx at `/tmp/prefill.data` and `/tmp/decode.data`.
+
+## CORRECTION: vt CPU q8_0 vs ggml, the repack tier was not engaged (2026-08-06)
+
+Supersedes the CPU half of the parakeet.cpp probe numbers quoted in the first
+revision of `.agents/specs/parakeet-conformer-encoder.md`. Recorded here rather
+than edited away, per "evidence is moved, never deleted".
+
+**What was wrong.** An A/B of `vt::MatmulBTQuant` against ggml's q8_0 `MUL_MAT`
+at a conformer encoder's real shapes reported ggml ahead 1.2x to 2.2x on dgx
+aarch64, and the conclusion drawn was "vt loses on CPU everywhere".
+
+**Why.** `MatmulBTQuantKernel` (`src/vt/cpu/cpu_quant_gemm.cpp:145-200`)
+dispatches in three tiers: `b.repacked` goes to the G7 i8mm repack GEMM; else
+the G6 mmla tier, but ONLY when `m % 2 == 0 && n % 2 == 0`; else the portable
+scalar `QuantChunk`. The bench constructed its weight tensor directly and left
+`Tensor.repacked` false, and a conformer's M values are odd (131 frames, 261
+frames, 1 at decode), so five of six cases missed BOTH fast tiers and ran the
+portable scalar path. That path is not what production runs: the GGUF keep-quant
+loader repacks at load (`qwen3_5_gguf_weights.cpp:104-107`, gated on
+`QuantRepackEligible`).
+
+**Corrected numbers.** Same box, same binary, same shapes, 8 threads, median of
+7 batches, with `vt::cpu::QuantRepackWeight` applied and `repacked` set. All six
+shapes are repack-eligible (q8_0, N%4==0, K%32==0). GFLOP/s:
+
+| shape (M,K,N) | ggml q8_0 | vt q8_0 repack | vt faster |
+|---|---:|---:|---:|
+| 256,256,5220 | 394.8 | **1961.8** | 4.97x |
+| 131,2048,512 | 455.5 | **628.5** | 1.38x |
+| 131,512,2048 | 429.1 | **1390.1** | 3.24x |
+| 131,512,512 | 403.9 | **565.3** | 1.40x |
+| 261,512,512 | 413.7 | **612.9** | 1.48x |
+| 1,640,2560 | 263.5 | **525.1** | 1.99x |
+
+`vt` wins every quantized case, including M=1. The 191 to 255 GFLOP/s the
+superseded run reported was the portable tier; the jump to 525 to 1962 is the
+3.7x to 5.9x G7 already claimed, independently reproduced here.
+
+**What did NOT change.** 16-bit is still ggml's. Dtype-matched (f32 activations,
+f16 weight, which is what ggml runs and what the elementwise kernel is designed
+for), ggml is ahead 1.14x to 2.00x (403-444 vs 141-242 GFLOP/s). Also measured:
+vt bf16-both 177-197, f32-both 260-322, f16-both 130-141, so feeding f16
+activations is a pessimisation and f32-act/16-bit-weight is the right call. And
+x86 is unchanged: `QuantRepackEligible` is false off i8mm, so x86 runs the
+portable tier by construction until G5 lands.
+
+**Standing lesson for benchmarks against this engine.** A `vt::` quant GEMM
+measured without the loader's repack, or at odd M, is measuring a tier
+production never selects. Any future A/B must state which tier it engaged.
+
+## Why vt's 16-bit CPU GEMM trails ggml: it is llamafile, plus SSE2 on x86 (2026-08-06)
+
+Follow-up to the CORRECTION above. That entry closed the q8_0 question (vt wins
+on Arm once the G7 repack tier is engaged) and left 16-bit open. This attributes
+the 16-bit gap to a specific cause with two controls, rather than assuming the
+kernel is weak. All figures GFLOP/s, f16 weight with f32 activations, conformer
+encoder shapes, 8 threads, median of 7 batches, idle boxes.
+
+### Control 1: native fp16 arithmetic, REFUTED
+
+dgx reports `fphp` and `asimdhp`, and ggml's `simd-mappings.h:254-259` uses
+`float16x8_t` + `vfmaq_f16` (8 half-lanes vs our 4 f32 lanes after widening), so
+the obvious hypothesis was that ggml wins on fp16 FMA throughput. Giving ggml
+f32 weights instead makes no difference (ffn_down 419.8 f16 vs 422.1 f32;
+attn_261 412.9 vs 422.7), so fp16 arithmetic is NOT the mechanism. Recorded as a
+refuted hypothesis so it is not re-run.
+
+### Control 2: llamafile tinyBLAS, CONFIRMED
+
+ggml ships llamafile's tiled sgemm and we have no equivalent. Rebuilding ggml
+with `GGML_LLAMAFILE=OFF`, Arm:
+
+| shape | vt | ggml no-llamafile | ggml stock |
+|---|---:|---:|---:|
+| 256,256,5220 | 222.1 | 212.0 | 441.4 |
+| 131,2048,512 | 220.6 | 214.4 | 419.8 |
+| 131,512,2048 | 216.8 | 215.4 | 416.3 |
+| 131,512,512 | 215.4 | 208.1 | 404.0 |
+| 261,512,512 | 241.7 | 209.9 | 412.9 |
+| 1,640,2560 | 141.3 | 159.2 | 164.9 |
+
+**On Arm our NEON MR=4 kernel is at parity with ggml's stock kernel and slightly
+ahead on four of six shapes.** The whole 16-bit deficit is llamafile: ~1.9x on
+f16, ~1.2x on f32. `KERNEL-GEMM-CPU-ELEM` is not defective.
+
+### x86 carries a second cause
+
+Our x86 tier is SSE2 (128-bit, MR=2, `cpu_matmul_elem.cpp:226-231`) plus F16C
+for conversion only, while the dev box reports `avx2`, `avx512f`, `avx512_bf16`
+and `fma`, none of which we use:
+
+| shape | vt | ggml no-llamafile | ggml stock |
+|---|---:|---:|---:|
+| 256,256,5220 | 170.5 | 449.7 | 423.4 |
+| 131,2048,512 | 166.6 | 587.0 | 1403.2 |
+| 131,512,2048 | 201.6 | 531.9 | 1333.4 |
+| 131,512,512 | 199.2 | 506.5 | 1107.1 |
+| 261,512,512 | 205.9 | 516.9 | 1166.9 |
+| 1,640,2560 | 136.2 | 282.3 | 280.0 |
+
+Decomposing `131,2048,512`: 166.6 to 587.0 is **3.5x and is the
+SSE2-vs-AVX-512 width ratio**; llamafile then adds **2.4x** (587.0 to 1403.2)
+for the ~8.4x total. llamafile does nothing for the 256,256,5220 shape on either
+arch, so its benefit is shape dependent, not uniform.
+
+### Levers this identifies, in priority order
+
+1. **A tinyBLAS-style tiled sgemm for `vt::`.** ~1.9x on 16-bit on Arm and ~2.4x
+   on x86, and it helps every architecture at once. Largest single 16-bit lever.
+2. **x86 AVX2/AVX-512 elementwise tiers.** ~3.5x on x86 alone. This is the
+   SIBLING of quant work row G5: G5 covers the quantized kernels, and nothing
+   currently covers the elementwise ones on x86. Worth a row of its own.
+
+Neither is a micro-optimisation of the current kernel, which is already
+competitive with stock ggml. Caveat carried from the 2026-08-06 op-dispatch
+profile: on the GGUF bench workload the elementwise GEMM is 21.5% of prefill and
+24.9% of decode, so a 1.9x on that term is bounded well below 1.9x end to end,
+and neither lever touches the 47% decode threadpool cost that profile found.
+
+Minor observation: `vt` f16 costs ~1.2x more than its own f32 on Arm (216-242 vs
+260-322) but nothing on x86 (166-206 vs 148-204), so the NEON `vcvt_f32_f16`
+widen in the inner loop has a small cost the x86 F16C path does not.
+
+## KERNEL-GEMM-CPU-TILED: the llamafile 1.9x is UNREACHABLE under byte-identity (2026-08-06)
+
+Spike follow-up that changes the row. The tiled-sgemm row was scoped at ~1.9x on
+Arm 16-bit, taken from the measured llamafile delta. Reading llamafile's actual
+inner loop, and then testing the reachable part, shows that headroom is not
+available to us without abandoning the bit-exactness contract.
+
+### What llamafile actually does
+
+`ggml/src/ggml-cpu/llamafile/sgemm.cpp` @ `237ad9b96`, `gemm<RM,RN,BM>`:
+
+- `:550` `D Cv[RN][RM] = {}` are VECTOR accumulators.
+- `:561` `Cv[j][i] = madd(Av[i], Bv, Cv[j][i])` accumulates along K **in vector
+  lanes**, so lane `l` holds the partial sum for a different `k`.
+- `:232-293` `hsum(...)` horizontally reduces each accumulator at the END.
+- `:134-170` `madd` is FMA everywhere (`vfmaq_f32`, `_mm256_fmadd_ps`,
+  `_mm512_fmadd_ps`, plus `float16x8_t` and `__m512bh` variants).
+
+Both properties are order-changing. Splitting K across lanes and hsum-ing at the
+end is a DIFFERENT summation order per output, and FMA does not round the
+product. Our kernel vectorises across OUTPUT COLUMNS specifically so each output
+keeps a strictly sequential K reduction (the E1-E4 invariant), and that choice is
+what forces the 4x4/8x8/16x16 transpose which is our dominant per-tile cost.
+
+So llamafile is not "the same kernel, better tiled". It is a structurally
+different kernel whose speed comes from the exact freedoms we gave up.
+
+### The reachable part, MEASURED NEGATIVE
+
+If the win were merely a bigger register tile, raising `kMrNeon` would show it.
+Idle dgx aarch64 (load 0.12), one flock, same binary discipline, f16 weight with
+f32 activations, GFLOP/s:
+
+| shape | MR=4 (today) | MR=6 | delta |
+|---|---:|---:|---:|
+| 256,256,5220 | 220.1 | 204.4 | **-7.1%** |
+| 131,2048,512 | 216.6 | 228.4 | +5.4% |
+| 131,512,2048 | 213.8 | 224.5 | +5.0% |
+| 131,512,512 | 212.6 | 224.0 | +5.4% |
+| 261,512,512 | 239.1 | 219.0 | **-8.4%** |
+| 1,640,2560 | 140.7 | 138.2 | -1.8% |
+
+A wash: three shapes gain ~5%, two lose 7-8%. Register pressure (MR*4 + 4 of 32
+vectors) trades against transpose amortisation and the two effects cancel. This
+is NOT a 1.9x lever and no further MR sweep is warranted.
+
+### Consequence, and the decision it needs
+
+`KERNEL-GEMM-CPU-TILED` as scoped is **not achievable while byte-identity
+holds**. Two honest options, and the choice is a PRODUCT call, not an
+engineering one:
+
+1. **Keep byte-identity.** The row's realistic headroom is a few percent, not
+   1.9x. It should be rescoped or closed, and the 16-bit CPU gap against ggml
+   stands as a deliberate cost of bit-exactness.
+2. **Add an OPT-IN fast path** (`VT_CPU_MATMUL_FAST` style, default OFF) that
+   vectorises along K with FMA and hsum, matching llamafile's structure. It
+   would NOT be byte-identical to the portable tier, so it needs its own
+   numerical gate (NMSE against an f64 reference rather than memcmp) and an
+   explicit statement of which surfaces may use it. T0 forbids trading the
+   token-exactness precondition on the gate models, so such a path must be
+   provably off wherever that precondition applies.
+
+Recorded WITHOUT choosing. No row is being marked done or dead here.
+
+### Unaffected
+
+The x86 wide-ISA row (`KERNEL-GEMM-CPU-ELEM-X86WIDE`, W1/W2 landed) is NOT
+affected by any of this: AVX2 and AVX-512 widen the OUTPUT-lane dimension, which
+preserves the reduction order, and both pass the 654-assertion memcmp gate. Its
+~3.5x width headroom stands on its own.
+
+## KERNEL-GEMM-CPU-ELEM-X86WIDE W1/W2 landed: AVX2 and AVX-512 tiers, INDICATIVE speed
+
+Correctness is the binding result and it is met: 654/654 memcmp byte-identity
+assertions on every tier, with the tier ACTUALLY selected verified via
+`ElemGemmTierName()` so a silent fallback cannot pass the gate vacuously.
+
+| forced tier | selected | assertions |
+|---|---|---|
+| default | avx512 | 654/654 |
+| portable | portable | 654/654 |
+| avx2 | avx2 | 654/654 |
+| avx512 | avx512 | 654/654 |
+| ref | ref | 654/654 |
+
+**Speed below is INDICATIVE, NOT BINDING.** The x86 dev box is VOID for timing
+per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`, and these runs were taken at load ~10 while
+another session's test suite was finishing, not on an idle box. No ratio here
+may be quoted as a result. GFLOP/s, f16 weight with f32 activations, 8 threads:
+
+| shape | SSE2 (was) | AVX2 | AVX-512 | AVX-512 vs SSE2 |
+|---|---:|---:|---:|---:|
+| 256,256,5220 | 168.5 | 231.8 | 271.2 | 1.61x |
+| 131,2048,512 | 159.3 | 266.8 | 451.1 | 2.83x |
+| 131,512,2048 | 208.5 | 276.6 | 431.8 | 2.07x |
+| 131,512,512 | 210.8 | 279.5 | 428.9 | 2.03x |
+| 261,512,512 | 231.1 | 311.8 | 396.8 | 1.72x |
+| 1,640,2560 | 153.2 | 194.4 | 238.3 | 1.56x |
+
+Against the reference points from the same-day attribution: ggml WITHOUT
+llamafile is 449-587 on these shapes, so AVX-512 at 271-451 closes most of the
+width gap that motivated the row (`131,2048,512`: 451.1 vs 587.0, 1.30x
+remaining). The residue is consistent with FMA, which ggml uses and we cannot
+without breaking byte-identity, and with llamafile on top of that.
+
+A first attempt at these numbers produced 0.5-79 GFLOP/s and looked like a
+catastrophic regression. It was measured at load 202 while another session ran
+the full vllm.cpp test suite from
+`.claude/worktrees/agent-a1ebc9ca0b6aa195e/build-p26/`. Discarded, not reported.
+Recorded here because "no kernel design explains 300x" is the check that caught
+it, and because concurrent sessions on this box are a live hazard for anyone
+measuring here.
+
+A binding number needs an idle, qualified x86 host, which the project does not
+currently have.
+
+## Deep dive: what byte-identity actually costs, and what it does NOT (2026-08-06)
+
+Decision taken: **byte-identity is kept.** This entry separates the costs that
+are genuinely forced by that contract from the costs we are paying for unrelated
+reasons, because the previous entry conflated them and closed the tiled row too
+early.
+
+### The invariant, precisely
+
+Byte-identity requires only this: **each output's K reduction must happen in the
+same ORDER as the scalar reference.** It says nothing about layout, tiling, or
+vector width. Everything below follows from taking that literally.
+
+### Finding 1: the transpose is NOT required by byte-identity
+
+`vt` has two elementwise families and both satisfy the invariant:
+
+- `Bt16*` ([N,K] weight): outputs strided by K, so it must TRANSPOSE a
+  4x4/8x8/16x16 block per tile to get "element p across the 16 outputs".
+- `Nk16*` ([K,N] weight): outputs contiguous per p, **no transpose at all**.
+
+Measured on idle dgx (load 0.12, one flock), same logical GEMM, same operands,
+only storage orientation differing, f16 weight + f32 activations, GFLOP/s:
+
+| shape | bt ([N,K], transpose) | nk ([K,N], none) | agreement |
+|---|---:|---:|---|
+| 256,256,5220 | 224.5 | 247.9 | **BYTE-IDENTICAL** |
+| 131,2048,512 | 223.7 | 262.7 | **BYTE-IDENTICAL** |
+| 131,512,2048 | 219.2 | 211.4 | **BYTE-IDENTICAL** |
+| 131,512,512 | 215.0 | 269.2 | **BYTE-IDENTICAL** |
+| 261,512,512 | 243.5 | 274.8 | **BYTE-IDENTICAL** |
+| 1,640,2560 | 144.3 | 178.9 | **BYTE-IDENTICAL** |
+
+Every output bit agrees between the two orientations, verified by exact
+comparison rather than tolerance. So the transpose is a cost of LAYOUT, not of
+bit-exactness, and it is worth ~1.15x (1.10x to 1.25x, one shape regressing).
+
+### Finding 2: the nk path has NO M blocking, and that is just an omission
+
+`src/vt/cpu/cpu_ops.cpp:135`:
+
+    const int mr = (kBT && tier.btm[bi] != nullptr) ? tier.mr : 1;
+
+M blocking applies ONLY to the `bt` path. The `nk` path always runs `mr = 1` and
+reloads the entire weight tile for every activation row. Note nk still BEATS bt
+by ~1.17x while carrying that handicap.
+
+Standalone aarch64 prototype (`-ffp-contract=off`, mul-then-add, single
+threaded, so read the RATIO not the absolute):
+
+| shape | nk mr=1 | nk mr=4 | gain |
+|---|---:|---:|---:|
+| 131,2048,512 | 36.8 | 52.9 | **1.44x** |
+| 131,512,2048 | 29.6 | 52.5 | **1.78x** |
+| 131,512,512 | 36.7 | 53.0 | **1.44x** |
+| 261,512,512 | 36.8 | 53.7 | **1.46x** |
+| 1,640,2560 | 30.8 | 30.8 | 1.00x (M=1, nothing to block) |
+
+M blocking preserves the invariant trivially: it reuses a loaded weight vector
+across MR activation rows and touches no output's accumulation order.
+
+Honest caveat on that prototype: its byte-identity self-check reported DIFFERS,
+but the diagnostic shows `o1=nan o4=nan` with `maxabs=0`, i.e. every reported
+difference is NaN != NaN and there is NO numeric divergence. The harness has a
+NaN bug. The timing ratio is unaffected (both arms do identical work), but the
+byte-identity property must be established by the real `test_ops_matmul_elem`
+memcmp battery on a real kernel, not by this probe.
+
+### What byte-identity genuinely costs
+
+Two things, both irreducible:
+
+1. **FMA.** The scalar reference rounds the product before the add. Every
+   llamafile `madd` is an FMA.
+2. **Vectorising along K with a final `hsum`.** That is a different summation
+   order per output.
+
+Those are the real price, and they are the part of the llamafile gap we are
+choosing not to buy. Everything else in that gap is ours to take.
+
+### Revised plan for KERNEL-GEMM-CPU-TILED, byte-identity retained
+
+The previous entry said the row's headroom was unreachable. That was too
+strong: it was true of llamafile's STRUCTURE, not of the gap. Reachable, in
+order:
+
+1. **Add an M-blocked `nk` kernel** (`nkm` in the tier table, plus the
+   `cpu_ops.cpp:135` dispatch). Prototype says ~1.44x to 1.78x. Pure omission,
+   no contract question.
+2. **Repack [N,K] -> [K,N] at load** so `MatmulBT` reaches the no-transpose
+   family, exactly as the q8_0 G7 tier already repacks at load and flags it on
+   the tensor. Worth a further ~1.15x, and the precedent for doing it is in
+   this repo.
+
+Neither needs FMA and neither reorders any reduction. Combined they plausibly
+recover most of the llamafile delta while the memcmp gate stays valid and
+unchanged, which is the whole point.
+
+## 2026-08-06 — `sm_86` (Ampere consumer / RTX 3090 class) BUILD-VERIFIED, no runtime
+
+Prompted by an external report: someone built the CUDA server for 2x RTX 3090 and
+saw ~10 tok/s on a `qwen35moe` 35B MoE GGUF (InternScience/Agents-A1 Q4_K_M). No
+`sm_86` board is reachable here, so this entry is a build-verification only and
+owes no throughput number. Nothing has executed on that arch.
+
+Host: dgx.casa GB10, CUDA 13.0.88, gcc 13.3.0, commit `ab130737` transferred by
+`git archive`.
+
+Configure, single-arch `86`:
+
+* `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` and `-DVLLM_CPP_CUTLASS_FETCH=ON`
+  BOTH resolve clean, exit 0. FETCH pulls CUTLASS 4.5.0 over the network.
+* Reports `CUDA feature fa2: ENABLED for [86]` and `FlashAttention-2
+  prefill/decode: ENABLED for arch(es) [86]`.
+* Every sm_12x-only feature (fp4-mma, cutlass-nvfp4, cutlass-nvfp4-sm100,
+  cutlass-fp8, scaledmm-c3x-sm90/sm100, marlin-nvfp4) reports `DISABLED (no
+  requested arch in [86] provides it)` rather than erroring, so the cross-family
+  target resolves honestly.
+
+Compile, all 7 FA2 translation units, `-Werror` present in the command line:
+
+| TU | rc | time |
+|---|---|---|
+| `cuda_flash_attn_fa2.cu` | 0 | 2s |
+| `flash_fwd_split_hdim256_bf16_causal_sm80.cu` | 0 | 81s |
+| `flash_fwd_split_hdim256_bf16_sm80.cu` | 0 | 137s |
+| `flash_fwd_split_hdim128_bf16_causal_sm80.cu` | 0 | 85s |
+| `flash_fwd_split_hdim128_bf16_sm80.cu` | 0 | 140s |
+| `flash_fwd_split_hdim192_bf16_causal_sm80.cu` | 0 | 69s |
+| `flash_fwd_split_hdim192_bf16_sm80.cu` | 0 | 116s |
+
+Zero warnings across all seven. Gencode was
+`--generate-code=arch=compute_86,code=[compute_86,sm_86]`, and `cuobjdump -lelf`
+shows `sm_86` in every resulting object, so these are real cubins and not PTX
+that would JIT at load. This upgrades `86` from inherited-same-major (the WA-1
+claim build-verified only `80` and `87`) to directly build-verified. `89` still
+inherits.
+
+### The finding that shipped a fix
+
+With no CUTLASS tree the configure printed `CUDA feature fa2: ENABLED for [86]`
+from the arch-capability table, then four lines later a STATUS line saying FA2
+was disabled, and proceeded to a binary with no FlashAttention and nothing red.
+The arch-capability table answers "does this arch support FA2", not "was it
+built", so the two lines are each individually true and together misleading.
+
+Reachable from a bare `cmake -S . -B build`: `VLLM_CPP_CUDA` defaults to `AUTO`,
+so on a CUDA box that enables CUDA, resolves fa2 for `121a`, and drops FA2
+because the default `third_party/cutlass` does not exist. This is the same
+degraded-cutlass condition that has drifted near-tie gates here before.
+
+The missing-CUTLASS branch now splits on `VT_FA2_ARCHS` and warns when the arch
+did support FA2. Four configure cases checked: arch 86 without CUTLASS warns;
+GB10 default with CUTLASS silent and still builds FA2; bare `cmake -S . -B build`
+on the CUDA box warns (true positive); `-DVLLM_CPP_CUDA=OFF` completely silent,
+so CPU builds gain no noise.
+
+### Not verified
+
+That any of it runs. There is no `sm_86` board on this network, and a compile
+plus a SASS dump is not execution evidence.
+
+## nkm landed: M blocking on the [K,N] path, and the prototype OVERESTIMATED it
+
+`KERNEL-GEMM-CPU-TILED` lever 1 is implemented (`nkm` family on every tier,
+dispatch degated from `kBT` in `cpu_ops.cpp:135`). Byte-identity holds: 654/654
+memcmp assertions on all five tiers, each verifying the tier actually selected.
+
+Measured on dgx aarch64 (load 6.35, one flock, same binary discipline), f16
+weight + f32 activations, GFLOP/s:
+
+| shape | bt (today's default) | nk BEFORE nkm | nk AFTER nkm | nkm gain | nk vs bt |
+|---|---:|---:|---:|---:|---:|
+| 256,256,5220 | 219.7 | 247.9 | 254.2 | 1.03x | 1.16x |
+| 131,2048,512 | 215.9 | 262.7 | 281.4 | **1.07x** | **1.30x** |
+| 131,512,2048 | 211.8 | 211.4 | 261.9 | **1.24x** | **1.24x** |
+| 131,512,512 | 211.0 | 269.2 | 274.4 | 1.02x | 1.30x |
+| 261,512,512 | 235.9 | 274.8 | 281.3 | 1.02x | 1.19x |
+| 1,640,2560 | 140.2 | 178.9 | 178.2 | 1.00x | 1.27x |
+
+**The prototype overestimated, and that is worth recording as a method lesson.**
+The standalone probe predicted 1.44x to 1.78x from M blocking; the real kernel
+delivers 1.02x to 1.24x. The probe was single threaded with a naive outer loop,
+so it modelled the register-level amortisation but not the CACHE behaviour of
+the real chunk worker, which already walks a 16-row activation tile
+(`blck_1 = 16`) against one column block. In that structure the weight tile is
+usually still in L1/L2 when the next row reads it, so most of what M blocking
+saves in registers was already being saved by the cache. A micro-probe that
+omits the caller's blocking structure will flatter a locality optimisation;
+this one did.
+
+**What is real.** The [K,N] orientation now beats the [N,K] default by **1.16x
+to 1.30x** at every shape, byte-identically. That is the payoff available from
+lever 2 (repack `[N,K] -> [K,N]` at load, as the q8_0 G7 tier already does),
+since `MatmulBT` is what production calls and it currently cannot reach this
+family at all.
+
+Context against the outside references on the same shapes: ggml stock is ~214
+and we are now at ~281 on `131,2048,512`, so we are **ahead of ggml's own
+kernel by ~1.3x**; ggml WITH llamafile is ~419, so ~1.5x still separates us and
+that residue is the FMA plus K-vectorised-hsum structure we are deliberately not
+adopting.
+
+## MiniMax-H3 render-coherence ROOT-CAUSED — VAE decoder is CORRECT (encode->decode round-trip is coherent); the DiT emits a spatially-WHITE latent at real geometry (2026-08-06, `row/H3-RENDER-COHERENCE` PR #70, `ROAD-V1-H3`, dgx GB10 sm_121a)
+
+**Setup.** dgx.casa GB10, dual-lock (`$HOME/gpu.lock`+`/tmp/gpu`), worker down,
+`drop_caches` before loads. Real ~39 GB NVFP4 arm cached at `~/h3fp4/ckpt`
+(DiT `minimax_h3_ref2va_nvfp4_full.safetensors` 18.75 GB + both VAEs + GGUF
+encoder). Diagnostics built on `7d05aee9`: env-gated `VT_H3_TRACE_MOTION`
+(per-step velocity + latent-motion), `VT_H3_DUMP_DIR` (raw f32 latents),
+`VT_H3_VAE_PROBE` (receptive field), `VT_H3_GAUSSIAN_NOISE`, and two driver
+modes `--decode-latent` / `--roundtrip`. Spatial coherence metric = mean cosine
+of adjacent latent-cell channel-vectors (16x16 grid) vs random-pair cosine.
+
+**Latent bisection (each rung MEASURED at 256x256/22f):**
+| Rung | Measurement | Verdict |
+|---|---|---|
+| Denoise loop | final latents byte-DIFFER at 3/12/50 steps (md5; s12-s50 corr 0.25); velocity 1.40->5.52 rms; disp-from-init ~1.9 | loop MOVES latent, not frozen -> not upstream-loop |
+| **VAE decoder** | `--roundtrip`: real test pattern encode->post_quant_conv->decode returns a COHERENT image (bars/timecode/diagonal), no grid | **DECODER CORRECT** (overturns #64 "device VAE decode" framing) |
+| DiT latent | adjacent-cos: encoded (coherent) **0.789** vs DiT **0.06**; laplacian 0.93 vs 4.2; 8x8-token adj-cos ~0 (== random) | DiT latent is spatially WHITE -> the grid |
+| fp4 vs bf16 | both white (cos 0.057 / 0.040); NOT byte-exact on real weights (max|diff| 11.2) | not the residency/precision path |
+| DiT attn kernel | MMA vs chunk (`VT_DFLASH_ATTN_MMA=0`): both white (0.057/0.056) | not the attention kernel |
+| VAE attn kernel | f32 chunk/warp/keylane identical (max|diff| 1/255) | not the VAE attention kernel |
+| init noise | Gaussian vs uniform: 0.077 vs 0.057 | marginal, not the fix |
+
+**Why the gates missed it.** DiT-forward gate runs latent 4x6 (spatial 2x3 = 6
+tokens) and matches upstream at **1.6e-7** there, so spatial mixing is correct
+at small scale; the divergence is real-geometry-specific, appearing only between
+2x3 and the real 8x8 (64 tokens) — same shape as the earlier temporal-chunking
+and VAE-tiling misses (every gate sits below the regime that breaks).
+
+**The mechanism of the grid.** The ViT3D decoder's `proj_out` maps EACH latent
+token to its own 16-px pixel patch; cross-patch coherence comes only from the
+latent's spatial structure. Given a real (spatially-coherent) latent it renders
+a coherent image (round-trip proves this); given the DiT's spatially-white
+latent it renders one independent smooth block per cell = the observed grid,
+identically at any step count (the loop only decides WHICH white latent).
+
+**Secondary real bug.** Driver seeded uniform[-1,1] init noise (std 0.577); a
+flow model needs Gaussian N(0,1) (torch.randn). `VT_H3_GAUSSIAN_NOISE=1` fixes
+INIT rms 0.58->1.0; correctness deviation, not the render fix.
+
+**Residual / handoff.** Bug RE-LOCALIZED to the DiT forward's spatial mixing at
+real geometry (video tokens not mixed). Exact line needs an upstream (vllm-omni)
+DiT-activation diff at real geometry — impractical on one GB10 (no quantized
+vllm-omni H3 arm; bf16 is 4xB300). Diagnostics committed on PR #70; latents at
+`dgx:~/h3fp4/diag`. fp4 speed path unchanged/CLOSED. No source/kernel/model/gate
+mark changed (all additions are env-gated diagnostics, byte-identical when off).
+
+## MiniMax-H3 DiT-forward GEOMETRY LADDER — the #70 spatial-mixing hypothesis is REFUTED at reduced dims; the divergence is NOT a reduced-dim-reproducible DiT math bug (2026-08-06, `row/H3-DIT-SCALE-GATE` PR #74, `ROAD-V1-H3`, CPU-only dev box)
+
+**Question (#70 follow-up).** #70 root-caused the H3 render grid to the DiT emitting
+a spatially-WHITE latent at real token geometry (adjacent-cell cosine 0.06 vs 0.789
+for a real encode; VAE/loop/fp4/bf16/attention-kernels all ruled out). The DiT parity
+gate only ran 2x3 spatial tokens (1.6e-7 vs upstream). Hypothesis: a spatial-MIXING
+bug in position/packing/modulation MATH (not weight values) should reproduce with the
+H3Rand random-weight harness at real TOKEN geometry with reduced hidden dims.
+
+**Method (CPU-only, no dgx).** Extended the reduced-dim DiT-forward parity gate
+(`scripts/gen-minimax-h3-goldens.py` :: `emit_dit_ladder`; RefDiT oracle + upstream
+`minimax_h3_packed_sequence`, both from the shared FNV-1a+splitmix64 stream) into a
+GEOMETRY LADDER. Each rung gates, at reduced hidden dims (hidden=64, head_dim=16):
+(1) the upstream packed-sequence layout (cu_seqlens / img_position_ids fp64 grid /
+masks — the 2x3-only packed gate was the same blind spot); (2) the HOST forward
+(`MiniMaxH3DitForward`); (3) the DEVICE-resident forward (`MiniMaxH3DitForwardDevice`,
+CPU backend — the path the real pipeline runs); (4) a spatial-MIXING probe (perturb one
+video-target token, measure the per-output response). New permanent gate case
+`test_minimax_h3.cpp :: "DiT-forward geometry ladder matches upstream (host+device,
+mixing)"`. Goldens regenerate byte-identically against local `~/_git/vllm-omni`.
+
+**Ladder result — ours == upstream oracle at EVERY rung (host AND device):**
+| Rung | latent t×h×w | spatial grid | video tokens | host max\|diff\| | device max\|diff\| | mix fraction | verdict |
+|---|---|---|---|---|---|---|---|
+| 2x3 | 1×4×6 | 2×3 | 12 (6 tgt) | 1.8e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 4x4 | 1×8×8 | 4×4 | 32 (16 tgt) | 1.8e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 6x6 | 1×12×12 | 6×6 | 72 (36 tgt) | 2.1e-7 | ≤2.4e-7 | 1.0 | PASS |
+| **8x8** | 1×16×16 | **8×8** | **128 (64 tgt)** | **2.4e-7** | **≤2.4e-7** | **1.0** | **PASS** |
+| 4x8 | 1×8×16 | 4×8 | 64 (32 tgt) | 1.8e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 8x8t3 | 3×16×16 | 8×8 ×3f | 256 (192 tgt) | 2.4e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 12x20t5 | 5×12×20 | 6×10 ×5f | 360 (300 tgt) | 3.0e-7 | ≤5.4e-7 | 1.0 | PASS |
+
+All ≤ 3e-7 vs the 2e-5 gate. The mixing probe: perturbing ONE video-target token
+changes EVERY other target token's output (fraction 1.0 at all rungs) — the packed
+bidirectional attention (`cu_seqlens = [0, used, seq_len]`, one document) couples all
+video tokens at real geometry, exactly the property #70 found broken in the real run.
+
+**Hidden-dim-scale leg (the other #70 escape hatch).** A second gate case runs the SAME
+geometries at the REAL head_dim=128 / rope_inv_freq_len=16 (rot_dim=96) ratio and
+requires the DEVICE forward to track the trusted HOST loops (no oracle needed).
+Device-vs-host max\|diff\| = 5e-7…1.2e-6 across all 7 rungs — no head_dim- or
+rope-scale assumption in a shared device op. `"DiT device-vs-host forward holds at the
+REAL head_dim=128 ratio"`.
+
+**The metric that does NOT translate (why the ladder can't SHOW #70's symptom).**
+Measured the #70 adjacent-cell COSINE on the CORRECT RefDiT oracle output at reduced
+dims: adj_cos ≈ random-pair cos ≈ 0 at EVERY geometry (2x3 +0.11/−0.03; 8x8
++0.05/−0.01; 8x8t3 +0.02/+0.02). With RANDOM weights the correct reference is ALREADY
+spatially white by the cosine metric — spatial coherence in the real model is a
+TRAINED-WEIGHTS property, not an architecture-math property. So the random-weight
+harness fundamentally cannot reproduce #70's cosine symptom; its valid discriminators
+are oracle-logit equality and information flow (both green), NOT the cosine.
+
+**VERDICT.** The "spatial-mixing bug in the DiT-forward MATH" hypothesis is **REFUTED**
+at reduced dims and real token geometry: our port (host AND device) is byte-exact to the
+oracle at 2x3→8x8→temporal→packed-mix and at the real head_dim=128 ratio, and the
+attention demonstrably mixes all video tokens. The #70 white latent is therefore NOT a
+reduced-dim-reproducible DiT-forward bug; it is a **trained-weights / real-scale**
+phenomenon the harness cannot see. A **GPU re-render is NOT expected to be coherent** on
+the strength of this work — nothing was fixed in the render path; the secondary Gaussian-
+noise fix from #70 stands but was already known not to be the render fix.
+
+**Residuals / where the #70 hunt goes next (both beyond this CPU box):**
+1. **Shared port⇄RefDiT bug vs TRUE upstream.** `vllm`/`cache_dit`/`aenum` are not
+   importable here, so the DiT oracle is the RefDiT *restatement*, not the real
+   `minimax_h3_transformer.py`. A bug shared identically by our port AND RefDiT (a
+   co-mirrored misreading) is invisible to this ladder ("gate on a shared helper =
+   consistency, not correctness"). CLOSE IT on the dgx oracle venv (vllm IS installed):
+   run the real `MiniMaxH3DiTModel` at TP=1 / reduced dims vs RefDiT.
+2. **Real-scale DiT INPUT wiring.** The harness feeds RANDOM prompt-embeds / video rows;
+   the real render feeds the Qwen3-VL encoder embeddings, the real fp64 position grid at
+   full canvas, and the real per-token timestep layout. A real-weights activation diff of
+   the DiT INPUTS (encoder output, position grid, condition-noise) at real geometry is
+   the untested surface #70 did not isolate.
+
+| Suspect | Test | Result |
+|---|---|---|
+| S1 (a)(b) DiT INPUT wiring at real scale | `VT_H3_DUMP_INPUTS` dumped every step-0 DiT input; diffed vs upstream `pipeline_minimax_h3.py` at t2va 512x512/22f (text_len=8, latent 7x32x32, seq_len 1920) | **EXACT** — packed layout, fp64 grid, token_tags, inverse/combined AdaLN indices, sigmas all byte-equal; tokenization byte-equal to `tokenizer(prompt,add_special_tokens=False)` |
+| encoder conditioning | shape/stat check | correct [8,5120], carries the expected Qwen massive-activation (row0 ch731=15915, others rms~4) — not all-pad, not garbage |
+| NVFP4 dequant | independent torch dequant of `blocks.0.attn.qkv_proj` + Laguna/Qwen3 already prove `DequantNvfp4ToBf16` byte-exact | sane trained weight (rms 0.089, absmax=ws2·6·maxscale=3.61) |
+| CUDA kernels at real seq | NEW gate `test_minimax_h3 :: CUDA device forward tracks the host at the REAL render seq (1920)` (RealRatioParams head_dim=128, seq 1920) | **CUDA device == CPU host** (28/28) — no scale-dependent kernel bug (#74 only ran device-vs-host on the CPU backend) |
+| forward math | RefDiT restatement vs true upstream source, read side by side (block, attention, AdaLN view(m*3,6H), 3D-RoPE, modulate) | identical |
+
+## MiniMax-H3 TASK/PARTITION GUARD — mirror `_resolve_task`'s raise; the two arms have NO structural discriminator so a stripped file must DECLARE its partition (2026-08-06, `row/H3-TASK-PARTITION-GUARD` PR #84, `ROAD-V1-H3`, CPU-only dev box)
+
+The #70/#74 follow-up. The white grid was `task=t2va` run on the Ref2VA-partition
+checkpoint; upstream `pipeline._resolve_task` RAISES on the mismatch
+(`pipeline_minimax_h3.py:374-391`, raise at 387-390), and the recipe documents the split
+(`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`). This row mirrors the raise 1:1 and adds the
+community-file fallback.
+
+**The discriminator finding (grounded both sides).** Upstream derives the partition from
+the release config `model_index.json` → `_minimax_h3` → `{partition, tasks}`
+(`pipeline_minimax_h3.py:279-282`). Community GGUF/NVFP4 STRIP that block, and there is
+NO structural fallback — MEASURED on the two real captured manifests:
+
+| Arm | Manifest (tensors) | Normalized base names | Key shapes (video/audio/condition/time patch) |
+|---|---|---|---|
+| Ref2VA | `minimax_h3_nvfp4_manifest.inc` (1051) | 535 after collapsing `{weight,weight_scale,weight_scale_2}` | `[5376,96]`/`[5376,32]`/`[5376,5120]`/`[5376,256]` |
+| FL2VA | `minimax_h3_gguf_manifest.inc` (535) | 535 | identical |
+
+`comm -23`/`-13` of the two normalized name sets is EMPTY both ways; all reference-relevant
+shapes match. Ref2VA prepends reference rows through the SAME `video/audio_patch_proj`, so
+it adds no reference-specific tensor. A name/shape auto-detector is impossible in principle,
+so a stripped file must DECLARE `--partition fl2va|ref2va` (server: `--video-partition`);
+`MiniMaxH3PartitionFromFlag` maps it to the recipe's served-task set (fl2va→{t2va,fl2va},
+ref2va→{ref2va}).
+
+**Guard behavior table (task × partition → pass/refuse):**
+
+| task \ partition | FL2VA {t2va,fl2va} | Ref2VA {ref2va} | unknown/stripped |
+|---|---|---|---|
+| t2va  | pass | **REFUSE (#77 mismatch)** | REFUSE (declare `--partition`) |
+| fl2va | pass | REFUSE | REFUSE |
+| ref2va| REFUSE | pass | REFUSE |
+
+**RED-first proof (reviewer mutation).** New case `test_minimax_h3 :: "the task/partition
+guard refuses the #77 mismatch"`, 38 assertions: the #77 combo throws, correct pairings
+pass, stripped refuses every task, `--partition` recovers, `MiniMaxH3TaskOfRequest` maps
+the three request shapes, and the two real manifests are asserted to reduce to the same
+535-name set. Neutralizing the guard body (`return;` at the top of
+`MiniMaxH3CheckTaskPartition`) turned the case RED at **10 failed assertions** (t2va-on-
+ref2va, the stripped refusals, the dispatch-level `t2va_req` on Ref2VA); restoring it went
+GREEN. Suite **67/67** (66 prior + this), 46549 assertions; `test_video_api` 4/4 (server
+wiring). Wired at both loading entry points: `MiniMaxH3GenerateT2va` guards every full
+render; the pure pipeline-math tests build `declared=false` requests so the guard is inert
+there. No numbers changed — this is a correctness/refusal gate, not a perf lever.
+
+## MiniMax-H3 ENCODER VISION TOWER — record reconciled + real-weights loader; the encoder GGUF DOES carry the vision tensors (2026-08-07, `row/H3-CONDITIONED-E2E`, `ROAD-V1-H3`, dgx GB10 sm_121a)
+
+**Record reconciliation.** #26/W3 recorded the vision tower "COMPLETE … only the MM
+processor remains"; #77 recorded it "still unported". Reading the code, both are true of
+different halves: the tower MATH exists as a CPU scalar reference
+(`minimax_h3_encoder.cpp` `MiniMaxH3VisionTowerForward:572` + surround) gated ONLY at
+reduced dims with SYNTHETIC weights (`test_minimax_h3.cpp:4041`), but it was NEVER wired to
+real weights — `LoadMiniMaxH3EncoderFromGguf` (`minimax_h3_encoder_gguf.cpp:47`) loads the
+TEXT tower only and skips every `visual.*` tensor; the device forward is text-only; the
+driver/server call only the text path. So: math CPU-gated synthetic, zero real-weights
+wiring.
+
+**Encoder-arm decision (measured, no download).** The on-box encoder
+`~/h3fp4/ckpt/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` (14 GiB) carries the FULL vision tower —
+`visual.blocks.{0..26}` (Q4_K/Q5_K), `patch_embed.proj` (F16 `[16,16,6,1152]`), `pos_embed`
+(F16 `[2304,1152]`=48²), `merger.*`, and 3 `deepstack_merger_list.*`. Geometry: hidden 1152
+/ 16 heads / depth 27 / intermediate 4304 / out 5120 / patch 16 / temporal 2 / merge 2 /
+pos 2304 (== the Qwen3.6-27B vision config, state.md :23310). ComfyUI quant reshapes
+non-256-aligned rows (in=1152) to ne0=256; dequant of the flat buffer preserves the
+row-major `[out,in]` order the tower reads. `deepstack_visual_indexes` is NOT in the
+weights-only GGUF and must be supplied from the H3 vision_config (residual for a bit-correct
+DeepStack inject).
+
+**Landing this row:** GGUF `visual.*`→`Qwen3VLVisionWeights` loader (`LoadQwen3VLVisionFromGguf`,
+mirrors safetensors `LoadQwen3VLVisionWeights` `qwen3_vl.cpp:417`) + a CPU/real-weights
+vision-tower forward gate + driver `--prompt-image` probe. HONEST residual (recorded, not
+claimed done): the vision-ENRICHED DiT render (DeepStack scatter into the DEVICE text tower
+actually changing the frames) needs the exact deepstack indexes + a device-text
+DeepStack/merge extension + an on-box GPU render; fl2va/ref2va frame-sanity verdicts recorded
+here as they are produced.
+
+### GB10 VERIFICATION (2026-08-07, dgx sm_121a, flock, worker parked)
+
+**Real-weights vision-tower probe RAN (deliverable 1).** `minimax-h3-gen --device cuda
+--encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --prompt-image <512x512 cat frame>`: the loader
+read the real `visual.*` tower (depth 27 / hidden 1152 / 16 heads / out 5120 / 3 DeepStack
+mergers); the stock Qwen3VLImageProcessor produced grid_thw [1,32,32] = 1024 tokens → 256
+merged; `Qwen3VLVisionForward` on the GGUF-loaded weights returned [256, 20480] = merged +
+3 deepstack concatenated, ALL FINITE and non-degenerate: merged rms 1.45 / maxabs 29.1 (the
+expected Qwen MASSIVE-ACTIVATION signature), deepstack rms 0.54/1.04/0.51. The vision tower now
+runs on real weights.
+
+**fl2va e2e — COHERENT (deliverable 2, frame-sanity PASS).** FL2VA-partition GGUF
+(`MiniMax-H3-FL2VA-Q3_K_M.gguf`, `--dequant-bf16`, ~66 GB device, free 117→23 G, no OOM) +
+`--first-frame` (real coherent orange-cat frame, VAE-keyframe conditioning) + `--partition
+fl2va`, 512x512/22f/12steps. Valid h264 512x512 + AAC mp4, 22 frames. VISUAL sanity (frames
+0/6/12/21 inspected): every frame is a coherent photorealistic ORANGE CAT sitting on a WOODEN
+TABLE, matching the conditioning first-frame's pose/table/gray-background, consistent across
+the whole clip — no patch-grid, no white latent. The render visibly CONTINUES/MATCHES the
+conditioning image. (This uses the VAE-KEYFRAME path, not the vision tower.)
+
+**ref2va e2e — STILL GRIDS (deliverable 2, frame-sanity FAIL, recorded honestly).** Ref2VA
+NVFP4 (`minimax_h3_ref2va_nvfp4_full`, `--fp4-resident`, ~16 GB, free 117→63 G) + `--ref-image`
+(one 256x256 real cat image, VAE-reference conditioning) + `--partition ref2va` + text
+prompt_embeds, 256x256/22f/12steps. Valid mp4, 22 frames, but EVERY frame (0/10/21) is a
+multicolour PATCH GRID — the #70/#74 degenerate render — NOT a coherent scene. First attempt
+(5x512 `--ref-video`) was ABANDONED: the reference-video VAE encode is a single-thread CPU
+3D-CNN scalar path (GPU 0%, 98% CPU) and did not finish in ~15 min — a known perf limit, not a
+bug. **HONEST verdict vs the mission's expectation:** landing the vision-tower LOADER does NOT
+fix the ref2va grid, because the tower is wired as a loader+probe and is NOT yet scattered into
+the DiT render-conditioning path — this render did not use it. fl2va (same partition family,
+same session, VAE-keyframe path) is COHERENT, so the DiT/VAE/partition are sound; the ref2va
+grid is specific to the ref2va conditioning assembly (VAE-reference rows + un-enriched text
+prompt). Testing whether the vision-enriched prompt fixes ref2va needs the render-conditioning
+scatter (merge merged-features into prompt_embeds + DeepStack inject into the DEVICE text
+tower) — the tracked residual. Suite note: the full `test_minimax_h3` run SIGSEGVs at an
+UNRELATED CUDA case (line 3503, "an NVFP4 checkpoint loads into a runnable DiT") that PASSES in
+isolation (585 assertions) and runs BEFORE the new case — a pre-existing cross-test CUDA
+resource-accumulation flake, not this change; the new loader gate passes standalone (59
+assertions).
+
+## MiniMax-H3 ENCODER VISION SCATTER + ref2va re-attribution (`row/H3-VISION-SCATTER` PR #90, 2026-08-07, dgx sm_121a)
+
+Closes the #86 residual at the framework level and RE-ATTRIBUTES the ref2va grid with a GB10
+render A/B. Builds on #86 (real `visual.*` tower LOADS + fl2va COHERENT via VAE-keyframe).
+
+**`deepstack_visual_indexes` CONFIRMED (was #86-inferred).** `{8, 16, 24}` grounded in the
+release config: MiniMax-H3's `text_encoder/` IS Qwen3-VL-32B-Instruct
+(HF DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/config.json), whose
+`vision_config.deepstack_visual_indexes = [8, 16, 24]`, depth 27, text `num_hidden_layers = 64`
+(→ min(64,50)=50). Identical to vllm-omni `Qwen3VLMoeVisionConfig` default and public
+`Qwen/Qwen3-VL-30B-A3B-Instruct`. The #86 inference was right; no code value change.
+
+**Deliverable 1 — DEVICE scatter+inject WIRED 1:1 + GATED.** `MiniMaxH3EncoderTextForwardDevice`
+now takes the optional `visual_pos_mask` + per-tap `deepstack` blocks and ADDS each block into the
+masked visual rows after each of the first `len(deepstack)` decoder layers — device mirror of the
+gated host reference and upstream `_deepstack_process` (encoder.py:770-800). The merged masked_scatter
+into inputs_embeds stays the caller's job (upstream `_encode`, encoder.py:1071). Gate
+(`test_minimax_h3 :: "the DEVICE keep-quant encoder matches the host f32 reference"`): device forward
+now also runs WITH a visual mask + 2 DeepStack blocks → device==host max|diff| **3.8e-4** (≤ 2e-3)
+AND DeepStack moves the conditioning (scale 1.006→1.062). PASS, 1562 assertions. Host text tower,
+full vision tower, GGUF visual.* loader, MM processor all green. The full-suite SIGSEGV at line 3503
+(NVFP4 case) is the known cross-test CUDA flake — passes standalone (585 assertions), not this change.
+
+**Driver `--cond-image`** routes a reference image through the encoder vision path (reuse only:
+Qwen3VLImageProcessor → Qwen3VLVisionForward → merged+3 DeepStack; ExpandImagePlaceholders inserts nm
+image-pad tokens; masked_scatter; Qwen3VLGetRopeIndex == H3 `_get_rope_index` for t==1). Additive.
+
+**GB10 render A/B (256×256/22f/12steps).**
+- **Deliverable 3 — fl2va WITH the encoder vision path = COHERENT + matching (PASS).** FL2VA GGUF
+  `--dequant-bf16` + `--first-frame` + `--cond-image` + `--partition fl2va`, prompt "a fluffy orange
+  cat sitting on a windowsill in warm sunlight". conditioning=[82,5120] (16 prompt + 66-token vision
+  block: 64 merged + 2 markers). Frame 0 = coherent orange cat (keyframe); frame 21 = the cat on a
+  WINDOWSILL in warm sunlight — the clip EVOLVED toward the prompt. No grid. Artifact
+  `~/h3fp4/out_vs_fl2va.mp4` (+ out_vs_fl2va/frame_*.ppm). The vision conditioning is SOUND.
+- **Deliverable 2 — ref2va WITH the vision-enriched prompt STILL GRIDS (honest FAIL).** Ref2VA NVFP4
+  `--fp4-resident` + `--ref-image` (VAE reference rows) + `--cond-image` + `--partition ref2va`, same
+  prompt. conditioning=[82,5120] (64 merged + 3 DeepStack), 1 reference image, latent 7×16×16. Every
+  frame (0/10/21) is the same multicolour PATCH GRID as #86's text-only ref2va. Artifact
+  `~/h3fp4/out_vs_ref2va.mp4`.
+
+**RE-ATTRIBUTION (with evidence).** The "vision-enriched conditioning fixes the grid" hypothesis is
+REFUTED. The ref2va grid is NOT the encoder conditioning: (a) the DiT forward MATH is byte-exact vs
+upstream (geometry ladder green every rung #74; device==host at real seq 1920 #77); (b) the SAME
+vision scatter+DeepStack path renders a COHERENT fl2va-with-`--cond-image`; (c) the grid is INVARIANT
+to text-only (#86) vs vision-enriched prompts. The only difference between coherent fl2va and gridding
+ref2va: fl2va PINS output rows (keyframe cond rows) each step, ref2va PREPENDS free-running reference
+rows. So the residual is the **ref2va reference-row conditioning ASSEMBLY**
+(`MiniMaxH3EncodeReferenceImages` VAE-reference rows + `minimax_h3_packed_sequence_ref2va_blocks`
+noised-anchor layout + how the denoise loop conditions the un-pinned target rows), NOT the prompt and
+NOT the DiT forward. Next diagnostic: dump the ref2va target-row VAE-input adjacency-cosine (like #77's
+0.95 for coherent fl2va) to confirm the target rows are white, and A/B the reference-row condition-noise.
+
+## MiniMax-H3 ref2va ASSEMBLY fix + grid RE-ATTRIBUTED to the NVFP4 checkpoint (`row/H3-REF2VA-ASSEMBLY` PR #93, 2026-08-07, dgx sm_121a)
+
+Followed §8.9's residual (ref2va reference-row assembly), diffed it vs upstream, fixed a real bug,
+gated it, re-rendered — and the render DISPROVED the §8.9 attribution.
+
+**Real bug fixed.** `MiniMaxH3EncodeReferenceImages`/`Video` emitted PATCHED ref-block dims
+(`ls.h/patch_size_h`); `BuildMiniMaxH3PackedSequenceRef2va` divides `block.latent_h/kPatchH` AGAIN
+(mirroring upstream `packed_sequence.py:328-330`, which takes the UNPATCHED latent; upstream feeds the
+raw latent `visual_shape=(1,height//16,width//16)`, `pipeline_minimax_h3.py:1141-1145`). Double-division
+under-allocated the reference span by patch_h*patch_w (=4); the denoise pin-loop `>=` check silently
+TRUNCATED the oversized encoded reference to its first quarter. Fix = emit raw `ls.{t,h,w}`.
+
+**Gates.** goldens section 5c (ref2va-shaped DiT-forward rung: image + video+audio ref blocks, 8×8
+geometry, ref2va timestep partition + audio update mask, RefDiT) → C++ case "DiT-forward REF2VA rung
+matches upstream (reference rows, mixing)"; RED-first encoded-vs-layout row-count invariant
+(reintroducing the bug fails 128==512 = 16 encoded vs 4 allocated; restored green). Suite 69/69, 52377
+assertions. Goldens regen purely additive (635 inserts, 0 deletes).
+
+**GB10 render A/B + ISOLATION (256×256/22f/12steps, fixed incremental binary).**
+
+| Render | Checkpoint | Quant | Assembly | Result |
+|---|---|---|---|---|
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | fp4-resident | full | GRID |
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | bf16 dequant | full | GRID (fp4 eliminated) |
+| t2va (no refs, no cond-image, `--partition fl2va`) | ref2va NVFP4 | bf16 dequant | NONE | GRID (assembly eliminated) |
+| fl2va (keyframe + `--cond-image`) | FL2VA GGUF | bf16 | keyframe | COHERENT (cat→windowsill; no regression) |
+
+**Re-attribution (corrects §8.9 + §8.6).** The grid is NOT the ref2va assembly and NOT fp4 — it appears
+with the ENTIRE reference assembly removed, in both fp4 and bf16. It correlates 1:1 with the ref2va
+NVFP4 CHECKPOINT: every render loading `minimax_h3_ref2va_nvfp4_full` grids; every FL2VA-GGUF render is
+coherent. §8.9's A/B varied only the prompt, §8.6's only the task — neither varied the checkpoint/quant,
+so both misattributed a checkpoint/loader defect. True residual = the NVFP4 DiT loader for this file
+(`StreamMiniMaxH3Nvfp4ToDeviceBf16/Fp4`): suspect fp32-island preservation (patch/time/output layers,
+`minimax_h3_transformer.py:898-904`), `weight_scale_2` double-dequant, or the 1051-tensor name mapping.
+Synthetic-NVFP4 gates proved the dequant MATH byte-exact but never loaded THIS file vs a coherent oracle.
+Next: a REF2VA GGUF (bf16, known-good loader) as checkpoint oracle — dgx-disk-blocked (23 GiB free).
+Artifacts `~/h3fp4/out_{vs_ref2va,bf16_ref2va,t2va_nvfp4,vs_fl2va}.mp4`.
+
+## MiniMax-H3 — the Thor render-speed leg, the audio-duration bug, and the Q3_K_M quantization floor (2026-08-06)
+
+Moved out of `docs/BENCHMARKS.md` on landing: the scoreboard is a keyed table, so
+the measured results live there as three rows and the forensics live here.
+
+**Thor render speed (sm_110, no FlashAttention-2).** One Jetson Thor, 864x480 /
+124 frames / 50 steps, Q4_K_M DiT:
+
+| stage | measured |
+|---|---|
+| DiT forward | **34.6 s/step** (was 574.5 s before the attention work: **16.6x**) |
+| attention share of a step | 96% before, and the whole of that 16.6x |
+| full 50-step render | **~28 min** (was ~8 h) |
+
+The 16.6x is three landed changes and two MEASURED NEGATIVES: warp-per-query,
+then a chunked warp reduce-scatter (1.76x), then bf16 tensor cores via
+`mma.sync` (9.82x). Shared-memory K/V tiling (**23% SLOWER**) and register
+Q-blocking (**-0.8%**) were both measured and REVERTED. Both chased memory
+traffic, which is not the bound: one head's K+V is 3.9 MB against 32 MB of L2.
+Do not re-run either without a new reason.
+
+**Quantization floor: use Q4_K_M, not Q3_K_M.** H3's split-half RoPE produces
+channel-wise magnitude outliers that 3 bits cannot hold. A controlled A/B (same
+prompt, same seed, same code, only the DiT encoding changed) turned a murky
+lattice-covered silhouette into a photoreal close-up.
+
+**The audio-duration bug: a 124-frame render silently muxed as 61 frames.**
+`audio_t` is the PER-CHANNEL latent length (the planner sets it from 40 Hz *
+duration) and the packed layout carries `audio_t * audio_channel` ROWS, one per
+(channel, step). The denormalize step divided by the channel count, so the
+decoded audio ran half the video's duration; because the muxer passes
+`-shortest`, that silently truncated the VIDEO to half its frames too.
+
+Worth recording is WHY the suite was blind to it. Every existing gate asserts
+shape SELF-CONSISTENCY, and a uniformly halved pipeline is perfectly
+self-consistent: the shapes agreed with each other, they were just half as long
+as the request asked for. `ffprobe` on the artifact exposed it. The gate added
+is the invariant that is NOT self-consistency: latent steps / 40 Hz must equal
+the video duration, to within one latent step.
+
+(The sibling reference-leak bug found in the same render session, where
+conditioning rows reached unpatchify, was independently fixed on `main` by
+`row/H3-RENDER-CLOSE` taking the TRAILING target rows; this row's alternative
+`update_mask` mechanism was dropped rather than landed twice.)
+## MiniMax-H3 NVFP4 ref2va grid — independent-oracle loader diff: fp4 nibble-order bug FIXED, but a 2nd NVFP4-path defect remains (`row/H3-NVFP4-LOADER-DIFF` PR #94, 2026-08-07, dgx sm_121a)
+
+Followed #93's residual (the ref2va NVFP4 checkpoint/loader) with an independent-oracle loader diff — NO new download. Root-caused + fixed a REAL loader bug #93 mis-guessed, verified byte-exact, but the render still grids from a SECOND, independent defect that is NOT the checkpoint content and NOT the loader dequant.
+
+**Method.** An independent CPU dequant of `minimax_h3_ref2va_nvfp4_full.safetensors` (own fp8-e4m3fn + E2M1 + bf16 math; each primitive byte-EXACT vs torch, verified over all 256 fp8 bytes and 200k bf16 RNE cases) diffed against the coherent FL2VA GGUF via the maintained `gguf.quants` dequant (trusted, independent). The two files share the SAME base DiT: the islands (`condition_proj`, `time_embedder`, both patch projections, norms, `rope.inv_freq`) are BYTE-IDENTICAL, and every sampled projection (`qkv`/`out`/`fc1`/`fc2`/`adaln`, blocks 0..45 step 5 + both token_refiners) has sign-agreement 1.000 — so fl2va and ref2va are one model, and the coherent GGUF is a per-tensor oracle for the ref2va projections too.
+
+**Root cause (fixed).** The community checkpoint (metadata `converted_by: "Star Ultimate Model Converter Pro"`) packs the two fp4 elements per byte HIGH-first (element 2i in the high nibble, 2i+1 in the low) — the opposite of the modelopt standard our `DequantNvfp4ToBf16` + Marlin assume. Read low-first, every adjacent fp4 pair is swapped, so each projection matrix is internally scrambled: vs the coherent GGUF, low-first gives elementwise corr **0.000**; HIGH-first gives **sign-agreement 1.000 over 115M+ weights** and corr 0.85→0.94 rising with |w| (the NVFP4-vs-Q3_K quant-noise floor). Islands are bf16 (not nibble-packed) → byte-identical → exactly why #93/#86 misattributed. #93's three guesses (island preservation / weight_scale_2 / name mapping) were all wrong; none named the nibble order. Fix: swap the two nibbles of every packed byte at load (`(b>>4)|(b<<4)`) in the three H3 NVFP4 loaders (reference + bf16 streamer + fp4-resident Marlin streamer) → the file's high-first bytes become the standard low-first both arms expect. H3-scoped; shared `DequantNvfp4ToBf16` untouched (Laguna/DS4/Qwen3 stay low-first). Default ON; `VT_H3_NVFP4_LOWNIBBLE=1` reverts.
+
+**Fix BYTE-VERIFIED on GB10.** An env-gated dump of the actual streamer output: the binary's `blocks.0.attn.qkv_proj[0:16]` with the fix = `-0.0859 -0.0430 -0.1289 -0.0430 -0.0859 0.1719 -0.1289 0.2578 ...` = EXACTLY the independent oracle's HIGH-first row, sign-identical to the GGUF (`-0.0679 -0.0679 -0.1357 ...`). Derived params IDENTICAL between the two files (L=50 refL=2 H=5376 heads=56 ffn=14336 txt=5120 lat=24 alat=32 adaln=96768 …).
+
+**GB10 render A/B (256×256/22f/12steps).**
+
+| Render | Checkpoint | Quant | nibble | Result |
+|---|---|---|---|---|
+| t2va (no refs, `--partition fl2va`) | ref2va NVFP4 | bf16 | LOW (=1) | severe dark GRID (= #93 baseline) |
+| t2va (no refs, `--partition fl2va`) | ref2va NVFP4 | bf16 | HIGH (fix) | pale GRID (weights now correct; STILL grids) |
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | bf16 & fp4 | HIGH (fix) | GRID |
+| fl2va + keyframe (`--first-frame`) | ref2va NVFP4 | bf16 | HIGH (fix) | GRID (output-pinning does NOT rescue) |
+| t2va (no refs, `--partition fl2va`) | FL2VA GGUF | bf16 | — | COHERENT orange cat (control, this build) |
+| fl2va + keyframe (`--first-frame`) | FL2VA GGUF | bf16 | — | COHERENT (#93) |
+
+**RE-ATTRIBUTION (corrects #93 again).** The nibble fix CHANGES the output (low-first severe grid → high-first pale grid, so the swap IS applied) yet EVERY NVFP4 render grids — t2va, ref2va, AND fl2va-with-keyframe — while the fl2va-GGUF control (SAME weights, SAME params, verified byte-for-byte) renders a coherent cat in the same build and same task. So: the checkpoint CONTENT is sound (byte-matches the coherent GGUF), the loader dequant is now byte-correct (binary dump == oracle == GGUF-sign), the derived params are identical, and output-pinning (keyframe) does NOT rescue it (rules out free-generation divergence). The residual grid is therefore a SECOND, independent defect in the NVFP4 render PATH itself — the device stream / forward, NOT the checkpoint, NOT the fp4 nibble order, NOT free-gen. The fp4-resident Marlin arm additionally grids differently (a THIRD, Marlin-specific issue — that path was only ever wiring-gated, never correctness-gated). The nibble fix is the objectively-correct dequant (the file IS high-first) and lands default-ON (A/B via `VT_H3_NVFP4_LOWNIBBLE=1`); it is byte-verified but not yet render-validated, blocked on the second defect. Next diagnostic: layer-by-layer intermediate-activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream (identical weights) to locate where they diverge — the streamers are structurally identical except the dequant source and the island read (bf16-disk vs f16-disk), so the divergence is a candidate.
+
+Artifacts `~/h3fp4/{t2va_fix,t2va_nofix,ctrl_t2va,ab_bf16fix,ab_fix,ab_nofix,kf_nvfp4}.mp4`.
+
+## Rolled out of the scoreboard on 2026-08-07
+
+Moved verbatim from `docs/BENCHMARKS.md` by `scripts/roll-benchmark-record.py`. Nothing edited or deleted.
+
+## Startup latency
+
+**PROVISIONAL, not binding.** Qwen3.6-27B-NVFP4 on GB10, `--startup-only`, three
+interleaved ours/vLLM repetitions under one `/tmp/gpu` lock, page cache dropped
+before every launch, GPU proven idle before and after each leg. vLLM oracle
+0.25.0 in the same production config the throughput grid uses.
+
+| Repetition | vllm.cpp | vLLM 0.25.0 |
+|---|--:|--:|
+| r1 | 37.94 s | 460.36 s (cold FlashInfer autotune) |
+| r2 | 36.51 s | 221.51 s |
+| r3 | 35.88 s | 217.86 s |
+| **median** | **36.51 s** | **221.51 s** |
+
+**6.07x faster to first `/health`.** Our band is 35.88 to 37.94 s (±3%); vLLM's
+two warm legs agree within 1.7%.
+
+The 460 s vLLM leg is a genuine one-time-per-machine cost, and vLLM's own log
+names it: r1 `init engine (profile, create kv cache, warmup model) took 259.42 s
+(compilation: 46.43 s)` while the FlashInfer autotuner **saved** 64 configs;
+r2 `took 26.95 s (compilation: 11.73 s)` while it **loaded** them from
+`~/.cache/vllm/flashinfer_autotune_cache`. Note that even warm, vLLM's engine
+init is only ~27 s of its ~221 s: the rest is process start, imports and weight
+load, which is where our advantage actually comes from.
+
+Our equivalent one-time cost is **+33 s**: a separate quiet-box run with both
+autotune caches cleared measured our cold-cache start at **69.29 s** against the
+36.51 s warm median (`[VT_FP4_CACHE] loaded=0` vs `loaded=64 tuned=0`).
+
+### Why this is not binding yet
+
+1. **Contention.** A concurrent build session appeared on the box at 00:38:41,
+   overlapping r2 and r3 of both arms. Our numbers look unaffected (the
+   overlapped leg was our fastest), but both warm-cache vLLM legs are inside
+   that window and contention would bias vLLM slow, inflating the ratio.
+2. **The re-run died with the host.** The uncontended repeat completed our
+   cold-cache r1 (69.29 s) and then the box **hard-rebooted at ~00:54** during
+   vLLM's cold-autotune leg (`gpu_memory_utilization=0.6` on the 119 GiB unified
+   pool; the previous boot's journal ends mid-leg with no shutdown sequence).
+   This is the known GB10 unified-memory reboot hazard, now also reproduced with
+   a *cold-autotune* vLLM leg, which peaks higher than the warm one the first
+   series ran six times without incident.
+
+Repro: `scripts/dgx-online-serving.sh --startup-only --model 27 ...`; evidence
+under `dgx:~/work/vllm.cpp-online-gate/evidence/8f752ae5.../startup/27/`.
+Method and caveats: [.agents/specs/startup-latency-axis.md](../.agents/specs/startup-latency-axis.md).
+
+
+## MiniMax-H3 NVFP4 ref2va grid — the #94 residual DIAGNOSED: NO discrete load-path defect (identical-weights activation diff) (`row/H3-NVFP4-STREAM-DIFF` PR #95, 2026-08-07, dgx sm_121a)
+
+Ran #94's prescribed next diagnostic — a layer-by-layer activation diff of the NVFP4-bf16 stream vs the FL2VA-GGUF-bf16 control on BYTE-IDENTICAL inputs — plus direct WEIGHT fingerprints. The result REFUTES the "second NVFP4-render-path defect" hypothesis: there is **no discrete load-path materialization bug**. All weights load correctly; the residual grid is checkpoint-quantization fidelity × the DiT's massive-activation sensitivity.
+
+**Method.** Env-gated per-stage fingerprint hook inside `MiniMaxH3DitForwardDevice` (`VT_H3_ACT_DUMP`, byte-inert unset; `minimax_h3_device.cpp`): summary stats (mean/rms/absmax/finite) + a fixed positional-sample spread (catches transpose/scramble even when rms matches), at every embed/scatter/time stage, every block's adaln+post-attn+post-mlp, the final heads, the RoPE cos/sin cache, the block-0 attention internals (qkv/split/qknorm/rope/core/out_proj), and input-independent WEIGHT fingerprints for every island, bias, output head, q/k-norm and block-0/refiner-0 projection. Both arms: ONE small t2va forward (`--denoise-only --steps 2`, 256×256/22f, `--partition fl2va`) with byte-identical `--prompt-embeds pe.f32` (encoded once, reused → no encoder; both arms feed the SAME text conditioning) + identical seeded noise; final video checksum is DETERMINISTIC per arm (GGUF 9411.61, NVFP4 1160.19, reproduced across three runs).
+
+**Every loaded tensor is quant-noise-close; there is no scramble/transpose/mis-stride/wrong-dtype/wrong-shape.** Direct fingerprints (NVFP4 vs GGUF): `qkv_proj` rms 8.94e-2 vs 8.46e-2, `q_norm`/`k_norm` essentially identical (rms 1.086 vs 1.086), `out_proj` 8.47e-2 vs 8.14e-2, `fc1`/`fc2`/`adaln_w` within 2-6% (Q3_K-vs-NVFP4 quantizer variance, sign-correct); ALL biases identical (`adaln_b` 0.1554 vs 0.1554, `final_adaln_b`, `condition_b`, time biases all <0.1% apart); ALL fp32 islands and output heads (`video_patch_w` rms 0.22059 both, `video_out_w`, `audio_out_w`, `time_in/out_w`) quant-noise-close; and the **RoPE cos/sin cache is IDENTICAL** (same samples, rules out `rope.inv_freq`). Both arms run the IDENTICAL forward code, so the grid is 100% attributable to the per-weight NVFP4-vs-Q3_K quantization difference on the SAME weights (#94 proved sign-agreement 1.000 → same weights; dequant byte-verified).
+
+**Divergence profile (paired stage rms-ratio N/G, and sample-relative-L2):** embed video/audio/text-condition/adaln = 1.00 (quant noise); FIRST real divergence at the **token refiner** `text_refined` (0.92, sampRelL2 0.48); then `block.0.normed_pre_attn` (0.89 — the attention INPUT already diverges) → `qkv_out` (0.78) → `core_out` (0.78) → `out_proj` (0.60); amplifies through the 50-block stack; final latents are DECORRELATED (sampRelL2 >1, not scale-related). Driver: the Qwen massive text activation (`condition_proj` output absmax **~7.4e4**) makes the refiner/attention chaotically sensitive to the few-% weight quant delta. NVFP4 stays systematically lower-magnitude (→ "pale"). This is CHAOTIC trajectory divergence, not a fixable scramble/scale.
+
+**Render A/B re-confirmed in the same byte-inert build (256×256/22f/12steps, `pe.f32`, `VT_H3_ACT_DUMP` unset).** NVFP4 t2va = pale multicolour PATCH GRID every frame (0/10/21, per-patch uniform = degenerate latent); FL2VA-GGUF t2va = a COHERENT photorealistic orange cat on a windowsill. The diagnostic hooks are byte-inert (reproduce #94's outputs exactly).
+
+**CONCLUSION.** The mission's "2nd load-path defect" does not exist — our loader materializes the community NVFP4 file's weights faithfully (byte-verified). The residual is the **community NVFP4 checkpoint's quantization fidelity** (metadata `converted_by: "Star Ultimate Model Converter Pro"` — same dubious-converter lineage as the #94 nibble bug; corr to the coherent Q3_K only 0.85-0.94, well below the >0.99 a clean 4-bit quant gives) interacting with the DiT's massive-activation sensitivity. Definitively separating "poor community quant" from "inherent t2va-OOD sensitivity of these fl2va/ref2va finetunes" needs a clean reference — a bf16 ground truth (132 GiB host-f32 = OOM on one GB10) or a same-finetune REF2VA-GGUF control (disk-blocked, 23 GiB free) — both currently blocked; the path forward is an official modelopt-NVFP4 checkpoint, not a loader change. The #94 nibble fix stands as the objectively-correct dequant. The fp4-resident Marlin arm's separate grid stays a distinct, wiring-gated-only residual (untouched, per the mission). Artifacts `~/h3fp4/diff/{nvfp4_t2va,gguf_t2va}.mp4` + `{gguf,nvfp4}{2,3,4}.txt` fingerprints.
+
+---
+
+## 2026-08-07 — Kimi-Linear-48B W7-speed STRICT lever: bf16 regime 106→120/128, plateaus (device islands the residual)
+
+Full 48.9B model on GB10 (sm_121a clean CUDA build, cutlass-4.5.0, 14 GDN AOT symbols; CPU gate `test_kimi_linear_forward` 13/13·656 in the CUDA binary), §12 8-prompt×16-token gate vs the STRICT deterministic golden. Three env-gated numeric knobs added to `kimi_linear_device.cpp` (default OFF, byte-identical). Both flock locks, reclaim-wait ≥90 GiB between every reload, min-avail ≥115 GiB, no reboot.
+
+| Config | env | TOKEN MATCH /128 | tok/s | note |
+|---|---|---|---|---|
+| control | (none) | 106 | 1.31 | reproduces §13 baseline exactly (build integrity) |
+| residual only | `VT_KIMI_BF16_RESIDUAL` | 106 | 1.61 | net-zero: shuffles flips, BREAKS p3 into `163586×` repeat |
+| islands only | `VT_KIMI_BF16_ISLANDS` | 106 | 1.30 | fixes p2, destabilizes p3 — net-zero |
+| **residual + islands** | both | **120** | 1.30 | **BEST**: p0–p6 all 16/16; only p7 pos-8 flips (`18705`→`58084`) |
+| + island-output bf16 | (islands, out-round) | 90 | 1.32 | REGRESSION — reverted |
+| + f32 accumulation | `…VT_KIMI_ISLAND_F32ACC` | 91–106 | 0.84 | NEGATIVE — kept as documented A/B |
+
+FLIP LEDGER (deterministic golden arbitrates): the two levers interact — island bf16-input rounding fixes p2 but repeats p3; the bf16 residual stream (vLLM `fused_add_rms_norm` order) re-stabilizes p3. At 120/128 the SOLE divergence is p7 position 8 (golden deterministically `18705`, ours `58084`), a single near-tie that cascades to 8/16 on p7. Further precision-"matching" (output bf16, f32 accum) is a coin-flip that regresses — it is not vLLM's actual GDN-Triton/FA2 kernel arithmetic. Host-precision-matching PLATEAUS at 120/128.
+
+VERDICT: NO arm STRICT (K=3-deterministic golden → STRICT required, not distributional); default STAYS OFF (parity-enablers). NAMED residual (= also the speed lever): the device islands — a NEW per-channel-decay GDN kernel (`g[T,H,D]`; `vt::GdnDecode`/`GdnPrefill` carry only per-head `g[T,Hv]`, ops.h:1797/1846 — NOT a drop-in) + paged `mla::ForwardMlaAttentionBlock` (FA2). Speed HW-forced-indirect: 1.30 tok/s (O(n²) recompute + host islands, invariant to the numeric knobs); vLLM cannot serve Kimi-Linear-48B at bf16 on one GB10 (oracle capture needed util 0.82 for a single-seq eager run) so a direct `vllm bench throughput` arm is infeasible. Row STAYS ACTIVE.
+
+## 2026-08-07 — Kimi-Linear-48B: per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` — 106→122/128 AND 3.1× speed (the §14 residual, MEASURED on GB10)
+
+The §14 named residual ("a NEW per-channel-decay GDN kernel `g[T,H,D]`; `vt::GdnDecode`/`GdnPrefill` carry only per-head `g[T,Hv]` — NOT a drop-in") was BUILT as the additive device op `vt::KdaGatedDeltaRule` (`row/KIMI-KDA-DEVICE-KERNEL`, #104) and MEASURED. Grounded 1:1 in FLA `fused_recurrent_gated_delta_rule_fwd_kernel` IS_KDA=True (`b_h *= exp(b_gk[None,:])` per-K-channel, `third_party/flash_linear_attention/ops/fused_recurrent.py:136-137` @ 555967922); the shared GDN kernels are untouched (`test_ops_gdn` 66/66·4242 on GPU). Unit-gate `test_ops_kda_recurrence` (broadcast-g == `vt::GdnPrefill` BIT-IDENTICAL; distinct per-channel vs f64 ref; CPU↔CUDA parity) 4/4·8 GREEN on the GB10 CUDA binary.
+
+**Full 48.9B 128-token gate vs the §12 STRICT golden** (GB10 sm_121a, clean Release CUDA build, Triton-AOT vendored, cutlass-4.5.0; single-load per config; memory-safe: host RSS peak 1.7 GiB, min-avail 21 GiB, freed cleanly between configs, NO reboot):
+
+| Config | env | /128 | tok/s |
+|---|---|---|---|
+| control (f64 host recurrence) | `VT_KIMI_DEVICE_COMPUTE=1` | 106 | 1.35 |
+| **device-KDA** | `…DEVICE_KDA=1` | **122** | **4.24** |
+| device-KDA + bf16 knobs | `…DEVICE_KDA=1 BF16_RESIDUAL BF16_ISLANDS` | 90 | 4.19 |
+
+RESULT (the §14 thesis CONFIRMED): the device recurrence — vLLM's ACTUAL f32-on-bf16 arithmetic — moves **106→122/128** (prompts 0-6 all 16/16; only p7 diverges at pos-6, got `387` vs golden `11`, a comma near-tie) AND is **3.1× FASTER (1.35→4.24 tok/s)**. It beats BOTH the control (106) AND §14's host-precision best (120, which needed both bf16 knobs), and FIXES the p2 divergence the f64 host path had — because it runs the right arithmetic, not a coin-flip. The §14 bf16 knobs are now SUPERSEDED + COUNTERPRODUCTIVE: device-KDA + bf16 REGRESSES 122→90 (reintroducing p3's `163586×` repeat loop) — they were tuned to compensate for the f64 host island's over-precision. The speed win = the device recurrence kills the per-step host Download/f64-recompute/upload round-trip and runs the O(T²) recurrence in parallel on the GPU.
+
+VERDICT: device-KDA (122/128, 4.24 tok/s) is the NEW BEST on BOTH axes but STILL a DIVERGENCE (STRICT required, K=3-deterministic golden) → `VT_KIMI_DEVICE_KDA` STAYS OFF (parity-enablers). The residual is now a SINGLE near-tie (p7 pos-6). NAMED next brick to STRICT (+ more speed): the KDA chunked-prefill kernel family (vLLM processes the PROMPT with `chunk_kda`, we still run the recurrent form — regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or a native `chunk_kda` port) + paged `mla::ForwardMlaAttentionBlock` for the 7 NoPE-MLA layers + paged-incremental decode (persistent KDA state + MLA-KV, kills the remaining O(n²)). Row STAYS ACTIVE.
+## Vulkan GEMM tactic A/B — cooperative matrix vs the portable scalar kernel (2026-08-07, `VK-C`, NVIDIA Thor)
+
+**Setup.** NVIDIA Thor (Jetson, aarch64, JetPack R39, Vulkan 1.4 loader 1.4.321,
+NVIDIA ICD at `/etc/vulkan/icd.d`). SAME BINARY both arms —
+`examples/vulkan-gemm-ab`, built Release `-Werror` 0-warn with a user-local cmake
+3.31.6 — and the ONLY variable is `VT_VULKAN_COOPMAT`, which forces the scalar
+tactic when `0`. `MatmulBT` (the torch Linear layout), bf16 operands, f32 output,
+median of 20–30 reps after 5 warm-up dispatches. Every arm printed the tactic it
+actually ran (`PipelineExistsFor`) and verified against a host f32 oracle.
+
+Thor exposes the SAME 11 cooperative-matrix configurations as GB10, including the
+`16x16x16 bf16/bf16/f32/f32 SUBGROUP` one this shader is written to, and reports
+subgroup size 32 — so both selection preconditions hold and the COOPMAT arm
+genuinely engaged.
+
+| M x K x N | COOPMAT ms | scalar ms | speedup | coopmat GFLOP/s |
+|---|---:|---:|---:|---:|
+| 128 x 1024 x 1024 | 0.495 | 5.470 | **11.1x** | 542 |
+| 512 x 2048 x 2048 | 2.596 | 81.997 | **31.6x** | 1,655 |
+| 1024 x 4096 x 4096 | 19.896 | 654.181 | **32.9x** | 1,727 |
+
+`worst rel err = 0.000e+00` in every arm, so no arm is fast by being wrong.
+
+**WHAT THIS NUMBER IS NOT.** The baseline is our own `vt_matmul.comp`, which is
+DELIBERATELY a naive untiled kernel — one invocation per output element, sequential
+f32 accumulation, no shared-memory blocking — written to match the CPU's
+accumulation order and serve as the portable correctness tier. So this measures
+*tensor cores vs a naive scalar loop*, NOT *our coopmat vs a competent scalar
+GEMM*. A tiled scalar kernel would close a large part of this gap on its own. The
+honest reading is "the coopmat tactic is worth having and is correctly selected",
+not "we are 32x faster than anyone".
+
+It is also NOT a competitor comparison. llama.cpp's Vulkan backend is untouched
+here; that is `BENCH-VK-LLAMA` / `VK-E`, still owed.
+
+Speedup grows with size (11x -> 33x), which is what a tensor-core path should do:
+the fixed per-dispatch cost amortises and arithmetic intensity rises.
+
+## VK-E, llama.cpp Vulkan comparison — DENOMINATOR MEASURED, our arm BLOCKED (2026-08-07, GB10)
+
+**llama.cpp Vulkan baseline, at FULL STRENGTH.** Built from our pinned source
+`237ad9b96`, `-DGGML_VULKAN=ON`, GB10, under `$HOME/gpu.lock`. Runtime banner:
+`NVIDIA GB10 | uma: 1 | fp16: 1 | bf16: 1 | warp size: 32 | int dot: 1 |
+matrix cores: NV_coopmat2`.
+
+| model | test | t/s |
+|---|---|---:|
+| qwen3 0.6B F16 (1.11 GiB) | pp128 | **11,730.14 ± 238.49** |
+| qwen3 0.6B F16 (1.11 GiB) | tg32 | **161.37 ± 1.20** |
+
+**★ THE BUILD-TOOLCHAIN TRAP, CONFIRMED AND AVOIDED.** The fan-out spike predicted
+Ubuntu's `glslc` (shaderc 2023.8) would be too old for llama.cpp's coopmat2 probe.
+It is, and the effect is larger than "coopmat2": configured against the packaged
+glslc, llama.cpp reports
+
+    GL_KHR_cooperative_matrix        supported
+    GL_NV_cooperative_matrix2        NOT supported
+    GL_NV_cooperative_matrix_decode_vector NOT supported
+    GL_EXT_integer_dot_product       NOT supported
+    GL_EXT_bfloat16                  NOT supported
+
+— i.e. FOUR of its five Vulkan fast paths silently disabled, including its best
+NVIDIA one. Benchmarking against that would have handicapped the reference and
+flattered us, which is the exact inverse of the "denominator is the reference's
+PRODUCTION config" rule. Fixed by building shaderc from source on dgx
+(`v2026.4-dev`, `/tmp/shaderc/b/glslc/glslc`) and passing
+`-DVulkan_GLSLC_EXECUTABLE=`; all five then report `supported` and the runtime
+banner confirms `matrix cores: NV_coopmat2`. **Any future llama.cpp-Vulkan number
+from this box MUST check that banner** — the packaged glslc produces a build that
+looks fine and quietly runs the slow paths.
+
+**OUR ARM IS BLOCKED, and not for the reason expected.** The known limit was op
+coverage (16 of 87 native, the rest on the portable CPU tier). The ACTUAL blocker
+hit first: **no model on dgx loads in both engines.** Our GGUF path rejects the
+plain `qwen3` architecture (`qwen3_5_gguf_weights.cpp:829`, "unexpected
+architecture 'qwen3'" — the Qwen3.5 family loader), and llama.cpp cannot load our
+`la-f16.gguf` (Laguna, a vllm.cpp-side architecture). The two engines support
+DISJOINT GGUF sets among the models present.
+
+So VK-E's e2e comparison is not merely "we would lose"; it cannot be RUN yet. It
+needs either a GGUF architecture both load (a plain Llama/Qwen3 GGUF our loader
+accepts, or safetensors on our side against the same weights), or the quant tier
+(`VK-D`) so a shared quantised model is meaningful. Recorded as the binding
+blocker rather than papered over with a mismatched pair of numbers.
+
+**No vllm.cpp Vulkan number is claimed here.** The denominator above stands alone.
+
+## 2026-08-07 — Kimi-Linear-48B: device NoPE-MLA attention lever `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE (122→109/128 AND slower); STRICT still owes vLLM's ACTUAL FA2/chunk_kda kernels (`row/KIMI-STRICT-CLOSE`, #107)
+
+The §15 residual (d) — "the 7 NoPE-MLA layers still use a host f64 softmax island; closing p7 needs paged `mla::ForwardMlaAttentionBlock`" — was attempted in its device-COMPUTE form (the §15 device-KDA pattern applied to the MLA half) and MEASURED NEGATIVE on GB10. Additive knob `VT_KIMI_DEVICE_MLA` + `MlaAttnCoreDevice` (`kimi_linear_device.cpp`): the NoPE causal softmax over per-head `[k_nope|k_pe(shared)]`/`v` runs through the shared device op `vt::Attention` (f32 online max-subtracted softmax — vLLM's FA2 accumulation regime) instead of the f64 host `MlaSoftmaxIsland`. `vt::Attention` carries ONE head-dim for q/k/v while MLA is asymmetric (`qk = qk_nope+qk_rope = 192`, `v = 128`), so the value is zero-PADDED to `qk` — the weighted sum over the zero tail is 0, so `out[:, :, :v]` is byte-exact (softmax weights depend only on `q·k`). MLA dims VERIFIED from the real 48.9B `config.json` (nah=32, qk_nope=128, qk_rope=64, v=128, kv_lora=512, q_lora=None; 7 full-attn `[4,8,12,16,20,24,27]`, 20 KDA) — not the K3 numbers.
+
+Unit gate (RED-first, CPU) GREEN: `test_kimi_linear_forward` **14/14·825** (was 13/13·656) — NEW case (g2) `KimiMlaAttnCoreDevice` (pad-V + `vt::Attention`) == a from-first-principles f64 causal-softmax reference at the Kimi MLA geometry (rtol 3e-3); RED-first verified (a perturbed scale fails 108 assertions). Env-gated whole-forward runs green (`VT_KIMI_DEVICE_MLA=1` alone and with `VT_KIMI_DEVICE_KDA=1`). Same on the GB10 CUDA binary (clean Release, CUTLASS-NVFP4 + FA2 + Triton-AOT, 210 GDN + 23 KDA syms linked).
+
+Full 48.9B GB10 gate vs the §12 STRICT `greedy_ids.npy` (single-load per config, `flock $HOME/gpu.lock`, `drop_caches` before wall-clock, min-avail **21 GiB**, no reboot, worker parked+restored):
+
+| Config | env (all `VT_KIMI_DEVICE_COMPUTE=1`) | /128 | tok/s | verdict |
+|---|---|---|---|---|
+| control (device-KDA) | `DEVICE_KDA=1` | 122 | 4.24 | reproduces §15 EXACTLY (p0-p6 16/16, p7 10/16) |
+| **+ device-MLA** | `DEVICE_KDA=1 DEVICE_MLA=1` | **109** | **3.89** | **REGRESSION on BOTH axes** |
+
+WHY NEGATIVE (the §14 razor, re-proven). device-KDA WORKS (106→122) because the recurrence is the SAME algorithm as vLLM's decode kernel, only f32-on-bf16 — it MATCHES. But vLLM's MLA prefill uses FA2 (a specific flash tiling/reduction ORDER); `vt::Attention`'s plain f32 online-softmax is the right MATH but a DIFFERENT reduction order, so — exactly like §14's host-precision plateau — it COIN-FLIPS near-ties: it BREAKS p3 16/16→3/16 (got `220,41938,382,1810,…163586,163586` — the same `163586×` degenerate repeat §14's bf16 knobs caused) while p7 stays diverged at 10/16. And it is SLOWER (4.24→3.89): the per-`(t,h)` key/value build copies + the 192-dim pad-V waste add overhead to the O(n²) recompute path. An approximation of vLLM's kernel is not enough — only the ACTUAL kernel matches.
+
+VERDICT: `VT_KIMI_DEVICE_MLA` STAYS OFF, kept as a documented-MEASURED-NEGATIVE A/B knob (parity-lever precedent: §14's `ISLAND_F32ACC`). device-KDA (122/128, 4.24 tok/s) remains the best config, itself default OFF (122 ≠ STRICT). The one-brick STRICT-close did NOT land. STRICT residual, SHARPENED: needs vLLM's ACTUAL kernels, not a device approximation — (c) the **chunk_kda** prefill family (`chunk_kda_scaled_dot_kkt`+`recompute_w_u`+`chunk_gla_fwd_o_gk`+`fused_kda_gate_chunk_cumsum`, FLA `ops/kda.py`) via a Triton-AOT regen for sm_121a (`scripts/regen-triton-aot.sh` + new `triton_kernels/*.py`), the named prime suspect; (d) the paged FA2 `mla::ForwardMlaAttentionBlock` (NOT the `vt::Attention` approximation tried here); (e) paged-incremental decode (needs a decode/paged-attn op with `query_len≠key_len`, which `vt::Attention` cannot express; kills the O(n²)). Each is a substantial multi-kernel brick, recorded as the named follow-on. Row STAYS ACTIVE. HONEST bar stays HW-forced-indirect (vLLM cannot serve this bf16 on one GB10 with KV headroom — §14).
+## Parakeet ASR port: first timing attempt, recorded VOID (2026-08-07)
+
+Recorded so the next person does not repeat it and does not mistake these
+numbers for a result.
+
+`examples/parakeet-transcribe`, `nvidia/parakeet-ctc-0.6b`, x86 dev box, 20
+cores, CPU f32:
+
+| clip | audio | wall |
+|---|---:|---|
+| 1089-134686-0000 | 10.44 s | 8.38 / 12.59 / 9.15 s |
+| 1089-134686-0001 | 3.27 s | 17.39 / 9.51 s |
+
+**VOID on three independent counts**, any one of which is disqualifying:
+
+1. The timed region includes loading a **2.4 GiB f32 safetensors** on every run,
+   which dominates it. The 3.27 s clip taking LONGER than the 10.44 s one is the
+   tell: this measures the loader, not the model.
+2. Run-to-run spread is ~2x (9.51 vs 17.39 s on the same clip), so there is no
+   stable median to quote. The box was at 98% disk with other sessions active.
+3. The x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`
+   regardless of the above.
+
+**What a real number needs**, in order: hoist the checkpoint load out of the
+timed region (load once, transcribe N clips); run on the gate host `dgx.casa`
+idle under one flock with 3+ reps; and put **parakeet.cpp on the SAME
+checkpoint** beside it as the floor, which today means converting
+`parakeet-ctc-0.6b` to GGUF since the local parakeet.cpp build only has
+`tdt_ctc-110m` (a 5.5x smaller model at f16, so the existing 0.17 s figure for
+it is NOT a comparable baseline and must not be quoted as one).
+
+Also worth stating plainly: **no optimisation pass has been attempted on this
+port.** It is f32, portable/AVX2 CPU tiers, no quantisation, no CUDA provider
+for its three new ops. The correctness work is done; the speed work has not
+started, and the first honest number will likely be poor.
+
+## Parakeet port vs parakeet.cpp, SAME checkpoint, load excluded (2026-08-07)
+
+Supersedes the VOID attempt above. Same box, same clip, and for the first time
+the SAME weights on both sides: `nvidia/parakeet-ctc-0.6b`, taken as HF
+safetensors by vllm.cpp and as `mudler/parakeet-cpp-gguf:ctc-0.6b-f16.gguf` by
+parakeet.cpp. LibriSpeech `1089-134686-0000.wav`, 10.44 s, x86 20 cores.
+
+### Correctness: the two engines agree EXACTLY
+
+parakeet.cpp `--json` emits token ids
+`67 17 163 33 131 209 50 70 969 69 26 10 896 808 346 1003 25 ...`
+and vllm.cpp's `parakeet-transcribe` emits the identical sequence, 63 ids, same
+order. Two independent implementations, one of them gated at WER 0 against NeMo,
+produce byte-identical token output on real audio. That is a stronger
+correctness signal than either engine's own oracle gate.
+
+### Speed: we are at least 12x slower, and that is the honest headline
+
+| engine | dtype | measurement |
+|---|---|---|
+| vllm.cpp | f32 | **6217 ms** forward-only, best of 5, load and mel EXCLUDED |
+| parakeet.cpp | f16 | **9.09 s** total for the 10.44 s clip, **9.24 s** total for a 3.27 s clip |
+
+parakeet.cpp's wall time is insensitive to clip length (9.09 vs 9.24 s for 3.2x
+the audio), so it is load-dominated and its INFERENCE is bounded by the
+difference: well under 0.5 s, and by the trend nearer 0.15 s. Against our
+6217 ms that is a floor of **>12x slower**, and plausibly ~40x.
+
+Method caveats, stated rather than buried: the x86 box is VOID for binding
+timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`, so treat the RATIO (same box, same
+clip, both engines) as the result and neither absolute as bindable. Our number
+excludes load while parakeet.cpp's includes it, which flatters US, and the gap
+is still >12x. Our f32 against their f16 also flatters them on memory
+bandwidth, so a like-for-like dtype comparison is still owed.
+
+### Why, and what would close it
+
+Nothing here is surprising and none of it is a defect:
+- we run **f32**; they run f16, and their GGUF path also has q8_0/q4_k
+- our three new ops (`kConv2d`, `kDepthwiseConv1d`, `kAttentionRelPos`) have a
+  portable CPU tier ONLY: no CUDA provider, and no arch-specific tier
+- ggml carries llamafile's tiled sgemm, measured earlier in this record as worth
+  ~1.9x on Arm 16-bit and ~2.4x on x86, which we deliberately do not match
+  because it splits the K reduction and uses FMA
+- no optimisation pass of any kind has been attempted on this port
+
+**The correctness work is done; the speed work has not started.** This entry
+exists so nobody mistakes the port for competitive, and so the first optimisation
+claim has a real baseline to beat.
+
+## 2026-08-07 — Kimi-Linear-48B: chunk_kda PREFILL AOT port SPIKED (kernel set + pinned-config record + regen recipe; NO gate yet) (`row/KIMI-CHUNK-KDA-AOT`)
+
+The §16 STRICT residual (c) — "vLLM processes the PROMPT with the CHUNKED `chunk_kda` kernel; the recurrent form we run is a different reduction order that coin-flips the p7 near-tie" — was SCOPED and de-risked to mechanical execution. This is a PLANNING/authoring spike; it MEASURES nothing on GPU and claims NO STRICT verdict.
+
+EXACT forward-only kernel set (`chunk_kda_with_fused_gate` → `_fwd` → `_chunk_kda_fwd_with_cumulative_g`, FLA `kda.py` @ 555967922), launch order: (1) `kda_gate_cumsum_fwd_kernel` `:1182` NEW; (2) `chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter` `:521` NEW; (3) `…intra_sub_intra` `:627` NEW; (4) `solve_tril` REUSE `gdn_tril_h32` (byte-identical sig at H=32,BT=64,A f32→bf16); (5) `recompute_w_u_fwd_kernel` `:817` NEW (KDA per-K-channel `exp2(gk)` + STORE_KG; ≠ GDN `wy_fast.py`); (6) `chunk_gated_delta_rule_fwd_h` REUSE `chunk_delta_h.py` with a NEW pin `USE_GK=1,USE_EXP2=1,USE_G=0,Hg=32` (the GDN `gdn_deltah` is `USE_G=1,USE_GK=0,USE_EXP2=0` — NOT reusable as-is); (7) `chunk_gla_fwd_kernel_o` `:1019` NEW. → 5 new Triton kernels + 1 new pin of an existing .py + 1 pure reuse. Decode STAYS the #104 recurrent `vt::KdaGatedDeltaRule` (mirrors vLLM's prefill=chunk / decode=recurrent split). Backward NOT owed.
+
+Pinned-config record (Kimi KDA: H=32, Hg=32, K=V=128, BT=FLA_CHUNK_SIZE=64, BC=16, NC=4): the full `_vllm_triton_aot_declare` recipe (bases, kernels, BK/BV/BD, warps/stages, grids, signatures) is in spec §17.3. num_warps/num_stages are correctness-invariant (pinned mirroring GDN); shape pins from FLA driver-fixed values + heuristic lists; dtypes MIRROR FLA (bf16 activations/intermediates, fp32 for gk-cumulative/A/Aqk/state). Scalar constants baked as literals (Triton AOT mis-packs fp32 scalars, per `chunk_o.py` note 3): `scale=K**-0.5`, softplus `beta=1.0`/`threshold=20.0`/`cumsum_scale=RCP_LN2`, `DOT_PRECISION="ieee"`.
+
+DELIVERED: 5 harness bodies authored (verbatim FLA ports, AOT-adapted) STAGED in `.agents/specs/kda-chunk-aot/` (CI-safe: drift check globs `triton_kernels/*.py` non-recursively); the `vt::KdaChunkPrefill` op design (buffer layout + 6-launch order + dispatch guard + prefill/decode split, mirrors `cuda_gdn.cu` GdnPrefill); the RED-first gate plan (unit vs #104 recurrent + #173 host refs + an FLA-python golden at Kimi shapes; then the full 48.9B GB10 gate vs the §12 STRICT golden with `DEVICE_KDA=1` + chunk-prefill).
+
+NOT YET (Phase-2, coupled — the harness signatures depend on the op's confirmed buffer dtypes so regen is premature until the op exists): move harness to `triton_kernels/`, add the §17.3 declarations, regen sm_121a cubins (`scripts/regen-triton-aot.sh`), wire `vt::KdaChunkPrefill`, run the RED-first unit + FLA golden + 48.9B STRICT gate + tok/s/TTFT ladder. Row STAYS ACTIVE. No default flips (nothing measured).
+
+**USER 2026-08-07 (mid-flight): the Kimi-Linear success bar is MEET vLLM SPEED — the §14/§16/#107 "HW-forced-indirect" framing is SUPERSEDED.** vLLM demonstrably RUNS Kimi-Linear-48B on ONE GB10: the §12 STRICT golden capture used it at `gpu_memory_utilization=0.82`, single-seq, eager. So the Phase-2 speed ladder MUST include a vLLM arm at that EXACT recipe (single-seq, eager, util 0.82, the §12 launch config) measuring steady decode tok/s + prefill TTFT on the SAME prompts as our arm — SEQUENTIAL after our runs, `local-ai-worker` PARKED, `drop_caches` before wall-clock, and PRE-WARM FlashInfer's autotune in a throwaway start at TINY util FIRST (cold autotune at util 0.82 with 91.5 GiB weights = the tightest vLLM config ever run on this box = a recorded OOM-reboot trigger; memory monitor mandatory, ONE attempt, if it OOMs record honestly and do NOT retry higher). The tok/s ladder then reads ours-vs-vLLM matched-config: the lane's distance-to-bar becomes a MEASURED number. Recorded in spec §17.5; below vLLM on any axis is an open gap, not done.
+## MiniMax-H3 — what quantizing the TEXT ENCODER to Q4_K_M does to the conditioning (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`, Thor sm_110)
+
+**The question.** Every H3 render so far conditioned on a Q4_K_M Qwen3-VL-32B text
+encoder (`enc_q4km.gguf`, 14.6 GB), and the encoder's contribution had never been
+measured. It mattered because weak conditioning and quantization-damaged
+conditioning are indistinguishable from outside a render: the wuxia prompt asked
+for measured shot/reverse-shot coverage of a martial-arts sect exchanging
+intelligence and produced a good but generic portrait.
+
+**Method.** The SAME prompt (`wuxia.txt`, 233 tokens), the SAME tokenizer, the SAME
+50-layer truncation, the SAME `MiniMaxH3EncoderTextForwardDevice`, the SAME f32
+activations — only the weight bytes differ (Q4_K_M ggml blocks vs the original
+bf16 14-shard release). Both arms self-report identical geometry
+(`layers=50 hidden=5120 heads=64 kv_heads=8 head_dim=128 ffn=25600`), which is what
+establishes they are the same model. Conditioning is `[233, 5120]` f32, written by
+`minimax-h3-gen --encoder-only --save-embeds`. Build `d3861693d51a`, CUDA 13.0.1
+container, Thor sm_110, GPU idle (the LocalAI render had finished).
+
+**A CALIBRATION arm, because a cosine is meaningless without a scale.** The bf16
+encoder also encoded a one-word edit of the same prompt (`bamboo forest at night`
+-> `at dawn`, also 233 tokens). That is a real semantic change to the scene, and it
+is the yardstick the quantization number is read against.
+
+| | max\|diff\| | RMS | rel RMS | rel RMS excl. sink tok | cos min | cos mean | cos median | angle mean | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** (quantization) | 154.0 | 0.5045 | **0.03403** | **0.06849** | 0.90916 | **0.99745** | 0.99810 | 3.793° | 24.61° |
+| bf16 `night`->`dawn` (one-word edit) | 31.1 | 0.2812 | 0.01897 | 0.06666 | 0.84736 | 0.99769 | 0.99963 | 2.228° | 32.07° |
+
+**Reading it.**
+
+1. **It is NOT a scale change.** The Q4 conditioning is uniformly ~1% smaller
+   (per-token norm ratio mean 0.99010), but the best single global rescale removes
+   almost none of the difference (0.03403 -> 0.03280). The change is DIRECTIONAL,
+   which is the kind that matters for conditioning.
+2. **Its total energy is on par with a one-word prompt edit.** Excluding token 0,
+   the perturbations are 6.85% (quantization) vs 6.67% (the edit) of the
+   conditioning norm. Quantizing the encoder moves the conditioning about as much
+   as rewriting a word of the prompt.
+3. **But the SHAPE is opposite, and this is the interesting part.** The word edit
+   is SPARSE: 172 of 233 tokens stay above cosine 0.999 (median rotation 0.16°) and
+   the change concentrates on ~6 tokens, the biggest at 32°. Quantization is
+   DIFFUSE: 232 of 233 tokens fall below cosine 0.999, EVERY token rotates by a few
+   degrees (median 3.5°), and one token (69) rotates 24.6°. That is a smear applied
+   everywhere, not a different prompt.
+4. **`max|diff|` = 154 is the attention sink, not corruption.** Token 0 has norm
+   15,522 against a 366 mean (42x) and carries 68% of the total squared error, yet
+   its DIRECTION is nearly untouched (cosine 0.99962). This is the channel-wise
+   magnitude-outlier behaviour ComfyUI PR 15298 attributes to H3's partial
+   split-half RoPE, showing up concretely: the outlier dominates every norm-weighted
+   aggregate, which is why the sink-excluded column is the honest one.
+
+**Verdict.** Q4_K_M is doing real, measurable damage to the conditioning — not a
+rounding artifact, and comparable in magnitude to editing the prompt — but it
+damages it DIFFUSELY. A uniform few-degree rotation of every token is the signature
+that blunts fine-grained compositional instruction (coverage, blocking, staging)
+toward a prompt's average semantics, which is exactly the "competent but generic"
+symptom. So the bf16 encoder is worth a render A/B.
+
+**What this does NOT establish.** It does not prove the render changes. The DiT
+consumes conditioning through a token refiner and cross-attention, and nothing here
+measures that path's sensitivity to a 3.5°-median rotation. The owed next
+measurement is a byte-identical-everything-else render A/B: same DiT, same seed,
+same steps, `--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin` (which is exactly
+what `--save-embeds` / `--prompt-embeds` make controllable).
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+load of the checkpoint) and each produced a BYTE-IDENTICAL conditioning file:
+`cond_q4km.bin` md5 `a331232096ef1da2628f885950b2fc55` and `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. So every number above is
+deterministic, not a sample — there is no noise band to argue about, and a
+future change to either path shows up as an md5 change.
+
+**Cost, for the next person.** Q4_K_M arm: 40 s wall, host+device peak **18.0 GiB**.
+bf16 arm: 40 s wall (35 s of it streaming), **45.41 GiB uploaded** to the device,
+host conversion peak **0.0195 MiB** (one norm — the projections never touch a host
+buffer), total host+device peak **51.95 GiB** on the 122 GiB UNIFIED pool. The
+streamer's counters confirm the path ran: `layers=50 tensors=400 direct=350
+converted=200 fused=100`.
+## 2026-08-06 — CPU grouped keep-quant GEMM was f32-ONLY: the `b4f5610a` CPU P0, root-caused and fixed
+
+`CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`, row `QUANT-GGUF-CIQ-GEMM`, base `main`
+`1e4d159b`, worktree `/home/mudler/_git/vllmcpp-ciq-grouped`, branch
+`row/QUANT-GGUF-CIQ-GEMM-grouped-act-dtype`.
+
+**NO PERFORMANCE NUMBER IS CLAIMED OR OWED HERE.** This is a correctness repair
+on the CPU reference tier: it restores output that was garbage, and it does not
+change the arithmetic of any path that was already correct (f32 activations are
+byte-untouched — asserted, not assumed). Per developer instruction the work was
+**CPU-ONLY**: no GPU regression suite, no SACRED set, no CUDA test and no CUDA
+benchmark was run, so nothing on the GPU axis is measured or re-confirmed here.
+
+### The symptom and the bisect (both pre-established, re-verified here)
+
+On a **CPU-only Release** build, `tests/parity/test_qwen36_gguf_engine.cpp` with
+`Qwen3.6-35B-A3B-APEX-Compact.gguf` produced 16/16 tokens that were ALL token id
+0 (`"!!!!!!!!!!!!!!!!"`) against the golden `{11751, 11, 9338, 13, …}`. Prompt
+tokenization was correct and the engine reported `finished`, so the loader and
+the scheduler were never implicated; the doctest SIGSEGV at `:145` is a
+second-order effect on the following prompt. First bad commit by bisect:
+**`b4f5610a`** "perf(qwen3_5): A3 W3b — keep-quant grouped MoE", range
+`88dcba77` (good) .. `4a62c43f` (bad), 712 commits, both endpoints gate-confirmed.
+`VT_ASYNC_SCHED=0` reproduces the byte-identical all-zero stream, so async
+scheduling was already ruled out.
+
+### Root cause — `src/vt/cpu/cpu_quant_gemm.cpp:228-235` (pre-fix line numbers)
+
+`MatmulBTQuantGroupedKernel`, the kCPU provider of `OpId::kMatmulBTQuantGrouped`,
+built its per-pair row views like this:
+
+```
+Tensor a_row = Tensor::Contiguous(
+    static_cast<float*>(act.data) + (bcast ? 0 : p) * act.stride[0],
+    DType::kF32, act.device, {1, K});          // <-- f32 ASSUMED, twice
+Tensor o_row = Tensor::Contiguous(
+    static_cast<float*>(out.data) + p * N, out.dtype, out.device, {1, N});
+```
+
+Two independent f32 assumptions, in one expression each:
+
+1. **Addressing.** `act.stride[0]` is in ELEMENTS, so `float* + p*stride` walks
+   `4` bytes per element. For a bf16/f16 activation the row pitch is `2` bytes,
+   so every row `p>0` was read from `2*p*K` bytes past where it lives — off the
+   end of the buffer at the last pairs. Same bug on the output base pointer for a
+   bf16 output.
+2. **Decoding.** The row was *declared* `DType::kF32`, so `LoadActF32`
+   (`cpu_quant_gemm.cpp:41`) read 4 bytes per element out of a 2-byte-per-element
+   buffer — two adjacent bf16 lanes reinterpreted as one f32. Even row `p==0`,
+   whose address is correct, decodes to garbage.
+
+**Why it survived review and CI.** The op's own contract is wider than the
+provider: `vt::MatmulBTQuantGrouped` validates `IsFloat(act.dtype) &&
+IsOutFloat(out.dtype)` (`src/vt/ops.cpp:220-221`), i.e. it ACCEPTS f32/f16/bf16
+in and f32/bf16 out, and the CUDA provider honours all three
+(`cuda_quant_dot.cu:1868-1871`, the `ActDT` switch). But every caller and every
+test that existed passed **f32**: `deepseek_v4.cpp:560` `GemmGroupedExpertsKq`,
+`laguna.cpp:985` `LqGemmGrouped`, `merged_gemm.cpp:45-47`, and all four grouped
+cases in `tests/vllm/models/test_deepseek_v4_gguf_load.cpp:571-715`. `b4f5610a`'s
+`KqGrouped` (`qwen3_5.cpp:4370`, `DBuf da(d, DType::kBF16, …)`) was the FIRST
+non-f32 caller in the tree. It was gated on CUDA, where the provider is correct,
+so the commit's "GATED BYTE-EXACT … grouped(=1) vs per-expert(=0) BYTE-IDENTICAL"
+claim was true *and* CUDA-only, and no CPU gate covered the new dtype at all.
+
+**A second, latent defect in the same function.** The hand-built weight slice
+started from `Tensor w{}` and never copied `weight.repacked` /
+`weight.q8_0_aligned`. That is exactly the CIQ-G7 failure mode recorded on
+2026-07-23 (`state.md`: "`ResidentWeight`/`MakeTensor` built the CPU forward's
+weight `vt::Tensor` WITHOUT propagating `OwnedTensor.repacked`, so the kernel
+read repacked bytes as plain q8_0 → all-zero tokens"), and it is why
+`Tensor::Slice` was made to throw on a repacked weight — a defence this call site
+sidesteps by constructing the slice by hand. It is latent rather than active for
+APEX-Compact (no q8_0 experts) but live for any repacked-q8_0 tower on an i8mm
+host, so it is fixed in the same change.
+
+### The fix
+
+`src/vt/cpu/cpu_quant_gemm.cpp:220-268`. Both row bases are advanced as
+`uint8_t*` by `SizeOf(act.dtype)` / `SizeOf(out.dtype)`, the activation row view
+carries `act.dtype` instead of a hardcoded `kF32`, and `repacked` /
+`q8_0_aligned` are propagated onto the per-expert slice. No change to the f32
+path's arithmetic: `SizeOf(kF32)==4` reproduces the old pointer walk exactly, and
+`kMoeGateUpSwiGLUGrouped` (which composes this kernel) inherits the fix.
+
+### RED → GREEN, unit tier (x86-64, CPU-only Release, no model, no GPU)
+
+Two NEW cases in `tests/vt/test_ops_quant_dot.cpp`, over all 12 weight encodings
+in `kWeightCases`: grouped-over-the-stacked-tower must be BIT-IDENTICAL to
+`vt::MatmulBTQuant` on the per-expert row-slice, (a) for every activation dtype
+the op accepts, (b) for a bf16 output.
+
+| Arm | `test_ops_quant_dot -tc="grouped keep-quant*"` |
+|---|---|
+| pre-fix | 2 cases FAILED, 33/88 assertions failed — f16 and bf16 fail on all 12 encodings; **f32 passes on all 12** |
+| post-fix | 2 cases passed, **88/88** assertions |
+
+The f32/non-f32 split is the diagnosis stated as a measurement: nothing but the
+activation dtype changes between a passing and a failing arm.
+
+Whole-file and neighbours, post-fix, same build:
+`test_ops_quant_dot` **21/21 cases, 150224/150224**; `test_deepseek_v4_gguf_load`
+(the f32 grouped + `MergedGemm` descriptor cases) **15/15, 931/931**;
+`test_ops_quant_repack` **5/5, 110/110**. So the f32 callers are byte-untouched.
+
+### e2e, CPU-only Release on dgx.casa (aarch64 GB10), one `flock /tmp/gpu` hold
+
+`cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF` in
+`/home/mudler/_git/vllmcpp-ciqgrouped`, then `tests/test_qwen36_gguf_engine -s`
+over both APEX files. GPU-host discipline: the build and both 17 GB/25 GB model
+runs ran SERIALLY inside a single flock hold, never concurrently — the box
+hard-reset earlier the same day under stacked heavy jobs.
+
+Same source tree, same `b/` build dir; arms A and B are the SAME binary and
+differ only by the env guard, and arm C differs from them by exactly ONE
+recompiled TU (`cpu_quant_gemm.cpp` swapped to its pre-fix content, 1 TU +
+relink) so nothing else in the binary moved.
+
+| Arm | `cpu_quant_gemm.cpp` | `VT_QWEN35_GROUPED_MOE` | Result |
+|---|---|---|---|
+| A | FIXED | unset (default = grouped ON) | **2/2 cases, 28/28 assertions, SUCCESS** on APEX-Compact AND APEX-Balanced |
+| B | FIXED | `0` (per-expert loop) | **2/2 cases, 28/28 assertions, SUCCESS**, byte-identical continuations to A |
+| C | PRE-FIX | unset (default = grouped ON) | **FAILURE**: `got == {0 × 16}` vs golden `{11751, 11, 9338, 13, …}`, then SIGSEGV |
+
+Arm A/B continuations, both files, both prompts, identical:
+`eiffel` → `" Paris, France. It is one of the most famous landmarks in the world and"`;
+`count` → `" 9, 10, 11, 12, "`. So the grouped path is not merely non-crashing —
+it is byte-equal to the per-expert reference in the same binary, which is the
+byte-exactness claim `b4f5610a` made on CUDA now also held on CPU.
+
+Arm C is the reported P0 reproduced exactly, including its second-order effect:
+`continuation="!!!!!!!!!!!!!!!!"`, `prompt_token_ids` CORRECT (so not a
+tokenizer fault), `out.finished` true, `got.size()==16`, and then `FATAL ERROR:
+test case CRASHED: SIGSEGV` at `test_qwen36_gguf_engine.cpp:145` on the
+following test case. `Asynchronous scheduling is enabled
+(max_concurrent_batches=2)` in every arm, so async scheduling is neither the
+cause nor part of the fix.
+
+Arm C is also the proof that the CPU grouped path is genuinely LIVE and
+load-bearing on this workload: if `test_qwen36_gguf_engine` did not route
+through `kMatmulBTQuantGrouped` on CPU, swapping that one kernel back could not
+have turned a 28/28 pass into token-0 garbage.
+
+Build (arm A): 343 CXX TUs, `-Werror` clean, 1:05 wall at `-j10`, 845 MB peak
+RSS, no compiler cache. Timings, for the record only: arm A 48 s for both files
+(cold-ish page cache), arm B 19 s (warm).
+
+### What this does NOT establish
+
+- **No GPU regression was run** (SACRED set, CUDA tests, CUDA benchmarks) — the
+  developer prohibited it for this session. The CUDA provider is untouched by
+  this change and the only edited TU is a CPU-only one, but that is an argument,
+  not a measurement.
+- No throughput/latency/memory number on any axis, CPU or GPU.
+- The **APEX-Balanced 2nd-case all-zeros** noted in `b4f5610a`'s message is a
+  SEPARATE, pre-A3 issue (tasks #50/#65) on the CUDA path; nothing here addresses
+  or re-measures it.
+- The class of defect — an op whose validation accepts N dtypes while one
+  provider implements 1 — is fixed at this call site only. A tree-wide sweep of
+  "provider narrower than its op contract" is NOT done and is worth a row.
+VERDICT: device-KDA (122/128, 4.24 tok/s) is the NEW BEST on BOTH axes but STILL a DIVERGENCE (STRICT required, K=3-deterministic golden) → `VT_KIMI_DEVICE_KDA` STAYS OFF (parity-enablers). The residual is now a SINGLE near-tie (p7 pos-6). NAMED next brick to STRICT (+ more speed): the KDA chunked-prefill kernel family (vLLM processes the PROMPT with `chunk_kda`, we still run the recurrent form — regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or a native `chunk_kda` port) + paged `mla::ForwardMlaAttentionBlock` for the 7 NoPE-MLA layers + paged-incremental decode (persistent KDA state + MLA-KV, kills the remaining O(n²)). Row STAYS ACTIVE.
+
+### VK-E unblocked: identical weights in both containers (2026-08-07)
+
+The blocker recorded above — "no model on dgx loads in both engines" — is RESOLVED
+without needing `VK-D`. The stock `Qwen/Qwen3-0.6B` HF snapshot (cached on dgx)
+was converted to GGUF with **llama.cpp's own** `convert_hf_to_gguf.py`, so
+llama.cpp runs the GGUF and vllm.cpp runs the safetensors it was made from —
+**byte-identical weights by construction**, which removes the weight-identity
+doubt that makes a same-named-model comparison unfalsifiable.
+
+Toolchain note worth keeping: the converter needs `transformers` + `gguf` +
+`torch` and NO single interpreter on dgx had all three (the oracle venv has
+transformers but not gguf; system python has gguf+torch but not transformers).
+Resolved with **zero installs and zero disk** by borrowing transformers via
+`PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the system
+python. The oracle venv was deliberately NOT pip-installed into — it is the parity
+oracle and was expensive to repair.
+
+**llama.cpp Vulkan, full strength (`NV_coopmat2`), stock Qwen3-0.6B F16
+(1.40 GiB, 751.63 M params):**
+
+| test | t/s |
+|---|---:|
+| pp128 | **11,514.16 ± 388.21** |
+| tg32 | **160.91 ± 1.54** |
+
+Consistent with the finetune-GGUF run (11,730 / 161.4), which sanity-checks the
+measurement rather than the model.
+
+**vllm.cpp on Vulkan: the engine SELECTS Vulkan** (`[vt reference-tier] op=...
+device=3` — device 3 is `kVULKAN`) **and is orders of magnitude slower.** A
+4-prompt / 128-in / 32-out run did not finish inside 900 s, against llama.cpp's
+seconds. That is the expected shape and not a defect: **71 of 87 ops run on the
+portable CPU reference tier**, so this measures our HOST FALLBACK wearing a Vulkan
+label, not our Vulkan kernels. The reference tier announces itself per op, which
+is exactly why the slowness is attributable rather than mysterious.
+
+**Therefore no ratio is quoted.** A ratio here would be read as "our Vulkan vs
+llama.cpp's Vulkan" when it is really "our CPU tier vs llama.cpp's Vulkan". The
+comparison becomes meaningful when native coverage closes — the progress metric is
+`vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
+the RoPE table build, the sampler tail, and the remaining norm/glue set.
+#### CORRECTION (2026-08-07, same session): the vllm.cpp Vulkan arm is GPU-BOUND, not CPU-bound
+
+The entry above attributes vllm.cpp's slowness to "our HOST FALLBACK wearing a
+Vulkan label" — 71 of 87 ops on the portable CPU reference tier. **That
+attribution was asserted, not measured, and the measurement contradicts it.**
+
+Taken while the run was in flight (`vllm-bench`, Qwen3-0.6B, 1 prompt / 32 in /
+8 out, 26 min elapsed):
+
+| signal | value |
+|---|---|
+| process CPU | **1.6 %** |
+| GPU utilisation | **96 %** |
+| GPU compute apps | `495202 ./build-vk/examples/vllm-bench, 2066 MiB` — the ONLY one |
+
+A run pinned on the CPU reference tier would show the opposite: CPU saturated, GPU
+idle. This one is GPU-resident and GPU-busy, so the dominant cost is on the DEVICE.
+
+A second assumption also fails: the weights are **BF16** (all 311 tensors), so the
+coopmat tactic's dtype precondition is satisfiable here — this is not a case of
+"f16 model, coopmat ineligible".
+
+**The true attribution is UNMEASURED and is deliberately not replaced with another
+guess.** The candidates, in the order worth testing:
+1. **Per-op synchronous dispatch.** `VulkanContext::Dispatch` records, submits and
+   fence-waits for EVERY op (the W0 skeleton's documented design, "correct, not
+   fast"). `VK-A2` — async submission plus command-buffer reuse — was scoped as
+   "the single biggest speed lever" and never built. Thousands of round trips per
+   token would look exactly like this.
+2. **The naive GEMM where coopmat does not apply.** The tactic needs K % 16 == 0
+   and both operands bf16; activations may be f32 at some call sites, silently
+   falling back to the untiled scalar kernel measured at 52 GFLOP/s on Thor.
+3. **Paged attention**, which walks keys sequentially with a workgroup reduction
+   per key.
+
+`GetReferenceTierHits()` and the per-op provider counters distinguish (1)–(3)
+directly, and a `VT_VULKAN_COOPMAT=0` A/B isolates (2). None of that was run here.
+
+**Lesson, recorded because it recurs:** "we know why it is slow" is a claim like
+any other. The op-coverage number (16/87) made the CPU-tier story feel obvious
+enough to write down without checking `top`, and it was wrong.
+
+#### ATTRIBUTION MEASURED: per-op synchronous dispatch, not compute and not the CPU tier
+
+The previous note left the cause "UNMEASURED". It is now measured, and it is
+candidate (1).
+
+**Method.** `gdb -p` stack samples of the main thread plus `/proc/<pid>/status`
+context-switch deltas, taken on the live run (Qwen3-0.6B, 1 prompt / 32 in /
+8 out, ~34 min elapsed at sampling).
+
+| evidence | value |
+|---|---|
+| stack samples in `poll()` inside `VulkanContext::Dispatch` | **6 of 6** |
+| call path | `LLMEngine::step` → `GPUModelRunner::execute_model` → `Qwen3DenseModel::ForwardDevice` → `ForwardLayers` → `MatmulGeneric<true>` → `Go<…>` → `Dispatch` → NVIDIA driver `poll()` |
+| voluntary context switches | 202,770 → 203,730 in 10 s = **~96 blocking waits/s** |
+| process CPU | 1.6 % |
+
+**Arithmetic that makes it unambiguous.** Qwen3-0.6B is ~0.6 B params, so ~1.2
+GFLOP per token position; 40 positions plus lm_head is roughly **48-60 GFLOP**. Our
+NAIVE scalar Vulkan GEMM was measured at **52 GFLOP/s** on Thor. Even entirely on
+the slow kernel the compute is **~1-2 SECONDS**. Wall clock was ~34 minutes, so
+**>99 % of the time is dispatch round-trip latency, not arithmetic.**
+
+**Mechanism.** `VulkanContext::Dispatch` records a command buffer, submits it and
+FENCE-WAITS, for EVERY op — the W0 skeleton's documented "correct, not fast"
+design. At ~96 waits/s the model's per-token dispatch count turns into minutes.
+The GPU's reported 96 % "utilisation" is the driver context being resident while
+we poll, NOT compute saturation; on Tegra/GB10 that counter cannot distinguish the
+two, which is precisely why it misled the first attribution.
+
+**This retires the "71 of 87 ops on the CPU tier" explanation for THIS workload.**
+Op coverage is a real limitation, but it is not what makes the e2e run slow here.
+
+**Consequence for the roadmap.** `VK-A2` (async submission + command-buffer reuse,
+`SupportsGraphCapture()` via a pre-recorded `VkCommandBuffer`) was scoped in the
+campaign spec as "the single biggest speed lever" and deferred. It is now the
+MEASURED bottleneck, and it outranks further native-kernel work for anything
+end-to-end: more native ops would each still pay a ~10 ms round trip.
+
+#### SECOND, SEPARATE ANOMALY: the dispatch COUNT looks far too high
+
+The minimal workload — **1 prompt, 32 in, 8 out** — also failed to complete, hitting
+its 2400 s timeout with no result line. Per-dispatch latency alone does not
+explain that, and the gap is worth stating as its own open question rather than
+folding into the first finding.
+
+**Order-of-magnitude.** At the measured ~96 blocking waits/s, 40 minutes is
+**~230,000 waits**. A 28-layer Qwen3-0.6B forward should need roughly 11 dispatches
+per layer (qkv matmul, qkv split, rope, KV write, paged attn, o_proj, 2 norms,
+gate/up matmul, silu, down matmul) ≈ **~310 per forward**. Even counting 32 prefill
+positions plus 8 decode steps generously, the expected total is a few thousand —
+**not ~230,000**. That is roughly an order of magnitude and a half unaccounted for.
+
+**Two candidate explanations, NOT yet distinguished:**
+1. **Waits ≠ dispatches.** The driver's fence wait is a `poll()` loop that may wake
+   several times per fence, inflating the context-switch count relative to the
+   real dispatch count. If so the dispatch count is fine and only the latency
+   finding stands.
+2. **We really do dispatch far more than expected** — e.g. a per-token or per-head
+   dispatch where a per-tensor one was intended, or the `kFusedChain` interpreter
+   issuing one dispatch per recipe step.
+
+**Distinguishing them is cheap and is the next thing to do:** add a dispatch
+counter to `VulkanContext` (or read the existing per-op provider selection counts
+with `VT_OP_PROVIDER_STATS=1`) and print it per forward. Until then, the
+per-dispatch latency finding is MEASURED and this one is an OPEN QUESTION — not a
+second confirmed defect.
+
+**Recorded so it is not lost:** the e2e comparison against llama.cpp therefore has
+NO vllm.cpp number at all, not even a slow one. The workload never produced a
+completion at any size attempted (4 prompts/128/32 at 900 s; 1 prompt/32/8 at
+2400 s).
+
+#### RESOLVED: it was a GPU HANG, not slowness. VK-E now has BOTH arms.
+
+Everything above about "orders of magnitude slower", "per-op synchronous dispatch
+is the measured bottleneck" and "the dispatch count looks 10x high" was diagnosing
+a **hang**. All three readings are superseded.
+
+**How it was found.** Dispatch instrumentation showed ~300 submits in 1.2 s then
+total silence, with NO slow-dispatch line — and that absence was the clue, because
+the timing print runs only after the fence wait RETURNS. Tracing each submit
+BEFORE the wait named the culprit immediately:
+`#368 vt_matmul_coopmat groups=9496` — the lm_head GEMM at **M=1**.
+
+**The defect (mine, merged earlier this session).** `coopMatLoad` reads a FULL
+16x16 tile with no masking. At M=1 it read 15 rows, ~30 KB, past the end of the
+activation buffer; the GPU faulted and `vkWaitForFences(UINT64_MAX)` never
+returned. The shader's own comment claimed ragged M/N were safe "because the store
+is bounds-checked" — the store guard cannot help when the fault is on the LOAD.
+
+**Why the correctness gate missed it.** That gate used M=20, N=12 *specifically*
+to exercise ragged shapes and passed: the out-of-bounds read stayed inside the
+allocation, and its garbage rows were discarded by the bounds-checked store.
+Raggedness alone was not sufficient — the read has to LEAVE the allocation to
+fault, which needs a large N against a small operand, i.e. lm_head at decode.
+
+**Fix:** the tactic requires `m % 16 == 0 && n % 16 == 0` alongside `k % 16 == 0`;
+decode falls back to the scalar kernel, where coopmat would have wasted 15/16 of
+every tile anyway. A masked/padded load is the better long-term answer, not
+attempted here. New gate asserts the DECLINE at M=1, N=17 — expressible only as a
+tactic assertion, since the bad path hangs rather than returning a wrong number.
+
+**vllm.cpp Vulkan, GB10, Qwen3-0.6B bf16 safetensors (fix applied):**
+
+| workload | E2E | prefill tok/s | decode tok/s (per stream) |
+|---|---:|---:|---:|
+| 32 in / 8 out | **1,125.9 ms** | 28.42 | **8.59** |
+| 128 in / 32 out | **5,571.1 ms** | 22.98 | **5.85** |
+
+**The comparison, finally on both sides** (same weights; llama.cpp on the GGUF
+converted from this snapshot by its own script):
+
+| engine | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| llama.cpp Vulkan (`NV_coopmat2`) | **11,514** (pp128) | **160.9** (tg32) |
+| vllm.cpp Vulkan | 22.98 | 5.85 |
+
+That is roughly **500x on prefill** and **27x on decode** in llama.cpp's favour, and
+those ratios are honest but not yet diagnostic: 71 of 87 ops still run on the
+portable CPU tier, dispatch is still one submit + fence-wait per op (`VK-A2`
+unbuilt), and the scalar GEMM now serves every decode GEMM because coopmat
+declines at M=1. Each of those is a named, separately measurable lever.
+
+**Method lesson, the durable part:** a run that "never finishes" is not a slow run
+until proven so. Three separate attributions were published from indirect signals
+(op-coverage counts, CPU%, GPU-utilisation%) before anyone instrumented the thing
+that was actually blocking. The dispatch tracer cost minutes and answered it
+outright.
+
+### VK-A2/VK-F: the three named levers, MEASURED — two are dead, one is 55% (2026-08-07, GB10)
+
+The `VK-E` record above named three levers off the back of a 500x/27x gap and
+called them "separately measurable". Measuring them first killed two.
+
+**Instrumented, not inferred.** `VT_VULKAN_DISPATCH_STATS` grew a per-shader TIME
+profile alongside the count histogram, and a new `vulkan-dispatch-floor` benchmark
+sweeps one op across a 65,536x range of element counts.
+
+**Lever 1, "71 of 87 ops on the portable CPU tier" — IRRELEVANT in steady state.**
+The e2e run fires exactly ONE reference-tier op, `kRopeCosSinCache` (op=65), which
+builds the rotary table ONCE at setup. Every op in the per-token loop is already
+native: the histogram is `vt_rms_norm` 904, `vt_matmul` 792, `vt_paged_attn` /
+`vt_qkv_split` / `vt_reshape_and_cache` / `vt_rope_from_cache` / `vt_silu_and_mul`
+224 each, `vt_matmul_coopmat` 112, and 8 apiece of cast/embedding/argmax. The
+count is a REGISTRY-COVERAGE fact and was quoted as a hot-path one.
+
+**Lever 2, per-op synchronous dispatch (`VK-A2`) — CEILING 1.15x, REJECTED as the
+primary lever.** The floor benchmark is the decisive part: `kAdd` costs **0.046
+ms/dispatch and is DEAD FLAT from 256 to 262,144 elements** — a 1,024x change in
+work with no change in time — then finally rises past ~1M. So 0.046 ms is pure
+per-dispatch overhead. Against the model's measured 0.357 ms average, overhead is
+**13%**; the other 87% is real kernel execution. Perfect batching of all 2,952
+dispatches saves 136 ms of 1,054 = **1.15x**, against a 19-27x gap. This is the
+lever I had already published as "the measured bottleneck" and would have built
+first.
+
+**Lever 3, kernel quality — CONFIRMED, and it is where everything is.**
+
+| shader | count | % of GPU time | ms/call |
+|---|---:|---:|---:|
+| `vt_matmul` (scalar) | 792 | **49.3%** | 0.4971 |
+| `vt_rms_norm` | 904 | 18.3% | 0.1619 |
+| `vt_greedy_argmax` | 8 | **10.0%** | **10.0316** |
+| `vt_paged_attn` | 224 | 6.6% | 0.2368 |
+| `vt_matmul_coopmat` | 112 | 6.2% | 0.4455 |
+
+**FIRST FIX: greedy argmax, 10.03 -> 0.53 ms/call (18.9x), share 10.0% -> 0.6%.**
+The shader put ONE INVOCATION on each row and scanned the vocabulary serially; at
+decode there is one row, so `groups=1` walked 151,936 entries on a single lane
+while the device idled. Now one WORKGROUP per row with a tree reduction.
+
+**The gate caught a bug in the first version of that reduction, and it is the
+interesting part.** "Keep the left operand unless the right is strictly greater"
+looks like it reproduces the CPU's first-wins tie-break. It does not: a halving
+tree does NOT combine lanes in index order — lane 0 absorbs lane 16, and
+everything lane 16 already swallowed, long before it meets lane 1. With equal
+maxima at 8 and 900 the kernel returned **900** where the CPU returns 8. A
+different token, from a kernel whose maximum VALUE was perfectly correct. Ties are
+now broken on the INDEX explicitly, which makes the merge associative and
+commutative and therefore correct for any tree shape.
+
+Second subtlety, same fix: `x > best` is false for every NaN, so the CPU can never
+ADOPT one — a NaN only becomes the running best by being the value the scan
+STARTED from, element 0. Seeding every lane from its own first element would
+invent poisoning the CPU does not have, masking a real maximum inside that chunk.
+Only lane 0 seeds from element 0; the rest start at -inf.
+
+**MEASUREMENT DISCIPLINE: absolute totals on this box are unusable.** Five
+identical repeats spread **322.5 to 684.3 ms, a 2.1x swing**, and a cold run read
+799-879 ms — consistent with the recorded GB10 reload-swing effect. Per-shader
+SHARE is stable across the same five runs (`vt_matmul` 54.8% +/- 2.7, argmax 0.58%
++/- 0.08), so shares are what is quoted here and totals are not.
+
+**NEXT: `vt_matmul` at ~55% of GPU time.** It is one invocation per OUTPUT ELEMENT
+with a sequential K loop, so at decode (M=1, MatmulBT) consecutive lanes read
+addresses K*4 bytes apart — every load its own cache line. A GEMV shape with lanes
+splitting K coalesces those reads; that is the next change, and it moves the K
+reduction off the CPU's accumulation order into the NMSE tier, so it needs the
+token-exactness gate rather than an NMSE bound.
+
+### VK-F: the GEMV tactic — the 55% lever, cut to ~35% (2026-08-07, GB10)
+
+The profile above put `vt_matmul` at ~55% of GPU time. It is a COALESCING problem,
+not an arithmetic one, and the fix is a different assignment of work to lanes.
+
+**The defect.** `vt_matmul` gives each OUTPUT ELEMENT one invocation and loops K
+there. For `MatmulBT` — b is `[N,K]`, the torch Linear layout every model uses —
+lane `j` reads `b[j*k + q]`, so at a fixed `q` adjacent lanes are `k*2` bytes
+apart: 2 KB for a 1024-wide K. Every lane pulls its own 128-byte cache line to
+consume 2 bytes of it, so a 128-lane workgroup fetches ~16 KB to use 256 — a
+**64x waste of bandwidth** on a kernel that is entirely bandwidth-bound.
+
+**The tactic.** `vt_matmul_vec` gives each output element a WORKGROUP whose lanes
+stride K, so lane `t` reads `b[j*k + t]` and adjacent lanes read adjacent
+addresses — 2 fully-used cache lines instead of 128 barely-used ones. Structure
+from llama.cpp `mul_mat_vec.comp`; per-element semantics still our own
+`cpu_ops.cpp` `MatmulChunked`.
+
+**Scoped, not universal.** `MatmulBT` only: in the other orientation `vt_matmul`
+reads `b[q*n + j]`, which is ALREADY coalesced across lanes, and the vec shape
+would make it strided and strictly worse. Plus `m == 1` (one workgroup per output
+element is only the right trade when there are few) and `k >= 128`. The gate
+asserts the DECLINE in both directions, not just the win.
+
+**RESULT — interleaved paired A/B, `VT_VULKAN_GEMV` the only variable, same
+binary.** The first attempt ran the arms in BLOCKS and had to be thrown away: the
+OFF arm degraded monotonically (20.70 -> 13.55 -> 6.70 tok/s) because it ran last,
+so drift aligned with the arm. Re-run interleaved, 8 pairs:
+
+| metric | GEMV on | GEMV off | result |
+|---|---:|---:|---|
+| GEMM ms/call (median) | 0.2359 | 0.4256 | **1.80x**, ON faster in **7 of 8 pairs** |
+| GEMM share of GPU time | ~35% | ~53% | the lever is spent down, not gone |
+| decode tok/s (median) | 16.22 | 11.70 | 1.39x, ON faster in 5 of 8 — WEAK, quoted as such |
+
+The kernel claim is the strong one (7/8, direct metric). The e2e decode claim is
+5/8 and sits inside this box's known 2.1x run-to-run swing, so it is recorded as
+suggestive rather than established.
+
+**CORRECTNESS: the accumulation order changed, and that needed the strict gate.**
+The K reduction is now a tree, so unlike the scalar kernel this tactic does NOT
+share the CPU's accumulation order — it joins coopmat in the NMSE tier. A decode
+GEMM feeds the sampler, where a changed low bit is a changed TOKEN, so an NMSE
+bound would not have been enough. **opt-125m STRICT: 6/6 prompts token-exact
+(96/96 tokens) vs the vLLM 0.25.0 oracle, all 9 ops on device type 3, 0 declines.**
+
+**Gates.** llvmpipe `test_vulkan_backend` **15/15 (858 assertions)**, GB10
+**15/15 (856)**. The new tactic has NO hardware precondition — it is a lane
+assignment, not an instruction — so unlike coopmat, CI can gate the SELECTION for
+real rather than only gating that it is refused.
+
+**Still open.** GEMM remains ~35% of GPU time, so the lever is not exhausted:
+wider per-lane loads and subgroup reductions in place of shared memory are the
+obvious next steps. `vt_rms_norm` is now the second cost at ~18%.
+
+### VK-F follow-up: the SUBGROUP reduction is a WASH — built, measured, NOT shipped (2026-08-07, GB10)
+
+The remaining GEMM headroom was chased in the obvious direction and the obvious
+direction was wrong. Recorded because the negative result redirects the next lever.
+
+**What was built.** `vt_matmul_vec` gives each output element a 128-lane workgroup
+and reduces through shared memory: a 7-step halving tree with a barrier at every
+step. For lm_head at K=1024 that is 8 loads per lane against 7 barriers, so the
+reduction looked like the larger half. `vt_matmul_vec_sg` gave each output element
+one SUBGROUP instead, reducing with a single `subgroupAdd` — no barriers, no
+shared memory, 4x more terms per lane. This is llama.cpp's own `mul_mat_vec`
+structure. It needed a probe (`VK_SUBGROUP_FEATURE_ARITHMETIC_BIT` in compute,
+optional in Vulkan 1.1 and a PIPELINE-CREATION failure where absent), a second
+committed module (the extension is compile-time, so it cannot be a specialization
+constant), and a `VT_VULKAN_GEMV_SG` bisect lever.
+
+It WORKED: llvmpipe supports subgroup arithmetic, so CI exercised the subgroup
+path rather than the fallback; `test_vulkan_backend` 15/15 on both devices;
+opt-125m STRICT 6/6 token-exact.
+
+**And it bought nothing.**
+
+| comparison | GEMM ms/call | decode tok/s |
+|---|---|---|
+| sg vs SCALAR, 8 interleaved pairs | 2.51x, 7/8 | 2.06x, 6/8 |
+| sg vs WORKGROUP form, 8 interleaved pairs, ONE binary | **4/8 pairs, median 1.05x** | **4/8 pairs** |
+
+**An exact coin flip.** A cross-session read had suggested ~1.2x (sg 2.66x over
+scalar in one session versus vec 1.80x in another) and that advantage did NOT
+survive a paired test — it was session drift, which is precisely what this box's
+2.1x run-to-run swing produces and why the `VT_VULKAN_GEMV_SG` lever had to exist
+before the claim could be made at all.
+
+**REVERTED.** A second SPIR-V module, an optional-feature probe, a
+device-dependent code path and a fourth env lever, for a measured wash. The
+workgroup form is simpler, has no optional-feature dependency and runs everywhere.
+
+**WHAT THE NEGATIVE RESULT BUYS.** Replacing a 7-barrier shared-memory tree with
+one instruction changed nothing measurable, so **the reduction was never the
+cost** — which was the premise of the whole attempt. The GEMV is a memory-path
+problem, and it is not yet at the roof either: 1.50 GB of bf16 weights per decode
+token against GB10's ~273 GB/s is a 5.49 ms floor, i.e. ~182 tok/s, versus 19.8
+measured — still **~9x off**. So the next lever is the memory path (wider per-lane
+loads, weight layout), NOT the reduction and NOT dispatch batching (`VK-A2`,
+already capped at 1.15x).
+
+## Surface-coverage audit + ONE SURFACE guard (2026-08-07, `ARCH-ONE-SURFACE`, `row/SURFACE-COVERAGE-AUDIT`)
+
+A CPU-only records/tooling change, no measurement.
+
+- **No number owed on any axis.** No kernel, generation, scheduling, or engine
+  code path was touched — the change adds a checker
+  (`scripts/check-surface-coverage.py`, two axes), its two allowlists, a mutation
+  suite (46 cases, incl. subprocess enforcement seams), preflight + CI wiring, the audit spec, and public-doc edits.
+  No throughput/latency/memory number was measured, claimed, or owed.
+- **What was verified (CPU, no build):** `check-surface-coverage.py` rc=0 (13
+  example units; 12 internal-reachers tracked, `examples/cli` the clean baseline;
+  C-ABI table 7 reachable / 4 embedder-unreachable, all tracked; public set
+  derived from CMake; shrink-only ratchet at 12);
+  `test_check_surface_coverage.py` 46/46; `check-public-doc-tables.py` rc=0 (STATUS
+  inside its char ratchet); `check-now-current.py`, `check-agent-record.py`,
+  `check-state-order.py`, `check-supported-models.py` all rc=0.
+- **The guard caught one on landing:** the rebase onto the Parakeet `#89` main
+  surfaced `examples/parakeet_transcribe` (CLI-only ASR reaching internal headers,
+  Parakeet off-registry) — added to the transition tracker, not silently ignored.
+- The seven surface gaps (H3 video-gen, Laguna/DeepSeek-V4 fast decode,
+  transcription, Kimi-Linear incremental, embeddings/pooling, mm-input) each carry
+  a ranked fold in `.agents/specs/surface-coverage-2026-08-07.md`; their speed
+  gates are owed by the folds themselves, not by this change.
+### VK-F: Tier-1 fusion NEGATIVE, and the dispatch floor is now 49% (2026-08-07, GB10)
+
+**Two findings that reorder the whole lever list.**
+
+**1. `VT_FUSED_TIER=1` on Vulkan is a NEGATIVE — because it fuses NOTHING.**
+
+The portable fusion framework already exists (`include/vt/recipes.h`,
+`.agents/specs/portable-fusion-framework.md`), Vulkan already registers the
+Tier-1 interpreter (`kFusedChain` -> `vt_fused_chain`), and Qwen3 already calls
+`vt::FusedChain(..., kFusedAddRmsNormStd, ...)` with `VT_FUSED_CHAIN_ADOPT` ON.
+Only `VT_FUSED_TIER` defaulted to 0, so every call was realized as the Tier-0
+composite. That looked like a free lever: flip the flag.
+
+It engages, and it is correct — 456 `vt_fused_chain` dispatches versus 0, gate
+15/15, and opt-125m STRICT 6/6 token-exact under tier 1. **And the dispatch count
+is IDENTICAL in both arms: 2,952.**
+
+    tier 0:  vt_rms_norm 904
+    tier 1:  vt_rms_norm 448  +  vt_fused_chain 456  =  904
+
+`kFusedAddRmsNormStd` is (residual add + RMS norm), and `vt_rms_norm` ALREADY
+does both in a single dispatch through its `has_res` path. There was nothing to
+fuse. Tier 1 swapped a specialized kernel for a generic recipe interpreter and
+lost accordingly: **314.7 ms vs 275.8 ms total GPU, tier 1 faster in only 2 of 8
+interleaved pairs.** `VT_FUSED_TIER` stays 0.
+
+**The durable lesson: fusion that does not REMOVE a dispatch is not fusion.** The
+recipe adoption was real and the framework worked exactly as designed; the recipe
+in play simply described something one kernel already did.
+
+**2. The dispatch floor has grown from 13% to 49% of GPU time.**
+
+This is the growth predicted when `VK-A2` was first measured and set aside. Total
+GPU time fell from ~1,054 ms to 275.8 ms as argmax and the GEMV landed, while the
+per-dispatch floor (0.046 ms x 2,952 = 135.8 ms) did not move at all.
+
+The small ops are now almost pure launch overhead:
+
+| shader | calls | ms/call | vs the 0.046 ms floor |
+|---|---:|---:|---:|
+| `vt_rms_norm` | 904 | 0.0806 | 1.75x |
+| `vt_reshape_and_cache` | 224 | 0.0500 | 1.09x |
+| `vt_silu_and_mul` | 224 | 0.0462 | **1.00x** |
+| `vt_rope_from_cache` | 224 | 0.0433 | **0.94x** |
+| `vt_qkv_split` | 224 | 0.0422 | **0.92x** |
+
+Those 1,800 dispatches cost 113.6 ms of which **73% is launch overhead**. Several
+sit AT or BELOW the measured floor, which is the signature of a kernel that does
+no meaningful work relative to being launched at all.
+
+**So making these kernels faster is pointless; only removing dispatches helps.**
+`VK-A2` (command-buffer batching) is no longer a 1.15x afterthought — it is the
+top lever, and its ceiling is higher than the fence cost alone because batching
+also recovers the pipelining lost when the GPU idles between every submit.
+
+**Fusion is still worth having, but for the DISPATCH COUNT, not the kernel time.**
+The collapsible chain is `qkv_split -> rope_from_cache -> reshape_and_cache`:
+224x3 = 672 dispatches that could be 224, removing 448 launches. `kAttnQkNormRope`
+exists as a recipe but is composite-only — the Tier-1 vocabulary is
+`{kAdd,kMul,kSilu,kSigmoid,kRmsNorm}`, so extending it is shared-framework work
+that every backend inherits, not a Vulkan shader.
+
+**Also corrected here: the "~500x behind on prefill" figure was a metric
+artifact.** `bench_core.h` computed `input_throughput = total_input / WHOLE run
+duration`, so a 1-prompt 32-in/8-out run reported 32/E2EL and charged the entire
+decode to prefill. It was being compared against llama-bench `pp128`, which is
+prefill-ONLY. A true `prefill_throughput = total_input / sum(TTFT)` is now
+reported alongside it; `sum_prefill` was already being accumulated and discarded
+with `(void)sum_prefill`.
+
+### VK-A2: command-buffer batching — decode 2.62x, 8/8 pairs (2026-08-07, GB10)
+
+The lever this campaign twice mis-ranked. It was first published as "the measured
+bottleneck" (wrong), then measured at a 1.15x ceiling and set aside (right at the
+time), then predicted to grow — and it did, to 49% of GPU time once argmax and the
+GEMV landed.
+
+**THE BLOCKER, now solved.** `VulkanContext::Pipeline` held ONE `VkDescriptorSet`,
+updated per dispatch. That is sound only because each dispatch waited on a fence
+before the next touched the set. **A descriptor set is read at EXECUTION time, not
+record time**, so batching two dispatches of the same pipeline would have the
+second `vkUpdateDescriptorSets` overwrite the first's operands before the GPU ran
+either — silent garbage, not an error. Each pipeline now owns a ring of 16 sets,
+and a pipeline that exhausts its ring forces a flush.
+
+Between recorded dispatches there is a `VkMemoryBarrier`
+(COMPUTE->COMPUTE, SHADER_WRITE->SHADER_READ|WRITE): decode ops are sequentially
+dependent, so without it the batch would run them concurrently.
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_BATCH` the only variable:**
+
+| metric | batched | per-op | result |
+|---|---:|---:|---|
+| decode tok/s (median) | **64.5** | 24.8 | **2.62x, 8 of 8 pairs** |
+| per-pair ratios | 1.79 / 1.87 / 1.96 / 2.26 / 2.98 / 3.02 / 3.52 / 3.55 | | every pair a win |
+| prefill tok/s (median) | ~142 | ~135 | ~1.05x, as expected |
+
+Batches run **40-46 dispatches per submit**. Prefill barely moves, which is the
+right shape: it has fewer, larger kernels, so it was never floor-bound.
+
+**Decode is now 35% of the 182 tok/s bandwidth roof, up from 11%, and the gap to
+llama.cpp's 160.9 tok/s is 2.5x, down from ~19x on this workload.**
+
+**Correctness: opt-125m STRICT 6/6 token-exact (96/96), 0 declines, with batches
+of 40-46 actually recorded** — verified after catching that the first "pass" was a
+STALE BINARY (only `test_vulkan_backend` had been rebuilt), which reported zero
+flushes and a green gate. A gate that passes on a binary without the change is
+worth nothing.
+
+**The new gate asserts the MECHANISM**, because results cannot show it: batching
+runs the same kernels in the same order, so a batch silently degrading to one
+dispatch per submit computes identical numbers. It asserts `pending_batch() > 1`
+with the lever on and `== 0` with it off, so neither arm is vacuous.
+
+**DEFAULT OFF, and this is the one measured win in this campaign that does not
+immediately become the default.** Batching is sound only if every host read of
+device memory flushes first. `Backend::Copy`/`Memset`/`Synchronize` now do. The
+PORTABLE REFERENCE TIER does not and cannot yet: it runs CPU kernels directly
+against the shared mapped allocation, and `Resolve` caches the provider function,
+so there is no per-call seam to flush at. An op with no native Vulkan kernel would
+read STALE BYTES with no error. For the models that run on Vulkan today the
+reference tier fires once, at setup (`kRopeCosSinCache`), which is why the STRICT
+gate passes — but "empirically safe for two models" is not the bar for a default.
+
+**Closing that hazard is the gate on the default flip, and is the next task.**
+
+### VK-A2 DEFAULT-ON: the reference-tier hazard is closed by an existing seam (2026-08-07)
+
+The 2.62x batching win shipped OFF because the PORTABLE REFERENCE TIER runs CPU
+kernels directly over device memory with no per-call flush point — `Resolve`
+caches the provider function, so there appeared to be no seam.
+
+**There already was one.** `Backend::FlushPending` (`include/vt/backend.h:44-49`)
+exists for exactly this, is documented for exactly this, is already called by
+`op_provider.cpp` whenever a reference-tier kernel is selected, and Metal already
+implements it (M3c-1). Vulkan simply had not. The fix is one override.
+
+That is the second time in this campaign the framework already had the answer —
+the first was the fusion recipes. Looking for the seam before building one is
+cheaper than either.
+
+**`VT_VULKAN_BATCH` now defaults ON.** All three host-read paths drain first:
+`Copy`/`Memset` (host memcpy over the mapped allocation), `Synchronize`, and
+`FlushPending` for the reference tier.
+
+**A GATE THAT THE STRICT RUN COULD NOT PROVIDE.** opt-125m STRICT passes 6/6
+token-exact with batching on — and it would pass whether or not the hook existed,
+because OPT touches the reference tier only once, at setup, before any batch is
+open. So the hazard has its own gate: open a batch, resolve `kRopeNeox` (genuinely
+unimplemented natively on Vulkan), and assert `pending_batch() == 0` afterwards.
+
+**Verified by DISABLING the hook**: the gate goes red (`pending_batch() == 0` fails
+at 4 pending) and green again when restored. A gate never observed failing is a
+gate that has not been shown to test anything.
+
+**One bug caught in my own gate along the way.** The VK-A2 mechanism test
+re-derived the lever's default from the environment variable, so flipping the
+default to ON made it assert the wrong branch. It failed loudly, which was luck —
+a subtler duplication would have gone vacuously green. The context now exposes
+`batching_enabled()` and the test ASKS rather than restating. A predicate
+duplicated between an implementation and its gate will eventually disagree with
+itself.
+
+llvmpipe `test_vulkan_backend` **17/17 (873 assertions)** with the lever on AND
+off; opt-125m STRICT 6/6 (96/96), 0 declines, batching default.
+
+### The last two levers: one SUBSUMED, one UNESTABLISHED (2026-08-07, GB10)
+
+Both closed by measurement rather than built. Also fixes an observability
+regression `VK-A2` introduced.
+
+**Lever 4, Tier-1 fusion vocabulary — SUBSUMED BY `VK-A2`, not built.** The plan
+was to collapse `qkv_split -> rope_from_cache -> reshape_and_cache`, 672 dispatches
+into 224. Subtracting the per-dispatch floor from the batch-OFF profile shows what
+those ops actually COST once launch overhead is removed:
+
+| shader | measured | floor | REAL kernel work |
+|---|---:|---:|---:|
+| `vt_reshape_and_cache` | 11.2 ms | 10.3 | **0.9** |
+| `vt_silu_and_mul` | 10.3 | 10.3 | **0.0** |
+| `vt_rope_from_cache` | 9.7 | 10.3 | **0.0** |
+| `vt_qkv_split` | 9.5 | 10.3 | **0.0** |
+
+Their entire cost WAS the launch count, and batching already removed it. Fusing
+them now saves approximately nothing. GEMM is **64%** of real kernel work;
+`vt_rms_norm` is 22.5% and is genuine work rather than launch, so folding it would
+mean fusing INTO the GEMM — a much larger change than a vocabulary extension.
+
+**Lever 3, GEMV unroll — UNESTABLISHED at n=8, reverted.** Four independent
+accumulators keep four reads per lane in flight instead of one (memory-level
+parallelism, not instruction count). Correct: 17/17 and opt-125m STRICT 6/6.
+
+A first cross-session read said **0.99x**. Because a cross-session read is exactly
+what produced a false 1.2x for the subgroup tactic earlier today, the unroll factor
+was made a SPECIALIZATION CONSTANT so both arms run in one binary, and A/B'd
+interleaved:
+
+    unroll-4 faster in 5 of 8 pairs; ratios 0.92 0.95 1.00 1.03 1.08 1.10 1.11 1.18
+    arm medians 60.3 vs 60.4 tok/s
+
+A slight positive lean, well inside noise at this sample size, and 5/8 is not a
+majority. **Reverted**: a spec constant, an env lever, a tail loop and four
+accumulators is real complexity, and it has not been shown to buy anything. A
+larger sample could settle it; the honest state is "not established", which is not
+the same as the subgroup reduction's clean 4/8 wash.
+
+**OBSERVABILITY REGRESSION FROM `VK-A2`, fixed.** Per-shader TIME came from the
+per-dispatch fence wait. Batching submits many dispatches under ONE fence, so
+there is nothing to attribute and the profile printed **0.0 ms for every shader** —
+which reads as "these kernels are free" rather than "this was not measured". The
+dump now says so explicitly and prints counts only, pointing at
+`VT_VULKAN_BATCH=0` for per-kernel milliseconds. Restoring per-kernel time UNDER
+batching needs GPU timestamp queries (`vkCmdWriteTimestamp`), which is the proper
+Vulkan answer and is not built.
+
+**Blinding your own instrument is a cost of the optimisation, and it should be
+recorded as one.** Every lever this session was found with that profile.
+
+### GPU timestamp profiling restored — and the workload is now HOST-BOUND (2026-08-07, GB10)
+
+`VK-A2` blinded the per-shader time profile (one fence per batch, nothing to
+attribute). GPU timestamp queries restore it, and they are strictly BETTER
+evidence than what they replace: `vkCmdWriteTimestamp` brackets each dispatch on
+the DEVICE timeline, so this measures GPU execution rather than a host-side fence
+wait that also contained launch latency.
+
+Probed, not assumed: `timestampComputeAndGraphics` and a non-zero
+`timestampPeriod`, else profiling stays off and says so. The pool and the
+timestamp commands exist only under `VT_VULKAN_DISPATCH_STATS`, so production
+pays nothing.
+
+**MEASURED GPU TIME, batching on, Qwen3-0.6B decode:**
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 792 | 42.2 | **51.8%** | 0.0533 |
+| `vt_paged_attn` | 224 | 13.0 | 15.9% | 0.0579 |
+| `vt_matmul_coopmat` | 112 | 11.9 | 14.6% | 0.1061 |
+| `vt_rms_norm` | 904 | 9.2 | 11.3% | 0.0102 |
+| `vt_rope_from_cache` | 224 | 1.5 | 1.8% | 0.0066 |
+| `vt_reshape_and_cache` | 224 | 1.0 | 1.3% | 0.0047 |
+| `vt_silu_and_mul` | 224 | 0.9 | 1.1% | 0.0039 |
+| `vt_qkv_split` | 224 | 0.8 | 1.0% | 0.0038 |
+| **TOTAL** | 2952 | **81.4** | | |
+
+**★ THE HEADLINE: GPU busy is 81.4 ms of a 314.5 ms run — 26%. SEVENTY-FOUR
+PERCENT OF THE RUN IS HOST-SIDE.** Before `VK-A2` the same workload was ~276 ms of
+GPU time in ~1,092 ms. Batching removed 195 ms of GPU time and, in doing so,
+moved the bottleneck OFF the GPU entirely.
+
+**Every remaining GPU-side lever is now bounded by 26%.** Even an infinitely fast
+GEMM buys at most 51.8% of 26% = 13% of the run. The next lever is host
+orchestration — the same conclusion the CUDA campaign reached
+(`profile-full-step-not-just-kernels`), arrived at here from the opposite
+direction.
+
+**It also settles the fusion question DIRECTLY** rather than by subtraction:
+`qkv_split` 0.0038, `silu_and_mul` 0.0039, `reshape_and_cache` 0.0047 and
+`rope_from_cache` 0.0066 ms/call are **8-14% of the old 0.046 ms launch floor**.
+These ops do essentially no work. Abandoning the fusion lever was right, and this
+is the measurement that proves it instead of inferring it.
+
+### Host-side orchestration: the descriptor ring was capping batches — 1.51x (2026-08-07, GB10)
+
+`VK-A2` moved the bottleneck off the GPU (busy 26%). This is the first host-side
+lever, and it was found by profiling rather than guessing.
+
+**FIRST, A MISATTRIBUTION AVOIDED.** `perf record` put **62.87% of on-CPU time in
+`vt::cpu::Threadpool::ThreadReady`** — which looks damning on a Vulkan run. It is
+llama.cpp's `ggml_graph_compute_poll_for_work` ported 1:1: a `1024*128*poll`
+busy-wait, `poll=50`, across `hardware_concurrency` (20) threads. So it is IDLE
+SPIN, and `perf` samples on-CPU time, which a spinning thread dominates while
+contributing nothing.
+
+Tested rather than assumed, with `VLLM_CPP_CPU_THREADS=1` (19 fewer spinners), 8
+interleaved pairs: **4/8, 1.018x — a wash.** A profile percentage is not an
+attribution. It did, however, drown everything else, so the real profile needed
+the spin suppressed.
+
+**THE REAL HOST PROFILE**, `VLLM_CPP_CPU_THREADS=1`, by shared object:
+
+| | share |
+|---|---:|
+| `[kernel.kallsyms]` | **40.5%** |
+| `[nvidia]` | **21.9%** |
+| `libc` | 15.2% |
+| **our own code** | **13.7%** |
+| `libnvidia-eglcore`, `libstdc++`, rest | 7.0% |
+
+**62% of host time is kernel plus driver; only 14% is ours.** So the host cost is
+submissions and syscalls, not our C++ logic.
+
+**THE CAUSE: `kDescriptorRing = 16` was the batch-length limiter, not `kMaxBatch`.**
+Observed flushes were 40-46 dispatches against a cap of 128. `vt_rms_norm` runs
+**112 times per forward pass** (4 per layer x 28 layers), so it exhausted a 16-deep
+ring **seven times per pass** and forced a submit each time. Every forced flush is
+a `vkQueueSubmit` plus a blocking `vkWaitForFences`.
+
+Ring 16 -> 128 (and `kMaxBatch` 128 -> 512). Batches now reach **368 dispatches —
+an entire forward pass in ONE submit.**
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_RING` the only variable, one binary:**
+
+| | ring 128 | ring 16 |
+|---|---:|---:|
+| decode tok/s (median) | **87.3** | 57.7 |
+| per-pair ratios | 1.44 1.47 1.49 1.50 1.52 1.58 1.62 1.63 | |
+| result | **1.51x, 8 of 8 pairs** | |
+
+The ring depth was made a RUNTIME value first, so both arms run in one binary —
+a cross-build comparison is what produced a false 1.2x for the subgroup tactic
+earlier today.
+
+**Decode is now 87.3 tok/s: 48% of the 182 tok/s bandwidth roof, and 1.84x off
+llama.cpp's 160.9 — from ~19x at the start of the session, 10.2x overall.**
+
+opt-125m STRICT 6/6 token-exact; `test_vulkan_backend` 17/17.
+
+### Re-profile after the ring change: GPU-bound again, and a "void" result reversed (2026-08-07)
+
+**THE REGIME INVERTED TWICE IN ONE SESSION.** `VK-A2` batching cut GPU time and
+left the run HOST-bound at 26% GPU-busy. The descriptor-ring fix then cut the
+submits, and the bottleneck moved straight back:
+
+| | GPU busy (decode phase) |
+|---|---:|
+| before `VK-A2` | ~25% of a 1,092 ms run |
+| after `VK-A2` | **26%** -- host-bound |
+| after ring 16 -> 128 | **84%** -- GPU-bound again |
+
+**GPU timestamp profile at the new default** (32-token decode, 11,808 dispatches,
+288.7 ms GPU):
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 3504 | 157.9 | **54.7%** | 0.0451 |
+| `vt_paged_attn` | 896 | 66.4 | **23.0%** | 0.0741 |
+| `vt_rms_norm` | 3616 | 32.4 | 11.2% | 0.0090 |
+| `vt_matmul_coopmat` | 112 | 13.5 | 4.7% | 0.1203 |
+| the four small ops | 3584 | 15.0 | 4.4% | 0.0035-0.0059 |
+
+Host side, spin suppressed: kernel 45.6%, libc 17.7%, nvidia 17.7%, **our own code
+10.9%**.
+
+**★ A "NOT ESTABLISHED" RESULT REVERSED BY THE REGIME CHANGE, NOT BY NEW CODE.**
+The GEMV four-way unroll was measured earlier at **5/8 pairs, arm medians 60.3 vs
+60.4 tok/s**, and reverted as unproven. That verdict was taken while the GPU was
+26% busy — where a 10% GEMV win moves e2e by only 1.4%, far inside this box's
+noise. **5/8 was the expected result whether or not the change helped.**
+
+Re-tested unchanged in the new regime, where the same win is worth ~4.6% e2e:
+
+    unroll 4 vs 1, 8 interleaved pairs, one binary
+    7 of 8 pairs, median 1.055x, arm medians 91.7 vs 87.5 tok/s
+    ratios 0.983 1.048 1.049 1.050 1.059 1.063 1.077 1.096
+
+**Same code, same statistic, different regime: 5/8 -> 7/8.** Restored and shipped.
+
+**The durable lesson, and it is a correction to how this campaign has been
+measuring: A NEGATIVE RESULT IS REGIME-DEPENDENT.** "Not established" means "not
+resolvable against the noise floor *as the system stands now*", not "does not
+help". Every lever discarded while some other component dominates deserves a
+re-test once that component is fixed — and the discard should say which regime it
+was measured in. Re-check the subgroup-reduction wash (4/8, measured at 26% GPU
+busy) on the same grounds.
+
+Decode is now **91.7 tok/s: 50% of the 182 tok/s roof, 1.75x off llama.cpp's
+160.9**, from 8.59 at the start of the session.
+
+
+## 2026-08-07 — ROW 7 Kimi-Linear runner fold: GB10 campaign (`row/KIMI-RUNNER-FOLD` #122)
+
+Build: /dev/shm/kimifold, CUDA 121a, CUTLASS 4.5.0, FA2, Triton AOT sm_121a. Golden md5
+`bfa5bdbf` (§12). flock $HOME/gpu.lock + /tmp/gpu, drop_caches per leg, worker parked,
+min-avail >= 21G, no reboot. Engine legs: `kimi-linear-gen` thin ABI client
+(`vllm_engine_load` + `vllm_complete_tokens`, max_model_len 4096) over
+`~/kimi-linear-engine-dir` (snapshot symlinks + TikTokenConverter tokenizer.json).
+
+| leg | config | /128 | steady tok/s | note |
+|---|---|---|---|---|
+| SACRED 35B | `test_qwen36_paged_engine` post-fold | 2/2·315 | — | PASS |
+| SACRED 27B | `test_qwen27_paged_engine` post-fold | 1/1·235 | — | PASS |
+| CLI reference | `test_kimi_linear_fold_gate`, §19 config | **122** | 18.93 (120 steps) | reproduces §19; p7 10/16 got == §19 |
+| engine round 1 | FA2 unset (exact arm), pre-mirror-fix | 9 | 13.07 (16-step diff) | STALE HOST IDS (async device mirror) — root-caused, fixed |
+| engine exact arm | post-fix, `VT_KIMI_PAGED_MLA_FA2=0` | 111 | 11.46 (16-step diff) | §19 M-tiling near-tie class: p7→16/16, p4 15/16, p2 token-1 cascade 0/16 |
+| **engine FA2 arm** | post-fix (now DEFAULT) | **122** | 9.81 (16-step diff) | **p0-p6 16/16 + p7 got byte-equal CLI ⇒ engine==CLI 128/128** |
+| engine FA2, N=64 | async sched | 122-profile (p0/p1 16/16) | **16.87** | two-length diff N=64 vs N=1 — the honest steady rate |
+| engine FA2, N=64 | `VT_ASYNC_SCHED=0` | 122-profile | 16.11 | async is NOT the gap |
+| default-bind | flipped-default binary, no env | **122** | 9.44 (16-step diff) | binds the shipped default |
+
+Server smoke (`examples/server`, /v1/completions, converted tokenizer): STREAMED 48 tokens
+in 2.52 s = 19.0 tok/s WALL (incl. prefill + first-request warmup — a lower bound on steady
+decode); non-streamed haiku coherent; /v1/models lists the model.
+
+Verdicts: Gate A engine==CLI 128/128 BYTE-IDENTICAL; golden >= 122 bound MET (122, same
+profile). Speed: the SERVER 19.0 tok/s wall is the production-surface anchor (~0.90× the
+#111 vLLM ~21 floor; CLI 18.93 reproduced) — NOT >= vLLM. MEASUREMENT CAVEAT: the example's
+two-length diffs (N=64 16.9; N=16 9.8-11.5) run the LONG leg first and cold, so one-time
+CUDA warmup pollutes the subtraction — the diffs UNDERSTATE steady decode; anchor on the
+server wall (or run the short leg first / a warmup pass). Residual = per-step KDA host
+islands (beta/g1 downloads + host decay gate per layer), grouped MoE via the shared seam,
+decode graph. Exact-island arm kept as diagnostic (VT_KIMI_PAGED_MLA_FA2=0), its 111/128
+recorded as the §19 M-tiling near-tie regime, not a bug.
+
+vLLM same-session re-measure: ATTEMPTED and ABORTED BY BOX REBOOT. The leg (oracle venv,
+util 0.82 — the #111-precedented config, no tracing, worker parked, 95G+ free at launch)
+loaded all 20 shards and reached torch.compile/graph capture, then the box HARD-REBOOTED
+at 00:25:32 (journal boot logs; min-avail had sat at the 15-17G floor during load). This
+REPRODUCES the §19 finding that vLLM@0.82 + any additional pressure sits below the
+life-critical floor on the 119G unified pool — per the safety mandate ("do not retry
+higher", and now: do not retry AT 0.82 with compile/capture on), the leg is NOT retried.
+The DENOMINATOR for this campaign therefore remains the #111 recorded floor (~21 tok/s,
+16-token aggregate, same prompts/workload). Box recovered clean: single reboot, GPU
+visible, local-ai-worker auto-restored by --restart=always; /dev/shm build tree gone
+(campaign complete; all gate logs under $HOME).
+
+### 27B Vulkan re-run with the six GDN kernels: coverage MEASURED, speed NOT (2026-08-08, GB10)
+
+The GDN merge claimed the six new kernels would stop the reference-tier fallbacks.
+That was an inference from registration. This run makes it a measurement.
+
+**REFERENCE-TIER OPS: 11 -> 5.** Exactly the six that got kernels are gone —
+`kCausalConv1dUpdate`, `kRmsNormGated`, `kSigmoidGateBf16`, `kGdnPostConv`,
+`kGdnStateGather`, `kGdnStateScatter`.
+
+Still on the host, and each for a stated reason:
+
+| op | why |
+|---|---|
+| `kGdnPrefill`, `kGdnDecode` | chunked gated-delta recurrences, deliberately out of scope |
+| `kCausalConv1dFwd` | started and abandoned; its state write-back reads the OLD row while other tokens of the sequence still need it |
+| `kRopeCosSinCache` | **BY DESIGN** — double-precision table, mirrors vLLM's own split |
+| `kAttnQkNormRopeGate` | not attempted |
+
+**SPEED DID NOT MOVE, AND IS NOT CALLABLE.** decode 2.65 -> 2.40 tok/s, prefill
+2.22 -> 1.82, E2E 616.7 -> 709.1 s. That reads as a 9-18% regression and **it is
+n=1 per arm on a box that swung 2.1x run-to-run on the 0.6B**. Inside the noise
+band in both directions; calling it a regression would be the same error as
+calling it a win.
+
+**And no speed change was EXPECTED.** `kGdnPrefill`/`kGdnDecode` — the heavy
+recurrence cores — are still on the host. The six that landed are GLUE. Moving
+glue off the CPU while the dominant work stays there is a coverage and correctness
+result, not a throughput one.
+
+This is the regime effect recorded earlier today, applied prospectively for once:
+with the recurrence cores dominating, a glue-op improvement cannot clear the noise
+floor, so this measurement **cannot** resolve whether the six kernels are faster
+than their CPU counterparts. Re-measure them AFTER `kGdnPrefill`/`kGdnDecode`
+land, and treat today's numbers as unresolved rather than negative.
+
+**What the GDN merge IS justified on:** coverage (11 -> 5 fallbacks, measured),
+correctness (`test_vulkan_backend` 22/22 with 977 assertions on GB10 hardware, not
+just llvmpipe; opt-125m STRICT 6/6 with 0 declines), and the backend-wide
+sub-word buffer bug it exposed — `AllocBuffer` sized buffers at exactly the
+requested bytes while every operand is read through a `uint32_t[]` view, so a
+3-byte flag array gave a ZERO-element view and read false silently under
+robustBufferAccess.
+
+It is **not** justified on speed, and nothing measured here says otherwise.
+
+**Next lever for 27B Vulkan speed is `kGdnPrefill`/`kGdnDecode`** — that is where
+the prefill time sits, and a materially larger piece of work than the six glue ops.
+### paged_attn barrier batching: REFUTED, reverted (2026-08-07, GB10)
+
+With the run GPU-bound again, `vt_paged_attn` is the second cost at 23.0%. It runs
+ONE WORKGROUP per (query token, query head) with lanes splitting the head
+dimension, and calls `vt_tg_sum` **once per key** — 2 + log2(128) = 9 barriers to
+combine ONE multiply per lane, since `d = 128` equals the workgroup width. At 0.0741
+ms/call over ~48 keys that is 1.54 us per key, which looked barrier-bound.
+
+Batched four keys per reduction round: four independent sums pushed through ONE
+barrier sequence, with the online softmax still consuming them STRICTLY IN KEY
+ORDER so `m`/`l`/`acc` evolve identically. **Bit-identical, not NMSE-tier** — and
+opt-125m STRICT 6/6 with 1152 `kPagedAttention` selections confirmed it.
+
+**4x fewer barriers bought 1.6%: 0.0741 -> 0.0729 ms/call, share 23.0% -> 22.8%.**
+
+**The barriers were not the cost.** Per key the kernel gathers 128 K elements AND
+128 V elements through the block table — roughly 512 B of scattered reads against
+one multiply per lane. `vt_paged_attn` is **memory-bound on the KV gather**, not
+barrier-bound.
+
+Reverted: 2 KiB of shared memory and a restructured loop for nothing measurable.
+The next attempt on this kernel should target the GATHER — KV layout, vectorised
+loads, or caching the K/V slice across the query heads that share a KV head —
+**not** the reduction.
+
+Recorded because the hypothesis was specific and the refutation is reusable: this
+is the second kernel this session where a barrier-count argument looked compelling
+and measured flat (the subgroup GEMV was the first).
+
+## 2026-08-07 — sm_120 exact GDN causal-conv chunks: 3.069x kernel, +2.152% enclosing
+
+**Disposition:** ACCEPTED and reproduced on clean current-main transplant
+`upstream/main` `f91a5917a`. Exact chunks default ON; latency, VRAM and
+27B/35B gates stay open.
+
+The metadata builder enumerates exact `(sequence, 8-token chunk)` work, uploads
+its two i32 descriptors once per step and shares them across GDN layers. The
+register kernel consumes one descriptor per `grid.y`.
+`VT_CONV_EXACT_CHUNKS=0` is the same-binary whole-sequence rollback;
+`VT_CONV_REG=0` selects tiled/scalar.
+
+**Correctness.** RED compile evidence:
+`/tmp/vllm-agent-runs/gdn-exact-red-escalated.json`. Focused host metadata and
+flags, affected Qwen fixtures, full CUDA GDN and cached Qwen3.5-4B 3/3·1672
+were green. Three production ON/OFF pairs had identical token files for all
+128 requests × 128 outputs.
+
+**Same-binary profile.** Manifest
+`/tmp/vllm-agent-runs/qwen35-conv-exact-ab-profile.json`; rollback/default
+traces `/tmp/qwen35-conv-exact-{off,on}.nsys-rep`. Rollback: 1728 calls,
+720.047171 ms, 416.694 us mean. Exact: 1728 calls, 234.607112 ms, 135.768 us.
+That is **3.069x**, saving 485.440 ms. Exact `grid.y=279/280/282` work counts
+replace dominant `(64,28..32,1)` whole-sequence grids, confirming the proposed
+mechanism. Pinned-vLLM same-tool total is 145.421 ms; residual **1.613x**.
+
+**Enclosing A/B.** Manifest
+`/tmp/vllm-agent-runs/qwen35-conv-exact-local-ab.json`; evidence root
+`/tmp/qwen35-conv-exact-local-ab-20260807`. Three alternating pairs under one
+GPU lock and a 25 GiB user-systemd scope:
+
+| Axis | rollback | exact default | ratio |
+|---|---:|---:|---:|
+| total | 6641.800 tok/s | 6784.743 tok/s | 1.02152x |
+| output | 734.433 tok/s | 750.237 tok/s | 1.02152x |
+| TTFT | 1048.927 ms | 1018.040 ms | 0.97055x |
+| TPOT / ITL | 35.420 ms | 34.740 ms | 0.98080x |
+| E2E | 5547.687 ms | 5430.180 ms | 0.97882x |
+
+Against sealed vLLM, exact local is **1.021246x** throughput,
+**1.085812x** TTFT and **1.024597x** TPOT. Exact peak VRAM
+13044/13058/13058 MiB, mean 13053.3, versus old local 13054 and vLLM 12820.
+
+**VOID oracle attempts.** `qwen35-conv-exact-default-full-compare.json` exposed
+the missing live-driver link path; the harness now adds `/run/opengl-driver/lib`
+to `LIBRARY_PATH`. `qwen35-conv-exact-default-full-compare-rerun.json` reached
+13/18 legs before a transient Torch bytecode read invalidated Triton AOT cache
+keys. Neither attempt supersedes the sealed denominator. Full evidence:
+`docs/bench-evidence/qwen35-4b-sm120-main-20260807.md`.
+
+**Clean-transplant reproduction (`f91a5917a`).** Contained CPU/CUDA rebuild;
+focused CPU 6/6, full CUDA GDN 66/66·4300, cached 4B 3/3·1672. Same-binary
+graph-node traces `/tmp/qwen35-conv-exact-transplant-{off,on}.nsys-rep` and
+token files reproduce the mechanism with byte identity: rollback 1728 calls /
+720.216507 ms / 416.792 us, exact 1728 / 234.379395 ms / 135.636 us =
+**3.072866x**. Profiled enclosing totals are 6587.66→6727.35 tok/s
+(**1.021205x**), TTFT 1058.73→1025.46 ms, TPOT 35.70→35.04 ms and E2E
+5592.69→5475.91 ms. The transplanted result is therefore reproduced, not merely
+carried from its old branch. Against the sealed vLLM conv trace, residual is
+**1.611730x**.
+
+**Post-rebase reproduction (`3d2581551` on `upstream/main` `48a54141f`).** The
+contained rebuild and all three gates remain green: focused 6/6, CUDA GDN
+66/66·4300, cached 4B 3/3·1672. Fresh graph-node traces and token files under
+`/tmp/qwen35-conv-exact-rebase-3d2581551-{off,on}.*` are byte-identical.
+Rollback is 1728 calls / 718.704016 ms / 415.917 us; exact is 1728 /
+233.954533 ms / 135.390 us = **3.07198x**. Profiled enclosing totals are
+6589.65→6739.34 tok/s (**1.02272x**), TTFT 1057.63→1022.70 ms, TPOT
+35.70→34.99 ms and E2E 5590.92→5466.20 ms. The result therefore survives the
+27-commit main advance; against the sealed vLLM conv trace the residual is
+**1.60881x**. Trace SHA-256: rollback `6a5dde18e...f97c47`, exact
+`f47fb9cc...7aecf9`; both token files `83fcdc45...453545`.
+### Decode: the batch was being drained by every host memcpy (2026-08-08, GB10)
+
+Goal is llama.cpp Vulkan's **4.35 tok/s** on Qwen3.6-27B decode. We were at 2.74,
+with **GPU busy only 56% of wall** and both decode GEMMs already near the
+bandwidth roof (`vt_matmul_vec` 90%, lm_head 74%) — so the entire gap is host.
+
+**MEASURED, not guessed: 212 flushes per TOKEN**, most carrying 1-2 dispatches.
+Command-buffer batching was almost entirely defeated. Attributing each flush to
+its trigger settled why in one run:
+
+| trigger | flushes | avg dispatches |
+|---|---:|---:|
+| `copy` | **2081** | 3.2 |
+| `reference-tier` | 112 | 10.0 |
+| ring-full / batch-cap | **0** | — |
+
+The ring depth and batch cap — the two things previously tuned — **never fired
+once**. `Backend::Copy` drained the batch unconditionally, so every host memcpy
+paid a full submit-plus-blocking-fence round trip.
+
+**A drain is required only on a real dependency:** when the copy touches memory the
+OPEN batch bound. Reading a buffer the batch writes would see bytes the GPU has not
+written; writing one it reads would change operands mid-flight. If the batch never
+bound the buffer — the common case, since activations flow forward into freshly
+allocated ones — neither hazard exists. A pointer outside every Vulkan allocation
+is plain host memory and can never alias a bound buffer, so it never drains.
+
+**Result: flushes 212 -> 114 per token, decode 2.74 -> 2.99 tok/s (1.09x)**, with
+opt-125m STRICT 6/6 token-exact and 26/26 on GB10.
+
+**What remains, and it is architectural.** `copy-src` (3201) and `copy-dst` (3072)
+still account for 98 of the 114 flushes: the 27B forward moves activations through
+HOST vectors between ops, so it round-trips host<->device ~100 times per token.
+llama.cpp never does this — its whole graph runs and then one readback happens, so
+its mid-graph submits carry no fence at all and a single wait lands at step end
+(`ggml-vulkan.cpp:15709`, `:16344`). Closing that is a model-level change to
+`qwen3_5.cpp` (a device-resident forward), not a backend one, and it is the
+remaining 1.45x.
+
+`reference-tier` is a further 16 flushes/token from `kCausalConv1dFwd` and
+`kAttnQkNormRopeGate` still on the host — worth ~14% of flushes.
+
+**Also ruled out by the sweep of llama.cpp's backend:** pre-recorded/replayed
+command buffers do not exist upstream (`graph_plan_* = NULL`, `:17708-17711`;
+`eOneTimeSubmit`, `:8086`), so there is no CUDA-graph analogue to port. They submit
+MORE often than us, not fewer — every ~100 nodes, deliberately, to overlap host
+recording with GPU execution — and their descriptor sets are fungible across
+pipelines (one global layout, bump-allocated, `:6996-7009`, `:8137`), so ring
+exhaustion cannot force a flush at all. Our submit-then-block idiom is, in their
+code, a debug-only path behind `GGML_VK_SERIALIZE_SUBMISSIONS` (`:17016-17035`).
+
+---
+
+## BACKEND-VULKAN-DEVICE-RESIDENT — the 98 copy flushes were the GDN STATE cache, not activations (2026-08-09, GB10)
+
+The entry above named the remaining 1.45x as "the 27B forward moves activations
+through HOST vectors between ops". **That premise was wrong, and grounding it
+first is what made the fix small.** The 27B decode already runs a device-resident
+forward: `RunDenseLayerPaged` -> `GdnBlockPaged` / `FullAttnBlockPaged` /
+`DenseMlpBlock` all take and return `DBuf`, so no activation crosses the host.
+The host-vector helpers at `qwen3_5.cpp:886-917` (`MatmulF32`/`MatmulBf16`) are
+reached only from the non-paged reference path and the MoE router, not from this
+model's decode.
+
+**Where the copies actually came from.** `IndexedGdnStateIoEnabled` keyed its
+default on `needs_weight_staging()`, which is true ONLY on CUDA — the same
+"not-CUDA is not CPU" defect as issue #125, one level up. So every non-CUDA
+device took the ROW-COPY arm: per GDN layer, `GatherStateF32` + `ScatterStateF32`
+for the conv state and for the ssm state, each issuing a `Backend::Copy`. The 27B
+has 48 linear-attention layers of 64, so a decode token drove ~192 host memcpys
+over device memory, and the ones that touched a buffer the open batch had bound
+drained it. MEASURED, `VT_VULKAN_DISPATCH_STATS=1`, 1 prefill + 4 decode tokens:
+`copy-dst` 192 + `copy-src` 201 = **393 copy-triggered flushes, 457 submits
+total** — 98 and 114 per token, reproducing the campaign's figures exactly.
+
+**Why the indexed arm was reachable on Vulkan at all.** The 27B's
+`mamba_ssm_dtype` is `float32`, so `vt::GdnDecode(cache, &state_idx)` already
+satisfied the vt contract and the Vulkan shader already had `has_idx`. Only the
+CONV state was blocked: it is bf16, and `CheckConvCommon` spelled the
+compressed-state permission as `device == kCUDA`. That clause is now
+`Backend::SupportsCompressedConvState()` (CUDA + Vulkan true, CPU false), and
+`vt_causal_conv1d_update.comp` binds the state through the dtype-erased 32/16-bit
+view pair. The rounding is unchanged: `VT_LOAD` widens, the accumulation is the
+same f32 sequence, `VT_STORE` rounds once — the same single bf16->f32->bf16 round
+trip the gather/scatter arm performed.
+
+**Result (all same binary, `VT_GDN_INDEXED_STATE_IO=0` restores the baseline):**
+
+| | row-copy (A) | indexed in place (B) |
+|---|---|---|
+| submits, 1 prefill + 4 decode | 457 | **121** |
+| copy-triggered flushes | 393 (`copy-dst` 192, `copy-src` 201) | **9** (`copy-src` only) |
+| per decode token | 114 flushes, 98 copy | **~30 flushes, ~2 copy** |
+| median TPOT, 8 pairs | 314.3 ms (3.18 tok/s) | **254.4 ms (3.93 tok/s)** |
+
+8 order-alternated pairs, page cache dropped before every run, `--num-prompts 1
+--input-len 32 --output-len 32 --concurrency 1`: **B wins 8/8**, 1.235x. B is
+tight (249.4-255.7 ms); A is 300.8-319.4 plus one 519.9 cold outlier.
+
+**Regime matters, and two earlier blocks prove it.** Blocks 1-2 (6 + 8 pairs)
+ran WITHOUT dropping the page cache and B won only 15/18 overall, with two B runs
+at ~455 ms. The 27B on Vulkan holds its safetensors in host page cache AND a
+second full copy in Vulkan device buffers (both host RAM on GB10), so an
+uncontrolled run sits at the RAM ceiling; block 2 had 6 of 16 runs killed by a
+MemAvailable watchdog at 6 GB, in BOTH arms. An unguarded earlier attempt
+OOM-rebooted the box. **Releasing the host weight bytes after upload on the
+Vulkan load path is a real, unclaimed lever** (the GB10 NVFP4 recipe already does
+this on CUDA: 114 -> 67 GiB RSS).
+
+**Correctness:** greedy 32-token completion on the 27B is byte-identical between
+the two arms; `opt-125m` STRICT 6/6 token-exact (96/96, 0 declines);
+`test_vulkan_backend` 27/27 on GB10 (the 27th is a NEW case: a compressed conv
+state updated in place, bit-exact against the upcast arm it replaces); the CUDA
+library builds clean with the same
+change and takes exactly the branch it took before (`SupportsCompressedConvState`
+returns true on CUDA, and the `needs_weight_staging()` arm is untouched).
+
+**What remains, now located.** `reference-tier` grew from 64 to 112 flushes
+because the batch accumulates further between host-tier ops — it is now ~28 of
+the ~30 flushes/token. The declines name exactly three ops: `kCausalConv1dFwd`
+(op 5, prefill only), `kRopeCosSinCache` (op 66) and `kAttnQkNormRopeGate`
+(op 67). The last two run per full-attention layer, 16 per token, and are the
+next lever; they are kernel work, not plumbing.
+
+## Rolled out of the scoreboard on 2026-08-09
+
+Moved verbatim from `docs/BENCHMARKS.md` by `scripts/roll-benchmark-record.py`. Nothing edited or deleted.
+
+## 2026-08-08 — Gemma4 FP8 stream lab (gfx1201 R9700)
+
+| Path | Warm tok/s | Notes |
+|------|------------|--------|
+| vllm-cli Paris HIP=0 stream experts | ~38 | `--repeat` after cold expert fill |
+| server `/v1/completions` | ~38 | exclusive |
+| server `/v1/chat` thinking off | ~32 | after expert cache |
+| llama.cpp Vulkan Q8 tg128 (bar) | ~98 | separate stack |
+## BACKEND-VULKAN-GEMVROWS — the decode GEMV was already at 90% of roof; wide loads buy 1%, rows-per-workgroup LOSES, and the 1.8x bimodal legs are lm_head (2026-08-09, GB10, base `93852c28`)
+
+`vt_matmul_vec` is 89-90% of 27B decode GPU time and moves ~52 GB of bf16 weights per token, so it was
+the largest single line item left in the Vulkan campaign. Two structural differences against llama.cpp's
+`mul_mat_vec` (pin `237ad9b96`) were the candidates. Both were implemented as SPECIALIZATION CONSTANTS on
+the one committed SPIR-V module, so every arm below is the same binary with one variable.
+
+Neither candidate can reduce DRAM traffic, and neither was claimed to: the weights are read exactly once
+per token at any row count, and a 32-lane subgroup covers the same contiguous bytes at any load width.
+Rows-per-workgroup buys activation-re-read locality (L2, not DRAM) and memory-level parallelism; load
+width buys FEWER LOAD INSTRUCTIONS. So the only thing either could ever be is a latency / issue-rate
+effect on top of a kernel that was already bandwidth-bound.
+
+### Isolated sweep (`benchmarks/vulkan_gemv_ab.cpp`)
+
+Seven (k, n) shapes read from Qwen3.6-27B's own config (5120x34816 merged gate+up, 17408x5120 down,
+5120x12288 q+gate, 5120x2048 kv, 6144x5120 out, 5120x8192 and 5120x6144 GDN in). 9 arms x 4 rotated
+passes. Every arm is PAIRED against the rows=1/pack=0 baseline measured IN THE SAME PASS, because the box
+drifted 15.5% peak-to-peak between passes and an unpaired ranking would have been noise. The harness
+batches 8 dispatches per timed rep and reads GPU TIMESTAMPS: fenced per dispatch it read 45% of the
+bandwidth roof where the e2e profile of the same kernel read 89%, i.e. it was measuring a regime the model
+never runs in.
+
+| | pack 0 (2 B) | pack 1 (4 B) | pack 2 (8 B) |
+|---|---|---|---|
+| rows 1 | 1.000x | 1.025x | **1.086x** |
+| rows 2 | 0.966x | 1.017x | 1.047x |
+| rows 4 | 0.968x | 1.014x | 1.039x |
+
+Output bit-hashes over the full result vector, with full-mantissa operands (the obvious small-integer test
+pattern sums EXACTLY in f32 and cannot tell the arms apart): every rows value gives the SAME hash at a
+fixed pack width, confirming rows-per-workgroup is bit-identical by construction; every pack width gives a
+DIFFERENT hash, confirming it repartitions K.
+
+### Real 27B decode: the sweep OVERSTATED the win by 7x
+
+Two-length GPU-timestamp diff, output-len 36 minus output-len 4 over 32 decode tokens, so prefill and
+every one-time cost cancels. Run twice with the arm order reversed the second time.
+
+| per decoded token | block 1 pack 0 | block 1 pack 2 | block 2 pack 0 | block 2 pack 2 |
+|---|---|---|---|---|
+| `vt_matmul_vec` ms | 211.99 | 209.52 | 214.59 | 210.38 |
+| calls | 432 | 432 | 432 | 432 |
+| GB/s (52.1 GB/token) | 245.8 | 248.7 | 242.8 | 247.6 |
+| % of the 273 GB/s roof | 90.0% | 91.1% | 88.9% | 90.7% |
+| speedup | | **1.012x** | | **1.020x** |
+| whole-GPU ms | 237.35 | 234.72 | 470.18 (see below) | 235.69 |
+
+**Why the sweep lied.** It re-reads ONE 356 MB weight buffer 320 times, so its DRAM rows and TLB entries
+stay hot and instruction issue becomes visible as a secondary constraint. Decode streams 50 GB of distinct
+weights once per token, where DRAM is the whole story and a quarter as many load instructions buys ~1%.
+The campaign already has "a negative result is regime-dependent" on record from the GEMV unroll; this is
+the same lesson running the other way. A WIN can be an artefact of the measuring regime too, and an
+isolated harness must be shown to reproduce the e2e operating point (this one does: its baseline reads
+89.3% of roof against the e2e diff's 90.0%) before its RANKING is believed.
+
+### End-to-end
+
+Order-alternated AB/BA, page cache dropped before every leg, `--num-prompts 1 --input-len 32
+--output-len 32 --concurrency 1`, two blocks of 6 and 8 pairs. `VT_VULKAN_GEMV_PACK=0` reproduces the
+pre-row kernel bit for bit in the SAME binary.
+
+Eight of the 28 legs landed in the slow mode diagnosed below (5 baseline, 3 pack=2: arm-symmetric).
+Of the six pairs where BOTH legs were clean:
+
+| pair | baseline | pack=2 | delta |
+|---|---|---|---|
+| block1/6 | 242.38 (second) | 241.57 (first) | +0.33% |
+| block2/2 | 241.98 (second) | 240.08 (first) | +0.79% |
+| block2/5 | 241.24 (first) | 239.90 (second) | +0.56% |
+| block2/6 | 242.81 (second) | 243.03 (first) | -0.09% |
+| block2/7 | 242.68 (first) | 240.93 (second) | +0.72% |
+| block2/8 | 242.33 (second) | 240.54 (first) | +0.74% |
+
+**5 of 6 clean pairs**, median paired ratio **1.0064x**. Clean-leg medians **242.38 -> 240.54 ms**,
+decode **4.126 -> 4.157 tok/s**. NOISE FLOOR on the clean legs: **0.88%** peak-to-peak on the baseline arm
+(241.24 to 243.38 over 9 legs), 1.92% on the pack=2 arm over 11. A 0.7% effect therefore sits AT the edge
+of what an e2e wall clock resolves on this box; the GPU-timestamp two-length diff is what resolves it, and
+the two agree in sign and magnitude.
+
+### SIDE FINDING, worth more than this row's 1%: the 1.8x bimodal legs are `lm_head`
+
+The previous Vulkan row discarded two legs at "~1.8x the block median" as environmental. They are not
+diffuse contention. In block 2 of the two-length diff the baseline len-36 leg landed in that state, and the
+per-shader diff names it exactly:
+
+| per decoded token | fast leg | slow leg |
+|---|---|---|
+| `vt_matmul` (lm_head, NN, 1 call) | 12.35 ms | **242.12 ms** |
+| `vt_matmul_vec` (432 calls) | 210.38 ms | 214.59 ms |
+| whole GPU | 235.69 ms | 470.18 ms |
+
+A **19.5x** collapse on ONE kernel, while the GEMV beside it moved 1.2%. `lm_head` is 5120x248320 bf16 =
+2.54 GB, so that is 205 GB/s in the fast state and **10.5 GB/s** in the slow one. Mean TTFT is unchanged
+across the modes (6.21 to 6.55 s over all 28 legs), so it is neither the load nor prefill. Whatever selects
+that state is a bigger lever than every remaining Vulkan kernel optimisation combined, and it belongs to
+whoever owns `lm_head`.
+
+### Verdict
+
+The GEMV lever is CLOSED. It was at 90.0% of the GB10 bandwidth roof before this row and is at 91.1%
+after. llama.cpp Vulkan's 4.35 tok/s is 229.9 ms/token wall against our ~242; the GEMV alone is 210 ms of
+that, so even a PERFECT GEMV leaves ~20 ms and the remaining gap is the ~32 ms/token of non-GEMV cost.
+Rows-per-workgroup is kept as an off-by-default axis only because llama.cpp raises `rm_stdq` exactly on the
+AMD GCN and Intel parts `VK-I` is about.
+
+## BACKEND-VULKAN-LMHEAD — the one decode GEMM off the GEMV tactic: column blocking wins 6/6, the K-unroll is ZERO, and the 273 GB/s roof is not reachable (2026-08-09, GB10, `row/BACKEND-VULKAN-LMHEAD`)
+
+**Base:** `93852c28` (PR #183, the Vulkan head). Model Qwen3.6-27B bf16,
+`vllm-bench --num-prompts 1 --input-len 32 --concurrency 1`, `VLLM_CPP_DEVICE=vulkan`.
+All GPU work serialized through `flock ~/gpu.lock`.
+
+**The shape.** `VT_VULKAN_DISPATCH_STATS=1` names it exactly: `bt=0 m=1 k=5120
+n=248320`, the lm_head, whose weight is stored `[K,N]`. It is the ONLY GEMM per
+decode token that does not reach `vt_matmul_vec`, and the decline is correct --
+in `[K,N]` adjacent lanes already read adjacent addresses, so the GEMV shape
+would make a coalesced access strided. It moves `k*n` bf16 = **2.543 GB per
+token**.
+
+### 1. The 9.3 ms floor is WRONG, and the error is the roof, not the arithmetic
+
+2.543 GB at GB10's **theoretical** 273 GB/s is 9.3 ms, which made the measured
+12.43 ms look like 75% of roof and ~3.1 ms of headroom. Nothing on this box
+reaches 273 GB/s. `vt_matmul_vec` -- a genuinely coalesced streaming kernel --
+was run on the IDENTICAL byte count (`vulkan-gemm-ab 1 5120 248320 30`, M=1
+K=5120 N=248320, so `k*n` is the same 2.543 GB) and took **11.04 ms/call =
+230.3 GB/s**. That is the practical streaming ceiling here, 84% of theoretical.
+So the honest headroom for this kernel was **1.4 ms**, not 3.1.
+
+### 2. MEASURED NEGATIVE — the four-way K unroll is ZERO
+
+The first hypothesis was memory-level parallelism: the rolled loop issues one `b`
+load per iteration, so each lane should have a single outstanding read and stall,
+exactly the defect a four-way unroll fixed for `vt_matmul_vec`. A four-way K
+unroll was built with the accumulation order PRESERVED (four products folded into
+the same accumulator in ascending K, bit-identical, memcmp-gated) and A/B'd on one
+binary through a specialization constant.
+
+| arm | `vt_matmul` ms/call, len 36 | replicates |
+|---|---|---|
+| K-unroll 1 (rolled) | 12.4297, 12.4353, 12.3920 | median **12.430** |
+| K-unroll 4 | 12.5482, 12.4412, 12.5318 | median **12.532** |
+
+**ZERO, and half a percent the wrong way.** The driver already pipelines the
+rolled loop. The arm was removed rather than shipped; this row exists so it is
+not re-tried.
+
+**One leg of the FIRST block read 215.4 ms/call on the rolled arm** -- 17x -- and
+three replicates of the same arm then read 12.39-12.43. It was the GB10 residency
+lottery on a 2.54 GB buffer, not the arm. It is also why the kernel now prints
+`scalar matmul ARM: bt=... ncols=...` under `VT_VULKAN_DISPATCH_STATS`: both arms
+of a performance A/B produce bit-identical output and both report the same shader
+name in the histogram, so without a marker an arm that failed to take its flag is
+indistinguishable from a bad leg.
+
+### 3. WHAT WORKED — column blocking, 6 of 6 interleaved pairs
+
+The remaining structural difference between the two kernels at identical byte
+counts is CONTIGUITY PER WORKGROUP. `vt_matmul_vec` gives one workgroup one
+output element and strides its 128 lanes along K, so the workgroup sweeps a
+contiguous 10 KB run of `b`. The flat scalar body gives one INVOCATION one output
+element, so a 128-lane workgroup reads 256 contiguous bytes at row q and then
+jumps `n*2` = 486 KB to row q+1; contiguity survives only across workgroups still
+at the same q, and they drift apart.
+
+`VT_VULKAN_MATMUL_NCOLS` gives a workgroup `128*NCOLS` CONSECUTIVE output columns
+of one row. Lane t owns columns `t + c*128`, NOT `t*NCOLS + c` -- the strided
+assignment is what keeps each of the NCOLS loads a fully coalesced 128-lane
+contiguous read.
+
+`vt_matmul` ms/call at output-len 36, arms interleaved within each replicate:
+
+| NCOLS | replicates | median | GB/s | vs flat |
+|---|---|---|---|---|
+| 1 (flat, the pre-change kernel) | 12.4943, 12.5952, 12.5483, 12.3954, 12.4447, 12.4754 | **12.485** | 203.7 | — |
+| 2 | 13.9622, 12.4016, 12.4585 | 12.459 | 204.1 | ~0 |
+| **4 (shipped default)** | 11.6669, 11.6257, 11.5323, 11.5499, 11.3327, 11.4519 | **11.541** | **220.4** | **-0.944 ms, 1.082x** |
+| 8 | 12.8119, 12.8573, 11.9745 | 12.812 | 198.5 | SLOWER |
+
+**NCOLS 4 beat NCOLS 1 in 6 of 6 interleaved pairs.** Two-length diff (len 36
+minus len 4, over 32 tokens): flat `(449.1-49.9)/32` = **12.475 ms/token**,
+blocked `(412.3-47.2)/32` = **11.409 ms/token**, **-1.066 ms/token**.
+
+**Blocking is a TRADE, not a monotone win.** At NCOLS 8 the dispatch is only
+`ceil(248320/1024)` = 243 workgroups, ~31k threads, and the device runs out of
+work to hide memory latency with faster than the longer contiguous run buys back
+-- it is slower than not blocking at all. NCOLS 2 is indistinguishable from 1.
+The optimum is interior, which is why the gate pins the constant 4 rather than
+"not 1".
+
+At 220.4 GB/s the kernel is now at **95.7% of the 230.3 GB/s practical ceiling**
+measured on identical bytes. The residual is ~0.5 ms/token and there is no
+remaining structural difference identified to spend on it.
+
+**Nothing else moved.** Same 32,544 dispatches; `vt_matmul_vec` 0.4914-0.4981,
+`vt_matmul_coopmat` 1.6616-1.7308, `vt_rms_norm` 0.0614-0.0618 across both arms.
+`vt_matmul` is called exactly once per output token on this model and prefill
+never touches it (it takes the coopmat tactic), so the m>1 path is untouched by
+construction, and column blocking is host-gated to `bt == 0` besides.
+
+### 4. Correctness
+
+Every arm is BIT-IDENTICAL: each of a lane's accumulators owns one output element
+and sums the whole K sequentially, which is `cpu_ops.cpp` MatmulChunked's order --
+so `vt_matmul` keeps the byte-exact tier that the coopmat and GEMV tactics both
+gave up. `tests/vt/test_vulkan_backend.cpp` gates that with a **memcmp** of the
+blocked and flat arms in ONE process, not a tolerance. Two scratch mutations
+confirm the gate bites: defaulting NCOLS to 1 fails the mechanism assertion, and
+splitting the K reduction into two partial accumulators fails the memcmp. An
+earlier version of the case used the small exact operand ladder the neighbouring
+cases use and the reassociation mutation SURVIVED -- every partial sum was exact
+in f32 -- so the fixture now spans decades.
+
+GB10: `test_vulkan_backend` 30/30 (2369 assertions), `test_backend_cross_device`
+11/11, `VLLM_CPP_DEVICE=vulkan test_opt_paged_engine` 6/6 prompts token-exact
+(96/96 tokens), 0 declines.
+
+### 5. E2E wall clock — consistent, and at the edge of this box's noise
+
+8 order-alternated AB/BA pairs, output-len 32, arm A = NCOLS 4, arm B = NCOLS 1,
+same binary, `VT_VULKAN_DISPATCH_STATS` OFF. Median TPOT, ms:
+
+| pair | order | A (NCOLS 4) | B (NCOLS 1) | note |
+|---|---|---|---|---|
+| 1 | AB | 241.74 | 256.60 | B leg TTFT 84.05 s, contaminated |
+| 2 | BA | 242.56 | 244.76 | clean |
+| 3 | AB | 241.24 | 242.08 | clean |
+| 4 | BA | 243.14 | 242.72 | clean, B wins by 0.42 |
+| 5 | AB | 241.60 | 442.58 | B leg DISCARDED, 1.8x outlier |
+| 6 | BA | 241.19 | 242.62 | clean |
+| 7 | AB | 240.18 | 246.29 | B leg TTFT 18.57 s, contaminated |
+| 8 | BA | 246.47 | 493.09 | B leg DISCARDED, 2.0x outlier; A leg TTFT 53.70 s |
+
+**A wins 7 of 8 pairs overall and 3 of the 4 clean pairs.** Clean-leg medians:
+A 241.90 ms, B 242.67 ms, **-0.77 ms**, i.e. decode **4.121 -> 4.134 tok/s**
+(`1000/TPOT`). That is the same sign and the same order of magnitude as the
+paging-immune GPU-timestamp result (-1.066 ms/token) but it is 0.3% of wall, so
+the GPU-timestamp measurement is the BINDING one and this block is confirmation
+only. Two B legs and one A leg landed on gross outliers (up to 2x TPOT, TTFT up
+to 84 s) with no arm asymmetry in the mechanism -- this box's e2e wall clock is
+simply not resolving 1 ms in 242.
+
+**PROTOCOL DEPARTURE, stated.** The page cache was NOT dropped between legs, and
+a discarded warm-up leg ran first instead. Earlier Vulkan blocks dropped it
+because the box sat at the RAM ceiling; it did not here (MemAvailable ~116 of
+119 GB, no other job resident), and a cold leg costs ~30 minutes against ~4 warm
+-- 6 hours for 6 pairs. The first attempt was run that way, produced one pair in
+60 minutes, and was stopped.
+
+**Prefill is unaffected by construction and by measurement.** `vt_matmul` is
+called exactly once per output token and prefill takes the coopmat tactic, so no
+prefill GEMM reaches this kernel; the blocked arm is host-gated to `bt == 0`
+besides. Clean-leg median TTFT: A 6307 ms, B 6260 ms, a 0.7% spread with no
+ordering, well inside the leg-to-leg variation.
+
+## BACKEND-VULKAN-LMHEAD — the 19.5x `vt_matmul` BIMODALITY: memory pressure and co-residency are REFUTED, near-ceiling occupancy is the only surviving correlate (2026-08-09, GB10)
+
+Follow-up to the row above, prompted by two parallel agents reporting the same
+bimodality with opposite explanations ("a lever bigger than every other" vs
+"contamination from concurrent 27B benchmarks"). **Neither is supported by the
+measurement below.** MEASURED and INFERRED are separated explicitly.
+
+### The claim under test
+
+`vt_matmul` (the lm_head, 2.543 GB streamed per token) sometimes runs at
+~215-260 ms/call instead of ~12.4 -- a ~20x collapse to ~10 GB/s -- while
+`vt_matmul_vec` in the SAME leg moves under 1%.
+
+### Lock discipline, stated plainly
+
+**Every 27B run in this row went through `flock $HOME/gpu.lock`**, either
+`flock /home/mudler/gpu.lock <cmd>` for single runs or `exec 9>...; flock 9` held
+across a whole block. Evidence that it was real: the `P4` block sat QUEUED on the
+lock for 20+ minutes behind another agent's `--output-len 32` bench before
+running. The one thing NOT taken under the lock was the dgx BUILD (`nice -n 19`,
+`-j6`), which is CPU and RAM but not a second 27B.
+
+### MEASURED 1: the collapse happens with the box exclusively ours
+
+16 decode legs (output-len 4), arms alternated, whole block under the lock, with
+`/usr/bin/time -v` and `/proc/vmstat` deltas captured per leg.
+
+**`MemAvailable` immediately before EVERY leg was 119,024-119,276 MB of 119 GB**
+-- i.e. no other process of any size was resident. One leg collapsed:
+
+| leg | arm | `vt_matmul` ms/call | `vt_matmul_vec` | major faults | peak RSS | MemAvail before | TTFT |
+|---|---|---|---|---|---|---|---|
+| cB10 | ncols 1 | 12.457 | 0.4947 | 1090 | 105,995,280 KB | 119,215 MB | 6273 ms |
+| **cB12** | ncols 1 | **259.619** | 0.4959 | **1098** | **105,994,272 KB** | **119,276 MB** | **6346 ms** |
+| cB14 | ncols 1 | 12.422 | 0.4936 | 1102 | 105,995,248 KB | 119,067 MB | 6228 ms |
+
+The collapsed leg is **indistinguishable from its healthy neighbours on every
+memory metric**: same peak RSS to within 0.001%, same major-fault count, MORE
+free memory before it started, and a NORMAL TTFT. Its `vt_matmul_vec` moved
++0.3%.
+
+**REFUTED, therefore:** co-residency with another 27B (the box was empty),
+host page reclaim / swap (fault counts identical), and model-load or prefill
+effects (TTFT normal). The "contamination" explanation does not survive this leg.
+
+**Also refuted: heavy paging does not produce the collapse.** Four legs in the
+same block ran with 46k-304k major faults -- 40-270x the normal count, from a
+cold page cache -- and read 12.46, 13.24, 13.29 and 13.92 ms/call. Real paging
+costs about 10%, not 20x.
+
+### MEASURED 2: it does NOT reproduce standalone at low occupancy
+
+`benchmarks/vulkan_gemm_ab.cpp` gained an `nn` orientation and a `cycles`
+argument (free and REALLOCATE the weight between measurements), so the same
+kernel on the same 2.543 GB is reachable in seconds instead of a 3-minute,
+106 GB 27B leg. `vulkan-gemm-ab 1 5120 248320 12 nn 12` on an otherwise idle box
+(3 GB used, 116 GB available):
+
+**12 reallocations x 12 reps = 144 measurements, ALL between 12.39 and 13.96 ms.
+Zero collapses, no bimodality at all.**
+
+### What is left, and it is INFERRED, not established
+
+The single variable that differs between "collapses at ~6-14% of legs" and
+"never collapses in 144 measurements" is that the 27B process holds **106 GB RSS
+of a 119 GB unified box** while the standalone reproducer holds ~2.5 GB. So the
+surviving hypothesis is that near-ceiling occupancy, not contention from another
+process, puts the driver's management of this 2.54 GB buffer near a cliff.
+
+Why this kernel and not its neighbour is consistent with that: at `[K,N]` a
+workgroup reads 256 contiguous bytes and then jumps `n*2` = 486 KB, touching
+~620k distinct 4 KB pages per call, whereas `vt_matmul_vec` walks one weight row
+contiguously. `vt_matmul` is by far the most address-translation-hostile kernel
+in the model, so it is the one exposed to a placement or page-size regression.
+**This is a hypothesis. It was not tested**; the obvious next experiment
+(allocating ~100 GB of ballast to reproduce the occupancy) was NOT run because an
+unguarded large allocation has OOM-rebooted this box before.
+
+### SUGGESTIVE, explicitly NOT established: an arm asymmetry
+
+Across the blocks where both arms existed, every collapse landed on the FLAT
+arm: `NCOLS 1` 3 of 23 legs, `NCOLS 4/8` **0 of 31**. Including the two earlier
+blocks that predate column blocking it is 5 of 37 versus 0 of 31. Fisher exact
+one-sided p is about 0.06-0.07 -- **not significant**, and column blocking would
+plausibly reduce address-translation pressure, which is exactly the kind of
+just-so story this project has been burned by before. Settling it needs roughly
+60 more legs (about 3 hours) and it is the named next experiment, not a claim.
+
+### Bottom line
+
+**MEASURED:** the bimodality is real, is specific to `vt_matmul`, survives an
+exclusive box, and is not page reclaim. **REFUTED:** concurrent-benchmark
+contamination as its cause. **NOT ESTABLISHED:** the mechanism, and whether
+column blocking suppresses it. It is NOT "a lever bigger than every other Vulkan
+optimization" on the evidence available -- at 1 leg in 16 it costs roughly 6% of
+mean decode time, against the 8.5% that column blocking takes off this kernel
+deterministically.
+
+## BACKEND-VULKAN-HOSTDISPATCH — host is ~3 ms not 5.3, pipelining is worth 1.4 ms (5/5 paired), and llama.cpp's fence spin COMPUTES WRONG NUMBERS on GB10 (2026-08-09, GB10, base `6450604b`)
+
+The combined row left 27B Vulkan decode 3.1 ms/token short of llama.cpp Vulkan's
+4.35 tok/s (229.9 ms), with the GEMV lever closed and the whole residual attributed
+to host time by `wall - GPU = 5.3 ms`. **That subtraction is an INFERENCE ACROSS TWO
+RUNS** -- a wall-clock run with no query pool, minus the sum of per-shader GPU
+timestamps from a separate stats run -- and it cannot separate host recording cost
+from GPU-timeline time that the per-dispatch TOP-to-BOTTOM intervals never covered.
+
+**HOST TIME WAS MEASURED DIRECTLY.** `VT_VULKAN_HOST_PROFILE=1` times five phases
+inside `Dispatch` and separates submit from fence-wait inside the flush, under the
+mutex the dispatch already holds; cost is 6 vDSO clock reads per dispatch. Two-length
+diff (output-len 36 minus 4, over 32 decode tokens), Qwen3.6-27B bf16, 1 prompt,
+32-in, c1, so prefill and one-time costs cancel. Pre-row tree:
+
+| per decoded token | ms | share of host |
+|---|---:|---:|
+| flush-submit (`vkEndCommandBuffer` + `vkQueueSubmit`) | **1.50** | 49% |
+| record (barrier + bind + push + `vkCmdDispatch`) | 0.75 | 25% |
+| descriptor (`vkUpdateDescriptorSets`) | 0.29 | 10% |
+| bookkeeping (histogram map + bound-buffer set) | 0.28 | 9% |
+| pipeline-lookup (key build + `std::map`) | 0.10 | 3% |
+| **HOST TOTAL** | **3.04** | |
+| flush-wait (blocked on the GPU) | 234.67 | |
+
+900 dispatches and 4 flushes per token, matching the combined row's counts. Host
+plus fence-wait is 237.7 against that run's 237.2 ms TPOT, so the two account for
+the whole step and the instrument is self-consistent.
+
+**SO 5.3 ms IS SUPERSEDED: host is ~3 ms.** The rest of the old subtraction is
+GPU-timeline time outside any timestamped dispatch -- ~900 inter-dispatch barrier
+drains plus the command-buffer boundaries -- and no amount of host work removes it.
+The lever was smaller than it was sized.
+
+**AND ALL OF IT WAS SERIALISED AGAINST THE GPU**: every flush submitted and then
+immediately waited, so the device sat idle for the whole of the host's recording of
+the next batch. The fix is llama.cpp's, whose own comment states the mechanism --
+"Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with
+GPU execution" (`ggml_backend_vk_graph_compute`, ggml-vulkan.cpp:16192-16195 and
+:16417-16423 @ pin `237ad9b96`), waiting exactly once per graph
+(`ggml_vk_wait_for_fence`, :2298).
+
+### A FENCE SPIN WAS THE LARGER HALF OF THE APPARENT WIN AND IS REJECTED AS INCORRECT
+
+llama.cpp also spins on `vkGetFenceStatus` rather than blocking (:2306-2326). Ported,
+it read 229.43 ms against 232.07 for pipelining alone -- **and it computes the wrong
+numbers on GB10.** Same binary, one variable, on the device:
+
+| | `test_vulkan_backend` | opt-125m STRICT |
+|---|---|---|
+| `FENCE_SPIN=0`, `INFLIGHT=1` | 33/33 | 6/6 token-exact |
+| `FENCE_SPIN=0`, `INFLIGHT=2` | 33/33 | 6/6 token-exact |
+| `FENCE_SPIN=1`, `INFLIGHT=1` | **16/33** | **DIVERGES** |
+| `FENCE_SPIN=1`, `INFLIGHT=2` | **17/33** | **DIVERGES** |
+| `VT_VULKAN_BATCH=0` (pre-batching path) | 33/33 | - |
+
+It fails identically with pipelining ON and OFF, which is what identifies the spin
+rather than the pipelining. The failures are host reads of device memory returning
+PRE-DISPATCH contents (`CHECK(0 == Approx(-0.125))`, `CHECK(-9 == 0)`, 940 assertions),
+and opt-125m degenerates to "the the capital capital of of the the world world".
+Observing a fence signalled through `vkGetFenceStatus` did not make the device writes
+visible to the host on this driver the way returning from `vkWaitForFences` does.
+
+**It passed 33/33 on llvmpipe.** A full order-alternated 8-leg 27B A/B had already
+been run against the spin arm; **every number in it is VOID**, because the model was
+emitting garbage while being timed. That is the reusable lesson: a Vulkan
+synchronisation change measured only where a software rasterizer serialises
+everything reads as a clean win. The spin is deleted; the negative is recorded in
+`vulkan_context.cpp` next to the retire path so it is not re-attempted.
+
+### The surviving lever, measured
+
+Pipelined submission only, same binary, `VT_VULKAN_INFLIGHT` 1 vs 2, page cache
+dropped before every leg, `flock $HOME/gpu.lock`, order alternated:
+
+| pair | A = INFLIGHT 1 | B = INFLIGHT 2 | B - A |
+|---|---:|---:|---:|
+| scan (ring 128) | 233.22 | 232.07 | **-1.15** |
+| long decode, 128 tok x 2 prompts | 235.94 | 234.33 | **-1.61** |
+| r1 | 235.47 | 233.71 | **-1.76** |
+| s1 | 229.12 | 227.71 | **-1.41** |
+| s2 | 230.18 | 228.79 | **-1.39** |
+
+**5 of 5 paired comparisons favour pipelining; median -1.41 ms/token.** Best B leg
+227.71 ms = 4.39 tok/s, but the box drifted 229.12-235.94 ms across legs of the
+IDENTICAL control configuration during this session, so only the paired delta is
+quotable and **no absolute tok/s claim against llama.cpp's 4.35 is made from it**.
+
+**THE GOAL IS NOT MET.** 1.4 ms against the 3.1 ms owed.
+
+Post-change host profile, same session, same two-length method:
+
+| per decoded token | INFLIGHT 1 | INFLIGHT 2 |
+|---|---:|---:|
+| DISPATCH TOTAL | 0.79 | 1.49 |
+| flush-submit | 0.30 | 0.46 |
+| flush-other | 0.01 | 0.07 |
+| **host total** | **1.09** | **2.02** |
+| flush-wait (blocked) | 227.9 | 221.5 |
+| TPOT | 230.11 | 224.03 |
+
+The pipelined arm does MORE host work (4 flushes/token against 3, and it is never
+idle) and still finishes sooner, which is the mechanism working: the host cost is
+overlapped rather than removed. Note the blocked time also falls 6.4 ms, more than
+the host CPU it hides -- consistent with the submit-to-GPU-start latency of each
+flush being paid inside the wait in the un-pipelined arm and pre-paid in the
+pipelined one. Single runs each, so that 6.4 ms is DIRECTIONAL, not a claim.
+
+**NOT ESTABLISHED, and flagged rather than quoted:** the pre-row profile read host
+3.04 ms and the post-row `INFLIGHT=1` arm reads 1.09 ms, which would credit the
+per-dispatch cleanups (histogram off the hot path, open-addressed bound-buffer
+table, stack descriptor arrays) with ~1.9 ms. Those two profiles were taken about
+an hour apart in different box states (TPOT 237.22 vs 230.11) and the wall-clock
+A/B does not show a matching move, so the cleanups' wall-clock value is UNMEASURED
+and is not claimed. What both profiles agree on is the shape: host is single-digit
+milliseconds and `host + flush-wait` reconstructs TPOT.
+
+### Correctness
+
+GB10, `VLLM_CPP_VULKAN:STRING=ON` verified in the cache and `[vt vulkan]` /
+`[vt reference-tier]` lines present in every run: `test_vulkan_backend` **33/33
+(2479 assertions)** pipelined and **33/33 (2476)** at `INFLIGHT=1`;
+`test_backend_cross_device` **11/11 (132)**; `test_opt_paged_engine` **6/6 prompts
+token-exact (96/96 tokens), 0 declines** in BOTH arms. A 128-token x 2-prompt decode
+run in each arm produced **BYTE-IDENTICAL token ids** (md5
+`9a9fd41a97ca56a3beeebe420d874ae1`). llvmpipe: the same, plus `VT_VULKAN_BATCH=0`.
+Committed SPIR-V unchanged and up to date.
+
+### The mechanism gate, and what only the real device could catch
+
+Pipelining records the same kernels in the same order, so it is invisible in results.
+Three scratch mutations were run against the new gate: degrading the flush back to
+submit-and-wait is caught by the in-flight/blocked-wait counters; dropping the
+head-of-command-buffer barrier is caught by the barrier count; and **collapsing every
+slot onto descriptor slice 0 -- the exact silent-corruption hazard this change
+introduces -- passed the ENTIRE file on llvmpipe** until a structural assertion on
+the ring base was added. That is the same blind spot the fence spin exploited, and
+it is why the ring-base and barrier-count assertions are structural rather than
+numeric.
+
+### Open
+
+- The ~2.3 ms of GPU-timeline time between dispatches (900 barriers per token) is
+  now the largest identified residual and is UNTOUCHED. llama.cpp emits a barrier
+  only on a real dependency (`ggml_vk_sync_buffers`, ggml-vulkan.cpp:3193); this
+  backend emits one before every dispatch unconditionally. That is the next lever
+  and it is a correctness-risky one.
+- One 27B leg in this session stalled for 23 s inside a single token (median ITL
+  233.44 ms, P99 ITL 23,415 ms, TPOT 1313). It landed on a pipelined leg but its
+  signature -- one stall, normal median -- does not match the recorded ~20x
+  `vt_matmul` bimodality, and no mechanism was established. Discarded, and NOT
+  attributed either way.
+
+## BACKEND-VULKAN combined: the three levers measured TOGETHER on merged main (2026-08-09, GB10, `81ea01f0`)
+
+Each of the three Vulkan levers was measured against `93852c28` in isolation, so
+none of their numbers described a tree carrying all three. `docs/STATUS.md` was
+deliberately left at the CONSERVATIVE 4.24 (the largest single lever) rather than
+a sum. This entry is the binding combined measurement that replaces it.
+
+**METHOD.** `git archive` of the merged tree to dgx, `vt_matmul.comp` md5 verified
+identical on both sides. Fresh Release configure. 8 wall-clock legs with the page
+cache dropped before each and `flock ~/gpu.lock` held; then a two-length
+GPU-timestamp diff (output-len 36 minus 4, over 32 decode tokens) so prefill and
+one-time costs cancel. Qwen3.6-27B bf16, 1 prompt, 32-in, c1.
+
+**A FIRST ATTEMPT WAS INVALID AND IS RECORDED BECAUSE THE FAILURE IS REUSABLE.**
+It read 0.75-1.27 tok/s. `VLLM_CPP_VULKAN` defaults to `AUTO`, which resolves to
+`OFF` (Vulkan is opt-in so it cannot register into gate builds), and the fresh
+configure omitted `-DVLLM_CPP_VULKAN=ON`. The options had been copied from the
+reference build's `CMakeCache.txt` through `grep | head -15`, and the
+alphabetically-sorted list ended at `TRITON_TARGET`, exactly one line before
+`VULKAN`. Three independent tells were present in the output and are the cheap
+check: NO `[vt vulkan]` lines despite `VT_VULKAN_DISPATCH_STATS=1`, no
+`[vt reference-tier]` lines, and "Asynchronous scheduling is ENABLED" where every
+valid Vulkan run reports it disabled. Same family as this campaign's stale-binary
+false greens, in the opposite direction: a false catastrophe rather than a false
+pass. Re-run after confirming `VLLM_CPP_VULKAN:STRING=ON` in the cache AND that
+the run emits Vulkan lines BEFORE trusting it.
+
+**MEASURED, 8 legs, ALL CLEAN.** TPOT 232.18, 232.42, 232.50, 233.34, 233.42,
+233.47, 233.80, 234.07 ms; decode 4.27-4.31 tok/s. **Median 4.285 tok/s**, spread
+0.8%. Zero bimodal collapses in 8 legs (the ~1.8x pathology hit 1 leg in 16 in the
+lm_head row's block, so its absence here is consistent, not evidence against it).
+
+**MEASURED, per decode token, two-length diff:**
+
+| shader | before (`93852c28`) | merged | delta |
+|---|---:|---:|---:|
+| `vt_matmul_vec` | 214.1 | **210.1** | -4.0 |
+| `vt_matmul` (lm_head) | 12.43 | **11.57** | -0.86 |
+| `vt_rms_norm` -> `vt_rms_norm_wide` | 7.97 | **1.57** | -6.40 |
+| `vt_paged_attn` | 2.02 | 2.00 | - |
+| `vt_gdn_decode` | 1.40 | 1.40 | - |
+| **total GPU** | **240.3** | **227.7** | **-12.6** |
+
+Wall 233.0 ms, so host is **5.3 ms/token**. Each lever reproduced its own claim on
+the merged tree: `vt_rms_norm_wide` at 0.0123 ms/call is exactly the 0.0123 its row
+reported, and the GEMV and lm_head deltas match theirs to within the leg spread.
+
+**WHERE THE REMAINING 3.1 ms IS.** llama.cpp Vulkan is 4.35 tok/s = 229.9 ms/token
+on the same 50.89 GiB weights on this box. `vt_matmul_vec` is now 92% of our GPU
+time at 248.0 GB/s over 52.1 GB/token. The two named residuals are both small:
+lm_head at 219.8 GB/s is 95.4% of the 230.3 GB/s ceiling MEASURED for its own shape
+(worth ~1.3 ms if it could reach the layer GEMVs' 248), and host at 5.3 ms.
+
+**A CORRECTION TO THIS CAMPAIGN'S ROOF ARITHMETIC.** The lm_head row established
+that GB10 does not reach its theoretical 273 GB/s, by running a known-good
+streaming kernel on the identical byte count: 230.3 GB/s. That correctly retires
+the 9.3 ms lm_head floor. It does NOT invalidate the layer-GEMV percentages, which
+MEASURE 243-248 GB/s -- above 230.3 -- so 230.3 is a ceiling for THAT SHAPE
+(k=5120, n=248320, one 2.54 GB buffer), not a device ceiling. Why one shape's
+ceiling sits ~7% below the same kernel's on layer weights is UNEXPLAINED, and is
+the same lone buffer the 20x bimodal collapse attaches to.
+
+## Rolled out of the status page on 2026-08-09
+
+Moved verbatim from `docs/STATUS.md`; the keyed capability row remains the
+public status surface.
+
+## 2026-08-08 — Gemma4 ROCm fused helpers via portable vt:: seam (#154)
+
+Model files (`gemma4.cpp`, `gemma4_moe.cpp`) no longer call `vt::rocm::*` directly.
+Fused paths go through `include/vt/fused_ops.h` (`vt::RmsNormPlusAdd`,
+`DualRmsNormPlusRes`, `GeluMulSeparate`, `MatmulBTAlphaBeta`, `MatmulBTFp8Channel`,
+`ExpertGeGLUBf16TopKM1`). ROCm fast path under `VLLM_CPP_HIP`; non-HIP stubs for
+peer/pin/resident upload. `check-device-leakage` holds baseline.
+
+## Laguna-S-2.1 MoE STATUS cell, relocated verbatim (2026-08-09)
+
+MOVED, NOT EDITED. `docs/STATUS.md` carried this as a single 33,211-char table
+row against a 220-char cell bound, and the page's shrink-only ratchet could not be
+satisfied while it stayed. Its contract is ONE binding current-state line per
+capability; this was an accumulated run-by-run history. The binding result stays
+on the page and the history is preserved here byte-for-byte, per
+POL-EVIDENCE-PRESERVE. Nothing was rewritten or dropped.
+
+**BINDING 2026-08-04: 87% of vLLM (37.55 vs 43.10, SAME-TOOL nsys both engines); the whole +3.1 ms/step is the bf16 M=1 GEMV bucket (2/3 o_proj, ~196-204 vs 139 us/call, identical `gemvx` kernel); attention/MoE/glue tied or ours-ahead. Invocation match (bf16-out `cublasGemmEx`) A/B'd = WASH, ruled out; ROOT CAUSE FOUND 2026-08-04 (`VT_LAGUNA_RESIDENT_BF16W`): the bf16 projections read UNIFIED/ATS host memory, not `cudaMalloc`'d device memory — staging them device-resident (byte-exact ids) gives 38.8→44.6 tok/s (o_proj 194→131, lm_head 2410→1620 us/call), parity+ vs vLLM 43.1; **default-ON** (flip smoke-verified: canonical byte-exact ids, 44.6 clean-median). Earlier ceiling/diffuse verdicts below were cross-tool artifacts.** **REAL vLLM BAR ESTABLISHED (2026-07-31, `CLAIM-LAGUNA-VLLM-NVFP4`): FIRST-EVER vLLM Laguna run** — prior numbers (incl. the correctness oracle) were all llama.cpp, never vLLM. vLLM on official `poolside/Laguna-S-2.1-NVFP4` (single GB10, greedy, eager, MARLIN backend forced via `VLLM_TEST_FORCE_FP8_MARLIN=1` because the auto-default `FLASHINFER_CUTLASS` needs an absent `nvcc`): **~18.8 tok/s** (64-tok steady) — a LOWER bound. Our GGUF-Q4_K engine = 7.7 tok/s (vLLM ~2.4×); llama.cpp GGUF = 27.8 (still fastest at batch-1). llama.cpp is now a labeled SECONDARY "beat best-in-class GGUF" note; vLLM-NVFP4 is the headline bar. TRUE apples-to-apple still owes OUR NVFP4 Laguna forward arm (same tensor-core path as 27B/35B) — bring-up W-plan SPEC'D in `.agents/specs/laguna-nvfp4-arm-2026-07-31.md` (~85% reuse of the 35B NVFP4 W4A4 MoE infra + a name-map; bf16 attn/dense + fp4 experts; N1-N5 bricks, DGX-gated). **N1-scaffold LANDED (2026-07-31):** additive `LagunaMoeWeights.experts_{gate,up,down}_fp4` + `shared_{gate,up,down}_fp4` (`Nvfp4Weight`, mirror qwen3_5), dead until the N1 loader; CPU build clean + `test_laguna_scaffold` 8/8·167 unchanged. **N1b loader IMPLEMENTED (2026-07-31, build-verified):** `LoadLagunaForCausalLMWeights` (`laguna_weights.cpp`) replaces the `VT_CHECK(false)` stub — resolver + per-layer `LoadBf16Direct` (attn/dense/norms/embed/lm_head/router/shared-expert) + F32 `e_score_correction_bias` + `LnLoadCtNvfp4Raw` W4A4 experts. Name-map + dtypes VERIFIED against the real `poolside/Laguna-S-2.1-NVFP4` index (router `mlp.gate` BF16, bias F32, experts W4A4, shared-expert BF16). **N1b RUN-VERIFIED (2026-07-31):** loader round-trips a synthetic NVFP4 checkpoint byte-identically (`test_laguna_nvfp4_loader` 2/2·29; full detail in the benchmark record). **N2 FORWARD-BRANCH LANDED + CPU-GATED (2026-07-31):** `LqGemmNvfp4Fp4` (per-expert TRUE-W4A4: `ScaledFp4Quant(input_global_scale_inv)`→`MatmulNvfp4Fp4(alpha)`, unified-memory pattern like `LqGemm`) + `LagunaFfnBlock` branches on `fp4=!experts_gate_fp4.empty()` (routed experts fp4; keep-quant grouped fast-path gated off `!fp4`; bf16 attn/dense/router/shared-expert/lm_head unchanged) + both `LagunaForwardGguf{,Cached}` guards relaxed to `has_gguf_weights||has_nvfp4_weights`. **CORRECTION:** routed experts are W4A4 ⇒ per-expert `MatmulNvfp4Fp4`, NOT the grouped W4A16 `MoeGroupedGemmNvfp4` (grouped W4A4 deferred to N5 speed). `test_laguna_nvfp4_loader` 3/3·61 (added a forward run-gate: fp4 MoE branch runs through the real `LagunaForwardGguf` → finite+deterministic logits + routed-experts-consumed); `test_laguna_scaffold` 8/8 unchanged (GGUF byte-identical). **N3 DRIVER LANDED + CPU-SMOKE-VERIFIED (2026-07-31):** `examples/laguna_gen` auto-detects a safetensors DIRECTORY (→ NVFP4: `LoadHfConfig(config.json)` + `LoadLagunaForCausalLMWeights` + `LagunaForwardGguf{,Cached}`) vs a `.gguf` FILE (→ keep-quant), sharing the greedy loop; `--token-ids` bypass the tokenizer for the id-vs-golden gate. Verified on a synthetic NVFP4 dir with a REAL config.json (exercises the `LoadHfConfig`→`ParseLagunaParams` seam the loader test bypassed) → `has_nvfp4=1`, KV-cache decode runs finite. **N4 RAN on GB10 (2026-08-01) — the arm works end-to-end; correctness coherent+near-tie, speed 120× off.** git-archived `84fab587` → clean CUDA build (`121a`) → `laguna-gen --gpu` on the real 67 GiB `ckpt` with vLLM's exact prompt ids injected (`2,785,9626,377,15360,395`, captured via the HF tokenizer). Two GB10 memory fixes landed to run: release the mmap'd shards after the loader's memcpy-copy (114→67 GiB RSS), and create the CUDA context BEFORE the load (the 67 GiB reclaimable page cache otherwise starves `cudaStreamCreate`). **Correctness:** ours `22345 83 350 71070 395 340 9626 372 1703 …` vs golden `22345 83 290 350 674 330 5541 966 340 9626 377 15360 …` — **first 2 tokens match vLLM exactly**, then near-tie divergence; coherent ("France is" = 9626/377/15360; shares golden vocab). EXPECTED: our TRUE-W4A4 (fp4 activations) vs the MARLIN golden's W4A16 (bf16 activations) — different precision, not a bug. **Speed: 6.34 s/tok (0.16 tok/s), prefill 17.3s — ~120× slower than vLLM 18.8.** ROOT CAUSE (source-confirmed): `LqGemmNvfp4Fp4` uses the generic `vt::MatmulNvfp4Fp4` = the hand-written EMULATION CUDA kernel, NOT the cutlass sm120a fp4 tensor-core path the 27B/35B W4A4 use (`MatmulNvfp4Fp4DirectD`); + per-expert loop + per-GEMM host sync + no device residency. **nsys (2026-08-01) trace-confirmed + refined:** only 2 GPU kernels — `MatmulNvfp4Fp4Naive` = 99.3% of GPU time + fp4-quant 0.7%; GPU busy only ~18% of wall. NO bf16 GEMM on the GPU ⇒ `LqGemm`'s bf16 branch runs the host `MatmulNK` reference on the CUDA queue (attention/dense/router/shared/lm_head are CPU-bound, ~4.8 s/tok) — a second lever the source scan missed. **N5 LEVER #2 LANDED (2026-08-01) — 16× decode.** Routed the bf16 tower (attention/dense/router/shared/lm_head) off the host `MatmulNK` onto the GPU (`LqGemm` bf16 branch: `vt::CastBf16` the small activation + `vt::MatmulBT` bf16×bf16→f32, weight stays bf16 — no per-token `ReadF32` of `lm_head [100352,H]`): **decode 6.34 → 0.39 s/tok (16.3×; 0.16 → 2.56 tok/s), prefill 17.3 → 2.24s**; coherence preserved (near-tie). CPU path unchanged (run-gate byte-identical). **N5 LEVER #1 LANDED (2026-08-01) — native fp4 tensor-core, another ~2×.** The engine's native sm120a fp4 tensor-core MMA (`MatmulNvfp4Fp4Native`, `mma.sync kind::mxf4nvf4`) reads the same linear scale layout `LqGemmNvfp4Fp4` produces — it was gated OFF behind `VT_NVFP4_FP4_NATIVE`; the Laguna driver now defaults it ON (scoped; 27B/35B untouched). **decode 0.39 → ~0.20-0.24 s/tok (~2×; ~4.2-5.0 tok/s)**; coherent (byte-identical ids to the emulation path — numerically equivalent), first token matches the golden. **Cumulative N5: 0.16 → ~4.5 tok/s (~28×), now ~4× from vLLM 18.8.** **Device-resident MoE block LANDED + MEASURED (2026-08-01, `LagunaMoeResidentFp4`, `VT_LAGUNA_RESIDENT_MOE` default-ON):** the whole token's routed experts as ONE async device chain (fp4-quant→GEMM gate/up, `MoeSiluMul`, →down stacked, ONE `MoeCombine`), draining once vs ~Pk×3 syncs. **Speed EAGER-NEUTRAL (0.20 s/tok)** — empirically confirms the ds4 precedent (per-op syncs overlap GPU compute; wall is GPU-serial-bound; the graph is the payoff). **CORRECTNESS WIN: golden-token match 2 → 13** (the device `MoeSiluMul`/`MoeCombine` mirror vLLM's fused MoE faithfully). Lands default-ON (better correctness, no speed cost, graph prerequisite). **CORRECTED CEILING (from the measured state): a perfect decode graph caps at ~5.9 tok/s** (GPU already ~87% busy at 0.20 s/tok), still 3.3× short of vLLM 18.8 — the graph is necessary but NOT sufficient; the remaining 3.3× is KERNEL EFFICIENCY (native fp4 MMA ~302µs/M=1 expert GEMM vs vLLM's tuned cutlass sm120a fp4 + fused norm/quant/silu). Parity = TWO campaigns: (A) device-resident+graph → ~5.9; (B) cutlass DirectD experts + fused ops + M=1-tuned GEMV → the rest. **CAMPAIGN-B FIRST BRICK LANDED (2026-08-01): coalesced M=1 fp4 GEMV** (`MatmulNvfp4Fp4Gemv`, one warp/column, coalesced weight-row reads, `VT_NVFP4_FP4_GEMV` default-ON) — same-binary A/B: **decode 0.20 → 0.15 s/tok (1.33×; → ~6.7 tok/s), prefill 1.14 → 0.86s**, coherent+near-tie. **Cumulative this session: 0.16 → ~6.7 tok/s (~42×), now ~2.8× from vLLM 18.8.** (ILP variant `kCpw=4` measured SLOWER — 0.21 s/tok, occupancy loss > activation-reuse gain — reverted to `kCpw=1`; kernel kept templated as a re-measurable knob.) **ncu of the GEMV (sudo): sm__throughput 35-71%, DRAM n/a — COMPUTE/LATENCY-bound, not BW-bound.** Corrects the earlier "~6× BW → ~16-17 tok/s" estimate: the next GEMV lever is HARDWARE fp4 dequant (`cvt.e2m1x2`), not more bandwidth. Parity (18.8) is a multi-brick campaign (decode graph + fused norm/quant + hardware-dequant GEMV), not one more kernel. **B0 hw-fp8 SCALE-decode: MEASURED NEGATIVE, reverted (2026-08-01, `ab7a1c1e`).** Replacing the GEMV's per-byte software fp8-e4m3 group-scale decode (`F8E4M3ToF32Dev`/`ldexpf`) with hardware `cvt.rn.f16.e4m3` (`__nv_fp8_e4m3`→float) is bit-exact (ids byte-identical on the real ckpt) but paging-immune ncu shows it NEUTRAL-to-slightly-WORSE (grid768 41.2 vs 41.9µs tie; mean 53.6 vs 49.4µs) — GPU `ldexpf` is a cheap exponent-bit add, not a libcall. NOTE this is the fp8 SCALE decode, NOT the fp4-e2m1 WEIGHT dequant (the `kE2M1` `__constant__` LUT); the LUT→arithmetic/`cvt.e2m1x2` weight-dequant is a SEPARATE still-open lever (spec brick B1). Also: end-to-end wall-clock is unusable for kernel A/B here (67 GiB unified reload swings TPOT 0.16↔1.08 s/tok run-to-run) — kernel-duration ncu is the only honest anchor. **★ B2 SCOPED + DE-RISKED (2026-08-01, zero-DGX) — the real 18.8 lever:** vLLM's 18.8 bar is MARLIN W4A16 (`VLLM_TEST_FORCE_FP8_MARLIN=1`), which is LOW-M-optimized (decode-correct, unlike a tensor-core W4A4 GEMM that wastes M=1 tile rows). The engine already ships the EXACT kernel `vt::MoeGroupedGemmNvfp4Marlin` (1:1 lift of vLLM `moe_wna16_marlin_gemm`) + shared `MarlinRepackExpertWeight`, and qwen3_5 (27B/35B) already routes its NVFP4 experts through it (default-ON `VT_NVFP4_MARLIN`, 16/16-vs-oracle, +22% gate/+80% decode) via `BuildMoeMarlinResident`. So B2 = mirror that for `LagunaMoeWeights.experts_*_fp4` (a `BuildLagunaMoeMarlinResident` reusing the shared repack + route `LagunaFfnBlock`'s fp4 branch to the Marlin grouped GEMM, GEMV kept as the `=0` escape hatch) — pure reuse, no new kernel, matches vLLM's exact W4A16 numerics. **B2 IMPLEMENTED (2026-08-01, `3c49ef37`) — COMPILES CLEAN on GB10 sm_121a, runtime bug pending.** `LagunaMoeResidentMarlin` + `BuildLagunaMoeMarlinResident` (laguna.cpp, `#ifdef VT_MARLIN_NVFP4`) reconstruct the MoE Marlin path over the SHARED `dense_nvfp4::Dev`/`DBuf`/`ResidentNvfp4` + shared `vt::cuda` Marlin repack/align ops + `vt::MoeGroupedGemmNvfp4Marlin`; SACRED 27B/35B path BYTE-UNTOUCHED; gated `VT_LAGUNA_MARLIN_MOE=1` **default-OFF** (zero regression to the default GEMV path). Compiles clean on the full CUDA build. RUN: loads OK (48 layers, 256 experts) but the FIRST FORWARD device-faults silently on the Marlin path — a layout/param bug (suspects: `MoeCombine` bf16-in/f32-out dtype, the down-GEMM reusing the gate/up align, or the fp4-original free omitted → mem ~doubles). NEXT: `compute-sanitizer` localize → fix → near-tie vs the vLLM-Marlin golden + kernel-duration ncu → flip default-ON. Default path unaffected. **UPDATE (`22d6e146`): added the qwen3_5-style fp4-original free after repack** (device transients + host bytes; peak was ~3× the expert tower → past the 119 GiB pool → null-alloc → silent fault the likely cause); compiles clean. The runtime gate stayed INCONCLUSIVE this session (contended/orphaned processes on the shared box, no captured ids) — rerun on a clean uncontended session, compute-sanitizer if it still faults. **★★ B2 VALIDATED on GB10 (2026-08-01, with the mem-free fix): RUN_EXIT=0, coherent, first 13 generated tokens MATCH the vLLM-Marlin golden EXACTLY** (`22345 83 290 350 674 330 5541 966 340 9626 377 15360 81` — the best Laguna-NVFP4 correctness yet, W4A16 matching vLLM's config). **Steady-state decode 0.10 s/tok = ~10 tok/s** (steps 10-17 all 0.10; the TPOT-0.56 average is warmup-polluted — the DevicePool warms over ~9 decode steps then reuses). vs the GEMV path's 6.7 tok/s = **~1.5× faster; the gap to vLLM 18.8 closes from ~3× to ~1.9×.** Memory flat (7.9 GiB host RSS — the fp4-original free worked; it also fixed the first-forward fault). Still `VT_LAGUNA_MARLIN_MOE=1` default-OFF. TO DONE: move the lazy Marlin-resident build (216s first-forward, 48L×256E repack) to model-LOAD time → clean warm A/B + ncu → flip default-ON → matrix/roadmap. Remaining ~1.9×: vLLM graphs its decode (ours still eager) — decode CUDA-graph is the next lever. **REPRODUCED 3× (reproduction gate MET): GB10 runs deterministic — first 18-20 tokens byte-identical, steady-state 0.10 s/tok confirmed each — so the ~10 tok/s + golden-match is gated, not a single sample.** **#234 item (1) — load-time resident-build LANDED (`LagunaBuildMarlinResidents`, called from the example after load; mirrors vLLM process_weights_after_loading): builds all 48L×256E Marlin residents at LOAD so the repack is not a first-token TTFT spike. Fixed an anon-namespace linkage bug (public fn was defined with internal linkage → moved outside the anon namespace); BUILD CLEAN + links on GB10 sm_121a, default-OFF. Runtime prewarm-fires-at-load timing UNVERIFIED this session (repeated ssh-drops ate the run capture); the forward's lazy build is the validated fallback so it cannot regress. Owed: one clean run to confirm the build moved to load + then flip default-ON.** **★★ DONE (2026-08-01): Marlin is now the UNCONDITIONAL DEFAULT (`LagunaMarlinMoeEnabled` default-ON; `=0` is a code-level A/B opt-out no user needs) — "it just works" with NO env. Confirmed in a no-env GB10 run captured via tmux: `MARLIN residents built at load in 238.4s`, prefill 14.78s (build moved OUT of first-forward), golden-matching ids, steady-state 0.10 s/tok = ~10 tok/s (4th reproduction), RSS ~5-8 GiB. So a default Laguna-NVFP4 load on GB10 gets vLLM's own W4A16 Marlin decode (~10 tok/s, ~1.9× from vLLM 18.8) with zero flags. The 238s load-time repack is a one-time cost (mirrors vLLM process_weights_after_loading); optimizing its 48×256 per-expert sync count is a follow-up. Residual to 18.8 = decode CUDA-graph (deferred; user refocusing on DeepSeek next).** Post-lever-1 nsys: the remaining ~4× is HOST-SYNC-bound — 22,115 `cudaStreamSynchronize` (78.6% of API time, ~2,760/token, the per-GEMM `DrainQueue`), GPU kernels fast. Remaining levers: grouped W4A4 MoE (design input: `vt::MoeGroupedGemmNvfp4` is W4A16, so true-W4A4 grouped needs a new fp4×fp4 op or the `use_a16` mode + expert-stacking — needs a spike), device-resident decode (RECOMMENDED — the current forward is host-style so every GEMM drains; keep activations on-device, drain once/step; reuse qwen3_5's `Dev`/`Nvfp4Dev`/`ResidentNvfp4`/device-SwiGLU machinery; kills the 22k syncs; converges with the pending GGUF #228 and lifts both quant paths), decode CUDA-graph. Binding number needs a clean 2-3× re-run. See `docs/BENCHMARKS.md` + the spec N5 plan. See `docs/BENCHMARKS.md` `CLAIM-LAGUNA-VLLM-NVFP4`. Prior W7 nsys attribution: host-orchestration-bound, levers ranked (spec `laguna-s21-w7-speed-2026-07-31.md`, ledger `CLAIM-LAGUNA-W7-SPEED`). Prior RUNNABLE + FAST DECODE (W6, 2026-07-31): a per-layer K/V cache + single-token incremental decode replaces W5's O(n²) STATELESS full-recompute — TOKEN-IDENTICAL (byte-equal ids, md5 match, == the W5 golden) and 5.05× faster per token: decode 3.33 → 0.66 s/tok on the real 3-shard UD-Q4_K_XL GGUF (GB10, `--gpu`, keep-quant), same "The capital of France is" → " Paris.\n\nThe user is seeking a detailed explanation of the concept of \"cultural capital\"…". `LagunaKvCache` (mirrors `DeepseekV4KvCache`, MLA-latent → GQA multi-head K/V) caches post-QK-RMSNorm/post-RoPE K + raw V at f32 (bit-exact by construction: RoPE/QK-norm are position-only and attention is causal). MIXED attention handled per-layer: 12 GLOBAL layers grow the cache unbounded (full causal); 36 SLIDING-WINDOW-512 layers EVICT the oldest rows beyond the 512 window (gemma2/3 `is_sliding`), capping their K/V. `LagunaForwardGgufCached` + shared `LagunaAttention`/`LagunaFfnBlock` helpers used by BOTH forwards (identical float ops — the recompute path's ids are unchanged after the refactor); `examples/laguna_gen --stateless` forces the W5 recompute for the A/B gate. No cache bug: bit-exact on the first run. Next speed: grouped-expert GEMM + device-resident decode (both in-tree from ds4). See `.agents/specs/laguna-s21-w6-2026-07-31.md`. Prior RUNNABLE (W5, 2026-07-31): our engine greedy-generates COHERENT text on the REAL 3-shard UD-Q4_K_XL GGUF (GB10, keep-quant). `laguna-gen` "The capital of France is" → " Paris.\n\nThe user is seeking a detailed explanation of the concept of \"cultural capital\" as developed by French soci…" — the FIRST token is "Paris.", matching the llama.cpp-Poolside reference on the identical bytes. Multi-shard GGUF reader (LagunaGgufCtx routes each of 814 tensors to its shard; shard-1 = header only) + keep-quant tower (attn/dense/shared/experts/lm_head stay Q8_0/Q4_K/Q5_K COMPRESSED, consumed via `vt::MatmulBT`; norms/router/bias/embed → f32) + `LagunaForwardGguf` (the f32 composition with the ~9 GEMM sites swapped to keep-quant Gemm/GemmRowSlice, ds4 precedent) + `examples/laguna_gen`. Real GGUF metadata verified: dual-RoPE freq_base 500000/10000, dims 64/128, YaRN factor 32, sigmoid ungrouped-noaux router (scale 2.5), per-layer Q-head [48 global/72 sliding], per-head softplus out-gate, QK-RMSNorm. Load 20.6s, peak 71 GiB (fits 119 pool). Prior W4 IN PROGRESS (2026-07-31): 73.4 GiB UD-Q4_K_XL GGUF FETCHED + read authoritatively (814 tensors); 3 CPU-verified fidelity corrections grounded in the real GGUF + llama.cpp — per-head QK-RMSNorm (`attn_q/k_norm`, the scope MISSED it), GGUF-authoritative dual-RoPE mscale (llama.cpp `yarn_attn_factor·(1+0.1·ln(factor))`, factor 32 not HF 128), separate `ffn_gate/up_exps`. Keep-quant tower materialization + `ForwardGguf` + the real-model greedy run vs llama.cpp-laguna same-quant oracle = W5 close. Prior: W3 REAL host-reference forward + 3 new ops (`laguna_ops.cpp`, CPU `-Werror` clean, `test_laguna_scaffold` unit-gated)**
+
+## BACKEND-VULKAN-BARRIERS — the llama.cpp barrier lever, MEASURED: 19.8% of the ~900 per-token barriers are provably unnecessary and removing them is worth ~1 ms/token by the GPU-side instrument, unresolved e2e at 12 pairs; the llama.cpp goal is ALREADY MET on current main WITHOUT it (2026-08-09, GB10, base `c1716fd0`)
+
+**THE HEADLINE IS THE BASELINE, NOT THE LEVER.** No absolute tok/s number existed
+for main after `#191` landed pipelined submission. Eight legs of current main
+(`c1716fd0`, page cache dropped before each, `flock $HOME/gpu.lock`, Qwen3.6-27B
+bf16, 1 prompt, 32-in/32-out, c1) read TPOT **228.66, 229.16, 229.52, 229.54,
+229.61, 229.83, 230.25** ms and one 242.84 ms leg that is DISCARDED for a named
+cause: a compile job this session started overlapped it, which is contention, not
+the ~1-in-16 `vt_matmul` collapse. **Median 229.54 ms = 4.36 tok/s**, clean-leg
+spread 1.59 ms (0.69%). llama.cpp Vulkan on the same box and weights is **4.35**.
+**The gate is MET on current main, before this row.** The previous binding number
+(4.285 at `81ea01f0`) predates `#191`.
+
+**THE LEVER.** `vulkan_context.cpp` recorded an unconditional COMPUTE->COMPUTE
+`VkMemoryBarrier` before EVERY batched dispatch. llama.cpp instead syncs at 42
+explicit `ggml_vk_sync_buffers` call sites with per-scratch-buffer `need_sync`
+flags (`ggml-vulkan.cpp:3193`, `:2108`, `:8174`, `:8687-8748` @ `237ad9b96`).
+`VT_VULKAN_SMART_BARRIERS=1` generalizes that: a barrier is recorded only on a
+true RAW, WAW or WAR hazard against everything recorded since the previous
+barrier.
+
+**HOW THE READ/WRITE SETS WERE OBTAINED, WHICH WAS THE WHOLE PROBLEM.**
+`Dispatch()` receives one flat array of VkBuffers with NO roles attached, and
+guessing a role from the binding index is exactly the unverified assumption whose
+failure mode is a missing barrier. The GLSL already states it and glslang
+ENFORCES it: writing a `readonly buffer` is a compile error, and the promise is
+recorded as a `NonWritable` decoration in the emitted SPIR-V. So
+`gen-vulkan-spirv.py` now reflects each module's binding count and
+`writable_mask` OUT OF THE COMPILED BLOB (the same technique the existing
+`spec_ids` reflection uses), and `GetPipeline` hard-checks the declared binding
+count against what the host binds. No op-layer plumbing, no hand-maintained
+table, and the source of truth is machine-checked.
+
+**COMPLETENESS ARGUMENT.** The only device commands this backend records that
+touch a storage buffer are `vkCmdDispatch` — there is no `vkCmdCopyBuffer`,
+`vkCmdFillBuffer` or `vkCmdUpdateBuffer` anywhere in `src/vt/vulkan/`
+(`Copy`/`Memset` are host memcpy over the persistently mapped allocation, and
+they already drain). So every device-side reader and writer passes through the
+analysis. `AllocBuffer` binds each VkBuffer to its OWN VkDeviceMemory at offset
+0, so two distinct VkBuffers cannot alias; two tensors sharing one buffer are
+reported as colliding even when their byte ranges do not, which costs a barrier
+and never misses one. The access sets are cleared ONLY when a barrier is
+recorded — never at a flush, never at a drain — which is what carries the
+invariant across the command-buffer boundary that pipelined submission creates,
+using the same submission-order scope the unconditional barrier relied on.
+
+**MEASURED, two-length GPU-timestamp diff (output-len 36 minus 4, 32 decode
+tokens), same binary, one env variable:**
+
+| per decode token | always-barrier | smart | delta |
+|---|---:|---:|---:|
+| barriers recorded | 900.0 | 722.0 | **-178.0 (-19.8%)** |
+| barriers skipped | 0 | 178.0 | - |
+| GPU span (per-cmdbuf first-TOP to last-BOTTOM) | 231.38 ms | 230.29 ms | **-1.09** |
+| sum of per-dispatch intervals | 230.83 ms | 229.73 ms | -1.10 |
+| span - sum (the inter-dispatch GAP) | 0.556 ms | 0.563 ms | +0.007 |
+
+**A PRIOR CLAIM IS CORRECTED. The "~2.3 ms of GPU-timeline time OUTSIDE any
+timestamped dispatch" is NOT what this instrument reads.** The gap outside the
+timestamped intervals is **0.56 ms/token**, and it does NOT move when 178
+barriers per token are removed. What moves is the sum of the intervals
+themselves. `vkCmdWriteTimestamp` at `TOP_OF_PIPE` is written when the command
+reaches the top of the pipe, which a preceding barrier does not hold back, so the
+barrier's drain is billed INSIDE the following dispatch's interval, not between
+them. Span-minus-sum therefore UNDERSTATES barrier cost and is the wrong probe
+for it; the per-command-buffer SPAN is the honest one, and it is also the only
+one that stays meaningful once dispatches may overlap.
+
+**MEASURED, e2e, 8 order-alternated AB/BA pairs, same binary, cache dropped
+before every leg, `flock` held (TPOT ms):**
+
+| pair | order | always | smart | delta |
+|---|---|---:|---:|---:|
+| 0 | AB | 231.16 | 228.61 | **-2.55** |
+| 1 | BA | 231.15 | 230.51 | **-0.64** |
+| 2 | AB | 229.14 | 229.39 | +0.25 |
+| 3 | BA | 230.39 | 228.15 | **-2.24** |
+| 4 | AB | 229.98 | 231.41 | +1.43 |
+| 5 | BA | 230.86 | 230.03 | **-0.83** |
+| 6 | AB | 230.56 | 228.59 | **-1.97** |
+| 7 | BA | 230.30 | 228.29 | **-2.01** |
+
+**6 of 8 pairs to smart. Median TPOT 230.48 -> 229.00 (-1.48 ms, 4.339 -> 4.367
+tok/s); mean paired delta -1.07 ms.** SAY WHAT IS RESOLVABLE: a 6-of-8 sign test
+alone is p = 0.145 and does NOT establish the effect. What raises it above
+suggestion is that a SECOND, INDEPENDENT instrument — the GPU-side timestamp span,
+which is paging-immune and does not see the host at all — reads -1.09 ms/token on
+the same tree. The two agree to within 0.4 ms. The mechanism is also measured
+directly rather than inferred: 178 fewer barriers per token.
+
+**THE BOX DRIFTS MORE THAN THE EFFECT, WHICH IS WHY ONLY THE PAIRING IS
+QUOTABLE.** The always-barrier arm of the AB/BA block medians 230.48 ms while the
+standalone current-main block medians 229.54 ms — 0.94 ms apart on
+BEHAVIOURALLY IDENTICAL code, in two sessions an hour apart. A later block on a
+freshly rebooted box read 225.87 ms for the same arm. No cross-session absolute
+comparison of a ~1 ms effect on this box is meaningful.
+
+**A SECOND BLOCK OF 4 PAIRS RAN AFTER THE BOX REBOOTED, IN A DIFFERENT REGIME,
+AND IS REPORTED SEPARATELY RATHER THAN POOLED.** Post-reboot the same
+always-barrier arm runs 218-227 ms instead of 229-231, so this is not the same
+operating point: pair 40 218.39/218.29 (-0.10), pair 41 224.98/221.28 (**-3.70**),
+pair 42 224.31/225.26 (+0.95), pair 43 226.90/227.00 (+0.10). **2 of 4 to smart,
+mean paired delta -0.69 ms.** The block's own base arm drifts 8.6 ms across four
+pairs, which is six times the effect being looked for, so it constrains little on
+its own. **Across BOTH blocks, 12 pairs: 8 to smart, 4 to always; mean paired
+delta -0.94 ms/token (~0.4%); sign test p = 0.19.** The e2e instrument therefore
+does NOT establish this effect at 12 pairs. What does stand is the mechanism (178
+fewer barriers per token, counted) and the GPU-side span (-1.09 ms/token), and
+those two are what the default decision below rests on.
+
+**AN ATTEMPT TO EXTEND TO 16 PAIRS WAS LOST AND IS RECORDED BECAUSE THE CAUSE IS
+REUSABLE.** After 17 back-to-back legs, each preceded by `drop_caches` and a cold
+50 GB reload, the box hit `NVRM ... Out of memory [NV_ERR_NO_MEMORY]` repeatedly
+and REBOOTED (boot -1 ended 12:04:29, boot 0 started 12:07:45). The 27B is ~50 GB
+on a 119 GB UNIFIED box and the dropped page cache is refilled from zero every
+leg; this is the known GB10 unified-memory reboot pathology, not this change. All
+earlier evidence survived on disk. Two relaunch attempts also died (one to a shell
+quoting bug in a `sed`-generated script that silently dropped the pair index, one
+to the user systemd manager going away after the reboot), and the 8-pair block
+above is what stands.
+
+**CORRECTNESS, ALL ON GB10, RUN BEFORE ANY TIMING.** 12 combinations — both
+barrier arms x both `VT_VULKAN_INFLIGHT` depths x three gates:
+`test_vulkan_backend` **35/35 (2647 assertions at INFLIGHT=1, 2650 at 2)**,
+`test_backend_cross_device` **11/11 (132)**, `VLLM_CPP_DEVICE=vulkan
+test_opt_paged_engine` **1/1 (63)** reporting *"6/6 prompts token-exact (96/96
+tokens) vs the vLLM 0.25.0 oracle"* and *"all 9 OPT ops dispatched on device type
+3 with 0 declines"*. Every one exit 0. (35 test cases, up from 33: this row adds
+two.)
+
+**LONG DECODE, 256 OUTPUT TOKENS, BYTE-IDENTICAL.** `--output-token-ids` md5 over
+all four arms — {always, smart} x {INFLIGHT 1, 2} — is the SAME value
+`02f7606ec96c9a21775210c2ab33a2c5`. 32 tokens is not enough to expose a rare
+ordering hazard; this is.
+
+**THE MUTATION, AND IT IS THE MOST INFORMATIVE RESULT HERE.** Two scratch
+mutations, each built and run IN PLACE on the gated tree (a `cp -a` of the build
+directory does NOT work — CMake caches absolute source paths, so the copy rebuilt
+the ORIGINAL sources and produced a byte-identical binary and a false green; the
+tree was restored and both source and binary md5s verified back to
+`c6f4d518e1588dc7233fb5ab83b6a8ce` / `92a0334910be5faa3d0e73b2c689f20d`):
+
+* **M1, hazard predicate always reports INDEPENDENT** -> `test_vulkan_backend`
+  **32/35, 330 assertions failed**, and they are VALUE failures, not counters:
+  `CHECK( back[i] == ... )` reading `0 == -150`, i.e. a dispatch observing memory
+  before its producer's writes. **The unconditional barrier is load-bearing and
+  this proves it on the real driver.**
+* **M2, only the WRITE-AFTER-READ half removed** -> **34/35, exactly 2 assertions
+  failed**, both of them the new structural counters (`barriers == 4` read 3,
+  `skips == 1` read 2). **Every value assertion in the file still passed.** A
+  plausible partial implementation — RAW and WAW handled, WAR forgotten —
+  computes correct numbers on this hardware today and is caught ONLY by asserting
+  the barrier COUNT against a dependency structure known in advance. That is why
+  the gate asserts counters.
+
+**DEFAULT: OFF, DELIBERATELY.** The lever is gate-clean on GB10 in every
+combination tried and its mechanism is directly measured, but (a) the e2e effect
+is ~0.6% and the e2e instrument alone does not resolve it past this box's
+session drift, (b) the llama.cpp goal is already MET on current main without it,
+and (c) this is the same hazard class that shipped a measured-faster arm which
+computed garbage on GB10 two days ago. Flipping it is one environment variable
+with all of the above attached, and it should be flipped on an operator's
+re-measurement, not on this one.
+
+**OUT-OF-SCOPE OBSERVATIONS, NEITHER TOUCHED, NEITHER CAUSED BY THIS ROW.**
+(1) `vt_fused_chain`'s step list is memcpy'd by the HOST into ONE shared
+`ScratchBuffer` per dispatch while batching may leave earlier fused-chain
+dispatches unexecuted; a pipeline barrier does not and never did protect against
+a host overwrite of host-visible memory, so this is orthogonal to the barrier
+policy, but the "safe because dispatch is synchronous" comment on
+`ScratchBuffer()` predates batching. (2) `FreeBuffer` destroys a VkBuffer without
+draining. The hazard sets hold raw handle VALUES and are never dereferenced, so a
+destroyed handle in them is harmless (handle reuse can only manufacture an extra
+barrier). (3) `docs/ENVIRONMENT.md` documents `VT_VULKAN_RING` as defaulting to
+128; `kDescriptorRing` is 256.
+
+## BACKEND-VULKAN-LOADMEM — the 27B Vulkan load held the model TWICE; 100.759 -> 53.413 GiB VmRSS, device bytes unchanged (2026-08-09, GB10, `row/BACKEND-VULKAN-LOADMEM`)
+
+**Base:** `2b08dd24`. Build `-DVLLM_CPP_VULKAN=ON`, `CMAKE_CUDA_COMPILER:NOTFOUND`,
+Release, at `~/vkloadmem/build-vk` on dgx.casa; source md5-verified against the
+worktree after `git archive`. All GPU work under `flock $HOME/gpu.lock`, every
+model load behind a MemAvailable guard plus a kill-the-process watchdog.
+
+### 0. `VLLM_CPP_DEVICE` IS NOT READ ANYWHERE, and the Vulkan gate has been selected by accident
+
+`grep -rn VLLM_CPP_DEVICE src/ include/ tests/ docs/` returns NOTHING. The engine
+picks its device in `src/vllm/entrypoints/model_loader.cpp:81` via
+`CurrentPlatform()`, which walks `{kCUDA, kXPU, kVULKAN, kMETAL, kCPU}` and takes
+the first backend that probed a device. So `VLLM_CPP_DEVICE=vulkan
+test_opt_paged_engine` — the command recorded for this gate throughout the Vulkan
+campaign — selects Vulkan only because those builds had no CUDA compiler.
+MEASURED both ways on the same source: with `/usr/local/cuda/bin` on `PATH` at
+configure time the identical command reports `the engine selected device type 1`
+(kCUDA) and passes 6/6; without it, `device type 3` (kVULKAN), 6/6, 0 declines.
+`~/vkbar/build-vk/CMakeCache.txt` carries `CMAKE_CUDA_COMPILER:FILEPATH=NOTFOUND`,
+which is why the earlier rows were genuinely on Vulkan. The env var is a placebo
+and the gate needs a real selector.
+
+### 1. The attribution: a flat second copy of the model, not allocator excess
+
+`VT_VULKAN_ALLOC_STATS=1` (added by this row) prints, on every 1 GiB high-water
+crossing, the caller-REQUESTED bytes, the driver-COMMITTED bytes
+(`VkMemoryRequirements::size`), live buffer count, and the `/proc` context.
+
+Qwen3.6-27B bf16 (50.89 GiB on disk), `VT_ADOPT_DEVICE_BYTES` A/B on ONE binary:
+
+| arm | Vulkan live | buffers | VmRSS / VmHWM | MemAvailable floor | outcome |
+|---|---|---|---|---|---|
+| OFF (old behaviour) | 50.755 GiB | 863 of 894 | **100.759 GiB** | 13.85 GiB (MemFree 1.13) | watchdog KILLED it, still allocating |
+| ON (default) | 50.756 GiB | 894 | **53.413 GiB** | 47.33 GiB | completed, TTFT 18.44 s |
+
+Qwen3-4B bf16 (7.6 GiB): 8.622 GiB Vulkan / 375 buffers in BOTH arms; VmHWM
+16.392 -> 9.607 GiB; machine-wide cost 17.1 -> 9.45 GiB.
+
+Three things this rules out, with numbers rather than reasoning:
+
+* **No allocator excess.** `requested == committed` EXACTLY in every run
+  (50.756 GiB over 894 buffers at 27B, 8.622 over 375 at 4B). GB10's driver adds
+  no per-allocation rounding at these sizes, so there is nothing to win by
+  suballocating, and `maxMemoryAllocationCount` is nowhere near 894.
+* **No transient held too long.** The excess is a FLAT offset, not a spike: on the
+  27B OFF arm the RSS-minus-Vulkan gap reads 50.003 / 50.003 / 50.003 / 50.004 GiB
+  across the last four high-water lines. A staging buffer, a dequant scratch or a
+  duplicated upload would show as a bump, not a constant equal to the model.
+* **The windowed source-page release DOES fire.** During load, RSS holds ONE copy
+  of the copied bytes, not the mmap as well.
+
+The offset is the host `OwnedTensor.bytes` mirror. `ResidentWeight`
+(`dense_attn_block.h`, and its twin in `qwen3_5.cpp`) uploaded each weight and
+kept the host buffer. On a discrete GPU that mirror is free; the Vulkan backend
+allocates every buffer `HOST_VISIBLE|HOST_COHERENT` and persistently mapped, so
+on GB10 both copies are the same 119.6 GiB of system RAM.
+`src/vllm/platforms/vulkan.cpp` had reasoned that "there is exactly one copy of
+the bytes"; `dense_attn_block.h` made a second one.
+
+### 2. Page cache is NOT the OOM cause, and MemFree is the wrong instrument
+
+Sampled at 2 Hz through the 27B load, `Cached` tracks the copied bytes 1:1 and is
+never dropped: `MADV_DONTNEED` on a private file mapping drops the mapping's pages
+but leaves the page-cache pages, which needs `POSIX_FADV_DONTNEED` on the fd. It
+is reclaimable, so it does not consume MemAvailable — a first watchdog keyed on
+MemFree killed a perfectly healthy fixed-arm load at MemFree 11.46 GiB while
+MemAvailable was still 60.65 GiB. Recorded as a NEGATIVE for anyone tempted to
+guard on MemFree: on a 51 GiB checkpoint, MemFree measures the read, not the risk.
+
+### 3. Why it took the machine down rather than failing
+
+At the kill point the OFF arm had 1.13 GiB of MemFree and 13.85 GiB of
+MemAvailable with 31 buffers still to allocate, on a box whose Vulkan heap
+(89.72 GiB) was never the binding constraint — the MACHINE was. The recorded
+reboots ran repeated cold 27B loads with `drop_caches`, and the box also normally
+runs `local-ai-worker`, whose vLLM reserves HOST RAM on this unified machine. Two
+copies of a 50.89 GiB model plus any other tenant does not fit, and the NVIDIA
+driver reports that as `NV_ERR_NO_MEMORY` from `_memdescAllocInternal`.
+
+### 4. The fix, and what it is not
+
+`AdoptDeviceBytesAsHost` re-points `bytes` AT the device allocation through the
+existing `OwnedBytes` borrow, keyed alive by `d_dev`'s own control block. It is an
+ADOPTION, not a release: the bytes survive at the device address, so every
+`.bytes` reader (the f32 upcast, the portable CPU reference tier, `View`/`Numel`)
+reads the same bytes from the surviving copy, and unlike `ReleaseHost` it needs no
+"is the device path committed" proof. Gated on the new
+`Backend::DeviceMemoryIsHostAddressable()`, default FALSE, which is deliberately
+narrower than `UnifiedMemory()`: CUDA on GB10 is unified yet a `cudaMalloc`
+pointer is not host-dereferenceable.
+
+### 5. Gates, and the mutations that prove the test
+
+GB10, Vulkan build: `test_opt_paged_engine` **6/6 prompts token-exact (96/96
+tokens), 0 declines, device type 3**; `test_backend_cross_device` **11/11 (132)**;
+`test_vulkan_backend` **35/35 (2650/2650)**; `gen-vulkan-spirv.py --check` clean.
+The three mechanism cases in `test_qwen36_weights` are 3/3 (20) and go RED under
+each mutation: a no-op body (3 assertions), a dropped host-addressable guard
+(3), and a dropped keep-alive (2, including a genuine use-after-free that read
+`128` where `167` was written).
+
+### 6. Left open
+
+Peak is now the LOAD phase — the host `OwnedTensor` build reaches ~51 GiB before
+the first upload, and the adoption only acts afterwards. Copying from the mmap
+straight into the device buffer at load would cut that too. The unreleased page
+cache is a second, independent lever.
+## 2026-08-09 — Qwen3.6-27B NVFP4 re-verified on the `nvidia` ModelOpt checkpoint
+
+The recorded 27B-NVFP4 grid was measured on `unsloth/Qwen3.6-27B-NVFP4`, and
+that repo re-quantized in place: @`890bdef7` is genuine NVFP4, @`ccdaab7e` is the
+same repo name turned into FP8 W8A8 throughout. `nvidia/Qwen3.6-27B-NVFP4`
+@`0893e1606ff3d5f97a441f405d5fc541a6bdf404` is the publisher's own single-revision
+NVFP4 build and is the reference from here on. It is not the same model as the
+`unsloth` one: `hf_quant_config.json` declares `MIXED_PRECISION`, so the MLP is
+`W4A16_NVFP4` group-16 while the whole `linear_attn` + attention tower is FP8,
+and it declares `kv_cache_quant_algo: FP8`.
+
+### Two method defects found before any number was taken
+
+**The benchmark build was not the production stack.** `~/build_gdnfp8.sh` on dgx
+configured with `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_BUILD_TESTS=OFF
+-DVLLM_CPP_CUTLASS_DIR=...` and never passed `-DVLLM_CPP_TRITON=ON`, so
+`CMakeCache.txt` read `VLLM_CPP_TRITON:BOOL=OFF` and `src/vt/cuda/cuda_gdn.cu:45`
+compiled out the entire Triton-AOT family: `gdn_deltah_h48/h32`, `gdn_chunko_*`,
+the WU pipeline, the packed decode `gdn_decode_h48/h32` and the whole KDA family.
+Qwen3.6-27B is a GDN hybrid, so every layer fell back to the hand kernels.
+`.agents/environment.md:51-66` already calls both flags MANDATORY on this box and
+the 27B gate refuses to run without them; a hand-written benchmark script has no
+such guard, which is how it slipped. Re-measured on a correct build (configure
+log verified for `CUTLASS found`, `FlashAttention-2 prefill/decode: ENABLED` and
+`Triton AOT: ... <- vendored ... sm_121a`, plus `gdn_decode_h48` symbols present
+in the `cuda_gdn` object), the throughput difference is a WASH, so the Triton-AOT
+GDN family is not a decode-throughput lever on this model. The numbers taken off
+that build were still not quotable.
+
+**The 27B gate let the filesystem choose the checkpoint.** Five checkpoint-gated
+tests, including SACRED `test_qwen27_paged_engine`, resolved the snapshot by
+taking whatever `fs::directory_iterator` yielded first under a repo with TWO
+cached revisions. Order is unspecified, so a token-exact pass against the FP8
+revision would have been recorded as an NVFP4 pass. It has been green by luck:
+readdir yields @`890bdef7` first on this box today. Now pinned through
+`tests/parity/hf_snapshot.h` to the revision named in the goldens' own
+`oracle.model` field, with `VT_QWEN27_SNAPSHOT` as the explicit escape hatch.
+
+### Correctness
+
+Production build, GB10 sm_121a: `test_qwen27_paged_engine` 235/235,
+`test_qwen36_paged_engine` 315/315. On the `nvidia` checkpoint, which has no
+committed golden, the greedy continuation was captured from the SAME warm server
+processes that produced the throughput numbers, so a mismatch could not be blamed
+on the two engines having loaded different weights in different sessions. Both
+engines returned, for `"The capital of France is"` at 32 tokens,
+`" Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\n..."`
+identically.
+
+### Throughput
+
+Warm servers, one engine resident at a time under one `flock`, greedy,
+`ignore_eos` so both emit exactly 128 output tokens, 7-token prompt,
+`--gpu-memory-utilization 0.55 --max-model-len 4096`, medians of three
+repetitions after a discarded warm-up, vLLM 0.25.0 in its production graphed
+config. Ours at `row/NVFP4-REPUBLISH-LAND` (current main plus the republish
+loader fix, the fp8-native GDN tower and `max_num_seqs` 32).
+
+| c | ours | vLLM 0.25.0 | ours/vLLM | spread ours | spread vLLM |
+|---|---:|---:|---:|---:|---:|
+| 1 | 8.76 | 12.29 | 0.713x | 1.0002 | 1.0060 |
+| 2 | 17.07 | 23.49 | 0.727x | 1.0087 | 1.0690 |
+| 4 | 33.01 | 45.42 | 0.727x | 1.0067 | 1.0005 |
+| 8 | 62.13 | 86.01 | 0.722x | 1.0023 | 1.0030 |
+
+The deficit is uniform and far outside the noise band. Scaling is NOT the
+problem: c1 to c8 we gain 7.09x against vLLM's 7.00x. From the roof, 20.42 GiB
+of weights over about 273 GB/s puts a floor near 75 ms/token; vLLM's 79 ms is
+about 95% of it and our 114 ms about 65%, so roughly a third of our per-token
+time is not weight streaming.
+
+### Configuration facts recorded with the numbers
+
+vLLM honors the checkpoint's `kv_cache_quant_algo: FP8` and runs
+`kv_cache_dtype=fp8_e4m3`; we have no `kv_cache_dtype` concept at all, so vLLM
+moves half the KV bytes we do. At 128 output tokens that is a small share of the
+difference, at long context it is not, and it is a POL-MIRROR-VLLM gap either
+way. Separately, vLLM 0.25.0 transiently touches 118 of 119 GiB during
+`determine_available_memory` at this utilization and pushes the box into swap; it
+recovers, but that is inside the OOM-reboot band for GB10.
+
+Owed: the 1,024 in / 128 out total-throughput axis on this checkpoint, so it can
+be compared against the `unsloth` grid, and the same treatment for the 35B.
+
+### Lever A/B: the dense NVFP4 Marlin route on qwen3_5 (2026-08-09)
+
+`qwen3_5.cpp` carries its OWN `MatmulNvfp4MarlinD` (:2357) which sends E=1 DENSE
+projections through `MoeGroupedGemmNvfp4Marlin` plus a `moe_align` cache, while
+`dense_nvfp4_gemm.h` has a dense route (`vt::MarlinDenseGemm`, rank-2 operands,
+direct-A, no moe_align) that qwen3, olmo2, deepseek_v2 and minimax_h3 all take,
+and which this repo measured at 48-CTA ~86 us/call against the MoE route's
+128-CTA ~118 us/call. That made it the prime suspect for the uniform 0.72x.
+
+**The earlier attempt at this hung; the root cause is now named.** The reverted
+patch mirrored `dense_nvfp4_gemm.h:366-385` including its call sequence, and that
+sequence has NO per-call workspace memset because the shared
+`DenseMarlinWorkspace` zeroes at allocation. `qwen3_5`'s own `DenseMarlinWorkspace`
+does NOT zero at allocation; it relies on a memset at the call site. Marlin's
+fp32 reduce SPINS on those lock words, so uninitialized locks spin forever, which
+is a hang rather than a fault and is why turning the decode graph off appeared to
+"fix" it. Keeping the per-call memset, the route runs first try with no hang.
+
+**Same-binary A/B**, one build, one flock, `VT_MARLIN_DENSE` the only difference,
+27B `nvidia` @`0893e160`, ns=32, 3 reps:
+
+| c | dense ON | MoE route | delta |
+|---|---:|---:|---:|
+| 1 | 8.78 | 8.78 | +0.0% |
+| 2 | 16.83 | 16.74 | +0.5% |
+| 4 | 32.98 | 32.81 | +0.5% |
+| 8 | 62.29 | 61.81 | +0.8% |
+
+The 32-token greedy continuations of the two arms are IDENTICAL, and both match
+vLLM. So the lever is REAL but SMALL: it removes a framework fork and buys under
+one percent above c1, and it does not explain a 38% deficit. The prime suspect is
+retired; attribution moves to a decode-window profile rather than another
+structural guess.
+
+### Decode attribution: where the 114 ms/token goes (2026-08-09)
+
+Two-length `nsys` difference (8 vs 136 tokens, same prompt, `cuda_gpu_kern_sum`
+diffed per kernel), 27B `nvidia` @`0893e160`, single stream, production build.
+
+**The first run of this was WRONG and the way it was wrong matters.** `nsys`
+defaults to `--cuda-graph-trace=graph`, which reports a captured decode graph as
+ONE range, so every kernel inside it contributes nothing to the per-kernel table.
+The diff came back at 0.030 ms/step against a 114 ms/token wall clock, with
+`dInstances == 0` for `marlin_moe_wna16::Marlin`, `nvjet_sm121_*`, `gemvx` and
+every other forward kernel, and +128 only for the sampler and embedding kernels
+that live OUTSIDE the graph. That profile makes the sampler look like the whole
+cost of decode and the GEMMs look free. Re-run with `--cuda-graph-trace=node`.
+Sanity check for any future profile on a graphed path: the hot kernels'
+instance counts MUST scale with the number of decode steps.
+
+**Corrected decode-only total: 14,630 ms over 128 steps = 114.298 ms/step**,
+against a measured 114 ms/token wall clock. **We are ~100% GPU-busy at c1**, so
+there is no host, scheduler or launch-overhead lever to recover here; the entire
+deficit is kernel efficiency.
+
+| Share | Calls/step | ms/step | Kernel |
+|---:|---:|---:|---|
+| 40.0% | 192 | 45.77 | `marlin_moe_wna16::Marlin` (the NVFP4 MLP, 3 GEMMs x 64 layers) |
+| 22.7% | 80 | 25.98 | cuBLAS `gemvx` bf16 |
+| 16.2% | 48 | 18.51 | `nvjet_sm121_qqsss_mma_64x128x128` (cuBLASLt, FP8 tower) |
+| 10.0% | 1 | 11.38 | `cutlass_80_tensorop_s16816gemm_bf16_128x64_32x6_nn_align2` |
+| 6.2% | 48 | 7.05 | `nvjet_sm121_qqtst_mma_64x64x128` |
+| 1.9% | 32 | 2.19 | cuBLAS `gemvx` bf16 (second shape) |
+| 1.2% | 48 | 1.32 | `GdnDecodeFusedKernel` |
+
+Checkpoint census, which is what those kernels are reading: 8.561 GiB U8 (NVFP4,
+of which 7.969 is `mlp` and 0.592 is `lm_head`), 7.789 GiB F8_E4M3 (5.156
+`linear_attn`, 1.562 `self_attn`, 0.996 `mlp`), 4.066 GiB BF16 (2.376 of it the
+embedding TABLE, which decode reads one row of, plus 0.997 `mlp`, 0.450 other,
+0.195 `self_attn`), 20.416 GiB total.
+
+Two readings follow. The NVFP4 MLP moves 8.56 GB in 45.77 ms, about 187 GB/s or
+roughly 68% of this box's ~273 GB/s, so about 14 ms is theoretically on the
+table there. The bf16 `gemvx` line is the sharper anomaly: after the FP8 and
+NVFP4 towers are accounted for, at most about 1.7 GB of bf16 weight remains for
+those 112 calls, and 28.2 ms to move 1.7 GB is far off the bandwidth roof, which
+means those GEMVs are latency or occupancy bound rather than bandwidth bound.
+That is the largest single mis-shaped cost in the step and it is where the next
+lever belongs, ahead of any further structural refactor.
+
+### The FP8 tower was being dequantized to bf16, and it was the gap (2026-08-09)
+
+The decode profile said 24.6% of the step was cuBLAS bf16 `gemvx` moving at most
+~1.7 GB, which is nowhere near bandwidth bound. Reading the loader explains it.
+
+`LoadAttnDense` (`qwen3_5_dense_weights.cpp`) had exactly TWO branches, NVFP4 or
+`LoadBf16RawNK`, and the same was true of `LoadGdnDense`'s `out_proj`. A
+`modelopt_mixed` checkpoint quantizes the attention tower to FP8 W8A8 while
+leaving the MLP NVFP4, so every one of those projections matched neither branch's
+intent and fell through to the bf16 path, which DEQUANTIZES: 1.562 GiB of
+`self_attn` FP8 plus 1.41 GiB of `linear_attn.out_proj` FP8 became ~5.9 GiB of
+BF16, re-read every decode step and executed as cuBLAS `gemvx`.
+
+This was never a missing capability. `FullAttnLayerWeights` already carries
+`q/k/v/o_proj_fp8`, `GdnLayerWeights` already carries `out_proj_fp8`,
+`MatmulFp8CutlassD` / `MatmulFp8CutlassPreQuantD` already consume them, and
+`LoadAttn` on the MoE path (`qwen3_5_weights.cpp:319`) has done exactly this
+since the 35B work, with its own comment calling it the DEFAULT. The dense path
+was the one that never got it. vLLM does the same thing (`modelopt.py:519`
+`process_weights_after_loading` keeps `layer.weight` fp8 and transposes it, then
+applies through `fp8_linear`), so this is POL-MIRROR-VLLM, not an invention.
+
+**MEASURED**, same harness, same checkpoint, same box, 3 reps:
+
+| c | before | after | gain | vs vLLM before | vs vLLM after |
+|---|---:|---:|---:|---:|---:|
+| 1 | 8.78 | 10.41 | +18.6% | 0.713x | **0.847x** |
+| 2 | 16.83 | 20.22 | +20.1% | 0.727x | **0.861x** |
+| 4 | 32.98 | 38.76 | +17.5% | 0.727x | **0.853x** |
+| 8 | 62.29 | 72.49 | +16.4% | 0.722x | **0.843x** |
+
+Peak host RSS falls 24.2 -> 21.0 GiB, the ~3.2 GiB the expansion was costing.
+The 32-token greedy continuation is byte-identical to vLLM's, captured from the
+same warm process as the numbers. SACRED gates on this build:
+`test_qwen27_paged_engine` 235/235, `test_qwen36_paged_engine` 315/315.
+
+Per-token time goes 114 ms to about 96 ms, which is ~78% of the bandwidth roof
+against vLLM's ~95%. The residual is the NVFP4 MLP marlin at ~68% of roof, and
+that is the next lever.
+
+### 35B-A3B NVFP4 re-verified, and a FIRST-REQUEST-ONLY correctness defect found
+
+Same harness and checkpoint discipline as the 27B, on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` @`491c2f1e`, ours at the FP8-tower build:
+
+| c | ours | vLLM 0.25.0 | ratio | spread ours / vLLM |
+|---|---:|---:|---:|---:|
+| 1 | 70.58 | 74.71 | 0.945x | 1.001 / 1.001 |
+| 2 | 107.64 | 130.35 | 0.826x | 1.022 / 1.111 |
+| 4 | 194.87 | 204.67 | 0.952x | 1.005 / 1.029 |
+| 8 | 318.56 | 354.04 | 0.900x | 1.073 / 1.081 |
+
+c2 and c8 carry real noise on both sides (vLLM's c2 spread is 1.111 on one slow
+leg), so treat c1 and c4 as the trustworthy cells.
+
+**THESE NUMBERS SIT ON TOP OF A CORRECTNESS DEFECT AND ARE NOT A PARITY CLAIM.**
+The greedy continuation captured from the warm 35B server did NOT match vLLM's,
+and the probe that followed is the important part. Five identical greedy requests
+to ONE warm server, `"The capital of France is"`, 32 tokens, `ignore_eos`:
+
+- request 1: `" Paris, a city renowned for its rich history, culture, and iconic
+  landmarks. Paris is situated in the north-central part of France..."` -- this
+  is BYTE-IDENTICAL to vLLM.
+- requests 2 through 5: `" Paris, a city renowned for its iconic landmarks such
+  as the Eiffel Tower, the Louvre Museum, and the Notre-Dame Cathedral..."` --
+  all four identical to each other, none matching vLLM.
+
+So it is not noise and not a near-tie coin flip: the FIRST request on a fresh
+server is vLLM-exact and every subsequent request deterministically produces a
+different, still-fluent continuation. Something survives across requests and
+changes the result. Prefix caching is OFF on both engines.
+
+The same probe on the 27B is CLEAN: all five captures identical and capture 1
+byte-identical to vLLM (the fifth differed by one trailing newline from the
+harness's block splitting, verified equal after `strip()`). So this is specific
+to the 35B MoE/GDN path, not the shared serving loop.
+
+`test_qwen36_paged_engine` is 315/315 token-exact at ITS engine params, which
+means the model and the weights are right and the defect lives in the serving
+configuration or in state reuse between requests. This is plausibly the same
+"prod async batch-1 greedy degeneration" a probe found earlier. It is NOT fixed
+here and it OWNS the 35B speed row: no 35B parity claim may be made from the
+table above until a second request returns what the first one does.
+
+### CORRECTION to the 35B entry above: it is not a first-request defect
+
+The entry above claimed the 35B divergence was state-dependent, request 1
+byte-identical to vLLM and requests 2-5 different. **That claim is REFUTED and is
+withdrawn.** It rested on a single probe run and did not survive repetition.
+
+Four further probe runs on the same build and checkpoint, five captures each:
+async runner off (`VT_ASYNC_RUNNER=0`), decode graph off
+(`VLLM_CPP_CUDAGRAPH=0`), `--max-num-seqs 8`, and the default config twice. All
+twenty captures are IDENTICAL to each other and NONE matches vLLM. Adding the
+original run's four later captures, that is 24 of 25 captures on one answer. The
+single vLLM-matching capture has never reproduced and remains unexplained; it is
+recorded as an anomaly, not as a mechanism.
+
+Two things are cleared by those arms. The `max_num_seqs` 8 -> 32 default change
+in this branch did NOT cause it: `--max-num-seqs 8` diverges identically. And
+neither the async runner nor the captured decode graph causes it: both rollbacks
+diverge identically.
+
+**What it actually is, and it is worse.** vLLM was put through the same probe on
+the same checkpoint and params: five captures, all identical, all matching its
+own earlier golden. So vLLM is DETERMINISTIC here and we are DETERMINISTIC on a
+different continuation. Under the ratified near-tie gate -- token-exact where
+vLLM is deterministic, distributional only where vLLM's own greedy is not -- the
+distributional escape does not apply and we owe token-exactness. We fail it.
+
+Both continuations are fluent (`"...its rich history, culture, and iconic
+landmarks. Paris is situated in the north-central part of France..."` from vLLM
+against `"...its iconic landmarks such as the Eiffel Tower, the Louvre Museum,
+and the Notre-Dame Cathedral..."` from us), diverging at token seven.
+
+The scope is now precise. `test_qwen36_paged_engine` is 315/315
+token-exact against the same oracle, so at the GATE's engine params we match and
+at the SERVER's params we do not. The defect lives in whatever differs between
+those two configurations, and that difference is the next thing to bisect. The
+35B throughput table stands as measured and remains NOT a parity claim.
+
+### 35B divergence, bisected: it is PROMPT-dependent and lives in the engine
+
+Continuing the correction above, five more arms, each five captures unless noted:
+
+| Arm | Result |
+|---|---|
+| `VT_ASYNC_RUNNER=0` | stable, diverges |
+| `VLLM_CPP_CUDAGRAPH=0` | stable, diverges |
+| `--max-num-seqs 8` | stable, diverges |
+| `--max-model-len 0` (config default) | stable, diverges |
+| default config, twice | stable, diverges |
+| vLLM, same probe | stable, matches its own golden |
+| `examples/vllm-cli` (SYNC engine, all defaults, 1 run) | diverges, same text |
+
+Tokenization is identical on both sides and both models: `prompt_tokens=5`,
+`completion_tokens=32` for ours and for vLLM, on the 27B and the 35B.
+
+So the serving layer is EXONERATED. `vllm-cli` drives `LoadedEngine` +
+`engine().generate()` with `EngineParams{}` -- the same entry point
+`test_qwen36_paged_engine` uses, which is 315/315 token-exact -- and it produces
+the divergent continuation. The difference between the gate and this run is
+therefore not the engine configuration at all. It is the PROMPT.
+
+That relocates the whole thing. Our 35B forward disagrees with vLLM on
+`"The capital of France is"` from token seven, while agreeing token-for-token on
+the gate's pinned prompt. Both engines are internally deterministic, so this is
+not a scheduling or state-reuse effect and the distributional escape does not
+apply. It is either a logit near-tie this prompt happens to land on, or a real
+numerical difference in the MoE path that the gate's single prompt never
+exercises. Either way the gate has a COVERAGE hole: one prompt cannot certify a
+forward.
+
+Next: teacher-force both engines on this prompt and read the top-2 logit margin
+at the divergence position. A margin at the bf16 noise floor makes it a ratified
+near-tie and the gate needs more prompts; a wide margin makes it a real defect in
+the MoE forward. Until that is answered the 35B throughput table is not a parity
+claim.
+
+### RESOLVED: the 35B divergence is a BIT-EXACT tie in the oracle, not a defect
+
+vLLM was asked for `logprobs` on the same prompt and its own top-2 at the
+divergence position, token 7, are the SAME float32 value:
+
+| pos | top1 | logprob | top2 | logprob | diff |
+|---|---|---:|---|---:|---:|
+| 6 | `' its'` | -0.011696805246174335 | `' iconic'` | -5.511696815490723 | 5.500000 |
+| 7 | `' rich'` | -1.2221027612686157 | `' iconic'` | -1.2221027612686157 | **0.0** |
+| 8 | `' history'` | -0.13290393352508545 | `' cultural'` | -2.507904052734375 | 2.375000 |
+
+`' rich'` is token 8807 and `' iconic'` is token 25438. Their logits are EQUAL in
+the oracle's own arithmetic, so vLLM's `torch.argmax` returns the lower index and
+picks `' rich'`. Our sampler implements the same rule -- `ArgReduce` in
+`cuda_sample.cu` is documented and written as lowest-index-wins and compares the
+true global index, so the tie-break is order-independent -- but our logits are
+not bit-identical to vLLM's (no two different GEMM/accumulation orders are), so
+the equality does not reproduce on our side and 25438 wins.
+
+**So this is not a forward defect and the 35B is not broken.** It is the exact
+case the ratified near-tie gate exists for: at a zero-margin position the outcome
+is decided below the precision of either implementation, and demanding
+token-exactness there is demanding that two different kernel stacks produce
+bit-identical floats. The earlier framing on this page -- first a state-dependent
+bug, then a flat token-exactness failure -- is superseded by this measurement.
+
+Two things remain true and are the actual residue. The 35B gate certifies the
+forward with ONE pinned prompt, and the second prompt tried lands on a zero-margin
+tie, so the gate's coverage is thin and a prompt set with margins above the noise
+floor would be worth more than the single prompt. And the 35B throughput table
+stands: ours 70.58 / 107.64 / 194.87 / 318.56 against vLLM's 74.71 / 130.35 /
+204.67 / 354.04, so 0.945 / 0.826 / 0.952 / 0.900 -- we are BEHIND on the 35B
+too, by 5 to 10 percent on the trustworthy cells, and that is now unblocked
+ordinary speed work rather than a correctness question.
+
+### 35B-A3B decode attribution (2026-08-09)
+
+Two-length `nsys` difference at `--cuda-graph-trace=node`, same discipline as the
+27B. Decode-only GPU kernel time is 16.686 ms/step.
+
+| Share | Calls/step | us/step | Kernel |
+|---:|---:|---:|---|
+| 19.8% | 40 | 3308 | `nvjet_sm121_qqsss_mma_128x64x128` (cuBLASLt FP8) |
+| 18.6% | 80 | 3097 | `marlin_moe_wna16::Marlin` (routed experts) |
+| 10.0% | 40 | 1661 | `nvjet_sm121_qqtst_mma_128x64x128_splitK` |
+| 9.7% | 41 | 1611 | `marlin::Marlin` (the DENSE route) |
+| 7.2% | 30 | 1198 | `nvjet_sm121_qqsss_mma_192x16x128` |
+| 5.6% | 40 | 941 | cuBLAS `gemvx` bf16 |
+| 4.7% | 40 | 780 | `MoeRouterTopKKernel` |
+| 3.6% | 30 | 603 | `GdnDecodeFusedKernel` |
+| 3.1% | 41 | 515 | `CastF32Kernel` |
+| 1.6% | 40 | 274 | `RmsNormQuantFp8RowKernel` |
+| 1.5% | 80 | 249 | `SiluAndMulKernel` |
+
+Unlike the 27B, no single line dominates: the two GEMM families are 37% and 28%
+and the rest is a long tail. Two entries stand out as pure overhead rather than
+work. `CastF32Kernel` is 3.1% for 41 calls, one per NVFP4 marlin GEMM, and exists
+only because the caller asks for an f32 output from a kernel whose `c_type` is
+bf16 -- the same f32-stream pattern the Laguna campaign identified, and here it
+is on a GATE model rather than only on laguna and ds4 as the current
+`NOW.md` row claims. `MoeRouterTopKKernel` is 4.7% for routing alone.
+
+Those two together are 7.8% of the step against a 5 to 10 percent deficit, so
+they are the first place to look for 35B parity, ahead of touching either GEMM
+family. Both need their own gate: dropping the f32 cast changes the residual
+stream dtype and therefore the numerics, so it is a spike with a strict 27B/35B
+gate, not a one-liner.
+
+### LANDED: warp-shuffle MoE router top-k (2026-08-09)
+
+The 35B attribution put `MoeRouterTopKKernel` at 4.7% of the decode step, 780
+us/step over 40 calls, which is 19.5 us for a few hundred comparisons. The cause
+is structural rather than algorithmic: the grid is one block per token, so at
+decode ONE block on ONE SM ran the k selection rounds, and each round did a
+block-wide tree reduction costing log2(256) `__syncthreads`. For k=8 over 256
+experts that is roughly 64 barriers, and barrier latency was the kernel.
+
+The k rounds now reduce with `__shfl_down_sync` inside each warp and then one
+cross-warp pass, taking barriers per round from log2(kBlock)+1 to 2.
+
+**This is byte-identical, and the reason it is safe is worth stating.** The top-k
+rounds are an ARGMAX reduction, not an arithmetic one: the comparison is
+unchanged (higher value wins, exact tie goes to the lower expert index) and
+argmax under a total order is associative and commutative, so any reduction order
+yields the same (value, index). The softmax max and sum reductions in the same
+kernel ARE arithmetic and were deliberately left on their existing tree, because
+reassociating those would move the denominator by an ulp and could change which
+experts win.
+
+MEASURED, same harness/checkpoint/box, 3 reps, `nvidia/Qwen3.6-35B-A3B-NVFP4`
+@`491c2f1e`:
+
+| c | before | after | gain | vs vLLM before | after |
+|---|---:|---:|---:|---:|---:|
+| 1 | 70.58 | 73.24 | +3.8% | 0.945x | **0.980x** |
+| 2 | 107.64 | 113.02 | +5.0% | 0.826x | **0.867x** |
+| 4 | 194.87 | 199.90 | +2.6% | 0.952x | **0.977x** |
+| 8 | 318.56 | 325.36 | +2.1% | 0.900x | **0.919x** |
+
+The 32-token greedy continuation is unchanged from the pre-spike baseline, as the
+byte-identity argument requires. Gates on this build: `test_ops_moe` 33451/33451,
+`test_ops_moe_grouped` 440/440, `test_ops_moe_grouped_bf16` 19/19,
+`test_qwen36_paged_engine` 315/315, `test_qwen27_paged_engine` 235/235.
+
+c1 and c4 are now within 2 to 3 percent of vLLM. c2 and c8 remain the weak cells
+and both carry the wider run-to-run spread, so the next 35B work should start by
+tightening those measurements before chasing them. `CastF32Kernel` at 3.1%
+remains unclaimed and is the next lever.
+
+### Grouped-router top-k parallelised; Kimi-Linear effect NOT ESTABLISHED (2026-08-09)
+
+`MoeRouterGroupedTopKKernel` is the router Kimi-Linear-48B and the DeepSeek-style
+MoEs take (`use_grouped_topk`, so `num_expert_group > 0` routes here rather than
+to the ungrouped kernel fixed earlier today). It did `if (threadIdx.x != 0)
+return;` before the group scoring, so the group scores, the group mask, the top-k
+and the renorm ALL ran on one lane of one block. Its own comment said so and
+deferred the fix: "a few thousand serial ops per token ... Speed work belongs to
+W9, after the numerics are gated". At Kimi-Linear's shape (e=256, k=8) step (4)
+alone is ~2048 serial compares per token.
+
+Step (4) is now block-parallel with the same warp-shuffle argmax used for the
+ungrouped router, on the same byte-identity argument: the comparison is unchanged
+(higher score wins, exact tie to the lower expert index, which the serial
+ascending scan with strict `>` also produced) and argmax over a total order
+reassociates freely. Everything ARITHMETIC still runs on thread 0 in the original
+order -- the `denom` accumulation in k order, the renormalize, and the
+`routed_scaling_factor` -- and steps (2) and (3) stay serial because they are
+O(n_group * group_size) once and n_group is 1 or 8 for the shapes we serve.
+
+Gates on this build: `test_ops_moe` 33451/33451, `test_ops_moe_grouped` 440/440,
+`test_ops_moe_grouped_bf16` 19/19, `test_deepseek_v4_moe` 716/716,
+`test_qwen36_paged_engine` 315/315, `test_qwen27_paged_engine` 235/235.
+
+**The speed effect on Kimi-Linear is NOT ESTABLISHED, and the first run said
+otherwise.** Same box, same golden, `kimi-linear-gen` two-length diff, 128 steps:
+
+| rep | baseline tok/s | spike tok/s | paired |
+|---|---:|---:|---:|
+| 1 | 17.93 | 18.36 | +2.4% |
+| 2 | 18.14 | 17.73 | -2.3% |
+| 3 | 16.43 | 18.13 | +10.3% |
+
+Baseline median 17.93 with a 1.104 spread, spike median 18.13 with 1.036. Two of
+three pairs favour the spike and one does not, and the baseline's own range
+(16.43 to 18.14) is wider than the effect being measured. Reporting the rep-1
++2.4% would have been reporting noise. Token ids are IDENTICAL in all six runs
+(122/128 against the golden, the same `got:` sequence), which is what the
+byte-identity argument requires and is the part that IS established.
+
+The instrument is the limitation, not the change: `kimi-linear-gen`'s two-length
+diff carries a ~10% band here, while the 35B's warm-server harness ran spreads
+under 1.05 and resolved a 2-5% effect cleanly. Kimi-Linear cannot use that
+harness today because the published checkpoint ships tiktoken
+(`tiktoken.model` + `tokenization_kimi.py`) and no `tokenizer.json`, so the
+server refuses to load it; the measurement above only works against a
+hand-prepared `~/kimi-linear-engine-dir` with a converted tokenizer. Giving
+Kimi-Linear a warm-server path is a prerequisite for any binding Kimi speed
+number, and is worth more than re-running this A/B.
+
+## 35B c2/c8 "weak cells" REFUTED — they were a HARNESS MISMATCH, not code (2026-08-10, `row/BENCH-35B-C2C8-REGRID`, GB10, build `a0fa12c7`)
+
+The record carried two conflicting 35B pictures. The 2026-08-05 binding grid read
+c1 0.977 / c2 0.964 / c4 1.025 / c8 0.964 / c16 0.932 / c32 0.971. The 2026-08-09
+router-landing entry read c1 0.980 / c2 0.867 / c4 0.977 / c8 0.919 and concluded
+"c2 and c8 remain the weak cells and both carry the wider run-to-run spread, so
+the next 35B work should start by tightening those measurements". `NOW.md` then
+spliced the two, publishing c1/c4 0.98x alongside c2 0.87x / c8 0.92x.
+
+**The two number sets were never comparable.** Their absolute throughputs differ
+by ~8x (grid c1 593.7 tok/s against the 2026-08-09 run's 70.58), so they are
+different quantities from different harnesses, and no code change connects them.
+A router optimisation that is byte-identical by construction cannot regress c2 by
+10 points; that impossibility was the tell.
+
+**Re-measured on the binding harness** (`dgx-online-serving.sh --execute`, model
+35, 3 repetitions, single whole-model flock, drop_caches per leg, oracle vLLM
+0.25.0, `nvidia/Qwen3.6-35B-A3B-NVFP4` @`491c2f1e`, corpus byte-copied from the
+2026-08-05 grid). Binding-eligible 12/12 groups; gate FAIL (114/124 axes below
+floor), which is the expected result of a uniform sub-1.0 profile.
+
+| Axis | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| output tok/s (ours) | 65.6 | 93.6 | 142.9 | 197.6 | 256.2 | 323.1 |
+| output tok/s (vLLM) | 67.0 | 99.9 | 150.6 | 211.3 | 272.9 | 333.6 |
+| **throughput ratio** | **0.979** | 0.937 | 0.949 | 0.935 | 0.939 | 0.969 |
+| mean TPOT | 0.978 | 0.945 | 0.943 | 0.938 | 0.930 | 0.967 |
+| mean TTFT | 0.972 | **0.872** | 0.970 | 0.965 | 0.969 | 0.968 |
+| p99 TPOT | 0.977 | 0.961 | 0.972 | 0.933 | 0.938 | 0.951 |
+| our CoV | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
+| vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
+
+**There is no isolated c2/c8 weakness.** The deficit is a broad, flat
+mid-concurrency band: c1 and c32 are strongest (0.979 / 0.969) and everything
+from c2 to c16 sits in 0.935-0.949. Chasing "c2" and "c8" as two special cells
+would have been chasing an artefact of harness mixing.
+
+**Spread was not the problem either.** Every point has CoV under 0.81% on BOTH
+engines, so the ~6% c2 deficit is roughly 8x the noise — resolvable now, without
+more repetitions. The prescribed "tighten the measurement first" step is
+therefore DONE, and its answer is that the measurements were never loose; the
+disagreement was which harness produced them.
+
+**Two residues.** (1) The c4 1.025x win recorded 2026-08-05 did NOT reproduce
+(0.949 here) — either a regression since, or a non-robust win; a same-binary A/B
+against that SHA would separate them. (2) mean TTFT at c2 = 0.872 is the sharpest
+single-axis outlier and the one cell that still looks like a distinct effect
+rather than the flat band.
+
+**Memory PASSES decisively** on the same run: peak PSS 3.34 GiB vs vLLM 12.72 GiB
+(**3.81x**), peak RSS 3.34 vs 13.09 GiB (**3.92x**), peak GPU 50.1 vs 70.4 GiB
+(**1.40x**).
+
+**Blocker cleared to get here: the binding harness had been unrunnable since
+2026-08-09.** `examples/CMakeLists.txt` renamed the `server` target's OUTPUT_NAME
+to `vllm-server` with the release packaging; the harness hardcoded
+`examples/server` in 12 places across BOTH halves — the shell drivers (literal
+string) and `online_gate.py`/`gdn_packed_component.py` (pathlib join, which a
+literal-string grep does not match). The last grid before that was 2026-08-05, so
+nothing exercised it in between. Fixed in `5023adec` (shell) and `a0fa12c7`
+(Python). The Python failure mode was actively misleading: `_file_contains`
+returns False for a MISSING file, so a stale path reports as
+"server binary omits target marker b'MatmulNvfp4Cutlass'" when the marker is in
+fact present 12 times in the binary.
+
+Evidence: `dgx:~/work/g35c/evidence/a0fa12c7219a86832412a6ece1490f452c1d1c40`
+(manifest.json + ratios.json + all-runs.json + report.md + 36 raws + memory /
+thermal / cache-drop / memory-return). Build contract: RelWithDebInfo, nvcc
+13.0.88 at the pinned `/usr/local/cuda-13.0/bin/nvcc`, oracle-bundled CUTLASS
+4.5.0, TRITON=ON, BENCH_PROFILE_CONTROL=OFF. SACRED `test_qwen36_paged_engine`
+passed as the harness's own precondition.
+
+## 35B mid-band ATTRIBUTED to per-token MoE work; the marlin block-size lever REFUTED (2026-08-10, `row/BENCH-35B-MIDBAND-ATTRIB`, GB10, build `a0fa12c7` + Release profile build)
+
+The flat 0.935x-0.979x mid-band from the `a0fa12c7` grid, attributed and then
+lever-tested. Paired kernel profile: OURS under `nsys` (`--cuda-graph-trace=node`,
+session start/stop around the measured c8 leg) and vLLM under the harness's own
+`tools/bench/profile_vllm_online_gate.py` torch profiler, same corpus
+(`c8-r1.jsonl`), same server params (`--max-num-seqs 32
+--max-num-batched-tokens 8192 --no-enable-prefix-caching`).
+
+**What the deficit IS (established).** It is a uniform shift of the whole ITL
+distribution, not a tail: median ITL == mean ITL == 0.94 across c2-c32, and
+p90/p99 ITL are BETTER than the median (at c16/c32 we WIN p99 at 1.059/1.088).
+Fitting step time against batch, our FIXED per-step cost is LOWER than vLLM's
+(intercept 9.02 ms vs 9.43 ms); the entire deficit is marginal, per-token work:
+
+| B->B | ours ms/req | vLLM ms/req | ours vs vLLM |
+|---|---:|---:|---|
+| 1->2 | 4.90 | 4.18 | +17% |
+| 2->4 | 2.46 | 2.30 | +7.2% |
+| 4->8 | 1.95 | 1.80 | +8.5% |
+| 8->16 | 2.07 | 1.89 | +9.4% |
+| 16->32 | 1.86 | 1.91 | **-3.0%, we win** |
+
+So there is nothing to win in launch/host overhead, and the c32 recovery is a
+genuine crossover rather than noise. Geometry: 256 experts, top-8,
+`moe_intermediate` 512, 40 layers, so per-expert M stays ~1.0-1.6 even at B=32
+(the experts never densify); what scales is the NUMBER of distinct active
+experts (~8 at B=1 to ~162 at B=32), i.e. NVFP4 expert-slab streaming.
+
+**Kernel profile, both engines.** Both are dominated by the SAME
+`marlin_moe_wna16::Marlin` (we ported it): 42.5% of GPU time ours, 40.3% vLLM.
+Our dominant instantiation is 2.7% slower per launch (172.6 us vs 167.9 us),
+which is within shape-mix noise. The one STRUCTURAL difference is a
+configuration we launch and vLLM never does:
+
+| `<threads, m_blocks, n_blocks, k_blocks, m_block_size_8, stages>` | vLLM | ours |
+|---|---|---|
+| `<128,1,8,4,true,4>` | 91440 @ 167.9 us | 40640 @ 172.6 us |
+| `<256,4,16,4,false,4>` (prefill) | 1200 @ 2462 us | 880 @ 1571 us |
+| `<128,3,8,4,false,4>` | 240 @ 901 us | 80 @ 898 us |
+| `<128,1,8,4,false,4>` | **never launched** | **20320 @ 59.7 us = 5.4% GPU** |
+
+Root cause of the extra variant: `DenseAlignFor` (`qwen3_5.cpp:2344`) routes the
+DENSE projections through the GROUPED-MoE Marlin with a degenerate `E=1,
+top_k=1`, and picks the tile with `MarlinMoeAlignBlockSizeSelect`, a port of
+vLLM's grouped `marlin_moe.py` heuristic whose ratio
+`num_tokens*top_k/num_experts/cand` collapses to `M/cand` in that case. At M=8,
+`8/8 = 1.0` fails the `< 0.9` test, so it selects a 16-row tile (32 at M=16, 48
+at M=32). vLLM instead runs those projections through DENSE `marlin::Marlin`
+(~93k launches to our ~21k, the mirror image).
+
+**The block-size lever is REFUTED (same-binary A/B, `VT_DENSE_ALIGN_BLOCK`, 3
+reps/arm, order-alternated).** Forcing block 8 at M=8 is SLOWER, not faster:
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | default (block 16) | 201.0, 203.6, 202.3 | 202.34 | - |
+| c8 | forced block 8 | 200.6, 200.0, 198.5 | 199.99 | **-1.16%** (ITL +2.12%) |
+| c4 | default (already 8) | 145.1, 144.2, 144.3 | 144.33 | - |
+| c4 | forced block 8 | 145.0, 144.8, 144.5 | 144.76 | +0.29% |
+
+The c4 arm is the internal CONTROL: the default already picks 8 there, so the
+override is a no-op and its +0.29% is the noise floor. Against that floor c8's
+-1.16% is real. **The 16-row tile is the better choice at M=8**; the "wasting
+half the tile" reading was wrong. The knob was NOT landed (a dead diagnostic
+default is debt, not evidence).
+
+Note the heuristic could NEVER have explained c2/c4 anyway: the 16-row tile only
+appears at M>=8, yet the deficit is already ~6% at c2 (0.937) and c4 (0.949)
+where the selector still picks 8. That was flagged before the A/B ran, and the
+A/B confirms the whole line is dead.
+
+**NEXT TRACEABLE HYPOTHESIS (gap stays OPEN, no ceiling declared):** that we
+route dense projections through the grouped-MoE kernel AT ALL. The cost would be
+the `moe_align_block_size` bookkeeping plus row padding (M=2 padded to a
+block) that vLLM's dense path never pays, which -- unlike tile choice -- is
+present at EVERY batch and so is consistent with the deficit appearing at c2.
+Testing it means routing the `E=1` dense path to the dense Marlin entrypoint, a
+real change rather than an env flag. Second candidate: the ~2.7% per-launch gap
+on the shared dominant kernel, which needs an ncu shape-matched comparison to
+separate from mix.
+
+Token identity across the A/B: 3 of 4 greedy probes byte-identical; the 4th
+(`b8` at c8) differs, but that probe is a SINGLE request at M=1 where BOTH arms
+select block 8, so the override is inert and cannot be the cause -- it is the
+run-to-run instability already recorded for this checkpoint.
+
+Evidence: `dgx:~/mbprof` (ours nsys-rep + `kern.csv`), `dgx:~/vlprof2`
+(vLLM torch trace + metadata; vLLM's own `output_digests_equal: false` on that
+run), `dgx:~/abblock` (12 A/B result JSONs + token probes). The harness's
+`--trace-only` and `summarize_torch_kernels.py` are both hard-gated to model 27
+("35B performance remains held"), so this profile was driven directly rather
+than through them.
+
+## 35B mid-band lever LANDS: the fused shared-expert gate_up sink was still on the MoE-marlin route (+1.31% c8 / +1.38% c4, 2026-08-10, `row/PERF-35B-SHARED-GATEUP-DENSE`, GB10)
+
+Direct follow-on to the mid-band attribution above, and it confirms that entry's
+NAMED next hypothesis: the cost is routing dense projections through the
+grouped-MoE kernel AT ALL, not the tile size (that lever was refuted).
+
+`efa6e40d` (#57) already established "dense route beats MoE on every axis" and
+flipped `VT_MARLIN_DENSE` default ON for `MatmulNvfp4MarlinD`. But
+`SharedGateUpFusedMarlinD` — the ONE fused shared-expert gate_up sink — was
+never given that route and still called `MoeGroupedGemmNvfp4Marlin` with a
+degenerate `E=1, top_k=1` plus a `DenseAlignFor` moe_align cache. The c8 profile
+counted it exactly: **20320 launches per leg = 40 layers x 508 steps, one per
+layer per step**, of `<128,1,8,4,m_block_size_8=false>` at 59.7 us = **5.4% of
+GPU time, a configuration the pinned vLLM never launches**.
+
+Fix mirrors the sibling exactly: rank-2 operand views over the SAME resident
+(`mr.w`/`mr.s`/`mr.g`) and workspace, direct-A, no moe_align cache and no row
+padding. `VT_MARLIN_DENSE_PAIR`, default ON (opt out `=0`) per the
+parity-enabler policy.
+
+**MEASURED, same binary, 3 reps/arm, order-alternated (def first at c8, pair
+first at c4), single load per arm, 35B-A3B NVFP4 @`491c2f1e`:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | MoE route (was default) | 198.3, 200.5, 198.1 | 198.27 | - |
+| c8 | dense route | 202.0, 200.9, 200.6 | **200.87** | **+1.31%** |
+| c4 | MoE route | 143.1, 143.9, 142.9 | 143.07 | - |
+| c4 | dense route | 144.4, 145.0, 145.2 | **145.04** | **+1.38%** (ITL -2.17%) |
+
+Bands are NON-OVERLAPPING at both points, and +1.3% is ~4.5x the +-0.29% noise
+floor established by the block-size A/B's c4 control. Unlike that refuted lever
+this one helps at c4 as well as c8, which is what the deficit's onset at c2
+requires.
+
+**SACRED gates unmoved on the new default:** `test_qwen36_paged_engine` 315/315
+and `test_qwen27_paged_engine` 235/235 with the route ON, and 315/315 again on
+the `=0` opt-out path.
+
+**Token identity NOT claimed.** The warm-server greedy probes are not stable
+run-to-run on this checkpoint (the BASELINE arm itself produced two different
+32-token continuations across its own two runs, `ccc8ca62` at c8 vs `e5d301c5`
+at c4, while both dense-route runs agreed at `d4dfa279`). That instability is
+already recorded for this configuration, so the deterministic SACRED fixtures
+are the correctness arbiter here, not the probe.
+
+**Stale doc corrected in the same change:** `docs/ENVIRONMENT.md` described
+`VT_MARLIN_DENSE` as "off (opt-in)" and "DEFAULT OFF until the strict token
+battery proves oracle byte-match", but `efa6e40d` flipped it ON months ago. The
+page disagreed with the code until 2026-08-10.
+
+Residual: the mid-band is not closed. At c8 this recovers ~1.3% of a ~6.5%
+deficit. The remaining term is the ~2.7% per-launch gap on the shared dominant
+`marlin_moe_wna16` (needs an ncu shape-matched comparison to separate from mix)
+plus whatever the routed-expert path itself carries. Gap stays OPEN.
+
+Evidence: `dgx:~/abpair` (12 result JSONs + token probes), `dgx:~/mbprof`
+(the nsys kernel table that named the sink), `dgx:~/gate2.log`.
+
+## The 35B "2.7% per-launch marlin gap" is NOT ESTABLISHED — ncu would have measured two identical kernels (2026-08-10, `row/BENCH-35B-NCU-PREREQ`, GB10)
+
+The mid-band entries above listed a ~2.7% per-launch gap on the shared
+`marlin_moe_wna16` as the next lever, to be settled by an ncu shape-matched
+comparison. Running ncu's PREREQUISITE checks first retires the lever instead:
+there is no implementation difference for ncu to find.
+
+**Everything structural is identical**, ours (nsys sqlite) vs the pinned vLLM
+(torch trace), c8, same corpus:
+
+| property | ours | vLLM |
+|---|---|---|
+| launch geometry | grid 144x1x1, block 128 | grid 144x1x1, block 128 |
+| template instantiation | `<128,1,8,4,true,4,1,false>` | same |
+| registers / stack / shared | REG:94 STACK:32 SHARED:1024 CONST:1043 | **identical** |
+| launches per 24-request leg | 30480 | 30480 |
+
+The register/shared footprint is byte-identical via `cuobjdump -res-usage` on
+our `vllm-server` and the oracle's `_moe_C_stable_libtorch.abi3.so`, so the
+occupancy / wave-quantisation hypothesis (different toolchains -> different
+register allocation -> different waves at small grids) is REFUTED too.
+
+**A COUNTING ERROR of mine, corrected here.** Raw launch counts looked 1.148x
+higher on our side, and per-kernel they were EXACTLY 1.333x (ours 40640 vs vLLM
+30480). That factor is not a finding: our nsys window covered the whole client
+invocation including its `--num-warmups 8`, i.e. 32 requests against the 24 the
+ratio should normalise to (32/24 = 1.3333). After normalising, the big-GEMM
+counts match exactly. Any count-based inference from the raw numbers is void.
+
+**The control that kills the marlin framing.** The SAME FlashAttention kernel,
+same source, same geometry, differs by grid size:
+
+| kernel | grid (CTAs) | ours | vLLM | delta |
+|---|---|---:|---:|---|
+| `flash_fwd_splitkv` (prefill) | (16,8,16) = 2048 | 1027.96 us | 1027.72 us | **+0.02%** |
+| `flash_fwd_splitkv` (decode) | (1,6,16) = 96 | 82.41 us | 78.25 us | **+5.31%** |
+| `marlin_moe_wna16` | 144 | 172.56 us | 167.92 us | +2.76% |
+
+At large grids we are identical to 0.02%; the delta appears only on small-grid
+decode-phase kernels and is LARGER on FlashAttention than on marlin. So it is
+not a marlin property. It is also not GPU idle: merged-interval busy is 97.99%
+ours against 96.14% vLLM -- **we are MORE GPU-busy than the oracle**, so host
+gaps cannot explain it either.
+
+**What remains is cross-tool uncertainty, which cannot carry a 2-5% claim.**
+Ours was measured by `nsys` (CUPTI, `--cuda-graph-trace=node`), vLLM by the
+torch profiler, on separate sessions minutes apart. The protocol says plainly
+that cross-tool comparisons never establish invocation parity; a delta that
+vanishes on long kernels and appears on short ones is exactly the shape of
+per-kernel instrumentation or thermal/phase drift. **The 2.7% is withdrawn as a
+lever.** Re-opening it would need BOTH engines under the SAME tool.
+
+**What IS visible and survives:** glue share is 13.00% of GPU kernel time ours
+against 11.37% vLLM. That is the next thing to characterise, and it is countable
+rather than timing-sensitive: after normalisation we launch ~2x the SiLU kernels
+of vLLM's fused `triton_poi_fused_mul_silu_slice_0`, and we run a
+`CastF32Kernel` (~15.9k/leg) with no obvious oracle counterpart -- the same
+`CastF32` already flagged at 3.1% of the 35B step in the f32-out GEMV audit.
+
+Evidence: `dgx:~/mbprof/ours-c8.sqlite`, `dgx:~/vlprof2/vllm-profile/`,
+`cuobjdump -res-usage` on both binaries.
+
+## 35B glue lever #2 LANDS: shared-expert down-proj emits bf16, one CastF32 per layer-step removed (+2.05% c8, 2026-08-10, `row/PERF-35B-SHARED-DOWN-BF16`, GB10, #213)
+
+Follows the glue lead from the withdrawn per-launch entry: glue was 13.00% of
+GPU kernel time ours against 11.37% vLLM, with a `CastF32Kernel` (~1 per layer
+per step) that has no oracle counterpart.
+
+Root cause: the shared expert's `down_proj` called `MatmulNvfp4F32D`, i.e. the
+Marlin GEMM produced bf16 and was then upcast to f32 across a whole `[T,H]`
+buffer -- while BOTH consumers (`SharedExpertGate` and `MoeCombineGate`) widen
+to float in-kernel and re-round through bf16 on store. The f32 buffer was
+written and re-read for a value that was already bf16.
+
+Fix: `sd` is now templated in both consumers (bf16 or f32) and the sink uses the
+existing `MatmulNvfp4Bf16D`. `VT_SHARED_DOWN_BF16`, default ON per the
+parity-enabler policy.
+
+**BIT-IDENTICAL, and the gates say so on BOTH arms with UNCHANGED assertion
+counts** -- `test_qwen36_paged_engine` 315/315 and `test_qwen27_paged_engine`
+235/235 with `Status: SUCCESS` for ON and for `=0`. The warm-server greedy probe
+is byte-identical across all four runs (`d4dfa279e5a5`), which the previous
+lever could not show because its baseline was unstable run-to-run.
+
+**MEASURED same binary, 3 reps/arm, order-alternated, single load per arm:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | f32 (opt-out) | 193.2, 193.6, 188.8 | 193.22 | - |
+| c8 | bf16 (default) | 197.2, 197.4, 196.5 | **197.18** | **+2.05%** (ITL -1.72%) |
+| c4 | f32 | 140.3, 141.6, 141.8 | 141.59 | - |
+| c4 | bf16 | 142.2, 142.7, 142.9 | **142.71** | **+0.79%** |
+
+Bands NON-OVERLAPPING at both points (c8 max f32 193.6 < min bf16 196.5; c4
+141.8 < 142.2).
+
+**A METHODOLOGY BUG this exposed, worth more than the lever.** The first attempt
+at this change wired only `SharedExpertGate` and missed `MoeCombineGate`, which
+threw `sd must be f32 [T,H]`. The gate command in use greps `assertions:`, and
+that line read `285 | 285 passed | 0 failed` -- GREEN -- while the run's real
+status was `test cases: 0 passed | 2 failed` / `Status: FAILURE!`. When a case
+throws, assertions already executed still count as passed and the case aborts.
+What caught it was the assertion COUNT (285 against the 315 this gate always
+reports), not the pass/fail. **Gate commands must grep `Status:`/`test cases:`
+as well, and any change in assertion count is RED even when everything
+"passed".**
+
+Cumulative on the mid-band: this plus the shared gate_up dense route. The band
+is still OPEN -- glue was 1.63 points of the ~6.5% deficit and the ~2x SiLU
+launch count against vLLM's fused `triton_poi_fused_mul_silu_slice_0` is the
+next countable item.
+
+Evidence: `dgx:~/abdown` (12 result JSONs + 4 identical token probes),
+`dgx:~/g5.log` (both arms, both gates, with Status lines).
+
+## CORRECTIONS to the two 35B glue entries above (2026-08-10)
+
+Two numbers those entries carry do not survive re-measurement. Corrected here
+rather than left standing.
+
+**"~2x the SiLU launch count" is WRONG.** It matched only ONE of vLLM's two
+SiLU-family kernels. Normalised per layer-step, vLLM runs
+`triton_poi_fused_mul_silu_slice_0` at 1.00 AND
+`vllm::act_and_mul_kernel<..., __nv_bfloat162, ...>` at 0.98 = **1.98**, against
+our 2.00. **The counts MATCH.** What differs is per-launch cost: ours 22.6 us
+against ~2.45 us, a **9.2x** gap — 4.1% of our GPU kernel time against 0.50% of
+vLLM's, i.e. **3.6 percentage points**, over half the remaining mid-band. Now
+spec'd as `PERF-35B-SILU-VECTORIZE` ([spec](specs/moe-silu-vectorize.md)): our
+kernel does two integer divisions per element and no vectorisation; vLLM's does
+neither.
+
+**"CastF32 was 3.1% of the 35B decode step"** was quoted from the older f32-out
+GEMV audit row, not from the c8 profile that justified the change. In that
+profile `CastF32Kernel` is **0.6%** of GPU kernel time at 1.02 launches per
+layer-step. The landed +2.05% is unaffected and gate-verified — the win is the
+eliminated `[T,H]` f32 write plus the consumer's cheaper read, not the cast
+kernel's own share — but 3.1% is not this profile's number.
+
+Both corrections share one failure mode: matching a single kernel name and
+concluding a ratio. Enumerate the whole kernel family and normalise per
+layer-step before claiming any count difference.
+
+## 27B post-lever grid, the 35B lever A/B, and an unattributed 35B c1 anomaly (2026-08-11, main `348c265d`, GB10)
+
+Both #213 levers landed: the NVFP4 `lm_head` kept packed, and the GDN fp8
+`in_proj_qkv`+`in_proj_z` merged into one qkvz GEMM.
+
+**Both are CONFIRMED ACTIVE by kernel signature**, which is the check a contended
+box cannot fake: `cutlass_80_tensorop_s16816gemm_bf16` (lever 1's 11.183 ms/step
+BF16 logits GEMM) is ABSENT; the split `nvjet_sm121_qqsss_mma_64x128x128` (lever
+2's 48 `in_proj_qkv` launches) is ABSENT and a merged `192x48x128` shape appears
+in its place; `marlin::Marlin` now carries the head.
+
+### 27B, same recipe as the pre-lever binding grid
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| post-lever ratio | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| pre-lever ratio | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| ours tok/s, post | 9.366 | 19.529 | 32.870 | 51.753 |
+
+Our legs are tight (spread 1.0013-1.0068); the vLLM arm carried one cold leg per
+concurrency (spread to 1.27), absorbed by medians.
+
+**THE OPEN PROBLEM: c1 did not move.** c2-c8 gained ~10 points, c1 gained 0.010,
+and both levers demonstrably execute at c1. The pre-lever nsys attribution closed
+to four decimal places and sized these levers AT c1 (lm_head 8.6414 + fp8 tower
+7.6068 of 17.3292 ms/step), so it mis-assigned what the c1 step actually spends.
+Two profiling attempts were DISCARDED rather than reasoned from: a whole-lifetime
+two-length diff whose calls/step came out non-integral (114.703) with a total at
+half the wall clock, and a session-based warm capture that produced no report.
+The valid method is the pre-lever one: `nsys start`/`stop` windows inside one
+already-warm server, validity-checked by integral instance deltas.
+
+### 35B-A3B, same-binary lever A/B (`VT_GDN_MERGED_QKVZ_FP8` the only variable)
+
+| | c1 med | c1 spread | c8 med | c8 spread |
+|---|---:|---:|---:|---:|
+| lever OFF (rollback) | 32.261 | 1.076 | 190.150 | 1.006 |
+| lever ON (shipped) | 33.158 | 1.086 | 187.357 | 1.007 |
+
+- **c1: NOT ESTABLISHED.** +2.8% nominal, inside an ~8% band on both arms.
+- **c8: -1.5%, REAL** against a 0.6-0.7% band.
+
+So the lever that gains ~10 points on the 27B **dense** is mildly NEGATIVE on the
+35B **MoE** at c8. Whether the default should be scoped by model family is open.
+
+### The 35B c1 anomaly is NOT the lever, and is unattributed
+
+Our 35B c1 reads ~32 tok/s here against a recorded 70.58. The A/B rules the lever
+out: with it rolled back, c1 still reads ~32. An earlier cache-sizing hypothesis
+was also withdrawn -- `num_blocks=4736` is what the canonical harness uses for
+every model, and the 35B/27B scale ratio (32.9 vs 9.4 tok/s) is what an A3B MoE
+should give. So it is protocol drift from the earlier record, or a build
+property, and the ad-hoc-harness 35B grid is NOT comparable to the 08-05 binding
+grid. It is therefore NOT published as a ratio. Re-run through the canonical
+`--execute` harness (model key `35`), which enforces per-model sizing, cache-drop
+proof and the one-lock boundary.
+
+### Method notes worth keeping
+
+- A fast `Passed` is indistinguishable from a skipped test in ctest output. Check
+  assertion counts, not exit codes. Page-cache warmth varies timings ~50x here.
+- The gate host rebooted SIX times in 18 hours during this work, at least one with
+  no OOM evidence at all (journal ends mid-normal-operation). Long runs are at
+  ongoing risk of silent truncation; c16/c32 still have no numbers because both
+  canonical attempts died that way.
+## `PERF-35B-SILU-VECTORIZE` is NEGATIVE — the 9.2x per-launch gap was an averaging artifact (2026-08-10, GB10, #213)
+
+Implemented the row-blocked SiluAndMul from [the spec](specs/moe-silu-vectorize.md)
+(block per token row, no integer divisions, flat kernel kept as fallback,
+`VT_SILU_ROW`). Bit-identical: 315/315 + 235/235, `Status: SUCCESS`, assertion
+counts unchanged on BOTH arms, all four warm greedy probes byte-identical.
+
+A/B, same binary, 3 reps/arm, order-alternated: **c8 -0.17%** (196.64 -> 196.29)
+and **c4 +0.52%** (141.72 -> 142.45), bands OVERLAPPING at both points. The
+spec's stop condition governs; the knob was NOT landed.
+
+**The premise was wrong.** The 22.6 us per launch that motivated the row is a
+MEAN over a bimodal distribution: `min 1.34 / med 18.88 / max 979.78 / stddev
+47.69 us`. Prefill launches drag the mean up; our DECODE SiluAndMul is ~1.3 us,
+FASTER per launch than the ~2.45 us vLLM mean it was compared against. There was
+no 9.2x gap, and the "3.6 percentage points of glue" scoped around it does not
+survive either.
+
+This is the documented prefill/decode mixing trap, not applied when the spec was
+written. **Read the DISTRIBUTION (min/med/max/stddev) before quoting any
+per-launch ratio** — a mean over a bimodal kernel is not a per-launch cost. The
+same discipline that withdrew the marlin 2.7% applies here: the next attempt
+needs a decode-only window on BOTH engines under ONE tool.
+
+The 35B mid-band therefore stands at two landed levers (`VT_MARLIN_DENSE_PAIR`
++1.31%, `VT_SHARED_DOWN_BF16` +2.05%) with the remaining ~5% UNATTRIBUTED.
+
+## `kGemvHeuristicAlgos` CUDA build-verify CLOSED (2026-08-10, GB10, main `812de8ca`)
+
+`NOW.md` carried "build-verify `kGemvHeuristicAlgos` on dgx" as an open residual
+on the invocation-parity row. **That row was STALE:** both halves were already on
+main (the named constant in `cuda_matmul.cu` and
+`scripts/check-gemv-invocation-consistency.py`), and `docs/STATUS.md` already
+recorded "CUDA build-verified on dgx (clean -Werror, 2026-08-04)". NOW and
+STATUS disagreed; STATUS was right.
+
+Re-verified at current main anyway, since `cuda_matmul.cu` has moved since
+2026-08-04 and a six-day-old verification is not a claim about today's tree.
+
+Guard, on main:
+
+```
+OK (out-dtype): 4 cuBLASLt C/D layout site(s) all take their dtype from the
+                dtype-faithful out_type variable.
+OK (algo-count): 4 requestedAlgoCount site(s) all route through kGemvHeuristicAlgos.
+```
+
+Build-verify, GB10 sm_121a, Release + CUTLASS 4.5.0 + Triton, nvcc 13.0.88:
+`cuda_matmul.cu` **recompiled** (forced — the first attempt was a stale-object
+pass because `812de8ca` was records-only, and a build that skips the TU verifies
+nothing) with **zero warnings** under `-Werror`, and the resulting binary gates
+clean: `test_qwen36_paged_engine` **315/315** and `test_qwen27_paged_engine`
+**235/235**, `Status: SUCCESS`, assertion counts unchanged.
+
+NOW row corrected to match STATUS. Evidence: `dgx:~/gemv2.log`, `dgx:~/g7.log`.
+
+## #323 FIXED: the decode graph replayed against stale HOST token ids (2026-08-11, `row/FIX-323-GRAPH-DECLINE`, GB10)
+
+`DenseDecodeGraphForward` called `graph->Step(input.token_ids, ...)` — the HOST
+ids — and never read `input.device_token_ids`. On the depth-2 async path the
+combine has patched the DEVICE ids and `token_ids` is deliberately stale for
+decode rows, so the replay generated from stale ids and every concurrent request
+past slot 0 degenerated (the #31 signature).
+
+Three discriminators isolated it, same binary and battery:
+
+| async depth | decode graph | result |
+|---|---|---|
+| depth-1 | ON (default) | PASS 78/78 |
+| depth-2 | OFF | PASS 82/82 |
+| depth-2 | ON (default) | **FAIL**, slots 1-3 degenerate |
+
+Both conditions required, which is why the registry-level `DeviceTokenIdsScope`
+(`60e71a0e`) did not close it: this path returns BEFORE the eager forward runs.
+
+**Fix (MITIGATION):** decline the graph while the mirror is live, falling back to
+the eager path that honours the scope. Correctness first — a correct stream
+outranks the graph's throughput. The END STATE is for `Step()` to read the ids at
+REPLAY time from a stable device buffer, which restores graphed decode for async
+serving; that is owed and NOT done here.
+
+**Gates, default configuration (async ON, graph ON):**
+
+```
+test_qwen3_dense_async_serving  7/7 cases, 246/246   (was 2 FAILED, 6 assertions)
+test_qwen3_paged_engine         184/184  SACRED
+test_qwen36_paged_engine        315/315  SACRED
+```
+
+The async suite now carries Llama, Mistral and InternLM2 as permanent regression
+gates. Llama passed even before the fix, but only because it did not engage the
+graph in that battery — the defect is a property of the shared path, so all three
+stay.
+
+**Blast radius, corrected upward twice during this investigation:** first filed
+as a Mistral/InternLM2 bug, then found to be every classic-dense model with the
+graph on (the default). Any concurrent serving on that path could return garbage
+for every request after the first.
+
+Evidence: `dgx:~/fx_run.log` (7/7), `dgx:~/fx2.log` (SACRED), `dgx:~/diag.log`,
+`dgx:~/diag2.log`, `dgx:~/g9.log`.
+
+## Qwen3.6-35B-A3B: first CANONICAL post-lever grid, and the ad-hoc grid it invalidates (2026-08-11, main `348c265d`, GB10)
+
+Run through `scripts/dgx-online-serving.sh --execute --model 35` on a build made
+to the H1d contract (RelWithDebInfo, oracle ninja, oracle flashinfer cutlass,
+`VLLM_CPP_BENCH_PROFILE_CONTROL=OFF`, tests ON, pinned `/usr/local/cuda-13.0/bin/nvcc`),
+against `nvidia/Qwen3.6-35B-A3B-NVFP4`@`491c2f1e`. FA2 marker verified present.
+
+| c | ours med tok/s (n=3) | vLLM med tok/s (n=2) | ratio |
+|---:|---:|---:|---:|
+| 1 | 65.262 (spread 1.005) | 67.223 (1.001) | **0.9708x** |
+| 2 | 93.012 (1.003) | 100.088 (1.006) | 0.9293x |
+| 4 | 140.174 (1.002) | 144.226 (1.066) | **0.9719x** |
+| 8 | 193.477 (1.018) | 210.679 (1.002) | 0.9183x |
+| 16 | 251.490 (1.007) | 271.479 (1.002) | 0.9264x |
+| 32 | 311.897 (1.007) | 332.606 (1.005) | 0.9377x |
+
+**NOT parity: 0.918x to 0.972x.** These are the campaign's FIRST c16/c32 numbers;
+both earlier canonical attempts died to host reboots.
+
+### This invalidates the ad-hoc 35B grid recorded on 2026-08-10
+
+That grid put our c1 at 32.9 tok/s and the ratio at 0.524, and flagged an
+"unexplained ~14% floor drop". The canonical harness measures our c1 at **65.262
+tok/s**, essentially double, and in line with the historical 70.58. The anomaly
+was an artifact of the ad-hoc harness, NOT of the engine and NOT of the #213
+levers -- which the same-binary lever A/B had already ruled out independently.
+The ad-hoc grid was correctly disclaimed rather than published; this supersedes it.
+
+### The harness rejected the ORACLE, not us
+
+Our arm completed 18/18 legs. The vLLM arm stopped at 12/18 when the stream probe
+caught it emitting **127 token chunks where 128 were requested** with
+`ignore_eos`. So the run has no driver-written summary and vLLM's medians are over
+**2 reps, not 3** -- weaker than ours, and stated rather than averaged away. A
+check strict enough to fail the reference implementation is why these numbers are
+worth more than the ad-hoc ones.
+
+### Known 35B-specific lever result
+
+The #213 merged-qkvz lever measures **-1.5% at c8 on this MoE model** (real,
+against a 0.7% band) while gaining ~10 points on the 27B dense. Scoping that
+default by model family is an open question, worth ~1.5% at c8 here.
+
+## Closed gaps moved verbatim out of docs/BENCHMARKS.md (2026-08-11)
+
+The scoreboard's `Open gaps` table is Track / Status / **Next gate**. These three
+rows had reached next gate `none` -- the gap each tracked is closed and no gate
+remains -- so they are not open gaps. They are reproduced here BYTE-FOR-BYTE, per
+this file's header contract, so the page can carry the two void-measurement rows
+that #223 and #238 owe without exceeding its 45,000-character cap. The full
+forensics for each are already in this file: `kGemvHeuristicAlgos CUDA
+build-verify CLOSED`, `DFlash speculative decode ... D14 c1 SPEED GATE MET`, and
+the Laguna-XS-2.1-NVFP4 decode sections. Nothing was edited or dropped.
+
+| Track | Status | Next gate |
+|---|---|---|
+| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
+| DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
+| cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |
+
+## Muse Glimmer 30B — the speed attempt (2026-08-11, issue #333, `row/MUSE-BENCH`)
+
+**Outcome: NO binding number on any axis.** Three of four bars are blocked, each
+with a named cause, and the one bar that ran produced a contended single-leg
+datapoint that is explicitly not a result. No ratio appears below, because no
+cell has two quant-matched sides.
+
+Branch `row/MUSE-BENCH` off `row/MODEL-MUSE-GLIMMER` @ `8af36075`.
+Full reasoning in `.agents/specs/muse-glimmer.md` §11.
+
+### The bars
+
+| Bar | Arm | Value | Quant-matched? | Status |
+|---|---|---|---|---|
+| vLLM | any | — | n/a | **OPEN GAP by construction**: the pin carries no `muse_glimmer`. Nothing substituted for it. |
+| llama.cpp `030ebb5` | `muse-glimmer-30B-kquant-17gb.gguf` | pp32 **9.79 t/s**, tg8 **0.79 t/s** (`-r 1 -t 4`, CPU) | **no** — nothing to match it against | **NON-BINDING**, see contention below |
+| ours | same GGUF | — | — | **BLOCKED**: tokenizer refuses `tokenizer.ggml.pre "llama4"` |
+| HF transformers | bf16 safetensors | — | — | **BLOCKED**: dgx GPU lock held all window |
+| ours | bf16 safetensors | — | — | **BLOCKED**: same host; CUDA build not started, deliberately |
+
+### Blocker 1 — our GGUF arm dies in the tokenizer, not the forward
+
+```
+$ build-cpu/examples/vllm-bench \
+    --model /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/muse-glimmer-30B-kquant-17gb.gguf \
+    --num-prompts 1 --concurrency 1 --input-len 32 --output-len 4
+vllm-bench: ... engine | num_prompts=1 input_len=32 output_len=4 concurrency=1 seed=0 temp=0.00
+vllm-bench: failed: tokenizer: unsupported tokenizer.ggml.pre "llama4"
+```
+
+The file carries `tokenizer.ggml.model = gpt2` (accepted) and
+`tokenizer.ggml.pre = llama4`, refused at `src/vllm/tokenizer/tokenizer.cpp:749`.
+llama.cpp routes `llama4` to `LLAMA_VOCAB_PRE_TYPE_GPT4O`, `clean_spaces = false`
+(`src/llama-vocab.cpp:2294-2299`), whose regex pair (`:428-434`) is neither our
+`kLlama3` nor either `kQwen2`. So this is a genuinely missing pre-tokenizer, not
+a missing alias — aliasing it would mistokenize silently (issue #347). **This is why the
+quant-matched llama.cpp cell cannot be filled today**: the GGUF is the only
+artifact both engines can hold, and we cannot open its tokenizer. Our bf16
+against a 4-bit GGUF would report quantization as speed, so it is recorded
+not-comparable rather than published with a caveat.
+
+Note this is upstream of everything §10.6 listed as unproven: the k-quant
+loader's 731/731 tensor accounting still stands, but no forward can be reached
+through the engine until the pre-tokenizer lands.
+
+### Blocker 2 — dgx was correctly busy for the entire window
+
+Another session held `/tmp/gpu` running the 27B/35B online-serving gate
+(`dgx-online-serving.sh --model 27n`, evidence `348c265d…`) from 04:37 onward; it
+advanced 18 -> 23 of ~36 legs across the window. The lock was respected: no GPU
+work was started, and no CUDA build was started either, because a parallel build
+on the same 20-core host would have perturbed a live serving measurement. Both
+bf16 cells are therefore blocked on host availability, not on any technical gap.
+
+### Blocker 3 — the local box could not host a clean measurement either
+
+The measurement host carried four other agents' concurrent builds and test runs
+(`vllm.cpp-bf16out` full test suite, `tp-task25-mutation-ef36c7ad`,
+`vllm.cpp-bug335`, and others). Observed load average over the window: **39.5,
+44.3, 48.2, 63.5, 88.1, 123.2** on 20 cores. The root filesystem hit **100% (435
+MB free)** twice; a rebuildable Docker build cache was pruned (4.58 GB) to let
+the builds proceed, and an unrelated `/tmp` cleanup deleted in-flight compiler
+temporaries mid-build, which was worked around with a private `TMPDIR`.
+
+`.agents/benchmarking.md` requires the noise band to be calibrated from repeated
+identical legs before any delta is read, and requires reproduction on an idle
+box. Under this contention neither is achievable, so the single llama.cpp leg is
+recorded as an artifact of the attempt, not as a measurement. A
+`-p 512 -n 64 -r 3 -t 20` leg was started and abandoned unfinished.
+
+### Recipe (for the re-run, which is owed)
+
+```sh
+# llama.cpp, CPU, Muse support merged 2026-08-10 (PR #26841)
+git clone --depth 1 -b master https://github.com/ggml-org/llama.cpp   # 030ebb5
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DGGML_NATIVE=ON
+cmake --build build -j --target llama-bench
+build/bin/llama-bench -m muse-glimmer-30B-kquant-17gb.gguf -p 512 -n 64 -r 3 -t 20
+
+# ours, CPU-only (no GPU on this host)
+cmake -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF \
+      -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON
+cmake --build build-cpu -j6 --target vllm-bench
+build-cpu/examples/vllm-bench --model muse-glimmer-30B-kquant-17gb.gguf \
+      --num-prompts 1 --concurrency 1 --input-len 512 --output-len 64
+```
+
+Artifacts: bf16 `/mnt/nas_share/checkpoints/muse-glimmer-30b` rev `f84ecc3a0e`,
+59.55 GB over 2 shards, `model_type: muse_glimmer`, 52 layers, hidden 6656,
+32/2 heads, head_dim 128, vocab 202048, `qk_scale_factor` 3.87,
+`post_norm_eps` 1e-8. GGUF `/mnt/nas_share/checkpoints/muse-glimmer-30b-gguf`
+rev `2fb01e4e6f`, `muse-glimmer-30B-kquant-17gb.gguf` 16,756,681,056 bytes,
+arch `muse-glimmer`, 731 tensors, file_type 15 (Q4_K_M), block_count 52,
+sliding_window 2048. Both read over a CIFS `soft` mount at ~117 MB/s.
+
+### What these numbers do and do not establish
+
+They establish that llama.cpp master loads and runs this GGUF on CPU, and that
+our engine cannot yet reach a forward on it for a reason that is now named and
+located. They establish **nothing** about how fast vllm.cpp runs Muse Glimmer,
+nothing about how it compares to any engine, and nothing about vLLM — which
+remains the only bar that counts and remains unavailable. **No ceiling is
+claimed or implied anywhere in this entry.**
+## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
+
+**Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
+Locally positive and token-safe; default and release-model gates remain open.
+
+**Selection and falsification.** On exact-chunks `c3bb0f39a`, the accepted
+Qwen3.5-4B/c32/1,280-block graph-node trace measured fast megablock
+228.150171 ms and the existing per-V-head split 448.364941 ms across 1,728
+calls. Both token files were identical. The split is 1.965x slower and the
+enclosing run 0.97% slower, so V-only launch decomposition is rejected.
+Pinned vLLM's same-tool `_fused_post_conv_kernel` is 108.034870 ms across 1,923
+calls. Source comparison instead selected vLLM/FLA's 16-token, per-head,
+four-warp schedule and Q/K register reuse.
+
+**Implementation and numerical mutant.** `GdnPostConvTokenTileKernel` maps one
+block to `(16 tokens, one Q/K or V head)` and one warp to four tokens. Each Q/K
+lane retains features `lane+{0,32,64,96}` across normalization. The first
+implementation summed those four squares sequentially before a warp reduction:
+kernel time improved 227.731960→122.472980 ms and enclosing throughput
+6731.69→6773.85 tok/s, but the tile token SHA
+`1d496ff0f989978155d8e900c7a5500a43db26816dead8e035310d0bf9cb9756`
+did not match fast `83fcdc45...453545`; REJECTED. Reproducing the current
+128-lane tree exactly—`(i+i+64)`, then `(i+i+32)`, then shuffle offsets
+16/8/4/2/1—restored byte identity without restoring the reload/barrier costs.
+
+**Final same-binary profile.** One `/tmp/gpu` lock, 22/25 GiB user-systemd
+scope, `--cuda-graph-trace=node`, identical production workload and binary:
+
+| Axis | fast megablock | token tile | change |
+|---|---:|---:|---:|
+| post-conv GPU total, 1,728 calls | 227.887066 ms | **122.587027 ms** | **1.858982x faster** |
+| mean post-conv call | 131.879 us | **70.942 us** | **46.21% lower** |
+| total throughput | 6734.82 tok/s | **6770.62 tok/s** | **+0.532%** |
+| output throughput | 744.72 tok/s | **748.68 tok/s** | **+0.532%** |
+| TTFT | 1024.14 ms | **1015.43 ms** | **-0.850%** |
+| TPOT / ITL | 35.01 ms | **34.85 ms** | **-0.457%** |
+| E2E | 5469.87 ms | **5440.81 ms** | **-0.531%** |
+
+The vLLM kernel residual is now **1.134699x**, down from 2.112x. Final token
+files are identical, full SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Portable flag/grid tests pass 6/6·50; CUDA GDN passes 67/67·4384 including
+partial/exact tiles, packed BA non-zero views/wider row strides, byte-exact five
+outputs, finiteness and norms; cached Qwen3.5-4B passes 3/3·1672.
+
+**Evidence.** Final fast/tile traces
+`/tmp/qwen35-postconv-tile-exact-{fast,tile}.nsys-rep`, SHA-256
+`c75e2cb...bcadc` / `a0eb1808...f418`; token files beside them. Rejected
+arithmetic traces `/tmp/qwen35-postconv-tile-wip-{fast,tile}.nsys-rep`, SHA-256
+`c2d8872e...b774` / `1c42d489...d66b`. Selection traces and exact recipes are
+in [the spike/result](specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+One local profile is not extrapolated to the unavailable Qwen3.6-27B/35B gates;
+the flag therefore remains opt-in.
+
+## 2026-08-08 — sm_120 causal-conv residual: K=4 specialization wins; 256-channel tile falsified
+
+**Disposition:** arm 1 is IMPLEMENTED, byte-exact and locally positive behind
+`VT_CONV_CHANNEL_TILE=1`; arm 2 (`=2`) is retained as an explicit falsified
+experiment. Unset/`0` remains the default pending repeated and release-model
+gates.
+
+**Divide-and-conquer selection.** Fresh current-main/post-conv tracing measured
+causal conv 234.255 ms versus pinned-vLLM 145.532 ms, while post-conv's
+remaining excess was only 14.476 ms. Grouping causal-conv launches by grid
+showed the 279/280-program waves consumed 136.189 ms (58.1%). Local used 64
+feature blocks and runtime width at 43 registers/thread; vLLM used `BLOCK_N=256`,
+32 feature blocks and compile-time width at 32 registers/thread. The spike split
+those differences into arm 1 (compile-time K=4, unchanged 64 blocks) and arm 2
+(K=4 plus two channels/thread, 32 blocks).
+
+**Correctness/review finding.** A serial-stripe arm 2 corrupted the second
+stripe when an exact final-chunk block wrote state before stripe 2 loaded initial
+history; the CUDA matrix caught it and the accepted kernel preloads both stripes.
+Fresh mutation review then found byte comparisons could stay green when a whole
+specialized dispatch branch was deleted. A fresh fix routes production through
+the same portable callback dispatcher the tests mutate. Scoped re-review killed
+arm-1 deletion, arm-2 deletion, relaxed arm-2 parsing and removed non-K4 fallback.
+Final gates: portable 9/9·88, CUDA GDN 67/67·4631, paged-forward 4/4·8.
+
+**VOID series.** `/tmp/qwen35-conv-arm{0,1,2}-565a26fcc.*` is invalid for
+selection: the test executables had rebuilt but `vllm-bench` had not relinked.
+All three traces proved the old runtime kernel/grid/registers ran. This was
+caught structurally before timing interpretation.
+
+**Accepted rebuilt same-binary profile.** One GPU lock, 22/25 GiB user-systemd
+scope, exact c32 workload and `--cuda-graph-trace=node`:
+
+| Axis | arm 0 runtime | arm 1 K4x1 | arm 2 K4x2 |
+|---|---:|---:|---:|
+| kernel / grid / registers | runtime / 64 / 43 | K4<1> / 64 / 52 | K4<2> / 32 / 58 |
+| causal-conv total, 1,728 calls | 234.604587 ms | **219.506425 ms** | 228.400830 ms |
+| 279-program mean | 149.546 us | **140.133 us** | 145.586 us |
+| 280-program mean | 149.480 us | **139.982 us** | 145.468 us |
+| total throughput | 6759.39 tok/s | **6767.62 tok/s** | 6757.19 tok/s |
+| output throughput | 747.43 tok/s | **748.34 tok/s** | 747.19 tok/s |
+| TTFT | 1016.69 ms | **1013.82 ms** | 1017.61 ms |
+| TPOT / ITL | 34.91 ms | **34.88 ms** | 34.91 ms |
+| E2E | 5449.87 ms | **5443.16 ms** | 5451.66 ms |
+
+Arm 1 improves conv **6.4356%**, with every enclosing axis positive but small.
+It leaves a **1.5083x** same-tool vLLM conv residual. Register count rises rather
+than falls, falsifying the occupancy rationale; compile-time removal of runtime
+width work is the supported cause. Arm 2 improves only 2.6443% versus baseline,
+is **4.0520% slower than arm 1**, and is neutral/slightly negative end to end:
+halving blocks does not repay duplicated channel-local register state on sm_120.
+
+All accepted token files SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Report SHA-256 arm0/arm1/arm2:
+`39d383dd878fc340a3cfaaee79a4addcb4eccb181439e9b4725f724f4569a6eb`,
+`c8799ac0b4cdf997d383fe8a690b223be882dce3b1ee1a6fff35a62d75f7cf85`,
+`3d38793571539864b23688fd9a85966debbf1e7c48fe8a1a2509438a45ee0452`.
+Full recipe and decision:
+[structured spike/result](specs/sm120-qwen35-conv-channel-tile-2026-08-08.md).
+
+## 2026-08-09 — sm_120 block-256 causal conv and four-warp GDN decode refuted
+
+**Block-256 causal conv (`VT_CONV_CHANNEL_TILE=3`) — REJECTED and removed.**
+At production head `84c7e23b0`, one rebuilt binary, one GPU lease/lock and the
+standard c32 Qwen3.5-4B scope gave byte-identical arm-1/arm-3 token files
+(SHA-256 `83fcdc45...453545`). The intended launch change executed: K4 arm 1
+used grid-x 64 / block 128 / 52 registers, while arm 3 used grid-x 32 / block
+256 / 52 registers. Nevertheless the selected 279+280 programs regressed
+127.645906→142.936163 ms over 912 calls (**+11.9802%**) and all causal conv
+regressed 219.400955→245.421363 ms over 1,728 calls (**+11.8598%**). The
+enclosing single profile also lost: total/output throughput
+6772.76/748.91→6756.52/747.12 tok/s, TTFT 1014.42→1016.46 ms, TPOT/ITL
+34.84→34.93 ms and E2E 5439.06→5452.21 ms. Halving block count does not repay
+the residency cost of twice as many threads at this register footprint. Per the
+spike stop condition, the dormant arm-3 selector, instantiation and tests were
+removed; accepted arm 1 and the falsified arm-2 control are unchanged. Traces:
+`/tmp/qwen35-conv-block256-arm{1,3}-84c7e23b0.nsys-rep`, SHA-256
+`39d333c5...344b9` / `62ee50dd...3f4e9`.
+
+**Four-warp fused GDN decode (`VT_GDN_DECODE_NW=4`) — correctness REJECTED,
+no timing claim.** The immediately following existing-selector discriminator
+changed the production token SHA from default NW8
+`83fcdc45...453545` to `93003ca1...8eebe`: 24/128 requests and 678/16,384
+aligned token positions differed, with equal lengths. Correctness failed before
+timing acceptance, so NW8 stays unchanged and no selector code changed. The NW4
+diagnostic-only profile was total/output 6730.55/744.25 tok/s, TTFT 1017.55 ms,
+TPOT/ITL 35.08 ms and E2E 5473.25 ms. Trace
+`/tmp/qwen35-gdn-decode-nw4-84c7e23b0.nsys-rep`, SHA-256
+`8680008e0261e9aa70bb9e001e2b31165e7999341ae3f963bc0b667caff7fb9a`.
+Reducing decode warps is therefore closed for exact greedy inference unless a
+separate numerical-order-preserving implementation is spiked.
+
+## 2026-08-09 — sm_120 fused GDN decode BV16 accepted opt-in
+
+**Disposition:** ACCEPTED OPT-IN at product commit `92256e6a9`. The exact
+`VT_GDN_DECODE_BV=16` selector changes only the independent value tile; unset
+keeps BV32. Default and Qwen3.6-27B/35B release gates remain open.
+
+**Correctness and geometry.** Operator gates pass: portable selector/geometry
+3/3 · 49, CUDA GDN 68/68 · 4,699, and Qwen3.5 paged-forward 4/4 · 8. Every
+profile and memory-run token file has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+The profiler confirms the intended grid-x 4 / block 256 / 52-register BV32
+launch becomes grid-x 8 / block 128 / 52-register BV16, preserving NW8 and its
+arithmetic order.
+
+**Counterbalanced same-binary graph-node series.** Order was
+BV32a→BV16a→BV16b→BV32b on the identical 128-request Qwen3.5-4B BF16 c32
+workload:
+
+| Arm | all GDN decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV32a | 295.608238 ms | 149.887342 ms | 6763.51 / 747.89 | 1014.64 ms | 34.90 ms | 5446.55 ms |
+| BV16a | 265.417816 ms | 133.690094 ms | 6766.91 / 748.27 | 1013.00 ms | 34.89 ms | 5443.79 ms |
+| BV16b | 264.152452 ms | 133.030633 ms | 6779.94 / 749.71 | 1011.37 ms | 34.82 ms | 5433.25 ms |
+| BV32b | 295.123586 ms | 149.627524 ms | 6763.94 / 747.94 | 1015.48 ms | 34.89 ms | 5446.15 ms |
+
+Counterbalanced means are **295.365912→264.785134 ms (-10.3535%)** across all
+1,704 decode calls and **149.757433→133.360364 ms (-10.9491%)** for the
+dominant grid-y 800 shape. That shape falls from 183.526 to 163.432 us/call.
+Pinned vLLM remains faster at 128.061 us/call, a local BV16 residual of about
+**1.276x**; unequal all-call composition prevents claiming an all-call oracle
+ratio.
+
+**Enclosing and memory reproduction.** A third pair sampled peak memory.
+Across all three pairs, BV32→BV16 means are total throughput
+6783.437→6791.063 tok/s (**+0.1124%**), output throughput
+750.093→750.940 tok/s (**+0.1129%**), TTFT 1013.237→1011.490 ms
+(**-0.1724%**), TPOT/ITL 34.7867→34.7500 ms (**-0.1054%**), and E2E
+5430.777→5424.630 ms (**-0.1132%**). The memory pair itself is
+6822.86/754.45 tok/s, 1009.59 ms TTFT, 34.57 ms TPOT/ITL and 5399.63 ms E2E
+for BV32 versus 6826.34/754.84, 1010.10, 34.54 and 5396.85 for BV16. Peak GPU
+memory is 13058→13054 MiB and peak PSS 2,273,490→2,170,880 KiB.
+
+**Evidence.** Traces, exported SQLite databases and tokens are
+`/tmp/qwen35-gdn-bv{32a,16a,16b,32b}-92256e6a9.*`; trace SHA-256 values are
+`198d1bf843443f69fd1491131a13e7aa95cc136c56e96441aa43c48f267958f5`,
+`2f5e47f54faafa70ed8494c3afaa2160e31d311d90e7412cbf9777f2e93e3d18`,
+`3b0303a97e2335d5ca2f88eacf5c2e5f063d7d899cb44db3dd7d6a170938d117`,
+and `3d7b4a214b14976c95e9e4c944540e91163c7f10e820bb63bf7d0cb9fc9d8b11`.
+Memory JSONL/log/token evidence is
+`/tmp/qwen35-gdn-bv{32,16}-mem-92256e6a9.*`. The accepted result is local
+evidence only; it is not extrapolated to unavailable release models and does
+not change the default.
+
+## 2026-08-09 — sm_120 fused GDN decode BV8/BV24 rejected
+
+**Disposition:** REJECTED AND REMOVED at measured implementation `e102a14de`
+and cleanup `634ccba70`; BV16 remains the sole exact opt-in and BV32 remains
+default. Default and Qwen3.6-27B/35B release gates remain open.
+
+Operator runtime gates pass: portable selector/geometry **3/3 · 100**, CUDA GDN
+**69/69 · 4,850** including the public production-graph geometry case, and
+Qwen3.5 paged-forward **4/4 · 8**. The prescribed same-binary order was
+BV32a→BV16a→BV8a→BV24a→BV24b→BV8b→BV16b→BV32b. Every token file has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV32 | 302.7940655 ms | 153.7994265 ms | 6730.700 / 744.265 | 1022.205 ms | 35.050 ms | 5473.235 ms |
+| BV16 | 271.5899630 ms | 136.9721265 ms | 6740.010 / 745.290 | 1021.150 ms | 34.995 ms | 5465.690 ms |
+| BV8 | 278.4436445 ms | 141.1102230 ms | 6739.720 / 745.255 | 1021.195 ms | 35.000 ms | 5465.840 ms |
+| BV24 | 279.7297115 ms | 141.5291235 ms | 6732.840 / 744.500 | 1022.340 ms | 35.035 ms | 5471.455 ms |
+
+Against BV16, BV8 regresses all fused decode **2.5235%** and the dominant shape
+**3.0211%**; BV24 regresses **2.9971%** and **3.3270%** respectively. Both
+samples of each candidate have the same losing direction. They fail the ≥1%
+dominant-shape win and all-fused non-regression bars, so the enclosing means
+are recorded but confer no selection credit. BV16 repeats its win over BV32 in
+this series: **-10.3054%** across all fused calls and **-10.9411%** at grid-y
+800.
+
+Profiler launch contracts are exact at Dv=Dk=128 and 52 registers/thread:
+BV8 grid-x 16 / block 64 / 5,152 shared bytes; BV16 8 / 128 / 9,280; BV24 6 /
+192 / 13,408; BV32 4 / 256 / 17,536. Cleanup removes the losing selectors,
+arms, instantiations and expectations; `VT_GDN_DECODE_BV=8` and `=24` fall back
+to BV32, while exact `=16` remains opt-in.
+
+The current BV16 dominant mean is **167.858 us/call** versus pinned vLLM
+**128.061 us/call**, about **1.311x** slower. The prior accepted series' 1.276x
+ratio remains valid for that run; the difference is run variance, not evidence
+of a new oracle or a closed residual.
+
+Evidence is
+`/tmp/qwen35-gdn-bvsweep-{32a,16a,8a,24a,24b,8b,16b,32b}-e102a14de.{nsys-rep,sqlite,log,tokens.json}`.
+The per-leg values and eight trace SHA-256 values are preserved in the
+[structured result](specs/sm120-qwen35-gdn-decode-bv-sweep-2026-08-09.md).
+
+## 2026-08-09 — sm_120 fused GDN decode RPT2 rejected and removed
+
+**Disposition:** REJECTED AND REMOVED. Measured product `6ac8bf390` passed
+portable **4/4 · 125**, CUDA GDN **69/69 · 5,046**, and Qwen3.5 paged-forward
+**4/4 · 8**. All four production token files have SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Cleanup `f6a0c879141a1887f9fcf8c85a9eb3a8cf8a6275` removes the losing selector, specialization and
+tests; BV16 remains the sole opt-in and BV32 remains default.
+
+The intended geometry executed at Dv=Dk=128: BV16 grid-x 8 / block 128 /
+9,280 shared bytes / 50 registers, versus RPT2 grid-x 4 / block 128 / 17,536
+shared bytes / 56 registers. Across the counterbalanced
+`BV16a -> RPT2a -> RPT2b -> BV16b` series, the 1,704-call all-fused mean
+regressed **271.577988 -> 372.4151745 ms (+37.1301%)** and the 816-call y800
+mean regressed **136.9415415 -> 190.121047 ms (+38.8337%)**.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV16 | 271.577988 ms | 136.9415415 ms | 6732.58 / 744.47 | 1026.28 ms | 35.00 ms | 5471.38 ms |
+| RPT2 | 372.4151745 ms | 190.121047 ms | 6709.16 / 741.88 | 1027.645 ms | 35.145 ms | 5490.87 ms |
+
+RPT2 fails both micro bars and every enclosing mean despite exact correctness.
+BV16's current dominant call is **167.82 us/call** versus pinned vLLM
+**128.061 us/call**, about **1.310x** slower. Default/release and the
+hardware-unavailable 27B/35B gates remain open. Evidence is
+`/tmp/qwen35-gdn-rpt2-{bv16a,rpt2a,rpt2b,bv16b}-6ac8bf390.*`; full disposition
+is in the [structured result](specs/sm120-qwen35-gdn-decode-rpt2-2026-08-09.md).
+
+## 2026-08-09 — sm_120 BV16/NW8 GDN decode shared swizzle accepted opt-in
+
+**Disposition:** ACCEPTED OPT-IN at spike `bdfaf823e` and product `824370396`.
+Operator gates pass: portable **6/6 · 633**, CUDA GDN **69/69 · 4,742**, and
+Qwen3.5 paged-forward **4/4 · 8**; parser/mapping negative mutations fail 5/132.
+All six token files have SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Both arms launch gx8/bx128/reg56; shared bytes change 9,280 -> 9,728.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV16 | 289.8737275 ms | 146.959362 ms | 6724.18 / 743.54 | 1027.34 ms | 35.045 ms | 5478.205 ms |
+| SWZ | 268.254130 ms | 135.9178535 ms | 6739.86 / 745.275 | 1023.005 ms | 34.98 ms | 5465.725 ms |
+
+The prescribed `BV16a -> SWZa -> SWZb -> BV16b` series improves all fused
+decode **7.4555%** and y800 **7.5123%**, with both samples winning and every
+enclosing throughput/latency mean positive. The memory pair is likewise
+positive on user-visible/device axes: total 6784.64 -> 6793.05 tok/s, output
+750.23 -> 751.16 tok/s, TTFT 1020.77 -> 1018.67 ms, TPOT 34.72 -> 34.68 ms,
+E2E 5430.24 -> 5423.44 ms, and GPU 13,060 -> 13,054 MiB.
+
+Peak host PSS rises **1,909,259 -> 2,038,631 KiB (+6.78%)**, while the supplied
+available-memory drop is **1,641,476 -> 1,529,724 KiB**. The isolated PSS move
+is recorded as a noisy transient host-load caveat; the candidate stays explicit
+opt-in and receives no default/release credit. Accepted swizzle y800 is
+**166.566 us/call** versus pinned vLLM **128.061 us/call** (**1.301x** slower).
+
+Evidence is
+`/tmp/qwen35-gdn-swizzle-{bv16a,swza,swzb,bv16b}-8243703.{nsys-rep,sqlite,log,tokens.json}`
+and `/tmp/qwen35-gdn-swizzle-{bv16,swz}-mem-8243703.{jsonl,log,tokens.json}`.
+Trace SHA-256 prefixes: BV16a `59bb6081`, SWZa `082cd6d4`, SWZb `b44792c8`,
+BV16b `633fad31`. Default/release and 27B/35B gates remain open.
+
+## 2026-08-09 — sm_120 GDN decode register-state measured provisional opt-in
+
+**Disposition:** `MEASURED/PROVISIONAL` at product commit `7476818c1`. The
+strict `VT_GDN_DECODE_REGSTATE=1` specialization retains each lane's 16 F32
+state values across the two recurrence loops while preserving the accepted
+BV16/NW8/shared-swizzle mapping. It remains explicit opt-in: exact static SASS
+size and NCU attribution are pending external tool/download authority, so this
+is not fully `ACCEPTED` and changes no default, release, or 27B/35B claim.
+
+**Correctness, review and resources.** The full canonical preflight is green;
+fresh static and targeted mutation re-review is `PASS`. Operator gates pass:
+portable selector/mapping **10/10 · 1,962**, CUDA GDN **70/70 · 4,830**, and
+cached Qwen3.5 paged-forward **4/4 · 8**, all observed diffs zero. Every token
+file has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+The intended graph executes at gx8/gy800/bx128, 9,728 dynamic shared bytes, 56
+registers and zero local bytes. Same-tool ptxas evidence at
+`/tmp/cuda_gdn-regstate-candidate-7476818c1.log` reports the exact
+`bf16,bf16,float,NW8,SWIZZLED=true,REGSTATE=true` specialization at 56
+registers, one barrier, zero stack and zero spills; the accepted SWZ baseline
+also uses 56 registers. The missing exact-specialization static SASS-size
+<=5% and shared-instruction count are not inferred from these resource facts.
+The retained nvcc 12.9 build `/tmp/cuda-gdn-keep.gXumAL/` supplies additional
+non-substitute structure: exact cubin ELF symbol size is 27,008 bytes SWZ versus
+26,496 REGSTATE (**-1.896%**), while exact PTX counts are 922/894 total
+instructions, 69/53 shared loads and 47/31 shared stores, with unchanged 19/7
+global loads/stores and two barriers. The exact -16/-16 PTX shared operations
+support the mechanism and the cubin byte-size direction, but neither is the
+required SASS instruction/shared-op count; cuobjdump remains pending. PTX/cubin
+SHA-256 values are `dc500503...e2e6` / `5169611e...d913`.
+
+**Counterbalanced same-binary graph-node series.** The prescribed order was
+`SWZa -> REGa -> REGb -> SWZb` on the standard 128-request Qwen3.5-4B BF16 c32
+workload. Both REGSTATE raw legs beat both bracketing SWZ legs on grid-y 800 and
+all fused decode.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| SWZ | 268.1141915 ms | 135.7758125 ms | 6726.240 / 743.770 | 1026.800 ms | 35.000 ms | 5471.960 ms |
+| REGSTATE | 264.7265645 ms | 134.2911050 ms | 6739.125 / 745.195 | 1021.745 ms | 35.000 ms | 5466.420 ms |
+
+REGSTATE improves all fused decode **1.263502%** and the dominant y800 shape
+**1.093499%**, with total/output throughput **+0.191563%/+0.191591%**, TTFT
+**-0.492306%**, unchanged TPOT/ITL, and E2E **-0.101243%**. This is a local
+same-binary discriminator, not a new pinned-vLLM ratio.
+
+**Memory and evidence.** The separate non-profiled memory pair reports peak GPU
+allocation 13,058 -> 13,060 MiB and peak PSS 2,436,964 -> 1,989,479 KiB. The
+candidate's host PSS is lower, so no repeat is owed; timing from the memory pair
+is non-binding. Four-leg roots are
+`/tmp/qwen35-gdn-regstate-{swza,rega,regb,swzb}-7476818c1.*`; memory roots are
+`/tmp/qwen35-gdn-regstate-{swz,reg}-mem-7476818c1.*`. `cuobjdump`/NCU downloads
+were separately requested but are not authorized and the Ordino service is
+unavailable. Preserve this candidate as provisional opt-in until those exact
+diagnostics can run.
+
+## 2026-08-09 — sm_120 GDN decode REGK structurally rejected and removed
+
+**Disposition:** `REJECTED/REMOVED` before product commit or GPU work. The
+red-first missing-contract compile was captured, then the candidate selector,
+specialization and tests existed only as uncommitted experiment changes and
+were fully restored. Clean disposition head
+`28d3a9334d50a80e16f0f3d2ccc0e0cc1b9a4593` has no REGK code or test residue.
+The restored portable gate passed **13/13 · 2,005**.
+
+The contract negatives were live: a parser-prefix mutation killed **0/1** with
+two failures, regular-path eligibility died at `-Werror`, and both compile-time
+assertions killed the shared-column mapping mutation. The required recurrence
+discriminator failed structurally. Same-tool nvcc 12.9 exact
+`bf16,bf16,float,NW8,SWIZZLED=true,REGSTATE=true,REGK=true` PTX is byte-identical
+for the baseline, first-loop-to-`bk`, and second-loop-to-`bk` variants: exact
+symbol **848 instructions**, **53 `ld.shared`**, full PTX SHA-256
+`1fec62b7f48dc5fa2a33bfe414ce6a10aa01979c41489375a8d67b07c88a97a0`; both
+loop comparisons are identical. Current REGSTATE without REGK already has
+**53 `ld.shared`**, proving the compiler performs the intended K reuse and the
+spec's mandatory shared-load reduction cannot be met.
+
+No GPU, timing, performance or memory run was made and no such claim follows.
+REGSTATE's provisional exact result is preserved; exact SASS and NCU remain
+pending. The next candidate must be a new spike for direct register-to-global
+REGSTATE writeback, removing the final `rr` shared write, synchronization and
+shared reread while treating global-store coalescing as a falsifiable tradeoff.
+Do not pursue q+k caching: q is single-use and K caching is a compiler no-op.
+
+## 2026-08-09 — sm_120 GDN decode direct store rejected and removed
+
+**Disposition:** `REJECTED/REMOVED`. Product experiment `9485a5514` was
+reverted in the records/cleanup change; all seven product, test, env and
+pending-doc paths equal parent `a9d778957`. Every token SHA-256 is exact and
+the candidate graph is gx8/gy800/bx128/smem9728. REGSTATE/DIRECT STORE report
+56/55 registers and zero local storage.
+
+| Arm mean | all fused decode | grid-y 800 | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| REGSTATE | 264.656741 ms | 134.3005475 ms | 6725.73 / 743.715 | 1029.48 ms | 35.02 ms | 5477.21 ms |
+| DIRECT STORE | 388.7906645 ms | 196.3294475 ms | 6694.67 / 740.28 | 1031.48 ms | 35.21 ms | 5502.83 ms |
+
+DIRECT STORE regresses y800 **46.1866%** (164.584 -> 240.600 us/call) and all
+fused decode **46.904%**; both raw DST legs lose. Total/output throughput fall
+**0.4618%/0.4619%**; TTFT, TPOT/ITL and E2E worsen
+**0.1943%/0.5425%/0.4678%**. Evidence roots are
+`/tmp/qwen35-gdn-direct-store-{rega,dsta,dstb,regb}-9485a5514.*`.
+
+Static PTX moved in the intended direction—848 -> 694 instructions, shared
+loads 53 -> 48, shared stores 31 -> 15, barriers 2 -> 1—but global stores rose
+7 -> 18 and the timing proves lost coalescing dominates. No memory pair is
+needed after the hard timing rejection. No acceptance, default, release,
+pinned-vLLM, 27B or 35B claim changes.
+
+## 2026-08-09 — sm_120 Qwen3.5-4B combined prefill arms accepted locally; cross-engine frontend ratios void
+
+**Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206).
+The immutable measured binary was commit `84be99763bfcd8de94c7e6e2dd871e7a793348ea`
+(SHA-256 `581ea963303b37a92f838c96e5f8f828f79b0c29081c0d4d1c240606ed3fd041`).
+The fresh mutation review found that the post-conv token-tile fallback for the
+independent Q/K and V head widths was not owned by a focused test. Commit
+`23bc978f0e2c43265d858fc154d484be6e995f42` extracted the production
+eligibility predicate and added split/env/Dk/Dv fallback coverage; the fresh
+scoped mutation re-review then passed. This was a test-contract finding, not a
+token or measured-product change.
+
+The reviewed same-binary series used the standard cached Qwen3.5-4B BF16
+workload: ShareGPT SHA-256
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`,
+128 requests, 128 output tokens, c32, greedy, 2,048 batched-token cap and 1,280
+KV blocks. BASE set `VT_CONV_CHANNEL_TILE=0` and
+`VT_GDN_POSTCONV_TOKEN_TILE=0`; COMBINED set both to `1`. The order was
+`BASE-r1 -> COMBINED-r1 -> COMBINED-r2 -> BASE-r2 -> BASE-r3 -> COMBINED-r3`.
+The GPU was idle before the series (RTX 5070 Ti, driver 595.71.05, P8, 0%
+utilization, no compute application); the whole series held `/tmp/gpu`.
+
+| Arm / leg | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| BASE-r1 | 6762.97 | 747.83 | 1031.42 ms | 34.77 ms | 5447.71 ms |
+| BASE-r2 | 6775.87 | 749.26 | 1019.15 ms | 34.79 ms | 5437.30 ms |
+| BASE-r3 | 6780.66 | 749.79 | 1018.40 ms | 34.76 ms | 5433.45 ms |
+| **BASE mean** | **6773.1667** | **748.9600** | **1022.9900 ms** | **34.7733 ms** | **5439.4867 ms** |
+| COMBINED-r1 | 6820.31 | 754.17 | 1010.46 ms | 34.58 ms | 5401.67 ms |
+| COMBINED-r2 | 6823.24 | 754.49 | 1009.11 ms | 34.57 ms | 5399.32 ms |
+| COMBINED-r3 | 6821.75 | 754.33 | 1008.28 ms | 34.59 ms | 5400.59 ms |
+| **COMBINED mean** | **6821.7667** | **754.3300** | **1009.2833 ms** | **34.5800 ms** | **5400.5267 ms** |
+| **COMBINED change** | **+0.7175%** | **+0.7170%** | **-1.340%** | **-0.556%** | **-0.716%** |
+
+Every one of the six token files has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Both candidate legs beat every base leg on every enclosing timing axis, so the
+combined K=4 causal-conv plus 16-token post-conv arm is **ACCEPTED as a local,
+default-OFF opt-in**. Raw evidence is
+`/tmp/qwen35-ab-combined-84be99763/`; the six raw log hashes in arm order are
+`a776a34e...dd02`, `15858c44...5c6`, `09b42ddd...e7f`,
+`413713fb...c201`, `c1a664df...3f19`, and `6b0b1780...f214`.
+
+### TTFT attribution and the frontend mismatch
+
+A local COMBINED diagnostic produced **6816.79 tok/s**, **1010.16 ms TTFT**
+and **34.60 ms TPOT**. Across all 128 request rows, mean
+intake/queue/prefill was **196.252 / 344.389 / 469.181 ms**, summing to
+**1009.822 ms**. The pinned vLLM `555967922` diagnostic produced
+**6633.514 tok/s**, client/core TTFT **942.785 / 942.261 ms**, and TPOT
+**33.91494 ms**; its mean queue/prefill components were
+**338.960 / 449.291 ms**. vLLM's request arrival is a wall-clock timestamp
+while its event timestamps are monotonic, so the raw recorded intake delta is
+invalid. The only comparable intake inference is
+`core_ttft - queue - prefill` = **154.011 ms**. The resulting TTFT-gap
+decomposition is **42.241 ms intake + 5.429 ms queue + 19.890 ms prefill =
+67.560 ms**.
+
+Request-id waves further localize the mismatch:
+
+| IDs | local mean TTFT | pinned vLLM mean TTFT |
+|---|---:|---:|
+| 0-31 | 2104.505 ms | 1752.132 ms |
+| 32-63 | 656.106 ms | 657.784 ms |
+| 64-95 | 643.766 ms | 670.053 ms |
+| 96-127 | 634.913 ms | 689.077 ms |
+
+The source proves the frontends are not timing the same work. Local starts
+`t0` before admission and submits prompt **strings** through `AsyncLLM`, so
+tokenization is inside its measured interval
+(`examples/bench/bench_core.h:508-529`). The oracle tokenizes every prompt
+before `run_closed_loop` starts its timer and submits `TokensPrompt` IDs
+(`tools/bench/vllm_closed_loop_metrics.py:59-82,137-167`). Therefore every
+prior cross-engine **total-throughput and TTFT ratio on this harness is VOID**;
+both axes are `PENDING` a pretokenized local rerun. The local same-binary
+COMBINED A/B above remains accepted because both arms timed the same frontend.
+TPOT remains comparable and open because it begins after the first token.
+
+Diagnostic evidence hashes: local log/token
+`f7359b58...f41b` / `83fcdc45...3545`; vLLM log/metrics/splits/tokens
+`9980b7b4...7148` / `61739a24...12a` / `a46753d9...3c4` /
+`eebbb644...a38`. Roots are `/tmp/qwen35-combined-ttft-split-84be99763.*`
+and `/tmp/qwen35-vllm-ttft-split-pin.*`. The next gate pre-tokenizes every
+local prompt before `t0`, submits the existing token-ID overload, then repeats
+counterbalanced same-binary rollback and fresh local/vLLM comparisons.
+
+## 2026-08-09 — pretokenized frontend real A/B failed token identity; timings void
+
+**Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206).
+The first real-GPU pair used clean implementation/review head
+`a33993a7cd8fdcf33b2b91112ef7a172b8f63fe1`, binary SHA-256
+`50f509cbde5865a6b0fe3b2bce0a05b68bf716337d41a90cb88d66480f1f8d02`
+and the accepted K4 causal-conv plus post-conv-token-tile flags in both arms.
+STRING-r1 set `VT_BENCH_PRETOKENIZE=0`; TOKENS-r1 set
+`VT_BENCH_PRETOKENIZE=1`. The ShareGPT corpus SHA-256 remained
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
+
+The hard correctness gate failed and stopped the series after that pair. Both
+arms reported 131,784 input tokens and produced 128 requests x 128 output
+tokens, but only **98/128 requests** and **15,507/16,384 positions** matched.
+The differing request IDs were
+`[1,7,10,23,30,41,46,50,51,60,61,68,70,74,77,80,82,83,85,86,88,92,95,110,113,116,122,124,126,127]`.
+STRING-r1 output SHA-256 was
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`;
+TOKENS-r1 was
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`.
+Raw evidence is `/tmp/qwen35-ab-pretoken-a33993a7/`; the two log SHA-256
+values are `02c4381844c0a62aa2cf20023750ada2042d54f11f65189d7cf581060a6fe197`
+and `3b0efb96c8b5ede5565bb12081d0d9010ccf10957a6fcb33ad7203ad766bc8d0`.
+
+| Invalid one-pair observation | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| STRING-r1 | 6803.47 | 752.31 | 1012.01 ms | 34.65 ms | 5412.13 ms |
+| TOKENS-r1 | 6839.78 | 756.32 | 1012.97 ms | 34.45 ms | 5388.73 ms |
+
+These values are **VOID**: changed output means changed work, so none receives
+performance credit and the missing second/third repetitions are not a reason to
+continue an invalid series.
+
+The mechanism is the admission boundary. Local `AsyncLLM` publishes and
+notifies one request at a time, and its background `EngineCoreProc` blocks on
+the first item then drains only items immediately available. String admission
+tokenizes between publishes; pretokenized admission publishes fast enough to
+change which requests are present for the first scheduling step. The pinned
+wrapper synchronously adds every request in the initial concurrency before its
+first `engine.step`, then publishes each refill group between steps. The next
+discriminator is therefore an additive **atomic wave admission** API: prepare
+all inputs and collectors first, register them under the shutdown lock, append
+every core ADD under one queue lock, and notify once. The benchmark will record
+arrivals for a whole refill wave and publish it once, so string rollback still
+times tokenization while both arms execute identical batches. The full
+RED-first, rollback and mutation gates are binding in the
+[campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
+
+## 2026-08-09 — Qwen3.5 corrected frontend comparison and retained local decode stack
+
+Atomic all-at-once request-wave admission repaired the pretokenized benchmark's
+batching confound at reviewed head `da449a88f0a06710839a0a6568f18426cb44fc19`.
+All repeated local and pinned-vLLM legs generated the same 128 x 128-token
+workload; the local token SHA-256 is
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`.
+The corrected, non-profiled three-repetition comparison is:
+
+| Engine | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E | peak VRAM |
+|---|---:|---:|---:|---:|---:|---:|
+| vllm.cpp direct-load | 6831.7100 | 755.4300 | 1016.5133 ms | 34.4767 ms | 5395.1333 ms | 12,950.7 MiB |
+| pinned vLLM `555967922` | 6643.4025 | 734.6087 | 936.5893 ms | 33.9171 ms | 5244.0659 ms | 12,832.0 MiB |
+| ratio / gap | **1.028345x** | **1.028345x** | **1.085335x slower** | **1.016497x slower** | **1.028807x slower** | **+118.7 MiB** |
+
+Host peak/stable PSS is 2.338/0.770 GiB locally versus 7.868/4.496 GiB for
+vLLM, so host memory remains a large win. Raw comparison root is
+`/tmp/qwen35-compare-da449a88f/`; same-tool traces are
+`/tmp/qwen35-profile-da449a88f-{ours,vllm}.{nsys-rep,sqlite}`. Throughput is
+now a valid win; TTFT, TPOT/ITL, E2E and VRAM remain open.
+
+Two later exact, counterbalanced local stacks were retained as default-OFF
+opt-ins. `VT_GDN_DECODE_BV=16`, `VT_GDN_DECODE_SWIZZLE=1` and
+`VT_GDN_DECODE_REGSTATE=1` moved the direct-load local mean from
+6838.4400/756.1767 tok/s, 1014.0233 ms TTFT, 34.4533 ms TPOT and 5389.7900 ms
+E2E to **6852.1200/757.6900**, **1011.8500**, **34.3867** and **5378.9500**
+(+0.200% throughput, -0.214% TTFT, -0.193% TPOT, -0.201% E2E). Adding
+`VT_GDN_SLACK_MEMSET=1` produced **6856.8633/758.2133**, **1010.4800 ms**,
+**34.3700 ms** and **5375.1900 ms** against its adjacent decode-stack mean
+6852.5700/757.7367, 1011.5233, 34.3900 and 5378.6167. These local gains have
+not been consolidated into a new pinned-vLLM ratio; do not project them as a
+cross-engine pass. Roots are `/tmp/qwen35-ab-decode-stack-da449a88f/` and
+`/tmp/qwen35-ab-slack-memset-da449a88f/`.
+
+## 2026-08-09 — geometric argmax scratch rejected and removed
+
+Reviewed head `06db3bbb3454f85e20f75b96eeb299afba7036ae` passed 9 portable
+cases / 105 assertions plus CUDA sampling. All six legs were token-exact.
+
+| Arm mean, 3 reps | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|
+| Incumbent | 6862.2667 / 758.8100 | 1009.7167 ms | 34.3400 ms | 5371.0000 ms |
+| Geometric scratch | 6863.8867 / 758.9867 | 965.0133 ms | 34.6833 ms | 5369.7067 ms |
+
+The apparent -4.427% TTFT coincides with a **+0.9998% TPOT regression**, so
+the candidate fails the Pareto gate. Same-tool traces identify wait migration,
+not saved compute: `cudaFree` falls 506 calls / 2960.361 ms to 476 / 27.705 ms
+(exactly 30 argmax frees), while the same 567 `cudaStreamSynchronize` calls rise
+18,027.497 -> 20,878.260 ms. Raw A/B is
+`/tmp/qwen35-ab-argmax-geometric-06db3bbb/`; candidate profiler hashes are
+`1021b045...239e7` and `808a7516...b7be4`. Product and tests are removed; the
+falsified allocation hypothesis remains documented.
+
+## 2026-08-09 — BF16 GDN vector writeback rejected and removed
+
+Implementation `29de225c8` plus repair `3ca49e926` passed fresh mutation
+review (16 cases / 2,568 assertions), operator CUDA rebuild and focused
+`test_gdn_decode_fused` + `test_ops_gdn`. All four profiled legs were exact.
+
+| Arm | all fused decode | y800 decode | total / output tok/s | TTFT | TPOT | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| REG-a | 251.210058 ms | 139.127859 ms | 6760.82 / 747.59 | 1027.95 | 34.81 | 5449.30 |
+| VEC-a | 250.472657 ms | 138.702659 ms | 6802.32 / 752.18 | 1015.76 | 34.66 | 5417.91 |
+| VEC-b | 251.214368 ms | 139.138796 ms | 6804.21 / 752.39 | 1015.60 | 34.65 | 5416.35 |
+| REG-b | 251.404693 ms | 139.111428 ms | 6807.51 / 752.76 | 1013.82 | 34.65 | 5413.73 |
+
+Counterbalanced means improve y800 only **0.1430%** and all fused decode only
+**0.1846%**; VEC-b loses to both controls on y800. It therefore misses the
+required 1% and raw-leg gates. `nsys` records unchanged gx8/gy800/bx128,
+56 registers/thread, 9,728 dynamic shared bytes and zero local bytes. Evidence
+is `/tmp/qwen35-gdn-vecstore-{rega,veca,vecb,regb}-3ca49e926.*`. Product and
+tests are removed; REGSTATE remains the local opt-in.
+
+## Muse Glimmer 30B — the speed RE-RUN, first binding numbers (2026-08-11, issue #333, `row/MUSE-BENCH-2`)
+
+**Outcome: the quant-matched llama.cpp bar is MEASURED on every axis; the vLLM
+bar remains an OPEN GAP by construction.** Supersedes nothing in the §11 /
+2026-08-11 `row/MUSE-BENCH` entry above, which stands as the record of why no
+number existed then; it is the re-run that entry said was owed.
+
+Branch `row/MUSE-BENCH-2` off `origin/main` `75a29016`. Full reasoning in
+`.agents/specs/muse-glimmer.md` §14.
+
+### Why a number is possible now
+
+`11d45330` (the `llama4` / GPT-4o pre-tokenizer, #347) and `75a29016` (the Q/K
+interleaved-RoPE row order, #359) removed the two blockers §11 recorded. Both
+engines can now hold AND generate from the same file, which is the whole
+precondition for a quant-matched comparison.
+
+### The bars
+
+| Bar | Arm | Value | Quant-matched? | Status |
+|---|---|---|---|---|
+| vLLM | any | — | n/a | **OPEN GAP by construction**: the pin carries no `muse_glimmer`. Nothing substituted, nothing waived. Unblocks on vllm#51655 + a pin advance |
+| llama.cpp `70448594` (SECONDARY) | same 16.76 GB Q4_K_M file | table below | **YES**, byte-identical file | **BINDING** on an idle box, r=3-5, spreads calibrated |
+| ours | same GGUF | table below | **YES** | **BINDING** |
+| HF transformers bf16 | bf16 safetensors | see "bf16" below | would be yes | **PARTIAL**: probe only |
+| ours bf16 | bf16 safetensors | see "bf16" below | would be yes | **PARTIAL**: probe only |
+
+### Host, contention and provenance
+
+`dgx.casa`, NVIDIA GB10, aarch64, 20 cores (10 Cortex-X925 + 10 A725), 119 GB
+unified. **Idle at claim**: load 0.23/0.33/0.72, `local-ai-worker` already
+`Exited (0)`, `nvidia-smi` 0% util, `/mnt/nas_share` mounted, no holder on the
+box lock. `$HOME/gpu.lock` held via `flock` across the entire series; legs
+strictly sequential; loads recorded at every leg boundary (15-21 throughout,
+all of it our own 20-thread job).
+
+Model file copied from the CIFS NAS to local NVMe so neither engine pays a
+network-filesystem tax inside a measured window:
+`muse-glimmer-30B-kquant-17gb.gguf`, 16,756,681,056 bytes, md5
+`ba8da9b15aed63a1df095cb34f3e7665`, arch `muse-glimmer`, Q4_K_M (file_type 15),
+731 tensors, 52 layers; llama-bench reports it as 15.59 GiB / 27.85 B params.
+bf16 arm `/mnt/nas_share/checkpoints/muse-glimmer-30b` rev `f84ecc3a0e`.
+
+### Build and run recipe
+
+```sh
+# ours, CPU-only, on dgx (aarch64, gcc 13.3, cmake 3.28.3)
+cmake -S vllm.cpp -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF \
+      -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON -DVLLM_CPP_SERVER=OFF
+cmake --build build-cpu -j6 --target vllm-bench vllm-cli
+VLLM_CPP_CPU_THREADS=20 build-cpu/examples/vllm-bench --model $GGUF \
+  --num-prompts 1 --concurrency 1 --input-len 128 --output-len 16 \
+  --temperature 0 --seed 0
+
+# llama.cpp master 704485942ab54bbbbf1f241b3550ffba35f5f37e (2026-08-11)
+cmake -S llama.cpp -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+      -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+cmake --build build -j16 --target llama-bench llama-completion
+build/bin/llama-bench -m $GGUF -p 128 -n 16 -r 1 -t 20 -o csv
+```
+
+Note for a future run: on current llama.cpp master the `llama-cli` target no
+longer exists; the one-shot generation tool is `llama-completion` (`tools/cli`
+now builds `llama-app`). The §11 recipe's `--target llama-cli` fails with
+`No rule to make target`.
+
+### The measured table
+
+Ours = `vllm-bench` `Prefill token throughput (in/TTFT)` and `Mean per-stream
+decode rate`. llama.cpp = `llama-bench` `pp`/`tg`. Same two physical quantities,
+same file, same thread count, paired and order-alternated legs.
+
+| Workload | Axis | vllm.cpp | llama.cpp | Ratio |
+|---|---|---:|---:|---:|
+| in 128 / out 16, t=20, r=5 | prefill tok/s | 11.63 (10.36-12.10, 15.0%) | 12.94 (12.90-13.09, 1.4%) | 0.898x |
+| in 128 / out 16, t=20, r=5 | decode tok/s | 1.18 (1.04-1.71, **56.8%**) | 5.08 (4.88-5.28, 7.9%) | 0.232x |
+| in 128 / out 16, t=10, r=3 | prefill tok/s | 9.94 (1.2%) | 9.97 (0.8%) | **0.997x** |
+| in 128 / out 16, t=10, r=3 | decode tok/s | 1.31 (0.8%) | 6.41 (0.7%) | 0.204x |
+| in 512 / out 16, t=20, r=3 | prefill tok/s | 2.23 (0.4%) | 13.13 (0.5%) | 0.170x |
+| in 512 / out 16, t=20, r=3 | decode tok/s | 0.29 (0.0%) | 5.00 (9.6%) | 0.058x |
+| any | peak RSS | 30.29 GiB | 15.74 GiB | 1.92x MORE |
+
+Medians; brackets are min-max and spread as a percentage of the median. The
+noise band comes from the repeated identical legs themselves, before any delta
+was read. **No leg in this table was discarded.**
+
+Raw legs, in order: ours prefill@t20 `[11.63, 10.36, 10.36, 12.10, 11.68]`,
+ours decode@t20 `[1.71, 1.20, 1.04, 1.18, 1.18]`, llama prefill@t20
+`[13.09, 12.94, 13.01, 12.92, 12.90]`, llama decode@t20
+`[4.88, 5.24, 5.28, 5.08, 4.91]`.
+
+### Harness cross-check — the two harnesses agree in absolute scale
+
+`.agents/benchmarking.md` warns that two disagreeing ratio sets are often two
+different harnesses. Cross-checked with each engine's *other* tool on the same
+real prompt (`"The capital of France is"`, greedy, t=20): `vllm-cli` 12 tokens
+in 6.777 s = 1.771 tok/s whole-run; `llama-completion` prompt eval 11.90 tok/s
+and eval 5.33 tok/s, 2.566 s total. Both harness pairs put the two engines in
+the same 4-5x relationship on decode and near-parity on short prefill, so the
+`vllm-bench`/`llama-bench` ratios are not a harness artifact.
+
+### The decode gap is WORK, not occupancy — one hypothesis refuted
+
+The whole-run `Percent of CPU` reads 466-667% for us against 1062-1674% for
+llama.cpp, which looks like an idle-core story. It is not one: our run is
+dominated by a load-and-dequantize phase llama.cpp's mmap never pays. A
+two-length diff (out 4 -> out 36, in 128, t=20, the common load phase
+cancelling) measures the decode phase directly:
+
+| Engine | dCPU-seconds | dwindow | decode-phase CPU | CPU-s per decoded token |
+|---|---:|---:|---:|---:|
+| vllm.cpp | 599.95 (870.84 - 270.89) | 30.19 s (42.72 - 12.53) | **1987%** = 19.9 of 20 cores | **18.75** |
+| llama.cpp | 106.26 (128.58 - 22.32) | 5.87 s (7.97 - 2.10) | **1810%** = 18.1 cores | **3.32** |
+
+Both saturate the box, and we burn **5.6x the CPU-seconds per decoded token**.
+That is resource cost, NOT proof the extra seconds are useful work: the
+2026-08-06 CPU op-dispatch profile above already measured decode on this backend
+as **47.15% threadpool synchronisation** (`ThreadReady` + `PollForWork` +
+`Barrier`, ~58% on the secondary-thread view), and a spinning worker holds a
+core without advancing a token. So "our threadpool leaves cores IDLE" is
+**REFUTED**; "our threadpool burns them at the barrier" is the live lever, and
+it is the one already named.
+
+**Contamination, named.** The second repetition of this two-length diff is
+DISCARDED for a named cause, not for being inconvenient: at 14:26 another
+session started a CUDA build on the same host (`ptxas`/`cicc`/`cc1plus` at 100%,
+load 15-26), and *both* engines degraded together in that window (ours out=36
+201.52 s vs 42.72 s; llama.cpp tg36 1.891 vs 5.069 tok/s). Compilation
+legitimately does not take the box lock. The table above uses rep 1 only, which
+ran before that build started. A clean r=3 re-run of this diff is OWED.
+
+### The shape: llama.cpp is flat in context length and we are not
+
+llama.cpp prefill 12.94 -> 13.13 tok/s going from 128 to 512 input tokens
+(+1.5%); ours 11.63 -> 2.23 (**-81%**). llama.cpp decode 5.08 -> 5.00 (flat);
+ours 1.18 -> 0.29 (**-75%** for 4x the context). At 128 tokens we are within
+10% of it on prefill and a dead tie at 10 threads. The gap is created by
+sequence length, and it points at the **CPU attention path**, not the GEMMs.
+That lever is NOT new and is not claimed as new: the 2026-08-06 profile above
+already measured CPU paged attention at **~39% of prefill**, ~21 points of it
+inside a per-element dtype switch in the attention dot loop
+(`src/vt/cpu/cpu_paged_attn.cpp:29` called from `:143`), the same defect class E1
+hoisted out of the elementwise GEMM. What this row adds is the price: a peer
+that is FLAT over the same 4x context change while we lose 81% / 75%, which is
+the signature in [[no-fa2-arch-means-fallback-attn-is-the-wall]]. The owed next
+step is a decode-window profile of our CPU attention kernel against `ggml`'s on
+this workload. **No ceiling is claimed.**
+
+A second, independent lever sits in the same table: at 20 threads our decode
+spread is 56.8% and llama.cpp's is 7.9%; at 10 threads ours is 0.8%. GB10's 20
+cores are 10 big + 10 little, and our threadpool barrier is unstable across that
+split in a way llama.cpp's is not. Both engines are also faster at decode with
+t=10 than t=20 (ours 1.31 vs 1.18, llama.cpp 6.41 vs 5.08) and slower at
+prefill, which is the ordinary bandwidth-vs-compute split.
+
+### Memory is an open gap with a known cause
+
+30.29 GiB resident against llama.cpp's 15.74 GiB for the same 15.59 GiB file,
+exactly as spec §10.2 predicts: we dequantize `qkv_proj`, `lm_head` and
+`embed_tokens` (the merged-operand and transpose constraints) while llama.cpp
+keeps every operand in blocks. Constant across every leg (spread 0.0%).
+
+### bf16 arm — PARTIAL, and one new correctness fact
+
+Probed, not measured to r=3. `vllm-cli` on the bf16 safetensors **generated at
+full depth for the first time** (spec §13.4 recorded that it never had):
+`"The capital of France is"` -> `" Paris. It is"` at 4 tokens, peak RSS
+59,819,588 kB, wall 9:14 of which almost all is the 59.55 GB CIFS read at 16%
+CPU. HF `MuseGlimmerForConditionalGeneration` bf16 on CPU loads in 90.94 s and
+then costs **660.47 s for its FIRST 8-token forward and 5.74 s for the
+subsequent generate** — that first figure is one-time lazy materialization /
+page-in, not compute, and any HF leg must warm up before it is timed. VmHWM
+55,914,364 kB. A quant-matched bf16 r=3 series at in 128 / out 16 was written
+and queued and is **OWED**: it was stopped rather than run dirty when the
+foreign CUDA build appeared.
+
+**New correctness signal.** Our bf16 arm's first three tokens `" Paris. It is"`
+agree with **llama.cpp's** GGUF continuation (`"Paris. It is the most populous
+city in France and"`) rather than with our own GGUF arm's (`" Paris. The capital
+of France is Paris. The capital of"`). That points spec §13.4's unresolved
+divergence at the GGUF path rather than at the model wiring. It is a hint, not a
+finding: three tokens are not a gate, and a GGUF-vs-bf16 token diff at depth is
+owed.
+
+### Blocked cells, each with its blocker
+
+| Cell | Blocker |
+|---|---|
+| vLLM, any arm | The pin has no `muse_glimmer`. **OPEN GAP by construction**; not waived, not substituted |
+| ours bf16 on GPU vs HF bf16 on GPU | **Disk.** A CUDA build tree is ~169 GiB per `.agents/benchmarking.md`; dgx had ~122 GiB free and a full disk voids a binding silently, so no CUDA build was started |
+| bf16 CPU r=3 series | **Host availability.** Written, syntax-checked, queued on `$HOME/gpu.lock` and stopped twice rather than run contended: first behind a foreign CUDA build (14:26), then behind another session's `vllm-server` serving gate holding the lock from 15:00. The lock was respected both times; nothing was stolen. OWED. Binaries and scripts are staged on dgx (`~/dgx-final.sh`, `~/muse-bench/hf_bf16_bench.py`, `~/muse-bench/{llama.cpp/build/bin,vllm.cpp/build-cpu/examples}`, 546 MB total); the 16 GB local GGUF copy was deleted to return disk (122 GB free), and the recipe above recreates it in ~2.5 min from the NAS |
+| clean r=3 two-length CPU diff | Same cause and same queue. The r=1 numbers above are clean; only the repetitions are owed |
+| mmproj / perception encoder | Still refused by name (spec §10.4): `v.patch_embd.weight` lacks the `patch_temporal` axis. No multimodal speed axis exists |
+| DFlash draft acceptance A/B | Structurally reachable (spec §10.5), never exercised |
+
+### What these numbers do and do not establish
+
+They establish that on one idle 20-core aarch64 host, reading one byte-identical
+k-quant file, vllm.cpp is at **parity on short-context prefill** (0.997x at 10
+threads, 0.898x at 20), **~4-5x behind on decode**, **~5.9x behind on 512-token
+prefill**, and uses **1.92x the resident memory** — with the decode gap
+attributed to CPU work per token rather than idle cores, and the context-length
+gap pointing at the attention path.
+
+They establish **nothing about vLLM**, which is the only bar that counts and
+remains unavailable; nothing about GPU behaviour, which was not built; nothing
+about multimodal; and nothing about token-exactness, which spec §13.4 leaves
+open. **No ceiling is claimed or implied anywhere in this entry.**
+
+## BENCHMARKS.md compaction — the superseded 2026-08-08 `BENCH-VK-LLAMA`
+scoreboard row (moved 2026-08-11)
+
+`docs/BENCHMARKS.md` is a KEYED table: one row per subject, updated in place.
+The key `Vulkan vs llama.cpp Vulkan (BENCH-VK-LLAMA)` carried TWO rows. The
+0.6B one below was written by `468a3876` (2026-08-08); `93852c28` (2026-08-09)
+then added a SECOND row for the same key with the 27B result instead of
+updating this one in place, which is what made it superseded. The 27B row
+stays on the scoreboard, so the key keeps its handle there and nothing is
+lost — only the stale generation moves here. Moved VERBATIM, byte-for-byte,
+to pay for the rows PR #282 and PR #267 owe that page; no cap was raised and
+no evidence was deleted.
+
+Superseded by, and still on the page:
+
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
+
+The moved row:
+
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **Both arms measured, same weights.** 0.6B @128-in/32-out: llama.cpp Vulkan **11,956** pp / **174.8** tg; ours **575** pp / **66.6** tg | Decode **8.59 -> 91.7 t/s** (**10.7x**), 6/6 exact; **2.62x** off llama.cpp at matched shape. CUDA arm unblocked. 27B: fallbacks **11->5**. paged_attn batching REFUTED ([plan](../.agents/specs/bench-27b-five-way.md)) |

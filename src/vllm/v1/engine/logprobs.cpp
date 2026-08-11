@@ -32,7 +32,10 @@ LogprobsProcessor LogprobsProcessor::FromNewRequest(
     const tok::Tokenizer* tokenizer, const SamplingParams& sampling_params) {
   LogprobsProcessor lp;
   lp.tokenizer_ = tokenizer;
-  lp.num_logprobs_ = sampling_params.logprobs;             // sampling_params.num_logprobs
+  // logprobs.py:52 reads the `num_logprobs` PROPERTY, not the raw `logprobs`
+  // field: for a generative-scoring request it is len(logprob_token_ids), which
+  // is the row width the sampler hands back (sampling_params.py:724-729).
+  lp.num_logprobs_ = sampling_params.num_logprobs();
   lp.num_prompt_logprobs_ = sampling_params.prompt_logprobs;
   // cumulative_logprob = None if num_logprobs is None else 0.0 (:54).
   if (lp.num_logprobs_.has_value()) {
@@ -52,7 +55,11 @@ void LogprobsProcessor::UpdateSampleLogprobs(const LogprobsTensors& lists) {
   // _update_sample_logprobs (:69-119). Outer loop over positions (>1 only under
   // spec decode); each row is [sampled | top-k], sampled logprob first.
   const int width = lists.num_tokens_per_position;
-  if (width <= 0) return;  // the num_logprobs==-1 raw-vocab shape is not wired
+  // A plain zero-width guard: nothing to append. It never screened the
+  // num_logprobs==-1 raw-vocab shape (that one sets width == vocab), and no
+  // longer needs to — since #231 the input batch widens `-1` at admission, so
+  // that shape is unreachable from a live request.
+  if (width <= 0) return;
   for (int pos = 0; pos < lists.num_positions; ++pos) {
     const std::size_t base = static_cast<std::size_t>(pos) *
                              static_cast<std::size_t>(width);

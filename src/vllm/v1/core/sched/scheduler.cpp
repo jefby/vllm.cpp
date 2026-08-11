@@ -3,10 +3,16 @@
 #include "vllm/v1/core/sched/scheduler.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -23,6 +29,179 @@
 namespace vllm::v1 {
 
 namespace {
+
+// Prefill progress (chunked prefill). ON if VT_SERVER_PREFILL_PROGRESS=1 or
+// VT_SERVER_VERBOSE=1. Rate-limited ~2.5 Hz per request.
+//
+// The progress line is emitted in two halves (external PR #227). `begin` is
+// written at SCHEDULE time, because that is the only moment that proves the
+// request left the waiting queue at all. `running` / `done` are written AFTER
+// execute_model, because schedule() advances num_computed_tokens BEFORE the GPU
+// has run: timing them at schedule time reported the token rate of an empty
+// step and made a slow prefill look instantaneous.
+bool PrefillProgressEnabled() {
+  static const bool on = [] {
+    const char* p = std::getenv("VT_SERVER_PREFILL_PROGRESS");
+    if (p && p[0] == '0') return false;
+    if (p && p[0] == '1') return true;
+    const char* v = std::getenv("VT_SERVER_VERBOSE");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+
+using PrefillClock = std::chrono::steady_clock;
+
+struct PrefillState {
+  PrefillClock::time_point first{};  // first scheduled chunk (t0 for the rate)
+  PrefillClock::time_point last{};   // last emitted `running` line
+  int first_computed = -1;
+  int last_computed = -1;
+  bool logged_begin = false;
+  bool logged_done = false;
+};
+
+std::mutex& PrefillMu() {
+  static std::mutex mu;
+  return mu;
+}
+
+std::unordered_map<std::string, PrefillState>& PrefillStates() {
+  static std::unordered_map<std::string, PrefillState> states;
+  return states;
+}
+
+// Bound the per-request state map. It is keyed by request id, so without this it
+// grows for the process lifetime — one entry per request ever served.
+// Called with PrefillMu() held.
+//
+// Two eviction classes, because `logged_done` alone does not bound it: a request
+// ABORTED or preempted mid-prefill never reaches done and would pin its entry
+// forever. Anything no longer known to the scheduler is gone for good.
+void PrefillEvictLocked(
+    const std::map<std::string, std::unique_ptr<Request>>& live_requests) {
+  if (PrefillStates().size() <= 64) return;
+  auto& states = PrefillStates();
+  for (auto it = states.begin(); it != states.end();) {
+    if (it->second.logged_done || live_requests.find(it->first) ==
+                                      live_requests.end()) {
+      it = states.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// Emitted when tokens are SCHEDULED (before the GPU runs), so `first` anchors
+// the elapsed-time base at the moment work actually started.
+void PrefillMarkScheduled(const Request& request, int scheduled_this_step) {
+  if (!PrefillProgressEnabled() || scheduled_this_step <= 0) return;
+  const int prompt = request.num_prompt_tokens > 0 ? request.num_prompt_tokens
+                                                   : request.NumTokens();
+  if (prompt <= 0) return;
+  const int computed = request.num_computed_tokens;
+  if (computed >= prompt) return;  // already past prefill
+
+  std::lock_guard<std::mutex> lock(PrefillMu());
+  PrefillState& st = PrefillStates()[request.request_id];
+  const auto now = PrefillClock::now();
+  if (st.first.time_since_epoch().count() == 0) {
+    st.first = now;
+    st.first_computed = computed;
+  }
+  if (st.logged_begin) return;
+  st.logged_begin = true;
+  st.last = now;
+  st.last_computed = computed;
+  const int remaining = prompt - computed;
+  std::cerr << "INFO prefill id=" << request.request_id << " status=begin"
+            << " prompt_tokens=" << prompt << " already_computed=" << computed
+            << " remaining=" << remaining
+            << " scheduling=" << scheduled_this_step
+            << (remaining > scheduled_this_step ? " chunked=1" : " chunked=0")
+            << "\n";
+  std::cerr.flush();
+}
+
+// Called AFTER execute_model, so elapsed_s covers real GPU prefill time.
+void PrefillLogAfterExecute(
+    const SchedulerOutput& out,
+    const std::map<std::string, std::unique_ptr<Request>>& reqs) {
+  if (!PrefillProgressEnabled()) return;
+  if (out.num_scheduled_tokens.empty()) return;
+  const auto now = PrefillClock::now();
+  std::lock_guard<std::mutex> lock(PrefillMu());
+  for (const auto& [req_id, scheduled] : out.num_scheduled_tokens) {
+    if (scheduled <= 0) continue;
+    const auto rit = reqs.find(req_id);
+    if (rit == reqs.end() || !rit->second) continue;
+    const Request& request = *rit->second;
+    const int prompt = request.num_prompt_tokens > 0 ? request.num_prompt_tokens
+                                                     : request.NumTokens();
+    if (prompt <= 0) continue;
+    const int computed = request.num_computed_tokens;
+    // Decode phase: computed exceeds prompt once generation tokens append.
+    if (computed > prompt && !request.is_prefill_chunk) continue;
+
+    PrefillState& st = PrefillStates()[req_id];
+    if (st.first.time_since_epoch().count() == 0) {
+      st.first = now;
+      st.first_computed = std::max(0, computed - scheduled);
+    }
+    const int shown = std::min(computed, prompt);
+    const double elapsed_s = std::chrono::duration<double>(now - st.first).count();
+    const int made = std::max(0, shown - std::max(0, st.first_computed));
+    const double avg_tok_s =
+        elapsed_s > 1e-3 ? static_cast<double>(std::max(made, 1)) / elapsed_s
+                         : static_cast<double>(scheduled);
+
+    const bool done = !request.is_prefill_chunk && computed >= prompt;
+    if (done) {
+      if (!st.logged_done) {
+        const double el = std::max(elapsed_s, 1e-4);
+        const double tok_s = static_cast<double>(std::max(made, scheduled)) / el;
+        std::cerr << "INFO prefill id=" << req_id << " computed=" << shown << "/"
+                  << prompt << " (100%) status=done elapsed_s=" << el
+                  << " prefill_tok_s=" << tok_s << " avg_tok_s=" << avg_tok_s
+                  << " scheduled_last=" << scheduled << "\n";
+        std::cerr.flush();
+        st.logged_done = true;
+      }
+      continue;
+    }
+
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last)
+            .count();
+    if (st.last_computed >= 0 && ms < 400 && (computed - st.last_computed) < 256) {
+      continue;
+    }
+    const double window_s = st.last.time_since_epoch().count() == 0
+                                ? elapsed_s
+                                : std::chrono::duration<double>(now - st.last).count();
+    const int delta =
+        st.last_computed < 0 ? scheduled : std::max(0, computed - st.last_computed);
+    const double inst_tok_s = window_s > 1e-4
+                                  ? static_cast<double>(delta) / window_s
+                                  : static_cast<double>(scheduled);
+    st.last = now;
+    st.last_computed = computed;
+    const int remain = prompt - shown;
+    const double pct =
+        100.0 * static_cast<double>(shown) / static_cast<double>(prompt);
+    std::cerr << "INFO prefill id=" << req_id << " computed=" << shown << "/"
+              << prompt << " (" << static_cast<int>(pct + 0.5)
+              << "%) status=running remaining=" << remain
+              << " elapsed_s=" << elapsed_s << " inst_tok_s=" << inst_tok_s
+              << " avg_tok_s=" << avg_tok_s << " scheduled=" << scheduled;
+    if (avg_tok_s > 1.0 && remain > 0) {
+      std::cerr << " eta_s=" << (static_cast<double>(remain) / avg_tok_s);
+    }
+    std::cerr << "\n";
+    std::cerr.flush();
+  }
+  PrefillEvictLocked(reqs);
+}
 
 // Map the config-level policy onto the request-queue policy.
 //   kLPM (ENG-SGLANG-BEHAVIOR-FLAG) rides on the FCFS deque: the queue mechanics
@@ -388,6 +567,9 @@ SchedulerOutput Scheduler::schedule() {
     const std::string request_id = request->request_id;
     req_to_new_blocks[request_id] = *new_blocks;
     num_scheduled_tokens[request_id] = num_new_tokens;
+    // Progress `begin`, while num_computed_tokens is still the PRE-step count
+    // (update_after_schedule advances it below). Inert during decode.
+    PrefillMarkScheduled(*request, num_new_tokens);
     token_budget -= num_new_tokens;
     req_index += 1;
 
@@ -402,6 +584,16 @@ SchedulerOutput Scheduler::schedule() {
       const int num_scheduled_spec_tokens =
           num_new_tokens + request->num_computed_tokens - request->NumTokens() -
           request->num_output_placeholders;
+      static const bool spec_sched_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+      if (spec_sched_trace) {
+        std::fprintf(stderr,
+                     "[spec-sched] req=%s have=%zu num_new=%d computed=%d "
+                     "NumTokens=%d placeholders=%d -> sched=%d\n",
+                     request_id.c_str(), request->spec_token_ids.size(),
+                     num_new_tokens, request->num_computed_tokens,
+                     request->NumTokens(), request->num_output_placeholders,
+                     num_scheduled_spec_tokens);
+      }
       if (num_scheduled_spec_tokens > 0) {
         std::vector<int32_t> spec_ids = request->spec_token_ids;
         // Chunked-prefill / budget clamping may fit only a prefix of the drafts.
@@ -531,6 +723,10 @@ SchedulerOutput Scheduler::schedule() {
       token_budget -= num_new_tokens;
       request->status = RequestStatus::kRunning;
       request->num_computed_tokens = num_computed_tokens;
+      // Progress `begin` for a freshly admitted request. AFTER the assignment
+      // above so `already_computed` reports the prefix-cache hit, and still
+      // before update_after_schedule adds this step's tokens.
+      PrefillMarkScheduled(*request, num_new_tokens);
     }
     // KV-OFFLOAD W4: re-queue the connector-deferred requests to the FRONT of
     // waiting (reverse so FCFS order is preserved) to be re-asked next step.
@@ -775,7 +971,24 @@ EngineCoreOutputs Scheduler::update_from_output(
       new_token_ids = std::move(result.first);
       stopped = result.second;
     }
-    // DEFERRED: pooling stop.
+    // Pooling stop (ARCH-ONE-SURFACE ROW 6; scheduler.py:1718-1721 `elif
+    // request.pooling_params and pooler_output is not None`): a POOLING request
+    // finishes as soon as the runner produced its pooled output. The runner
+    // reports nullopt for a row still consuming prefill chunks (the
+    // is_valid=false rows, pooling_runner.py:40-41), so such a request keeps
+    // running. pooler_output is EMPTY on every generation step -> the text path
+    // above is byte-identical.
+    std::optional<std::vector<float>> pooler_output;
+    if (!model_runner_output.pooler_output.empty() &&
+        req_index < static_cast<int>(model_runner_output.pooler_output.size())) {
+      pooler_output =
+          model_runner_output.pooler_output[static_cast<std::size_t>(req_index)];
+    }
+    if (new_token_ids.empty() && request->pooling_params.has_value() &&
+        pooler_output.has_value()) {
+      request->status = RequestStatus::kFinishedStopped;
+      stopped = true;
+    }
 
     // scheduler.py:1636-1651: advance the structured-output FSM by the sampled
     // tokens. Only when the request produced tokens and the manager says the FSM
@@ -815,9 +1028,12 @@ EngineCoreOutputs Scheduler::update_from_output(
 
     // Extract sample logprobs if needed (scheduler.py:1815-1821). Only when the
     // request asked for logprobs and the runner produced them this step; slice
-    // this request's rows out of the batch-wide LogprobsLists.
+    // this request's rows out of the batch-wide LogprobsLists. The gate is
+    // upstream's `num_logprobs` PROPERTY (:1818), not the raw `logprobs` field,
+    // so a generative-scoring request — which sets logprob_token_ids and leaves
+    // `logprobs` unset — is sliced too.
     std::optional<LogprobsTensors> new_logprobs;
-    if (request->sampling_params.logprobs.has_value() &&
+    if (request->sampling_params.num_logprobs().has_value() &&
         model_runner_output.logprobs.has_value() &&
         model_runner_output.logprobs->num_positions > 0) {
       new_logprobs = model_runner_output.logprobs->slice_request(
@@ -838,11 +1054,14 @@ EngineCoreOutputs Scheduler::update_from_output(
     // (upstream's `if new_token_ids or ... or stopped`). A partial-prefill
     // request that produced neither is skipped: "EngineCore returns no partial
     // prefill outputs".
-    if (!new_token_ids.empty() || stopped) {
+    if (!new_token_ids.empty() || pooler_output.has_value() || stopped) {
       EngineCoreOutput out;
       out.request_id = req_id;
       out.new_token_ids = new_token_ids;
       out.finish_reason = finish_reason;
+      // Pooled data rides the output to the frontend (scheduler.py:1837
+      // `pooling_output=pooler_output`); nullopt on every generation output.
+      out.pooling_output = std::move(pooler_output);
       out.new_logprobs = std::move(new_logprobs);
       out.new_prompt_logprobs_tensors = std::move(new_prompt_logprobs_tensors);
       // stop_reason is int|str|None upstream; our EngineCoreOutput carries an
@@ -964,15 +1183,32 @@ void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
   reset_preempted_req_ids = {};
 }
 
+void Scheduler::LogPrefillAfterExecute(const SchedulerOutput& scheduler_output) {
+  PrefillLogAfterExecute(scheduler_output, requests);
+}
+
 void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
   // scheduler.py:1937-1957. Install the drafter's freshly-proposed spec tokens
   // onto their requests for the NEXT verify step.
   const std::size_t n =
       std::min(draft_token_ids.req_ids.size(),
                draft_token_ids.draft_token_ids.size());
+  static const bool spec_entry_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+  if (spec_entry_trace) {
+    std::fprintf(stderr, "[spec-update] called n=%zu\n", n);
+  }
   for (std::size_t i = 0; i < n; ++i) {
     const std::string& req_id = draft_token_ids.req_ids[i];
     auto it = requests.find(req_id);
+    if (spec_entry_trace) {
+      std::fprintf(stderr,
+                   "[spec-update] req=%s found=%d finished=%d prefill_chunk=%d "
+                   "drafts=%zu\n",
+                   req_id.c_str(), it != requests.end() ? 1 : 0,
+                   (it != requests.end() && it->second->IsFinished()) ? 1 : 0,
+                   (it != requests.end() && it->second->is_prefill_chunk) ? 1 : 0,
+                   draft_token_ids.draft_token_ids[i].size());
+    }
     if (it == requests.end() || it->second->IsFinished()) {
       // The request may have been finished. Skip.
       continue;
@@ -994,6 +1230,12 @@ void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
     // it so a non-structured request is unaffected. When wired, this drops draft
     // tokens that do not conform to the schema (upstream scheduler.py:1953-1956).
     request->spec_token_ids = draft_token_ids.draft_token_ids[i];
+    static const bool spec_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+    if (spec_trace) {
+      std::fprintf(stderr, "[spec-install] req=%s installed=%zu lookahead=%d\n",
+                   req_id.c_str(), request->spec_token_ids.size(),
+                   num_lookahead_tokens_);
+    }
   }
 }
 

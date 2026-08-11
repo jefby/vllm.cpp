@@ -3,11 +3,17 @@
 // dependency deviation.
 #include "vllm/entrypoints/openai/api_server.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <ctime>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,8 +22,10 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/v1/engine/async_llm.h"
+#include "vllm/v1/engine/input_processor.h"  // InputValidationError -> HTTP 400
 #include "vllm/v1/metrics/loggers.h"
 
 namespace vllm::entrypoints::openai {
@@ -105,16 +113,47 @@ ApiServer::ApiServer(OpenAIServingCompletion& completion,
                      OpenAIServingChat& chat, OpenAIServingModels& models,
                      std::string version, size_t max_concurrent_streams,
                      HttpWorkerPoolMode worker_pool_mode)
-    : completion_(completion),
-      chat_(chat),
+    : completion_(&completion),
+      chat_(&chat),
       models_(models),
       version_(std::move(version)),
       impl_(std::make_unique<Impl>(max_concurrent_streams, worker_pool_mode)) {}
 
-ApiServer::~ApiServer() = default;
+// Serving-less construction (transcription-only servers, ARCH-ONE-SURFACE
+// ROW 1): no AsyncLLM exists, so the generate handlers stay null and their
+// routes are not registered — vLLM's task-conditional route registration
+// (api_server.py:255-265) expressed at construction.
+ApiServer::ApiServer(OpenAIServingModels& models, std::string version,
+                     size_t max_concurrent_streams,
+                     HttpWorkerPoolMode worker_pool_mode)
+    : models_(models),
+      version_(std::move(version)),
+      impl_(std::make_unique<Impl>(max_concurrent_streams, worker_pool_mode)) {}
+
+ApiServer::~ApiServer() {
+  // Drain the async /v1/videos workers before the job store they write into is
+  // destroyed. Threads are joined, never detached, precisely so this ordering is
+  // guaranteed rather than hoped for.
+  std::vector<std::thread> workers;
+  {
+    std::lock_guard<std::mutex> lock(video_workers_mutex_);
+    workers.swap(video_workers_);
+  }
+  for (auto& worker : workers) {
+    if (worker.joinable()) worker.join();
+  }
+}
 
 ApiServer::DispatchResult ApiServer::handle_completions(
     const std::string& request_body) {
+  if (completion_ == nullptr) {
+    // vLLM's api_router `if handler is None: raise NotImplementedError` mirror
+    // for a serving-less (transcription-only) server; the socket layer never
+    // registers the route in that mode, so this answers direct dispatch only.
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Completions API "
+                     "(transcription-only server)");
+  }
   // completion/api_router.py:46 (create_completion): parse → check_model →
   // handler → JSON (non-stream) or text/event-stream (stream).
   nlohmann::json body;
@@ -141,8 +180,15 @@ ApiServer::DispatchResult ApiServer::handle_completions(
   try {
     std::unique_lock<std::mutex> legacy_lock(impl_->legacy_engine_mutex,
                                              std::defer_lock);
-    if (!completion_.uses_async_engine()) legacy_lock.lock();
-    result = completion_.create_completion(request);
+    if (!completion_->uses_async_engine()) legacy_lock.lock();
+    result = completion_->create_completion(request);
+  } catch (const vllm::v1::InputValidationError& e) {
+    // The request itself is unservable (today: a prompt at or past
+    // max_model_len). Upstream raises ValueError from _validate_prompt_len and
+    // create_error_response maps ValueError to BadRequestError / 400
+    // (serve/utils/error_response.py:62-65). Caught AHEAD of the generic arm
+    // below, which would otherwise report a client mistake as a server fault.
+    return MakeError(400, "BadRequestError", e.what());
   } catch (const std::exception& e) {
     // DISCRIMINATOR: attribute a 500 to its endpoint + model + raw cause so a
     // benchmark driver that only sees the generic HTTP body can still recover
@@ -168,6 +214,14 @@ ApiServer::DispatchResult ApiServer::handle_completions(
 
 ApiServer::DispatchResult ApiServer::handle_chat_completions(
     const std::string& request_body) {
+  if (chat_ == nullptr) {
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Chat Completions API "
+                     "(transcription-only server)");
+  }
+  {
+    LogHttpIngress("POST", "/v1/chat/completions", request_body.size());
+  }
   // chat_completion/api_router.py:53 (create_chat_completion).
   nlohmann::json body;
   try {
@@ -193,11 +247,16 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
   try {
     std::unique_lock<std::mutex> legacy_lock(impl_->legacy_engine_mutex,
                                              std::defer_lock);
-    if (!chat_.uses_async_engine()) legacy_lock.lock();
-    result = chat_.create_chat_completion(request);
+    if (!chat_->uses_async_engine()) legacy_lock.lock();
+    result = chat_->create_chat_completion(request);
+  } catch (const vllm::v1::InputValidationError& e) {
+    // Same mapping as /v1/completions above (error_response.py:62-65).
+    LogRequestError("", "/v1/chat/completions", e.what());
+    return MakeError(400, "BadRequestError", e.what());
   } catch (const std::exception& e) {
     std::cerr << "api-server: 500 endpoint=/v1/chat/completions model="
               << request.model.value_or("") << " what=" << e.what() << "\n";
+    LogRequestError("", "/v1/chat/completions", e.what());
     return MakeError(500, "InternalServerError", e.what());
   }
 
@@ -247,6 +306,318 @@ ApiServer::DispatchResult ApiServer::handle_ping() const {
   // sagemaker/api_router.py:47-50 — GET/POST /ping is a liveness probe that
   // returns the same empty 200 as /health.
   return handle_health();
+}
+
+namespace {
+
+ApiServer::DispatchResult VideoJsonOk(std::string body) {
+  ApiServer::DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body = std::move(body);
+  return out;
+}
+
+}  // namespace
+
+std::string ApiServer::video_model_warning(
+    const ::vllm::openai::VideoRequest& request) const {
+  // OpenAI clients send the SORA model name ("sora-2-pro"); this server generates
+  // with whatever video model it was started with, whose name they cannot know.
+  // Refusing would defeat the compatibility, and ignoring would hide a real
+  // mismatch, so the request is honoured and the divergence is STATED on the job.
+  if (request.model.empty() || models_.is_base_model(request.model)) return {};
+  return "requested model '" + request.model +
+         "' is not a served model ('" + models_.model_name() +
+         "'); generated with the video model this server was started with";
+}
+
+ApiServer::DispatchResult ApiServer::handle_audio_transcriptions(
+    const std::string& file_bytes, const std::string& response_format) const {
+  // Mirror of vLLM speech_to_text/transcription: api_router.py:31
+  // `create_transcriptions` reads the multipart upload
+  // (read_upload_with_limit) and hands the bytes to
+  // OpenAIServingTranscription.create_transcription (serving.py:50), which
+  // answers TranscriptionResponse {"text": ...} for response_format json and
+  // the raw text otherwise. The transcription itself runs through the ONE
+  // library seam (ParakeetTranscriber) — the same code path vllm_transcribe
+  // drives, so HTTP and FFI cannot drift.
+  if (!transcriber_) {
+    // The api_router `if handler is None: raise NotImplementedError` mirror;
+    // the socket layer never registers the route without a transcriber.
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Transcriptions API");
+  }
+  if (file_bytes.empty()) {
+    return MakeError(400, "BadRequestError",
+                     "Expected a non-empty `file` upload (16-bit PCM mono "
+                     "RIFF/WAVE)");
+  }
+  const std::string fmt = response_format.empty() ? "json" : response_format;
+  if (fmt != "json" && fmt != "text") {
+    // verbose_json / srt / vtt are NAMED RESIDUALS of this fold (protocol.py
+    // AudioResponseFormat lists them; nothing here produces segment timing).
+    return MakeError(400, "BadRequestError",
+                     "response_format '" + fmt +
+                         "' is not supported (supported: json, text; "
+                         "verbose_json/srt/vtt are named residuals)");
+  }
+  try {
+    const ::vllm::multimodal::ParakeetTranscription result = transcriber_(
+        reinterpret_cast<const uint8_t*>(file_bytes.data()), file_bytes.size());
+    if (!result.has_text) {
+      return MakeError(500, "InternalServerError",
+                       "the checkpoint ships no tokenizer.json, so ids-only "
+                       "transcription has no OpenAI response shape");
+    }
+    DispatchResult r;
+    if (fmt == "text") {
+      r.content_type = "text/plain; charset=utf-8";
+      r.body = result.text;
+    } else {
+      r.body = nlohmann::json{{"text", result.text}}.dump();
+    }
+    return r;
+  } catch (const std::exception& e) {
+    // Undecodable audio (not RIFF/WAVE, not PCM16 mono, wrong sample rate) is
+    // a caller error; the pipeline names the cause.
+    return MakeError(400, "BadRequestError", e.what());
+  }
+}
+
+ApiServer::DispatchResult ApiServer::handle_embeddings(
+    const std::string& request_body) const {
+  // Mirror of vLLM pooling/embed/api_router.py:28 `create_embedding` over the
+  // EmbeddingCompletionRequest shape (embed/protocol.py:34: `model` + `input`
+  // as ONE string or an ARRAY of strings) and the EmbeddingResponse shape
+  // (embed/protocol.py:173-185). The embedding itself runs through the ONE
+  // engine path (LLMEngine::embed -> registry forward -> PoolingRunner) — the
+  // same code path vllm_embed drives, so HTTP and FFI cannot drift.
+  if (!embedder_) {
+    // The api_router `if handler is None` mirror (embed/api_router.py:22-25);
+    // the socket layer never registers the route without an embedder.
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Embeddings API");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                     std::string("invalid JSON body: ") + e.what());
+  }
+  if (!body.is_object()) {
+    return MakeError(400, "BadRequestError", "request body must be an object");
+  }
+  // model: honoured like every other serving handler — an unknown name is 404.
+  if (body.contains("model") && body["model"].is_string() &&
+      !models_.is_base_model(body["model"].get<std::string>())) {
+    return MakeError(404, "NotFoundError",
+                     "The model `" + body["model"].get<std::string>() +
+                         "` does not exist.");
+  }
+  // encoding_format: float (the default) only; base64 is a NAMED residual.
+  if (body.contains("encoding_format") && body["encoding_format"].is_string() &&
+      body["encoding_format"].get<std::string>() != "float") {
+    return MakeError(400, "BadRequestError",
+                     "encoding_format '" +
+                         body["encoding_format"].get<std::string>() +
+                         "' is not supported (supported: float; base64 is a "
+                         "named residual)");
+  }
+  if (body.contains("dimensions") && !body["dimensions"].is_null()) {
+    // Matryoshka truncation is a NAMED residual of this fold (the pooler op
+    // supports it; the request plumb does not yet).
+    return MakeError(400, "BadRequestError",
+                     "dimensions is not supported yet (named residual)");
+  }
+  // input: ONE string or an ARRAY of strings (embed/protocol.py:34
+  // EmbeddingCompletionRequest via CompletionRequestMixin). Token-array
+  // inputs are a NAMED residual.
+  std::vector<std::string> inputs;
+  if (!body.contains("input")) {
+    return MakeError(400, "BadRequestError", "input is required");
+  }
+  if (body["input"].is_string()) {
+    inputs.push_back(body["input"].get<std::string>());
+  } else if (body["input"].is_array()) {
+    for (const nlohmann::json& item : body["input"]) {
+      if (!item.is_string()) {
+        return MakeError(400, "BadRequestError",
+                         "input must be a string or an array of strings "
+                         "(token-array inputs are a named residual)");
+      }
+      inputs.push_back(item.get<std::string>());
+    }
+    if (inputs.empty()) {
+      return MakeError(400, "BadRequestError",
+                       "input must contain at least one string");
+    }
+  } else {
+    return MakeError(400, "BadRequestError",
+                     "input must be a string or an array of strings");
+  }
+
+  try {
+    const EmbeddingBatch batch = embedder_(inputs);
+    if (batch.embeddings.size() != inputs.size()) {
+      return MakeError(500, "InternalServerError",
+                       "embedder returned a mismatched batch");
+    }
+    nlohmann::json data = nlohmann::json::array();
+    for (size_t i = 0; i < batch.embeddings.size(); ++i) {
+      data.push_back(nlohmann::json{
+          {"index", static_cast<int64_t>(i)},
+          {"object", "embedding"},
+          {"embedding", batch.embeddings[i]},
+      });
+    }
+    // id: "embd-<counter>" (upstream f"embd-{random_uuid()}",
+    // embed/protocol.py:180 — the serving_completion.h counter stand-in).
+    static std::atomic<uint64_t> embd_counter{0};
+    DispatchResult r;
+    r.body = nlohmann::json{
+        {"id", "embd-" + std::to_string(embd_counter.fetch_add(1))},
+        {"object", "list"},
+        {"created", static_cast<int64_t>(std::time(nullptr))},
+        {"model", models_.model_name()},
+        {"data", std::move(data)},
+        {"usage",
+         nlohmann::json{{"prompt_tokens", batch.prompt_tokens},
+                        {"total_tokens", batch.prompt_tokens}}},
+    }.dump();
+    return r;
+  } catch (const std::exception& e) {
+    return MakeError(500, "InternalServerError", e.what());
+  }
+}
+
+ApiServer::DispatchResult ApiServer::handle_videos(
+    const std::string& request_body) {
+  // vLLM-Omni's ASYNC video endpoint: validate, enqueue, and return the job id
+  // immediately. Generation is minutes-long (a 50-step denoise over the packed
+  // video+audio sequence), so answering inline would hold an HTTP worker for the
+  // whole run -- which is exactly why upstream splits async from /sync.
+  if (!video_runner_) {
+    return MakeError(500, "InternalServerError", "No video runner configured.");
+  }
+  ::vllm::openai::VideoRequest request;
+  try {
+    request = ::vllm::openai::ParseVideoRequest(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError", e.what());
+  }
+
+  const std::string id =
+      video_jobs_.Create(request.model, video_model_warning(request));
+  std::thread worker([this, id, request]() {
+    try {
+      video_jobs_.MarkRunning(id);
+      video_jobs_.MarkSucceeded(id, video_runner_(request));
+    } catch (const std::exception& e) {
+      // A runner throw is a FAILED job, not a crashed server: the thread must
+      // never let an exception escape (std::terminate) and must always leave the
+      // job in a terminal state, or a poller would wait on "running" forever.
+      try {
+        video_jobs_.MarkFailed(id, e.what());
+      } catch (const std::exception&) {
+      }
+    } catch (...) {
+      try {
+        video_jobs_.MarkFailed(id, "unknown error");
+      } catch (const std::exception&) {
+      }
+    }
+  });
+  {
+    std::lock_guard<std::mutex> lock(video_workers_mutex_);
+    video_workers_.push_back(std::move(worker));
+  }
+
+  ::vllm::openai::VideoJob job;
+  video_jobs_.Get(id, &job);
+  return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
+}
+
+ApiServer::DispatchResult ApiServer::handle_videos_sync(
+    const std::string& request_body) {
+  // The SYNCHRONOUS twin: run to completion on the calling worker and answer with
+  // the terminal job record. Same runner, same failure mapping -- only the
+  // waiting differs.
+  if (!video_runner_) {
+    return MakeError(500, "InternalServerError", "No video runner configured.");
+  }
+  ::vllm::openai::VideoRequest request;
+  try {
+    request = ::vllm::openai::ParseVideoRequest(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError", e.what());
+  }
+
+  const std::string id =
+      video_jobs_.Create(request.model, video_model_warning(request));
+  try {
+    video_jobs_.MarkRunning(id);
+    video_jobs_.MarkSucceeded(id, video_runner_(request));
+  } catch (const std::exception& e) {
+    video_jobs_.MarkFailed(id, e.what());
+    return MakeError(500, "InternalServerError", e.what());
+  }
+  ::vllm::openai::VideoJob job;
+  video_jobs_.Get(id, &job);
+  return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
+}
+
+ApiServer::DispatchResult ApiServer::handle_video_status(
+    const std::string& job_id) const {
+  ::vllm::openai::VideoJob job;
+  if (!video_jobs_.Get(job_id, &job)) {
+    return MakeError(404, "NotFoundError", "Unknown video job: " + job_id);
+  }
+  return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
+}
+
+ApiServer::DispatchResult ApiServer::handle_video_content(
+    const std::string& job_id) const {
+  // OpenAI's GET /v1/videos/{video_id}/content. Without it a caller can start and
+  // poll a job but never FETCH the result over HTTP, which makes the endpoint
+  // unusable to anyone without a filesystem view of the server.
+  ::vllm::openai::VideoJob job;
+  if (!video_jobs_.Get(job_id, &job)) {
+    return MakeError(404, "NotFoundError", "Unknown video job: " + job_id);
+  }
+  if (job.status == ::vllm::openai::VideoJobStatus::kFailed) {
+    return MakeError(500, "InternalServerError",
+                     "Video job " + job_id + " failed: " + job.error);
+  }
+  if (job.status != ::vllm::openai::VideoJobStatus::kSucceeded) {
+    // A pending job must NEVER answer with bytes: a partially muxed file would
+    // reach the client as a valid-looking, truncated MP4.
+    return MakeError(409, "ConflictError",
+                     std::string("Video job ") + job_id + " is not finished (status: " +
+                         ::vllm::openai::VideoJobStatusName(job.status) +
+                         "); poll GET /v1/videos/" + job_id + " until it succeeds");
+  }
+
+  std::ifstream file(job.output_path, std::ios::binary);
+  if (!file) {
+    return MakeError(500, "InternalServerError",
+                     "Video job " + job_id + " succeeded but its output is not "
+                     "readable: " + job.output_path);
+  }
+  std::string bytes((std::istreambuf_iterator<char>(file)),
+                    std::istreambuf_iterator<char>());
+  if (!file.eof() && file.fail()) {
+    return MakeError(500, "InternalServerError",
+                     "Video job " + job_id + " output could not be read in full: " +
+                         job.output_path);
+  }
+
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "video/mp4";
+  out.body = std::move(bytes);
+  return out;
 }
 
 ApiServer::DispatchResult ApiServer::handle_metrics() const {
@@ -328,7 +699,12 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
     const bool render_generation_prompt =
         add_generation_prompt && !continue_final_message;
     try {
-      prompt = chat_.prompt_fn()(messages, render_generation_prompt, tools);
+      if (chat_ == nullptr) {
+        return MakeError(500, "InternalServerError",
+                         "tokenize: the chat form needs the chat template of a "
+                         "text-generation server (transcription-only server)");
+      }
+      prompt = chat_->prompt_fn()(messages, render_generation_prompt, tools);
     } catch (const std::exception& e) {
       return MakeError(400, "BadRequestError",
                        std::string("Chat template render failed: ") + e.what());
@@ -611,14 +987,22 @@ void ApiServer::register_routes() {
     }
   };
 
-  server.Post("/v1/completions",
-              [this, write](const httplib::Request& req, httplib::Response& res) {
-                write(handle_completions(req.body), res);
-              });
-  server.Post("/v1/chat/completions",
-              [this, write](const httplib::Request& req, httplib::Response& res) {
-                write(handle_chat_completions(req.body), res);
-              });
+  // TASK-CONDITIONAL (mirrors vLLM registering the generate routes only when
+  // "generate" is in supported_tasks, api_server.py:255-265): a serving-less
+  // (transcription-only) server has no completion/chat handlers, so the two
+  // generate routes are NOT registered and answer 404.
+  if (completion_ != nullptr) {
+    server.Post("/v1/completions",
+                [this, write](const httplib::Request& req, httplib::Response& res) {
+                  write(handle_completions(req.body), res);
+                });
+  }
+  if (chat_ != nullptr) {
+    server.Post("/v1/chat/completions",
+                [this, write](const httplib::Request& req, httplib::Response& res) {
+                  write(handle_chat_completions(req.body), res);
+                });
+  }
   server.Get("/v1/models",
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_models(), res);
@@ -648,6 +1032,69 @@ void ApiServer::register_routes() {
                write(handle_server_info(), res);
              });
 
+  if (embedder_) {
+    // Embeddings (ARCH-ONE-SURFACE ROW 6). Registered ONLY when an embedder is
+    // attached (task-conditional, the api_server.py:255-265 supported_tasks
+    // mirror), so a text server answers 404 at the route table — and an
+    // embedding server, having no completion_/chat_ handlers, answers 404 on
+    // the generate routes the same way.
+    server.Post("/v1/embeddings",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_embeddings(req.body), res);
+                });
+  }
+
+  if (transcriber_) {
+    // Parakeet ASR (ARCH-ONE-SURFACE ROW 1). Registered ONLY when a
+    // transcriber is attached, so a text server answers 404 exactly as before.
+    // The multipart shape mirrors vLLM's create_transcriptions
+    // (speech_to_text/transcription/api_router.py:31): the audio arrives as
+    // the `file` upload, `response_format` as an ordinary form field.
+    server.Post("/v1/audio/transcriptions",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  if (!req.form.has_file("file")) {
+                    write(MakeError(400, "BadRequestError",
+                                    "multipart/form-data with a `file` upload "
+                                    "is required"),
+                          res);
+                    return;
+                  }
+                  write(handle_audio_transcriptions(
+                            req.form.get_file("file").content,
+                            req.form.get_field("response_format")),
+                        res);
+                });
+  }
+
+  if (video_runner_) {
+    // MiniMax-H3. Registered ONLY when a runner is attached, so a server built
+    // without video support answers 404 exactly as before.
+    server.Post("/v1/videos",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_videos(req.body), res);
+                });
+    server.Post("/v1/videos/sync",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_videos_sync(req.body), res);
+                });
+    // Registered BEFORE the bare-id pattern so the intent is readable in one
+    // place; the two cannot collide in any case, since `[^/]+` stops at the '/'
+    // and httplib full-matches the path.
+    server.Get(R"(/v1/videos/([^/]+)/content)",
+               [this, write](const httplib::Request& req,
+                             httplib::Response& res) {
+                 write(handle_video_content(req.matches[1]), res);
+               });
+    server.Get(R"(/v1/videos/([^/]+))",
+               [this, write](const httplib::Request& req,
+                             httplib::Response& res) {
+                 write(handle_video_status(req.matches[1]), res);
+               });
+  }
   if (metrics_ != nullptr) {
     server.Get("/metrics",
                [this, write](const httplib::Request&, httplib::Response& res) {
@@ -759,10 +1206,15 @@ void ConfigureUtilityEndpoints(ApiServer& server,
         });
   }
 
-  // /metrics and /reset_prefix_cache are deliberately NOT wired here — the
-  // production AsyncLLM frontend exposes no live PrometheusStatLogger and no
-  // thread-safe prefix-cache reset RPC (see the header block comment +
-  // specs/{utility,admin}-endpoints.md). They stay 404, byte-identical to before.
+  // /metrics is not wired HERE because it is not a utility endpoint: the caller
+  // owns the PrometheusStatLogger's lifetime and attaches it to both frontends
+  // plus set_metrics_logger (server_main.cpp). Since #277 that logger IS live
+  // on the AsyncLLM serving path, so /metrics reports real counts.
+  //
+  // /reset_prefix_cache stays deliberately unwired: reset_prefix_cache() lives
+  // only on the scheduler's KVCacheManager, mutated exclusively on the
+  // EngineCore engine thread, with no thread-safe RPC to reach it (see the
+  // header block comment + specs/{utility,admin}-endpoints.md). It stays 404.
 }
 
 }  // namespace vllm::entrypoints::openai

@@ -101,6 +101,8 @@ enum class OpId : uint8_t {
   kGdnDecode,
   kGdnSpecDecode,
   kGdnPackedDecode,
+  kKdaGatedDeltaRule,
+  kKdaChunkPrefill,
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
@@ -331,6 +333,35 @@ enum class OpId : uint8_t {
   // BYTE-EXACT (sequential reductions) to the host Laguna forward. Additive: only
   // LagunaForwardResidentDecode dispatches it. Appended before kCount (no id shift).
   kLaguna,
+  // DENSE Marlin W4A16 GEMM (lift of vLLM's own dense marlin.cu marlin_gemm; see
+  // MarlinDenseGemm below). Byte-preserving replacement for the single-expert
+  // MoE-marlin route the dense E=1 NVFP4/MXFP4 projections use today — direct-A,
+  // tile-per-CTA, vLLM's own dense fp32-C_tmp reduce (no par regrouping ULP).
+  // CUDA-only (Blackwell sm_12xa; vendored dense marlin TUs, VT_MARLIN_NVFP4).
+  // Appended before kCount (no existing op's id shifts).
+  kMarlinDenseGemm,
+  // MiniMax-H3 DiT device-resident-forward glue table (brick H3-2b). Only the 3
+  // small ops the shared vt:: surface does NOT already cover: the two indexed
+  // AdaLN modulates and plain elementwise SiLU. Everything else in the DiT
+  // forward reuses tuned shared ops (kMatmulBT, kRmsNorm, kQkvSplit, kSiluAndMul,
+  // kAdd, kIndexSelect, kIndexCopy, kRopeFromCache, kDFlashBlockAttention), so
+  // this table stays deliberately tiny. Registered on BOTH kCPU and kCUDA
+  // (cpu_ops.cpp / cuda_minimax_h3.cu) so the device forward is exercised in CPU
+  // CI too; resolved via minimax_h3::MiniMaxH3Device(). Additive: only
+  // MiniMaxH3DitForwardDevice dispatches it. Appended before kCount (no id shift).
+  kMiniMaxH3,
+  // --- Conformer / FastConformer audio-encoder kernels (spike
+  // .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Three primitives
+  // the tree had no device op for, each mirroring a transformers 5.3.0
+  // `transformers/models/parakeet/modeling_parakeet.py` module and, where the
+  // structure is identical, vLLM's own native conformer
+  // (`vllm/model_executor/models/conformer_encoder.py`). See vt::Conv2d,
+  // vt::DepthwiseConv1d and vt::AttentionRelPos below for the exact contracts.
+  // Additive: nothing outside the audio-encoder path dispatches them. Appended
+  // before kCount so no existing op's id shifts.
+  kConv2d,
+  kDepthwiseConv1d,
+  kAttentionRelPos,
   kCount
 };
 
@@ -418,6 +449,13 @@ struct CausalConv1dArgs {
   // Upstream `activation` is "silu"/"swish" (→ silu) or None (→ identity);
   // Qwen GDN always uses silu (gdn-semantics.md §2).
   bool silu_activation = true;
+  // Optional exact upstream prefill work descriptor, both i32 [num_programs]
+  // on the queue device. Entry p owns sequence batch_ptr[p] and its
+  // token_chunk_offset_ptr[p]-th 8-token chunk. CUDA consumes these when the
+  // default CUDA path is selected; VT_CONV_EXACT_CHUNKS=0 restores the legacy mapping and
+  // CPU keeps its scalar reference.
+  const Tensor* batch_ptr = nullptr;
+  const Tensor* token_chunk_offset_ptr = nullptr;
 };
 
 struct L2NormArgs {
@@ -455,6 +493,56 @@ struct AttentionArgs {
   // Causal masking: key position j attends only when j <= query position i.
   // Always true for the M0.9 decoder path (bidirectional is a M1.6+ concern).
   bool causal = true;
+};
+
+// --- Conformer / FastConformer audio-encoder op args (spike
+// .agents/specs/parakeet-conformer-encoder.md P1/P2/P3). ------------------------
+
+// torch `nn.Conv2d` arguments. Mirrors the constructor keywords 1:1 so a reader
+// of `ParakeetEncoderSubsamplingConv2D.__init__`
+// (transformers 5.3.0 transformers/models/parakeet/modeling_parakeet.py:357-390)
+// can map every field by name. `groups == in_channels == out_channels` is the
+// DEPTHWISE form that module's inner layers use (:377-386); `groups == 1` with
+// a 1x1 kernel is its pointwise layer (:388).
+struct Conv2dArgs {
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t pad_h = 0;
+  int64_t pad_w = 0;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  int64_t groups = 1;
+};
+
+// torch `nn.Conv1d(C, C, K, stride, padding, groups=C)` arguments — the
+// NON-CAUSAL depthwise conv1d of `ParakeetEncoderConvolutionModule`
+// (modeling_parakeet.py:116, ctor :138-146; padding = (K-1)//2 at :136). Not to
+// be confused with CausalConv1dArgs, which drives the Mamba/GDN CAUSAL conv and
+// carries a persistent conv_state; this op is stateless and centre-padded.
+struct DepthwiseConv1dArgs {
+  int64_t stride = 1;
+  int64_t padding = 0;
+  int64_t dilation = 1;
+};
+
+// Transformer-XL relative-position self-attention args — the conformer
+// attention of `ParakeetEncoderAttention` (modeling_parakeet.py:259, forward
+// :302-347, `_rel_shift` :349-355) and of vLLM's own native
+// `RelPosMultiHeadAttention` (conformer_encoder.py:170, forward :188-217,
+// `_rel_shift` :179-186). See vt::AttentionRelPos for the full formula.
+struct AttentionRelPosArgs {
+  // Softmax scale. Upstream sets it to head_dim^-0.5 (ParakeetEncoderAttention
+  // .scaling :271; RelPosMultiHeadAttention.scale :174).
+  float scale = 0.0f;
+  // WHERE the scale is applied, the one arithmetic difference between the two
+  // upstreams. false (default) = HF's form: `matrix_bd *= scaling` (:322) and
+  // `attn_weights = q@k^T * scaling + matrix_bd` (eager_attention_forward :247),
+  // i.e. `s = ac*scale + bd*scale`. true = vLLM's native form:
+  // `attn_scores = (matrix_ac + matrix_bd); attn_scores.mul_(self.scale)`
+  // (conformer_encoder.py:212-213), i.e. `s = (ac + bd) * scale`. The two agree
+  // in exact arithmetic and differ in f32 rounding, so the flag is exposed
+  // rather than chosen, and each upstream gets its own byte-exact path.
+  bool scale_after_sum = false;
 };
 
 // Arguments for vt::DFlashBlockAttention — the DFlash draft's IN-BLOCK attention
@@ -738,6 +826,25 @@ struct MoeMarlinArgs {
 using MoeGroupedGemmNvfp4MarlinFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
              const Tensor&, const Tensor&, const Tensor&, const Tensor&, const MoeMarlinArgs&);
+// DENSE Marlin W4A16 GEMM (lift of vLLM's own dense marlin_gemm; see
+// MarlinDenseGemm below). Scalar params travel in MarlinDenseArgs. Unlike the
+// MoE path there is NO moe_align gather (sorted_token_ids/expert_ids/top_k):
+// `a` is a plain [size_m, size_k] contiguous activation (lda = size_k).
+struct MarlinDenseArgs {
+  int size_m = 0;  // number of tokens (rows of `a`)
+  int size_n = 0;  // output features
+  int size_k = 0;  // input features (contraction; multiple of 16)
+  // Block-scale format selector, identical semantics to MoeMarlinArgs: default =
+  // NVFP4 (fp8-e4m3 scales, group 16, per-tensor global scale). group_size 32 +
+  // mxfp4=true selects the MXFP4 path (E8M0 scales, group_blocks 2, NO global
+  // scale; the `global_scale` tensor is ignored). Mirrors vLLM's is_nvfp4 branch.
+  int group_size = 16;
+  bool mxfp4 = false;
+};
+using MarlinDenseGemmFn =
+    void (*)(Queue&, Tensor& /*c*/, const Tensor& /*a*/, const Tensor& /*b_q_weight*/,
+             const Tensor& /*b_scales*/, const Tensor& /*global_scale*/, Tensor& /*workspace*/,
+             const MarlinDenseArgs&);
 using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These replace host-side
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
@@ -815,6 +922,20 @@ using GdnPackedDecodeFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
              const Tensor&, const Tensor&, Tensor&, const Tensor&,
              const GdnArgs&);
+// Per-k-channel-decay gated-delta recurrence (KDA). Same shape as GdnPrefillFn;
+// the ONLY difference is g is [T,Hv,Dk] (per-channel) not [T,Hv] (per-head).
+using KdaGatedDeltaRuleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                     const Tensor&, const Tensor&, Tensor&, const Tensor&,
+                                     const GdnArgs&);
+// KDA CHUNK-PREFILL: the chunked (WY-representation) forward of the SAME
+// per-K-channel gated-delta linear attention as KdaGatedDeltaRule, but processing
+// the whole prompt in BT=64 chunks through the vendored FLA Triton-AOT cubins
+// (vLLM's actual prefill kernels) instead of the token-sequential recurrence.
+// Takes the RAW gate projection g_raw + a_log + dt_bias (the gate is fused
+// on-device by kda_gate_cumsum), NOT a pre-gated per-channel decay.
+using KdaChunkPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                   const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                   Tensor&, const Tensor&, const GdnArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -829,6 +950,17 @@ using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
+// Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3).
+using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv2dArgs&);
+using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                   const Tensor& /*weight*/, const Tensor* /*bias*/,
+                                   const DepthwiseConv1dArgs&);
+using AttentionRelPosFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*query*/,
+                                   const Tensor& /*key*/, const Tensor& /*value*/,
+                                   const Tensor& /*rel_key*/, const Tensor* /*bias_u*/,
+                                   const Tensor* /*bias_v*/, const Tensor* /*key_mask*/,
+                                   const AttentionRelPosArgs&);
 using DFlashBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                         const Tensor&, const DFlashBlockAttentionArgs&);
 using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
@@ -1356,6 +1488,24 @@ void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tenso
                                const Tensor& expert_ids, const Tensor& num_tokens_past_padded,
                                const Tensor& topk_weights, const MoeMarlinArgs& args);
 
+// MarlinDenseGemm (lift of vLLM's DENSE marlin_gemm, marlin.cu:545 -> marlin_mm
+// at :326 — the byte-preserving dense W4A16 kernel vLLM itself ships for a16
+// weight-only linears). One launch computes y = a @ dequant(b).T with vLLM's own
+// direct-A, tile-per-CTA layout and dense fp32-C_tmp reduce — NOT the MoE
+// single-expert route, whose par regrouping of the reduce costs one bf16 ULP.
+//   c            [size_m, size_n]         bf16 (out)
+//   a            [size_m, size_k]         bf16 (token hidden; contiguous, lda=size_k)
+//   b_q_weight   [size_k/16, size_n*8/pack] i32 — Marlin-interleaved fp4 (SAME
+//                repack as the MoE path: marlin_permute; a shim is added only if
+//                a layout divergence is proven — see dense_nvfp4_gemm.h)
+//   b_scales     [size_k/group_size, size_n] fp8 (processed marlin scales)
+//   global_scale [1]                      f32 (nvfp4 only; ignored for mxfp4)
+//   workspace    [>= sms]                 i32 (zeroed reduction locks)
+// CUDA-only (Blackwell sm_12xa; needs the vendored dense Marlin TUs, VT_MARLIN_NVFP4).
+void MarlinDenseGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
+                     const Tensor& b_scales, const Tensor& global_scale, Tensor& workspace,
+                     const MarlinDenseArgs& args);
+
 // out[R,I] = silu(gate[R,I]) * up[R,I]  (moe-semantics.md §4; the fused-MoE
 // element-wise activation between the grouped gate/up and down GEMMs). gate/up
 // f32 or bf16, out f32/bf16; silu/mul computed in f32, rounded on store. Unlike
@@ -1751,6 +1901,51 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
                 const Tensor& g, const Tensor& beta, Tensor& state,
                 const Tensor& query_start_loc, const GdnArgs& args);
 
+// Kimi Delta Attention (KDA) gated-delta recurrence — the PER-K-CHANNEL-DECAY
+// variant of GdnPrefill. Ported 1:1 from FLA's
+// fused_recurrent_gated_delta_rule_fwd_kernel with IS_KDA=True (third_party/
+// flash_linear_attention/ops/fused_recurrent.py:88-175 @ pin 555967922; the KDA
+// wrapper is ops/kda.py:109-146 fused_recurrent_kda). The plain-GDN kernel
+// (IS_KDA=False) applies a PER-HEAD scalar decay `b_h *= exp(b_g)`; KDA applies a
+// PER-K-CHANNEL decay `b_h *= exp(b_gk[None, :])` — so `g` here is [T,Hv,Dk]
+// (one log-decay per K channel of the value head's [Dv,Dk] state), broadcast
+// across the Dv rows. Everything else is byte-for-byte GdnPrefill's recurrence
+// (decay -> predict -> beta -> rank-1 update -> read-out, all in f32):
+//   S[:,k] *= exp(g[hv,k]);  v' = (v - S @ k) * beta[hv];  S += outer(v',k);
+//   out = S @ (q*scale)
+// The shared GDN kernels are UNTOUCHED (Qwen3.6 27B/35B GDN gate byte-identical);
+// KDA lands as this additive per-channel op. q_in/k [T,Hk,Dk] MUST be
+// l2-normalized by the caller (as GdnPrefill; upstream fuses it via
+// USE_QK_L2NORM_IN_KERNEL, exact per gdn-semantics.md §4). v/out [T,Hv,Dv],
+// g [T,Hv,Dk] f32 per-channel log-decay, beta [T,Hv] f32 (per-head sigmoid(b)),
+// state [N,Hv,Dv,Dk] f32 in/out (zeros for fresh sequences),
+// query_start_loc [N+1] i32. For KDA Hk==Hv; GQA broadcast supported for reuse.
+void KdaGatedDeltaRule(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                       const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                       const Tensor& query_start_loc, const GdnArgs& args);
+
+// KDA CHUNK-PREFILL — the chunked forward of KdaGatedDeltaRule, computing the same
+// per-K-channel gated-delta linear-attention output but in BT=64 chunks through the
+// vendored FLA Triton-AOT cubins (kda_gate_cumsum -> kkt(inter+intra) -> solve_tril
+// -> recompute_w_u -> chunk_delta_h -> chunk_gla_o), mirroring vLLM's prefill path
+// (kimi_gdn_linear_attn.py:141 chunk_kda_with_fused_gate; decode stays the recurrent
+// KdaGatedDeltaRule). Result differs from the recurrence only by chunked-vs-recurrent
+// REDUCTION ORDER (not bit-exact). Fires only at the pinned Kimi KDA geometry
+// (Hk==Hv==32, Dk==Dv==128) in a CUDA + VLLM_CPP_TRITON build; any other shape or a
+// CPU queue transparently falls back to the recurrence. Inputs:
+//   q_in/k [T,H,Dk] f32/bf16, L2-normalized by the caller (as KdaGatedDeltaRule);
+//   v [T,H,Dv] f32/bf16; out [T,H,Dv] f32/bf16;
+//   g_raw [T,H,Dk] f32 — the RAW gate projection (kda_gate_cumsum fuses the gate:
+//     -exp(a_log)*softplus(g_raw+dt_bias), chunk-cumsum, RCP_LN2 fold, on device);
+//   beta [T,H] f32 — the per-head gate (sigmoid(b), applied directly);
+//   a_log [H] f32; dt_bias [H*Dk] f32 (or empty => no bias);
+//   state [1,H,Dv,Dk] f32 (fresh zeros in, final written); query_start_loc [N+1] i32.
+// args.scale == Dk^-0.5 (baked in the cubins; guarded).
+void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                     const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                     const Tensor& query_start_loc, const GdnArgs& args);
+
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and
 // state[B,Hv,Dv,Dk] row b for token b. q_in/k must be l2-normalized by the
@@ -1937,6 +2132,105 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
 // f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args);
+
+// --- Conformer / FastConformer audio-encoder kernels -------------------------
+// Spike: .agents/specs/parakeet-conformer-encoder.md (rows P1/P2/P3). Upstream
+// mirror: transformers 5.3.0 transformers/models/parakeet/modeling_parakeet.py,
+// which is what vLLM itself runs (vllm/model_executor/models/parakeet.py:37,62
+// delegate to `from transformers import ParakeetEncoder`); the structurally
+// identical vLLM-NATIVE conformer at
+// vllm/model_executor/models/conformer_encoder.py is cited alongside where it
+// agrees, and its one arithmetic divergence is a flag (AttentionRelPosArgs).
+//
+// P1 — torch `nn.Conv2d`, the encoder front end.
+//   out    [N, Cout, Hout, Wout]
+//   x      [N, Cin,  Hin,  Win ]
+//   weight [Cout, Cin/groups, KH, KW]   (torch's exact parameter layout)
+//   bias   optional rank-1 [Cout]
+// Hout = (Hin + 2*pad_h - dilation_h*(KH-1) - 1)/stride_h + 1, likewise Wout.
+// `groups` must divide both Cin and Cout; output channel oc reads input group
+// oc/(Cout/groups). Zero padding: taps outside [0,Hin)x[0,Win) are SKIPPED.
+// Per output element the reduction is a SINGLE f32 accumulator walked strictly
+// in (ic, kh, kw) order with the bias added LAST, so the result does not depend
+// on the thread count and is byte-reproducible; the in-test scalar reference in
+// tests/vt/test_ops_conv2d.cpp gates exactly that order.
+//
+// This is the op `ParakeetEncoderSubsamplingConv2D` (modeling_parakeet.py:357)
+// is built from: a dense 1->C k/stride/pad conv (:369-371), then per extra
+// stage a DEPTHWISE C->C conv (groups=C, :377-386) and a POINTWISE 1x1 conv
+// (:388). vLLM's native `Conv2dSubsampling` (conformer_encoder.py:18) is the
+// same stack. It also REPLACES the host `std::vector<float>` Conv2dK3S2P1 loop
+// in src/vllm/model_executor/models/gemma4_audio.cpp:92, which stays as an
+// independent correctness reference for that model's prefix.
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv2dArgs& args);
+
+// P2 — NON-CAUSAL depthwise `nn.Conv1d(C, C, K, stride, padding, groups=C)`, the
+// conformer convolution module's temporal mixer.
+//   out    [N, C, Lout]
+//   x      [N, C, Lin]
+//   weight [C, 1, K] (torch's depthwise parameter shape) or [C, K]
+//   bias   optional rank-1 [C]
+// Lout = (Lin + 2*padding - dilation*(K-1) - 1)/stride + 1. Zero padding: taps
+// outside [0,Lin) are SKIPPED. Per output element a SINGLE f32 accumulator over
+// k in increasing order, bias added LAST — thread-count independent and
+// byte-reproducible, gated in tests/vt/test_ops_conv1d_depthwise.cpp.
+//
+// Upstream: `ParakeetEncoderConvolutionModule.depthwise_conv`
+// (modeling_parakeet.py:116, constructed :138-146 with padding=(K-1)//2 :136,
+// applied :180); vLLM native `ConformerConvolution.depthwise_conv`
+// (conformer_encoder.py:229). DELIBERATELY a sibling of, never a modification
+// of, vt::CausalConv1dFwd (ops.h kCausalConv1dFwd): that op is causal, carries a
+// persistent conv_state across steps and folds a SiLU; this one is centre-padded,
+// stateless and activation-free, exactly as the conformer module wants.
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const DepthwiseConv1dArgs& args);
+
+// P3 — Transformer-XL relative-position ENCODER self-attention. No KV cache, no
+// paging, no RoPE, non-causal: every existing vt attention path is a decoder
+// path and none of them can express this.
+//   out      [T, Hq,  D]
+//   query    [T, Hq,  D]   raw q projection (bias_u/bias_v added here)
+//   key      [T, Hkv, D]   Hq a multiple of Hkv (GQA broadcast, as vt::Attention)
+//   value    [T, Hkv, D]
+//   rel_key  [P, Hq,  D]   P == 2*T-1, the projected relative-position keys
+//   bias_u   optional [Hq, D]  global CONTENT bias   (term (c))
+//   bias_v   optional [Hq, D]  global POSITION bias  (term (d))
+//   key_mask optional rank-1 [T] i8/i32, 1 = valid key, 0 = masked to -inf
+// Per q-head h (kv-head g = h/(Hq/Hkv)), query i, key j:
+//   ac = Σ_d (query[i,h,d] + bias_u[h,d]) * key[j,g,d]              (a)+(c)
+//   bd = Σ_d (query[i,h,d] + bias_v[h,d]) * rel_key[T-1-i+j, h, d]  (b)+(d)
+//   s[j] = scale*ac + scale*bd     (or (ac+bd)*scale, see scale_after_sum)
+//   p    = softmax_j(s)            (f32, max-subtracted)
+//   out[i,h] = Σ_j p[j] * value[j,g]
+// The `T-1-i+j` index IS the `_rel_shift` of both upstreams, closed-form. Proof:
+// _rel_shift left-pads the [T, 2T-1] matrix_bd by one column, reinterprets it as
+// [2T, T], drops the first row and reinterprets as [T, 2T-1]; element (i,p) then
+// carries flat index i*(2T-1)+p+T, whose (row, col) in the [T, 2T] padded view is
+// (i, T-i+p) because 1 <= T-i+p <= 2T-1 for all i,p in [0,T). Column c>=1 of the
+// padded view is original column c-1, so shifted(i,p) = raw(i, T-1-i+p); the
+// `[..., :T]` truncation then leaves p == j. HF (modeling_parakeet.py:349-355,
+// truncated :320) and vLLM native (conformer_encoder.py:179-186, truncated to
+// T2//2+1 == T) perform the identical map, so the closed form serves both.
+//
+// Deviation, recorded: upstream MATERIALIZES query+bias_u and query+bias_v as
+// activation-dtype tensors (:295-300 / conformer_encoder.py:205-206); we add the
+// bias inside the kernel in f32, which is at least as accurate but rounds
+// differently for a bf16/f16 activation. Pass bias_u/bias_v == nullptr and a
+// pre-biased query to reproduce upstream's rounding exactly.
+//
+// A query row whose every key is masked yields ZEROS rather than upstream's NaN
+// (softmax over an all -inf row); such a row is itself padding and its output is
+// discarded. Recorded deviation, asserted in tests/vt/test_ops_attn_relpos.cpp.
+// Reductions are strictly sequential per output element => thread-count
+// independent and byte-reproducible. f32/f16/bf16 in, f32/f16/bf16 out; all
+// softmax and accumulation math in f32.
+void AttentionRelPos(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                     const Tensor& value, const Tensor& rel_key, const Tensor* bias_u,
+                     const Tensor* bias_v, const Tensor* key_mask,
+                     const AttentionRelPosArgs& args);
 
 // Same contract and math as Attention (dense full/causal, GQA broadcast, f32
 // online-softmax), but the CUDA impl is WARP-scoped (one warp per (query,head),

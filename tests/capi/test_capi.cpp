@@ -12,9 +12,11 @@
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -22,10 +24,14 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include <nlohmann/json.hpp>
 
 #include "capi/engine_handle.h"
+#include "vllm/config/device.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/platforms/interface.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/bpe.h"
@@ -376,6 +382,72 @@ TEST_CASE("capi: two greedy completions of the same prompt are identical") {
 
   vllm_completion_free(&a);
   vllm_completion_free(&b);
+  vllm_engine_free(eng);
+}
+
+// ─── (b1b) ABI v13 pre-tokenized completion ──────────────────────────────────
+TEST_CASE("capi: vllm_complete_tokens matches the string-prompt completion (ABI v13)") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  vllm_sampling_params sp = GreedyParams(6);
+  // The string leg: "hello" tokenizes to the single id 13 in the synthetic
+  // tokenizer (see the vllm_complete greedy case above).
+  vllm_completion via_str;
+  REQUIRE(vllm_complete(eng, "hello", &sp, &via_str) == VLLM_OK);
+
+  const int32_t prompt[1] = {13};
+  int32_t out_tokens[16] = {0};
+  int32_t n_out = -1;
+  vllm_completion via_tok;
+  const vllm_status st =
+      vllm_complete_tokens(eng, prompt, 1, &sp, out_tokens, 16, &n_out, &via_tok);
+  CHECK(st == VLLM_OK);
+  CHECK(n_out == 6);  // greedy max_tokens, all reported
+  // Hand-pinned synthetic-model greedy stream.  This is intentionally
+  // independent of the string leg: a broken implementation that merely
+  // reports six zero-initialized buffer entries must not satisfy ABI v12.
+  const int32_t expected_ids[6] = {22, 12, 14, 9, 13, 2};
+  for (int i = 0; i < 6; ++i) {
+    INFO("generated token index ", i);
+    CHECK(out_tokens[i] == expected_ids[i]);
+  }
+  REQUIRE(via_tok.text != nullptr);
+  // Same engine, same greedy params, same (single-token) prompt => the SAME
+  // deterministic completion through both entry points.
+  CHECK(std::string(via_tok.text) == std::string(via_str.text));
+  CHECK(via_tok.prompt_tokens == 1);
+  CHECK(via_tok.completion_tokens == 6);
+  REQUIRE(via_tok.finish_reason != nullptr);
+  CHECK(std::string(via_tok.finish_reason) == "length");
+
+  // A truncating buffer reports fewer ids but never changes the generation.
+  int32_t small[2] = {0};
+  int32_t n_small = -1;
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, small, 2, &n_small, nullptr) ==
+        VLLM_OK);
+  CHECK(n_small == 2);
+  CHECK(small[0] == out_tokens[0]);
+  CHECK(small[1] == out_tokens[1]);
+
+  // Null contracts.
+  CHECK(vllm_complete_tokens(nullptr, prompt, 1, &sp, out_tokens, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, nullptr, 1, &sp, out_tokens, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, prompt, 0, &sp, out_tokens, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, nullptr, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, out_tokens, 16, nullptr,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  n_out = -1;
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, out_tokens, -1, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(n_out == 0);
+
+  vllm_completion_free(&via_str);
+  vllm_completion_free(&via_tok);
   vllm_engine_free(eng);
 }
 
@@ -1223,6 +1295,689 @@ TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);
   CHECK(vllm_abi_version() == VLLM_ABI_VERSION);
   // The engine-config growth (max_num_batched_tokens / scheduling_policy /
-  // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10.
-  CHECK(vllm_abi_version() >= 10);
+  // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10; the
+  // transcription slice (vllm_transcribe) is ABI v11; the video-generation
+  // slice (vllm_video_*) is ABI v12; the pre-tokenized completion entry
+  // point (vllm_complete_tokens) is ABI v13; the device-selection field
+  // (vllm_model_params.device) is ABI v14; the embeddings slice (vllm_embed /
+  // vllm_embedding_result_free) is ABI v15; the KV-pool sizing knobs
+  // (vllm_model_params.gpu_memory_utilization / kv_cache_memory_bytes,
+  // ROAD-V1-MEM M1) are ABI v16. The >= pin is the one check that
+  // can catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
+  // test_dlopen compare against the same macro and move with it (the #121
+  // lesson: an == floor moves with the macro and proves nothing).
+  CHECK(vllm_abi_version() >= 16);
+}
+
+// ─── ABI v16: KV-pool sizing knobs (ROAD-V1-MEM M1) ──────────────────────────
+TEST_CASE("capi: v16 KV-sizing knobs default and round-trip") {
+  vllm_model_params p = vllm_model_params_default();
+  // num_blocks now defaults to AUTO (0), not the historical 256; the resolver
+  // still falls back to 256, so the zero-struct behaviour is unchanged.
+  CHECK(p.num_blocks == 0);
+  // gpu_memory_utilization defaults to vLLM's 0.92; kv_cache_memory_bytes unset.
+  CHECK(p.gpu_memory_utilization == doctest::Approx(0.92));
+  CHECK(p.kv_cache_memory_bytes == 0);
+  // The appended fields are writable POD (borrowed for the load call only).
+  p.gpu_memory_utilization = 0.85;
+  p.kv_cache_memory_bytes = int64_t{4} * 1024 * 1024 * 1024;
+  CHECK(p.gpu_memory_utilization == doctest::Approx(0.85));
+  CHECK(p.kv_cache_memory_bytes == int64_t{4} * 1024 * 1024 * 1024);
+}
+
+// ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────
+// The FIRST real-checkpoint load gated through the PUBLIC ABI: vllm_engine_load
+// on the committed tiny Parakeet fixtures (tests/vllm/models/fixtures/
+// parakeet_e2e), then vllm_transcribe reproducing the transcript goldens the
+// PRE-refactor example binary printed. Everything before this exercised
+// vllm_engine_load's bad-path contract only (the severity note in
+// .agents/specs/surface-coverage-2026-08-07.md § C-ABI capability coverage).
+
+namespace {
+std::string ParakeetFixture(const char* head) {
+  return std::string(PARAKEET_E2E_FIXTURE_DIR) + "/" + head;
+}
+std::string ParakeetWav() {
+  return std::string(PARAKEET_E2E_FIXTURE_DIR) + "/audio.wav";
+}
+}  // namespace
+
+TEST_CASE("capi v11: vllm_transcribe reproduces the pre-refactor goldens") {
+  struct Golden {
+    const char* head;
+    std::vector<int32_t> ids;
+    const char* text;
+  };
+  const std::vector<Golden> goldens = {
+      {"ctc", {3, 4, 3}, "atheat"},
+      {"rnnt",
+       {5, 5, 5, 6, 6, 6, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6},
+       "sss on on onssssss on on on on on on on on"},
+  };
+  for (const Golden& g : goldens) {
+    CAPTURE(g.head);
+    vllm_model_params mp = vllm_model_params_default();
+    const std::string dir = ParakeetFixture(g.head);
+    mp.model_path = dir.c_str();
+    vllm_engine* eng = nullptr;
+    REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+    REQUIRE(eng != nullptr);
+
+    vllm_transcription_params tp = vllm_transcription_params_default();
+    const std::string wav = ParakeetWav();
+    tp.audio_path = wav.c_str();
+    vllm_transcription out;
+    REQUIRE(vllm_transcribe(eng, &tp, &out) == VLLM_OK);
+    REQUIRE(out.token_ids != nullptr);
+    const std::vector<int32_t> ids(out.token_ids,
+                                   out.token_ids + out.n_token_ids);
+    CHECK(ids == g.ids);
+    CHECK(out.has_text == 1);
+    REQUIRE(out.text != nullptr);
+    CHECK(std::string(out.text) == g.text);
+    vllm_transcription_free(&out);
+    CHECK(out.text == nullptr);      // zeroed after free
+    CHECK(out.token_ids == nullptr);
+    vllm_transcription_free(&out);   // double-free is a safe no-op
+    vllm_engine_free(eng);
+  }
+}
+
+TEST_CASE("capi v11: refuse-by-task in both directions") {
+  // Transcription handle: every text entry point refuses with the actionable
+  // message instead of crashing on the absent text stack.
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = ParakeetFixture("ctc");
+  mp.model_path = dir.c_str();
+  vllm_engine* asr = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &asr) == VLLM_OK);
+
+  vllm_sampling_params sp = vllm_sampling_params_default();
+  vllm_completion comp;
+  CHECK(vllm_complete(asr, "hello", &sp, &comp) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("transcription-only") !=
+        std::string::npos);
+  char* chat_out = nullptr;
+  CHECK(vllm_chat(asr, "{\"messages\":[]}", &chat_out) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("vllm_transcribe") !=
+        std::string::npos);
+  vllm_engine_free(asr);
+
+  // Text handle: vllm_transcribe refuses symmetrically.
+  vllm_engine* text = MakeSyntheticEngine();
+  REQUIRE(text != nullptr);
+  vllm_transcription_params tp = vllm_transcription_params_default();
+  const std::string wav = ParakeetWav();
+  tp.audio_path = wav.c_str();
+  vllm_transcription out;
+  CHECK(vllm_transcribe(text, &tp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("text-generation engine") !=
+        std::string::npos);
+  vllm_engine_free(text);
+}
+
+TEST_CASE("capi v11: vllm_transcribe argument contract") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = ParakeetFixture("ctc");
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+
+  vllm_transcription out;
+  // Neither input selected.
+  vllm_transcription_params none = vllm_transcription_params_default();
+  CHECK(vllm_transcribe(eng, &none, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  // Both inputs selected.
+  vllm_transcription_params both = vllm_transcription_params_default();
+  const std::string wav = ParakeetWav();
+  const float pcm[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  both.audio_path = wav.c_str();
+  both.pcm = pcm;
+  both.n_samples = 4;
+  both.sample_rate = 16000;
+  CHECK(vllm_transcribe(eng, &both, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  // pcm without a sample rate.
+  vllm_transcription_params bad_pcm = vllm_transcription_params_default();
+  bad_pcm.pcm = pcm;
+  bad_pcm.n_samples = 4;
+  CHECK(vllm_transcribe(eng, &bad_pcm, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  // Null engine / params / out.
+  CHECK(vllm_transcribe(nullptr, &none, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_transcribe(eng, nullptr, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_transcribe(eng, &none, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  // Unreadable audio file -> runtime error naming the path problem.
+  vllm_transcription_params missing = vllm_transcription_params_default();
+  missing.audio_path = "/nonexistent/vllm-cpp/audio.wav";
+  CHECK(vllm_transcribe(eng, &missing, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).size() > 0);
+  // A raw-PCM arm through the ABI marshals and runs end to end.
+  std::vector<float> silence(4000, 0.0f);
+  vllm_transcription_params pcm_ok = vllm_transcription_params_default();
+  pcm_ok.pcm = silence.data();
+  pcm_ok.n_samples = static_cast<int64_t>(silence.size());
+  pcm_ok.sample_rate = 16000;
+  REQUIRE(vllm_transcribe(eng, &pcm_ok, &out) == VLLM_OK);
+  CHECK(out.has_text == 1);
+  vllm_transcription_free(&out);
+  // NULL result free is a no-op.
+  vllm_transcription_free(nullptr);
+  vllm_engine_free(eng);
+}
+
+// ─── ABI v12: video+audio generation (ARCH-ONE-SURFACE ROW 2) ────────────────
+// The video slice gated THROUGH the public ABI on the fold fixture: the same
+// tiny checkpoint set + goldens the PRE-fold minimax-h3-gen binary rendered at
+// the branch base (tests/vllm/models/fixtures/minimax_h3_video_fold). What the
+// library-seam gate (test_minimax_h3_video_fold) proves for the C++ entry
+// point, this proves for the C marshalling on top of it.
+
+#include "../vllm/models/minimax_h3_video_fold_fixture.h"
+
+namespace {
+
+std::string ReadAllBytes(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  REQUIRE_MESSAGE(in.good(), "cannot open ", path);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// A pid-unique fixture + output workspace, torn down with the test.
+struct VideoFoldWorkspace {
+  std::string root, fixture;
+  VideoFoldWorkspace() {
+    static int counter = 0;
+    root = "/tmp/vllm_capi_video_" + std::to_string(::getpid()) + "_" +
+           std::to_string(counter++);
+    std::filesystem::create_directories(root);
+    fixture = root + "/fixture";
+    minimax_h3_fold::WriteFoldFixture(fixture);
+  }
+  ~VideoFoldWorkspace() {
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+  }
+};
+
+// Owned strings so the borrowed const char* fields stay alive per call.
+struct VideoFixtureParams {
+  std::string dit, vvae, vcfg, avae, acfg, embeds;
+  vllm_video_model_params mp;
+  explicit VideoFixtureParams(const std::string& dir)
+      : dit(dir + "/dit.gguf"),
+        vvae(dir + "/video_vae.safetensors"),
+        vcfg(dir + "/video_vae_config.json"),
+        avae(dir + "/audio_vae.safetensors"),
+        acfg(dir + "/audio_vae_config.json"),
+        embeds(dir + "/prompt_embeds.f32") {
+    mp = vllm_video_model_params_default();
+    mp.dit_path = dit.c_str();
+    mp.video_vae_path = vvae.c_str();
+    mp.video_vae_config_path = vcfg.c_str();
+    mp.audio_vae_path = avae.c_str();
+    mp.audio_vae_config_path = acfg.c_str();
+    mp.prompt_embeds_path = embeds.c_str();
+    mp.partition = "fl2va";
+  }
+};
+
+}  // namespace
+
+TEST_CASE("capi v12: the zero-value/default contract") {
+  // Zero values must preserve behaviour: the _default() constructors return
+  // fully zeroed structs (cpu, keep-quant, no paths, unseeded, and — via the
+  // documented <=0 mapping — noise_aug 1.0). The golden e2e case below runs
+  // on exactly these defaults (t2va), which pins every zero-value resolution
+  // EXCEPT noise_aug: that mapping only fires on a keyframe render, which the
+  // tiny fixture cannot express (the fl2va VAE-encoder half is the real
+  // 128-channel geometry). It is pinned at the seam level instead
+  // (MiniMaxH3VideoGenParams.noise_aug defaults to 1.0; the capi maps <=0
+  // onto it) — an honest, disclosed edge of this contract test.
+  const vllm_video_model_params mp = vllm_video_model_params_default();
+  CHECK(mp.dit_path == nullptr);
+  CHECK(mp.encoder_path == nullptr);
+  CHECK(mp.tokenizer_path == nullptr);
+  CHECK(mp.video_vae_path == nullptr);
+  CHECK(mp.video_vae_config_path == nullptr);
+  CHECK(mp.audio_vae_path == nullptr);
+  CHECK(mp.audio_vae_config_path == nullptr);
+  CHECK(mp.prompt_embeds_path == nullptr);
+  CHECK(mp.partition == nullptr);
+  CHECK(mp.device == 0);
+  CHECK(mp.dequant_bf16 == 0);
+  CHECK(mp.fp4_resident == 0);
+
+  const vllm_video_params vp = vllm_video_params_default();
+  CHECK(vp.prompt == nullptr);
+  CHECK(vp.width == 0);
+  CHECK(vp.height == 0);
+  CHECK(vp.num_frames == 0);
+  CHECK(vp.steps == 0);
+  CHECK(vp.seed == 0);
+  CHECK(vp.has_seed == 0);
+  CHECK(vp.first_frame == nullptr);
+  CHECK(vp.last_frame == nullptr);
+  CHECK(vp.ref_image == nullptr);
+  CHECK(vp.ref_video == nullptr);
+  CHECK(vp.ref_audio == nullptr);
+  CHECK(vp.noise_aug == 0.0f);  // <= 0 resolves engine-side to the 1.0 pin
+  CHECK(vp.output_dir == nullptr);
+
+  const vllm_video_mux_params mx = vllm_video_mux_params_default();
+  CHECK(mx.frames == nullptr);
+  CHECK(mx.audio_path == nullptr);
+  CHECK(mx.output_path == nullptr);
+  CHECK(mx.fps == 0);  // <= 0 resolves to the H3 default 24
+  CHECK(mx.crf == 0);  // <= 0 resolves to the library default 18
+}
+
+TEST_CASE("capi v12: vllm_video_generate reproduces the pre-fold goldens") {
+  VideoFoldWorkspace ws;
+  VideoFixtureParams fp(ws.fixture);
+  vllm_video_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK,
+                  vllm_last_error());
+  REQUIRE(eng != nullptr);
+
+  const std::string out_dir = ws.root + "/out";
+  vllm_video_params vp = vllm_video_params_default();
+  vp.num_frames = 5;
+  vp.height = 32;
+  vp.width = 32;
+  vp.steps = 3;
+  vp.output_dir = out_dir.c_str();
+
+  vllm_video_result out;
+  REQUIRE_MESSAGE(vllm_video_generate(eng, &vp, &out) == VLLM_OK,
+                  vllm_last_error());
+  CHECK(std::string(out.frame_dir) == out_dir);
+  CHECK(std::string(out.audio_path) == out_dir + "/audio.wav");
+  CHECK(out.frame_count == 8);
+  CHECK(out.width == 32);
+  CHECK(out.height == 32);
+  CHECK(out.fps == 24);
+  CHECK(out.sample_rate == 32000);
+
+  const std::string golden_dir = MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR;
+  for (int f = 0; f < 8; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06d.ppm", f);
+    INFO("frame ", f);
+    CHECK(ReadAllBytes(out_dir + name) == ReadAllBytes(golden_dir + name));
+  }
+  CHECK(ReadAllBytes(out_dir + "/audio.wav") ==
+        ReadAllBytes(golden_dir + "/audio.wav"));
+
+  // The mux argv is execvp-ready (NULL-terminated) and byte-matches the
+  // pre-fold `minimax-h3-mux --print-only` capture.
+  REQUIRE(out.mux_argv != nullptr);
+  REQUIRE(out.mux_argc > 0);
+  CHECK(out.mux_argv[out.mux_argc] == nullptr);
+  std::string joined;
+  for (int32_t i = 0; i < out.mux_argc; ++i) {
+    joined += (i == 0 ? "" : " ") + std::string(out.mux_argv[i]);
+  }
+  std::string golden_argv = ReadAllBytes(golden_dir + "/golden_mux_argv.txt");
+  while (!golden_argv.empty() &&
+         (golden_argv.back() == '\n' || golden_argv.back() == '\r')) {
+    golden_argv.pop_back();
+  }
+  size_t pos = 0;
+  while ((pos = golden_argv.find("W/", pos)) != std::string::npos) {
+    golden_argv.replace(pos, 1, out_dir);
+    pos += out_dir.size() + 1;
+  }
+  CHECK(joined == golden_argv);
+
+  vllm_video_result_free(&out);
+  CHECK(out.frame_dir == nullptr);
+  CHECK(out.mux_argv == nullptr);
+  vllm_video_result_free(&out);  // double-free is a safe no-op
+  vllm_video_result_free(nullptr);
+  vllm_video_engine_free(eng);
+}
+
+TEST_CASE("capi v12: text and video engines refuse each other's checkpoints") {
+  // Direction 1: vllm_video_engine_load on a TEXT/transcription checkpoint
+  // directory fails LOUDLY, naming vllm_engine_load as the right entry point.
+  VideoFoldWorkspace ws;
+  const std::string text_dir = ParakeetFixture("ctc");
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = text_dir.c_str();
+  vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
+  CHECK(vllm_video_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("vllm_engine_load") !=
+        std::string::npos);
+
+  // Direction 2: vllm_engine_load on the H3 checkpoint directory keeps
+  // failing EXACTLY as it did at v11 (captured at the branch base): status 2
+  // with the missing-config.json cause — the fold changed nothing here.
+  vllm_model_params tmp = vllm_model_params_default();
+  tmp.model_path = ws.fixture.c_str();
+  vllm_engine* text_eng = nullptr;
+  CHECK(vllm_engine_load(&tmp, &text_eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(text_eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("config.json") != std::string::npos);
+}
+
+TEST_CASE("capi v12: video argument contract") {
+  VideoFoldWorkspace ws;
+
+  // Null/missing load arguments.
+  vllm_video_engine* eng = nullptr;
+  CHECK(vllm_video_engine_load(nullptr, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  vllm_video_model_params empty = vllm_video_model_params_default();
+  CHECK(vllm_video_engine_load(&empty, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_video_engine_load(&empty, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  // A missing VAE is a load error with the cause named.
+  VideoFixtureParams no_vae(ws.fixture);
+  no_vae.mp.video_vae_path = nullptr;
+  CHECK(vllm_video_engine_load(&no_vae.mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(std::string(vllm_last_error()).find("video_vae") != std::string::npos);
+
+  // Generate-side contract on a good engine.
+  VideoFixtureParams fp(ws.fixture);
+  REQUIRE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK);
+  vllm_video_result out;
+  vllm_video_params vp = vllm_video_params_default();
+  CHECK(vllm_video_generate(nullptr, &vp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_video_generate(eng, nullptr, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_video_generate(eng, &vp, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  // output_dir is required.
+  CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("output_dir") != std::string::npos);
+  // An illegal reference combination surfaces as a runtime refusal.
+  const std::string out_dir = ws.root + "/out";
+  vp.output_dir = out_dir.c_str();
+  vp.first_frame = "/nonexistent.ppm";
+  vp.ref_video = ws.fixture.c_str();
+  CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("exclusive") != std::string::npos);
+  vllm_video_engine_free(eng);
+  vllm_video_engine_free(nullptr);  // no-op
+
+  // The standalone mux composer: contract + golden byte-match.
+  char** argv = nullptr;
+  int32_t argc = 0;
+  CHECK(vllm_video_mux_argv(nullptr, &argv, &argc) == VLLM_ERR_INVALID_ARGUMENT);
+  vllm_video_mux_params mx = vllm_video_mux_params_default();
+  CHECK(vllm_video_mux_argv(&mx, &argv, &argc) == VLLM_ERR_INVALID_ARGUMENT);
+  mx.frames = "frames_%06d.ppm";
+  mx.output_path = "silent.mp4";
+  REQUIRE(vllm_video_mux_argv(&mx, &argv, &argc) == VLLM_OK);
+  REQUIRE(argv != nullptr);
+  REQUIRE(argc > 0);
+  CHECK(argv[argc] == nullptr);  // execvp-ready
+  std::string joined;
+  for (int32_t i = 0; i < argc; ++i) joined += (i == 0 ? "" : " ") + std::string(argv[i]);
+  std::string golden = ReadAllBytes(std::string(MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR) +
+                                    "/golden_mux_argv_silent.txt");
+  while (!golden.empty() && (golden.back() == '\n' || golden.back() == '\r')) {
+    golden.pop_back();
+  }
+  CHECK(joined == golden);
+  vllm_video_mux_argv_free(argv, argc);
+  vllm_video_mux_argv_free(nullptr, 3);  // no-op
+}
+
+
+// ─── ABI v14: explicit device selection (ARCH-ONE-SURFACE ROW 8) ─────────────
+// The device knob: 0=auto (the byte-identical accelerator-first probe), 1=cpu,
+// 2=cuda — the vLLM DeviceConfig.device names (vllm/config/device.py:13). The
+// pure policy matrix (explicit cpu beats a registered accelerator; explicit
+// cuda never falls back) is gated in test_loaded_engine_dense.cpp; here the
+// C-ABI wire contract and the params->EngineParams->SelectQueue plumb.
+
+namespace {
+// A synthetic engine over an explicit EngineParams device selection, sharing
+// MakeSyntheticEngine's stack.
+vllm_engine* MakeSyntheticEngineWithDevice(vllm::Device device) {
+  const HfConfig c = MakeConfig();
+  EngineParams params = SyntheticParams();
+  params.device = device;
+  auto loaded = std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(),
+                                               params);
+  return vllm::capi::MakeEngineHandle(std::move(loaded));
+}
+}  // namespace
+
+TEST_CASE("capi v14: the device zero-value/default contract") {
+  // The default is 0 == auto — a zero-initialized struct and
+  // vllm_model_params_default() agree, so a pre-v14 caller's zero-filled
+  // growth keeps the accelerator-first probe engine byte-identical.
+  const vllm_model_params def = vllm_model_params_default();
+  CHECK(def.device == 0);
+  vllm_model_params zeroed;
+  std::memset(&zeroed, 0, sizeof(zeroed));
+  CHECK(zeroed.device == def.device);
+
+  // The zero value maps to AUTO, not to an explicit device: with device left
+  // at the default and a bogus path, the load must report the PATH (the auto
+  // arm defers to the probe and never resolves an explicit device up front).
+  // A mutation that maps 0 to an explicit cuda would surface the device error
+  // here instead — on the CPU tier that is the distinguishable half; 0-as-
+  // explicit-cpu is behaviorally identical on this tier and is pinned by the
+  // pure policy matrix in test_loaded_engine_dense.cpp plus the CUDA-build
+  // residual named in the spec.
+  vllm_model_params bogus = vllm_model_params_default();
+  bogus.model_path = "/nonexistent/vllm-cpp/model/dir";
+  vllm_engine* probe_eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&bogus, &probe_eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(probe_eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("not a directory") !=
+        std::string::npos);
+
+  // Behavior: on a CPU-only process the auto probe resolves CPU, so an
+  // explicit-cpu engine must generate EXACTLY what the default (auto) engine
+  // generates. (Guarded: on an accelerator build auto legitimately selects the
+  // accelerator, and byte-equality with a CPU run is not the contract.)
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+    vllm_engine* auto_eng = MakeSyntheticEngine();  // device unset == kAuto
+    vllm_engine* cpu_eng = MakeSyntheticEngineWithDevice(vllm::Device::kCPU);
+    REQUIRE(auto_eng != nullptr);
+    REQUIRE(cpu_eng != nullptr);
+    vllm_sampling_params sp = GreedyParams(6);
+    vllm_completion a{};
+    vllm_completion b{};
+    REQUIRE(vllm_complete(auto_eng, "hello world", &sp, &a) == VLLM_OK);
+    REQUIRE(vllm_complete(cpu_eng, "hello world", &sp, &b) == VLLM_OK);
+    CHECK(std::string(a.text) == std::string(b.text));
+    CHECK(a.completion_tokens == b.completion_tokens);
+    vllm_completion_free(&a);
+    vllm_completion_free(&b);
+    vllm_engine_free(auto_eng);
+    vllm_engine_free(cpu_eng);
+  }
+}
+
+TEST_CASE("capi v14: device range validates before any load work") {
+  // An out-of-range device is a CALLER error caught before FromModelDir — the
+  // bogus path must NOT be what fails here.
+  for (const int32_t bad : {static_cast<int32_t>(3), static_cast<int32_t>(-1),
+                            static_cast<int32_t>(7)}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.device = bad;
+    vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng == nullptr);
+    CHECK(std::string(vllm_last_error())
+              .find("device must be 0 (auto), 1 (cpu), or 2 (cuda)") !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("capi v14: explicit cuda on a CUDA-less process fails LOUD (plumb pin)") {
+  if (vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+    return;  // CUDA build/box: the explicit-cuda arm resolves; nothing to pin.
+  }
+  // device=2 with a bogus path: the DEVICE error must surface, not the path
+  // error — FromModelDir resolves an explicit device BEFORE any I/O, so this
+  // pins the whole capi -> EngineParams -> FromModelDir plumb (an implementation
+  // that drops params->device would report the path instead and go RED here).
+  vllm_model_params p = vllm_model_params_default();
+  p.model_path = "/nonexistent/vllm-cpp/model/dir";
+  p.device = 2;  // cuda
+  vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error())
+            .find("device 'cuda' was requested but no CUDA platform") !=
+        std::string::npos);
+
+  // device=1 (cpu) on the same bogus path proceeds to the path and reports IT —
+  // the plumb forwards the field's VALUE, not a constant.
+  p.device = 1;  // cpu
+  eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("not a directory") !=
+        std::string::npos);
+}
+
+TEST_CASE("capi v14: explicit cpu forces the CPU queue at the EngineParams seam") {
+  // The observable queue seam: an engine constructed with device=kCPU runs its
+  // runner on the CPU device. On the CPU tier this is trivially true of auto as
+  // well; on a CUDA build it is the force-CPU pin (the runner would otherwise
+  // sit on the CUDA queue). The CPU-tier statement of "cpu beats a registered
+  // accelerator" is the pure matrix in test_loaded_engine_dense.cpp.
+  const HfConfig c = MakeConfig();
+  EngineParams params = SyntheticParams();
+  params.device = vllm::Device::kCPU;
+  LoadedEngine loaded(c, MakeWeights(c), BuildFixture(), params);
+  CHECK(loaded.runner().device().type == vt::DeviceType::kCPU);
+
+  // And the ctor-path plumb (LoadedEngine's own SelectQueue call, the arm the
+  // GGUF/MoE branches take): explicit cuda on a CUDA-less process must throw
+  // the pinned message out of construction — never silently build on CPU.
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+    EngineParams cuda_params = SyntheticParams();
+    cuda_params.device = vllm::Device::kNamedPlatform;
+    CHECK_THROWS_WITH_AS(
+        LoadedEngine(MakeConfig(), MakeWeights(c), BuildFixture(), cuda_params),
+        doctest::Contains("device 'cuda' was requested but no CUDA platform"),
+        std::runtime_error);
+  }
+}
+
+// ─── ABI v15: embeddings (ARCH-ONE-SURFACE ROW 6) ────────────────────────────
+// The embeddings slice gated THROUGH the public ABI on the committed tiny
+// LlamaModel fixture (tests/vllm/models/fixtures/llama_embed_e2e): a REAL
+// checkpoint-directory load through vllm_engine_load, then vllm_embed through
+// the SAME registry forward + PoolingRunner engine step the fold gate
+// (test_llama_embedding_fold) anchors. Plus the argument contract and the
+// refuse-by-task pins in BOTH directions (the v11 precedent applied to the
+// pooling task).
+
+namespace {
+std::string LlamaEmbedFixture() { return std::string(LLAMA_EMBED_FIXTURE_DIR); }
+}  // namespace
+
+TEST_CASE("capi v15: vllm_embed embeds through the public ABI (fixture load)") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = LlamaEmbedFixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+  REQUIRE(eng != nullptr);
+
+  const char* texts[2] = {"the quick brown fox", "the lazy dog"};
+  vllm_embedding_result out;
+  REQUIRE(vllm_embed(eng, texts, 2, &out) == VLLM_OK);
+  REQUIRE(out.values != nullptr);
+  CHECK(out.n_embeddings == 2);
+  CHECK(out.dim == 64);  // the fixture's hidden_size
+  CHECK(out.prompt_tokens > 0);
+  // Each embedding is unit-L2 (the pooling normalize ran) and the two DIFFER
+  // (different prompts pool different last-token hiddens).
+  double delta = 0.0;
+  for (int32_t r = 0; r < out.n_embeddings; ++r) {
+    double l2 = 0.0;
+    for (int32_t c = 0; c < out.dim; ++c) {
+      const double v = out.values[r * out.dim + c];
+      l2 += v * v;
+    }
+    CHECK(std::sqrt(l2) == doctest::Approx(1.0).epsilon(1e-5));
+  }
+  for (int32_t c = 0; c < out.dim; ++c) {
+    delta += std::abs(static_cast<double>(out.values[c]) -
+                      static_cast<double>(out.values[out.dim + c]));
+  }
+  CHECK(delta > 1e-3);
+
+  vllm_embedding_result_free(&out);
+  CHECK(out.values == nullptr);  // zeroed after free
+  CHECK(out.n_embeddings == 0);
+  vllm_embedding_result_free(&out);  // double-free is a safe no-op
+  vllm_embedding_result_free(nullptr);
+  vllm_engine_free(eng);
+}
+
+TEST_CASE("capi v15: refuse-by-task in both directions (pooling vs text)") {
+  // Pooling handle: every text entry point refuses with the actionable message
+  // instead of driving generation over hidden states.
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = LlamaEmbedFixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* emb = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &emb) == VLLM_OK);
+
+  vllm_sampling_params sp = vllm_sampling_params_default();
+  vllm_completion comp;
+  CHECK(vllm_complete(emb, "hello", &sp, &comp) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("pooling (embedding)") !=
+        std::string::npos);
+  CHECK(std::string(vllm_last_error()).find("vllm_embed") != std::string::npos);
+  char* chat_out = nullptr;
+  CHECK(vllm_chat(emb, "{\"messages\":[]}", &chat_out) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("vllm_embed") != std::string::npos);
+  {
+    const int32_t prompt_ids[1] = {0};
+    int32_t out_ids[4];
+    int32_t n_out = 0;
+    CHECK(vllm_complete_tokens(emb, prompt_ids, 1, &sp, out_ids, 4, &n_out,
+                               nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(std::string(vllm_last_error()).find("vllm_embed") !=
+          std::string::npos);
+  }
+  vllm_engine_free(emb);
+
+  // Text handle: vllm_embed refuses symmetrically, naming the text entry
+  // points.
+  vllm_engine* text = MakeSyntheticEngine();
+  REQUIRE(text != nullptr);
+  const char* texts[1] = {"hello"};
+  vllm_embedding_result out;
+  CHECK(vllm_embed(text, texts, 1, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("text-generation") !=
+        std::string::npos);
+  CHECK(std::string(vllm_last_error()).find("vllm_complete") !=
+        std::string::npos);
+  vllm_engine_free(text);
+}
+
+TEST_CASE("capi v15: vllm_embed argument contract") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = LlamaEmbedFixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+
+  const char* texts[2] = {"the fox", nullptr};
+  vllm_embedding_result out;
+  // Null engine / texts / out; non-positive n_texts; a NULL texts entry.
+  CHECK(vllm_embed(nullptr, texts, 1, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, nullptr, 1, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, 1, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, 0, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, -3, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, 2, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("texts[1]") != std::string::npos);
+  // On every refused call *out stays zeroed.
+  CHECK(out.values == nullptr);
+  CHECK(out.n_embeddings == 0);
+  vllm_engine_free(eng);
 }

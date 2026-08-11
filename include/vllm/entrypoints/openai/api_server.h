@@ -24,14 +24,19 @@
 #define VLLM_ENTRYPOINTS_OPENAI_API_SERVER_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
+#include "vllm/entrypoints/openai/video_api.h"
+#include "vllm/multimodal/parakeet_transcription.h"
 
 namespace vllm::tok {
 class Tokenizer;
@@ -65,6 +70,18 @@ class ApiServer {
 
   ApiServer(OpenAIServingCompletion& completion, OpenAIServingChat& chat,
             OpenAIServingModels& models, std::string version,
+            size_t max_concurrent_streams = kDefaultMaxConcurrentStreams,
+            HttpWorkerPoolMode worker_pool_mode =
+                HttpWorkerPoolMode::kCapacityFixed);
+  // TASK-CONDITIONAL construction without the text-generation serving stack
+  // (ARCH-ONE-SURFACE ROW 1): a server for a SupportsTranscription-ONLY model
+  // (Parakeet) has no AsyncLLM to build OpenAIServingCompletion/Chat around, so
+  // /v1/completions and /v1/chat/completions are simply NOT REGISTERED (404),
+  // mirroring vLLM registering the generate routes only when "generate" is in
+  // supported_tasks (api_server.py:255-265). Attach the transcription seam via
+  // set_transcriber; /v1/models, /health, /version and the other utility
+  // routes behave as before.
+  ApiServer(OpenAIServingModels& models, std::string version,
             size_t max_concurrent_streams = kDefaultMaxConcurrentStreams,
             HttpWorkerPoolMode worker_pool_mode =
                 HttpWorkerPoolMode::kCapacityFixed);
@@ -105,6 +122,42 @@ class ApiServer {
   // (serve/instrumentator/metrics.py). Registered only when a metrics logger is
   // attached. Returns 404 (route absent) otherwise; the handler itself returns
   // the exposition with the prometheus content type.
+  // POST /v1/videos       -> enqueue, return {id, status} immediately
+  // POST /v1/videos/sync  -> run to completion, return the .mp4 path
+  // GET  /v1/videos/{id}  -> job status
+  // GET  /v1/videos/{id}/content -> the finished MP4 bytes (video/mp4)
+  // POST /v1/audio/transcriptions (ARCH-ONE-SURFACE ROW 1). Mirror of vLLM's
+  // speech_to_text/transcription/api_router.py:31 `create_transcriptions` +
+  // serving.py:29 OpenAIServingTranscription: multipart `file` upload (16-bit
+  // PCM mono WAV here — the extractor refuses anything else loudly), optional
+  // `response_format` = "json" (default, -> TranscriptionResponse
+  // {"text": ...}) or "text" (-> the raw transcript, text/plain).
+  // verbose_json / srt / vtt are NAMED RESIDUALS -> 400. Registered ONLY when
+  // a transcriber is attached (the video_runner precedent); the route lambda
+  // extracts the upload and calls this with the raw file bytes.
+  DispatchResult handle_audio_transcriptions(
+      const std::string& file_bytes, const std::string& response_format) const;
+
+  // POST /v1/embeddings (ARCH-ONE-SURFACE ROW 6). Mirror of vLLM's
+  // pooling/embed/api_router.py:28 `create_embedding` over the
+  // EmbeddingCompletionRequest shape (embed/protocol.py:34: `model`, `input`
+  // as ONE string or an ARRAY of strings) and the EmbeddingResponse shape
+  // (embed/protocol.py:173-185: id "embd-...", object "list", data rows
+  // {index, object:"embedding", embedding:[...]}, usage prompt/total tokens).
+  // Token-array inputs, `dimensions` (matryoshka) and `encoding_format:
+  // "base64"` are NAMED RESIDUALS -> 400. Registered ONLY when an embedder is
+  // attached (the transcriber precedent), so a text server answers 404 at the
+  // route table.
+  DispatchResult handle_embeddings(const std::string& request_body) const;
+
+  DispatchResult handle_videos(const std::string& request_body);
+  DispatchResult handle_videos_sync(const std::string& request_body);
+  DispatchResult handle_video_status(const std::string& job_id) const;
+  // OpenAI's download endpoint. Unknown id -> 404; a job that has not finished ->
+  // 409 naming its status (NEVER a truncated file); a failed job -> 500 carrying
+  // the failure. Only a succeeded job yields bytes, and only the whole file.
+  DispatchResult handle_video_content(const std::string& job_id) const;
+
   DispatchResult handle_metrics() const;
   // POST /tokenize, POST /detokenize (serve/tokenize/api_router.py). Registered
   // only when a tokenizer is attached. /tokenize accepts BOTH forms of the
@@ -140,6 +193,48 @@ class ApiServer {
   void set_metrics_logger(const v1::metrics::PrometheusStatLogger* logger) {
     metrics_ = logger;
   }
+  // Attach the video generation+mux runner backing POST /v1/videos and
+  // POST /v1/videos/sync (MiniMax-H3). ADDITIVE and OPT-IN like the routes
+  // above: absent runner => routes unregistered => 404, byte-identical to a
+  // server built without video support.
+  //
+  // The runner performs generation AND muxing and returns the .mp4 path, or
+  // throws to fail the job. The LIBRARY NEVER SPAWNS A PROCESS -- the ffmpeg
+  // invocation lives in examples/ (developer-ratified 2026-08-03), which is
+  // precisely why this enters as a callback rather than a built-in.
+  void set_video_runner(::vllm::openai::VideoRunner runner) {
+    video_runner_ = std::move(runner);
+  }
+
+  // Attach the transcription seam backing POST /v1/audio/transcriptions.
+  // ADDITIVE and OPT-IN like the video runner above: absent => route
+  // unregistered => 404, byte-identical to a server without ASR. The callback
+  // wraps the ONE library entry
+  // (vllm::multimodal::ParakeetTranscriber::TranscribeWavBytes) — the SAME
+  // seam vllm_transcribe drives — so HTTP and FFI cannot drift.
+  using TranscribeFn =
+      std::function<vllm::multimodal::ParakeetTranscription(
+          const uint8_t* wav_bytes, size_t num_bytes)>;
+  void set_transcriber(TranscribeFn transcriber) {
+    transcriber_ = std::move(transcriber);
+  }
+
+  // Attach the embedding seam backing POST /v1/embeddings (ARCH-ONE-SURFACE
+  // ROW 6). ADDITIVE and OPT-IN like the transcriber above: absent => route
+  // unregistered => 404, byte-identical to a server without pooling. The
+  // callback wraps the ONE engine path (LoadedEngine -> LLMEngine::embed ->
+  // the registry forward + PoolingRunner step) — the SAME path vllm_embed
+  // drives — so HTTP and FFI cannot drift. Returns one embedding per input
+  // (input order) + the total prompt token count for the usage block; throws
+  // to fail the request (-> 500).
+  struct EmbeddingBatch {
+    std::vector<std::vector<float>> embeddings;
+    int64_t prompt_tokens = 0;
+  };
+  using EmbedFn =
+      std::function<EmbeddingBatch(const std::vector<std::string>& inputs)>;
+  void set_embedder(EmbedFn embedder) { embedder_ = std::move(embedder); }
+
   // Attach the tokenizer + max_model_len backing /tokenize and /detokenize
   // (non-owning; must outlive the server).
   void set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
@@ -190,18 +285,35 @@ class ApiServer {
   size_t http_worker_count() const;
 
  private:
-  OpenAIServingCompletion& completion_;
-  OpenAIServingChat& chat_;
+  // Null in the serving-less (transcription-only) construction: the generate
+  // routes are then not registered, and direct handler dispatch reports the
+  // NotImplementedError mirror (see handle_completions).
+  OpenAIServingCompletion* completion_ = nullptr;
+  OpenAIServingChat* chat_ = nullptr;
   OpenAIServingModels& models_;
   std::string version_;
 
   // Opt-in C8 backings (all nullptr/empty by default → routes not registered).
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
+  ::vllm::openai::VideoRunner video_runner_;
+  TranscribeFn transcriber_;
+  EmbedFn embedder_;
+  mutable ::vllm::openai::VideoJobStore video_jobs_;
+  // Background workers for the ASYNC endpoint. Joined in ~ApiServer, which is
+  // why they are joinable threads and not detached: a detached worker would
+  // outlive `this` and write into a destroyed job store.
+  std::vector<std::thread> video_workers_;
+  std::mutex video_workers_mutex_;
   const vllm::tok::Tokenizer* tokenizer_ = nullptr;
   int64_t max_model_len_ = 0;
   bool tokenizer_info_enabled_ = false;
   std::function<bool(bool, bool)> reset_prefix_cache_;
   std::function<int(const std::vector<std::string>&)> abort_requests_;
+
+  // The non-fatal note a `model` naming something we do not serve earns (empty
+  // when absent or matching). See the definition for why it is not a rejection.
+  std::string video_model_warning(
+      const ::vllm::openai::VideoRequest& request) const;
 
   // Opaque httplib::Server (pimpl keeps third_party/httplib.h out of this
   // header — only api_server.cpp and the smoke test pull it in).
@@ -236,14 +348,16 @@ class ApiServer {
 //     the abort-ALL (empty request_ids) path is a NAMED RESIDUAL — AsyncLLM
 //     exposes no active-request-id enumeration, so empty ids abort nothing and
 //     report 0 (explicit-id abort is the supported production path).
-//   /metrics, /reset_prefix_cache — NOT wired (deliberate, honest residuals).
-//     The production frontend is AsyncLLM (main.cpp: loaded->async_engine()),
-//     whose output handler records no iteration/scheduler stats to any
-//     PrometheusStatLogger (async stats deferred, specs/async-serving.md) and
-//     neither LoadedEngine nor AsyncLLM constructs/exposes one; and
+//   /metrics — wired by the CALLER, not here, because the caller owns the
+//     PrometheusStatLogger's lifetime: server_main.cpp constructs one under
+//     --enable-metrics, attaches it to both frontends (including the production
+//     AsyncLLM, whose output handler folds each step's SchedulerStats +
+//     IterationStats into it since #277 — specs/async-metrics.md) and hands it
+//     to set_metrics_logger. Without --enable-metrics the route stays 404.
+//   /reset_prefix_cache — NOT wired (deliberate, honest residual).
 //     reset_prefix_cache() lives only on the scheduler's KVCacheManager, mutated
 //     exclusively on the EngineCore engine thread with no thread-safe RPC.
-//     Attaching either backing from main.cpp would be a fabricated wiring that
+//     Attaching a backing from main.cpp would be a fabricated wiring that
 //     never reaches the live engine, so it is left unwired and named in
 //     specs/{utility,admin}-endpoints.md.
 struct UtilityEndpointOptions {

@@ -146,26 +146,46 @@ __global__ void MoeRouterTopKKernel(float* weights, int32_t* indices, const Tin*
           li = static_cast<int>(idx);
         }
       }
-      red[threadIdx.x] = lv;
-      redi[threadIdx.x] = li;
+      // Warp-shuffle argmax, then ONE cross-warp pass. This replaces a
+      // block-wide tree that cost log2(kBlock) __syncthreads PER ROUND: at
+      // decode the grid is one block per token, so a k=8 top-k over 256 experts
+      // spent ~64 barriers on a single SM and the measured kernel was 19.5 us
+      // for work that is a few hundred comparisons (4.7% of the 35B decode
+      // step). Barriers per round drop from log2(kBlock)+1 to 2.
+      //
+      // BYTE-IDENTICAL, and the reason is worth stating: this is an ARGMAX
+      // reduction, not an arithmetic one. The comparison below is exactly the
+      // one the tree used -- higher value wins, and on an exact tie the lower
+      // expert index wins -- and argmax under a total order is associative and
+      // commutative, so ANY reduction order yields the same (value, index).
+      // The softmax max and sum reductions above are arithmetic and their tree
+      // is deliberately left untouched, because changing THEIR order would
+      // change the denominator in the last ulp.
+      for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, lv, off);
+        const int oi = __shfl_down_sync(0xffffffffu, li, off);
+        if (ov > lv || (ov == lv && oi >= 0 && (li < 0 || oi < li))) {
+          lv = ov;
+          li = oi;
+        }
+      }
+      constexpr int kWarps = kBlock / 32;
+      if ((threadIdx.x & 31u) == 0u) {
+        red[threadIdx.x >> 5] = lv;
+        redi[threadIdx.x >> 5] = li;
+      }
       __syncthreads();
-      for (int s = kBlock / 2; s > 0; s /= 2) {
-        if (static_cast<int>(threadIdx.x) < s) {
-          const float ov = red[threadIdx.x + s];
-          const int oi = redi[threadIdx.x + s];
-          const float cv = red[threadIdx.x];
-          const int ci = redi[threadIdx.x];
-          // Higher value wins; on an exact tie the lower expert index wins.
-          if (ov > cv || (ov == cv && oi >= 0 && (ci < 0 || oi < ci))) {
-            red[threadIdx.x] = ov;
-            redi[threadIdx.x] = oi;
+      if (threadIdx.x == 0) {
+        float best_v = red[0];
+        int best = redi[0];
+        for (int w = 1; w < kWarps; ++w) {
+          const float ov = red[w];
+          const int oi = redi[w];
+          if (ov > best_v || (ov == best_v && oi >= 0 && (best < 0 || oi < best))) {
+            best_v = ov;
+            best = oi;
           }
         }
-        __syncthreads();
-      }
-      const float best_v = red[0];
-      const int best = redi[0];
-      if (threadIdx.x == 0) {
         if (best >= 0) sp[best] = -INFINITY;  // exclude from subsequent rounds
         weights[row * k + j] = best_v;
         indices[row * k + j] = static_cast<int32_t>(best);
@@ -207,6 +227,7 @@ __global__ void MoeRouterGroupedTopKKernel(float* weights, int32_t* indices,
   float* gscore = smem + 2 * e;             // [n_group]
   float* gkeep = smem + 2 * e + n_group;    // [n_group] 0/1 mask
   __shared__ float red[kBlock];
+  __shared__ int redi[kBlock];  // argmax partner for red, step (4)
 
   // (1) scores = softmax(logits, -1) | sigmoid(logits)  (:110-117)
   if (sigmoid) {
@@ -256,9 +277,11 @@ __global__ void MoeRouterGroupedTopKKernel(float* weights, int32_t* indices,
   }
   __syncthreads();
 
-  if (threadIdx.x != 0) return;
-
+  // Steps (2) and (3) stay serial on thread 0: they are O(n_group * group_size)
+  // ONCE per token and n_group is 1 or 8 for the shapes we serve. The block is
+  // NOT retired here any more, because step (4) below now uses it.
   const int64_t group_size = e / n_group;
+  if (threadIdx.x == 0) {
   // Group score: top-2 SUM with a bias (:124-126), else the group MAX (:128-131).
   for (int64_t g = 0; g < n_group; ++g) {
     const int64_t base = g * group_size;
@@ -298,28 +321,72 @@ __global__ void MoeRouterGroupedTopKKernel(float* weights, int32_t* indices,
     if (best < 0) break;  // fewer groups than topk_group (wrapper forbids it)
     gkeep[best] = 1.0f;
   }
-  for (int64_t g = 0; g < n_group; ++g) {
-    if (gkeep[g] != 0.0f) continue;
-    for (int64_t j = 0; j < group_size; ++j) sel[g * group_size + j] = -INFINITY;
+    for (int64_t g = 0; g < n_group; ++g) {
+      if (gkeep[g] != 0.0f) continue;
+      for (int64_t j = 0; j < group_size; ++j) sel[g * group_size + j] = -INFINITY;
+    }
   }
+  __syncthreads();  // the group mask in sel[] must be visible to the block
+
   // (4) top-k over the masked selection scores; weight from the unbiased score.
-  float denom = 0.0f;
+  //
+  // BLOCK-PARALLEL, and byte-identical to the serial scan it replaces. This was
+  // `for idx in [0,e)` on THREAD 0 alone, k times: at Kimi-Linear's shape
+  // (e=256, k=8) that is ~2048 serial compares on one lane of one block, which
+  // the kernel's own comment deferred to "W9, after the numerics are gated".
+  // The identity argument is the same one used for the ungrouped router: this
+  // is an ARGMAX over a total order (higher score wins, exact tie to the lower
+  // expert index, which the serial ascending scan with strict `>` also gives),
+  // and argmax is associative and commutative, so any reduction order returns
+  // the same (value, index). Everything ARITHMETIC is untouched and still runs
+  // on thread 0 in the same order: the `denom` accumulation in k order, the
+  // renormalize, and the routed_scaling_factor.
+  float denom = 0.0f;  // meaningful on thread 0 only
+  constexpr int kWarps = kBlock / 32;
   for (int j = 0; j < k; ++j) {
-    int64_t best = -1;
-    float best_v = -INFINITY;
-    for (int64_t idx = 0; idx < e; ++idx) {
-      if (sel[idx] > best_v) {
-        best_v = sel[idx];
-        best = idx;
+    float lv = -INFINITY;
+    int li = -1;
+    for (int64_t idx = threadIdx.x; idx < e; idx += blockDim.x) {
+      const float v = sel[idx];
+      if (v > lv) {  // strict `>`, ascending stride -> lowest index at the max
+        lv = v;
+        li = static_cast<int>(idx);
       }
     }
-    if (best < 0) best = 0;
-    sel[best] = -INFINITY;
-    const float w = orig[best];
-    weights[row * k + j] = w;
-    indices[row * k + j] = static_cast<int32_t>(best);
-    denom += w;
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xffffffffu, lv, off);
+      const int oi = __shfl_down_sync(0xffffffffu, li, off);
+      if (ov > lv || (ov == lv && oi >= 0 && (li < 0 || oi < li))) {
+        lv = ov;
+        li = oi;
+      }
+    }
+    if ((threadIdx.x & 31u) == 0u) {
+      red[threadIdx.x >> 5] = lv;
+      redi[threadIdx.x >> 5] = li;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float best_v = red[0];
+      int best = redi[0];
+      for (int w2 = 1; w2 < kWarps; ++w2) {
+        const float ov = red[w2];
+        const int oi = redi[w2];
+        if (ov > best_v || (ov == best_v && oi >= 0 && (best < 0 || oi < best))) {
+          best_v = ov;
+          best = oi;
+        }
+      }
+      if (best < 0) best = 0;  // all -inf: the serial scan also fell back to 0
+      sel[best] = -INFINITY;
+      const float w = orig[best];
+      weights[row * k + j] = w;
+      indices[row * k + j] = static_cast<int32_t>(best);
+      denom += w;
+    }
+    __syncthreads();  // sel[best]=-INF visible + red/redi reusable next round
   }
+  if (threadIdx.x != 0) return;
   // (5) renormalize (:156-157) THEN routed_scaling_factor (:159-160).
   if (renormalize) {
     if (!(denom > 0.0f)) denom = 1.0f;
@@ -480,9 +547,13 @@ void MoeCombineKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out, const
 // topk_weight_and_reduce.py moe_sum) extended to fold the shared contribution.
 __device__ inline float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-template <typename Teo, typename Tout>
+// `sd` is read through Tsd: the f32 the shared down-proj used to be cast to, or
+// the bf16 the Marlin GEMM actually produced. Widening bf16 to float in-kernel
+// is EXACT, and the value is immediately re-rounded through bf16 below, so both
+// forms are bit-identical -- the bf16 one just skips a whole [T,H] f32 cast.
+template <typename Teo, typename Tsd, typename Tout>
 __global__ void MoeCombineGateKernel(Tout* out, const Teo* expert_out, const float* weights,
-                                     const float* sd, const float* gl, int64_t t, int64_t h,
+                                     const Tsd* sd, const float* gl, int64_t t, int64_t h,
                                      int k) {
   const int64_t n = t * h;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -495,7 +566,7 @@ __global__ void MoeCombineGateKernel(Tout* out, const Teo* expert_out, const flo
       acc += weights[row * k + j] * Load(expert_out, (row * k + j) * h + col);
     // Shared-expert gate, rounded through bf16 exactly as SharedExpertGate's
     // store, then re-added in f32 (matches MoeCombine's Load(shared) bf16->f32).
-    const float sv = SigmoidF(gl[row]) * sd[idx];
+    const float sv = SigmoidF(gl[row]) * Load(sd, idx);
     acc += __bfloat162float(__float2bfloat16(sv));
     Store(out, idx, acc);
   }
@@ -505,9 +576,15 @@ template <typename Teo, typename Tout>
 void LaunchCombineGate(cudaStream_t s, Tensor& out, const Tensor& expert_out,
                        const Tensor& weights, const Tensor& sd, const Tensor& gl, int64_t t,
                        int64_t h, int k) {
-  MoeCombineGateKernel<Teo, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
-      out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(), sd.Ptr<float>(),
-      gl.Ptr<float>(), t, h, k);
+  if (sd.dtype == DType::kBF16) {
+    MoeCombineGateKernel<Teo, __nv_bfloat16, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
+        out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(),
+        sd.Ptr<__nv_bfloat16>(), gl.Ptr<float>(), t, h, k);
+  } else {
+    MoeCombineGateKernel<Teo, float, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
+        out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(), sd.Ptr<float>(),
+        gl.Ptr<float>(), t, h, k);
+  }
   Check(cudaGetLastError(), "moe_combine_gate launch");
 }
 
@@ -527,6 +604,8 @@ void MoeCombineGateKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out,
            "cuda moe_combine_gate: unsupported expert_out dtype (f32/bf16 only)");
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
            "cuda moe_combine_gate: unsupported out dtype (f32/bf16 only)");
+  VT_CHECK(sd.dtype == DType::kF32 || sd.dtype == DType::kBF16,
+           "cuda moe_combine_gate: unsupported sd dtype (f32/bf16 only)");
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
   if (t == 0 || h == 0) return;
   cudaStream_t s = AsStream(q);

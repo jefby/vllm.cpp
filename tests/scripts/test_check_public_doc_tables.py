@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -359,9 +360,6 @@ class RollRecordTests(unittest.TestCase):
         self.assertTrue(all("not a heading" not in t for t, _ in sections))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # docs/STATUS.md is guarded by a RATCHET, not a budget: it may only shrink. The
 # mutations therefore prove both directions -- growth fails, shrinkage passes --
@@ -402,10 +400,6 @@ class StatusRatchet(unittest.TestCase):
                     f"dropping '{label}' was not rejected",
                 )
 
-    def test_growth_past_the_char_ratchet_is_rejected(self) -> None:
-        text = STATUS_VALID + "\n" + "x" * doc_tables.STATUS_RATCHET["chars"]
-        self.assertTrue(any("chars is" in e for e in doc_tables.status_errors(text)))
-
     def test_growth_past_the_section_ratchet_is_rejected(self) -> None:
         extra = "\n".join(
             f"## Extra {i}\n\nprose\n" for i in range(doc_tables.STATUS_RATCHET["h2_sections"] + 1)
@@ -427,7 +421,178 @@ class StatusRatchet(unittest.TestCase):
         errors = doc_tables.status_errors(STATUS_VALID + "\n\n| a | b |\n|---|---|\n" + rows)
         self.assertTrue(any("oversized cells is" in e for e in errors))
 
+    def test_a_lifecycle_line_costs_no_unrelated_deletion(self) -> None:
+        """The defect ENG-RECORD-CONFLICT-SURFACES (#364) removed.
+
+        This is the RED-BEFORE case. With the `chars` key in place it failed:
+        a page that gained one ordinary lifecycle line was over its byte
+        ratchet, so the PR had to find the bytes by deleting prose from some
+        UNRELATED row and re-pin the constant in the checker. That is what
+        coupled every concurrent PR to lines it did not own and made both
+        docs/STATUS.md and this checker merge hotspots.
+
+        A lifecycle line is the most ordinary edit this page takes. It must
+        cost nothing but itself.
+        """
+        line = "| New capability | Works |\n"
+        grown = STATUS_VALID + "\n" + line
+        self.assertEqual(doc_tables.status_errors(grown), [])
+
+        # And on the LIVE page, which is the case that actually failed.
+        live = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(live + line), [])
+
+    def test_two_concurrent_lifecycle_lines_do_not_couple(self) -> None:
+        """Two PRs adding a row each must both pass, independently.
+
+        The byte ratchet made this impossible by construction: whichever landed
+        second was over the number the first had re-pinned, so it had to be
+        rebased and re-paid even though the two edits touch nothing in common.
+        Asserting BOTH arms and their union is what proves the coupling is gone
+        rather than merely relaxed for one of them.
+        """
+        live = doc_tables.STATUS.read_text(encoding="utf-8")
+        a = "| Capability A | Works |\n"
+        b = "| Capability B | Works |\n"
+        self.assertEqual(doc_tables.status_errors(live + a), [])
+        self.assertEqual(doc_tables.status_errors(live + b), [])
+        self.assertEqual(doc_tables.status_errors(live + a + b), [])
+
+    def test_the_retained_keys_still_bind_on_the_live_page(self) -> None:
+        """Removing `chars` must not have quietly disarmed the other three.
+
+        Each retained key counts a QUALITY defect rather than a length, so this
+        mutates the LIVE page past each one in turn and requires a failure. If a
+        later edit lands the page on a cap, this goes red instead of the cap
+        silently ceasing to bind.
+        """
+        live = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(live), [])
+
+        over_sections = live + "\n" + "\n".join(
+            f"## Extra {i}\n\nprose\n"
+            for i in range(doc_tables.STATUS_RATCHET["h2_sections"] + 1)
+        )
+        self.assertTrue(
+            any("h2 sections is" in e for e in doc_tables.status_errors(over_sections))
+        )
+
+        para = "y" * (doc_tables.MAX_PARAGRAPH_CHARS + 1)
+        over_paras = live + "\n\n" + "\n\n".join(
+            [para] * (doc_tables.STATUS_RATCHET["long_paragraphs"] + 1)
+        )
+        self.assertTrue(
+            any("long paragraphs is" in e for e in doc_tables.status_errors(over_paras))
+        )
+
+        cell = "z" * (doc_tables.MAX_CELL_CHARS + 1)
+        over_cells = live + "\n\n| a | b |\n|---|---|\n" + "\n".join(
+            f"| {cell} | {cell} |"
+            for _ in range(doc_tables.STATUS_RATCHET["oversized_cells"] + 1)
+        )
+        self.assertTrue(
+            any("oversized cells is" in e for e in doc_tables.status_errors(over_cells))
+        )
+
     def test_the_live_page_is_inside_its_ratchet(self) -> None:
         self.assertEqual(
             doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
         )
+
+    def test_a_retired_claim_cannot_come_back_for_free(self) -> None:
+        """A claim the page RETIRED must cost something to reinstate.
+
+        The ratchet is what makes a deletion permanent. #277 paid for its STATUS
+        edit by deleting two claims that had become false -- that `/metrics` has
+        no live async backing, once in the OpenAI-server row and once in the
+        metrics paragraph. The char ratchet it also lowered is gone (#364);
+        the deletion obligation asserted here is not.
+
+        Two things are asserted, and neither is the byte-tightness above.
+        First, the retired wording is genuinely GONE: a page that still says
+        `/metrics` is unbacked while the AsyncLLM output handler records into it
+        is lying to a reader, and no size ratchet notices a false sentence.
+        Second, putting it back is rejected -- so a future edit reinstating it
+        has to find the space, out loud, instead of spending headroom the
+        deletion left behind.
+        """
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(text), [])
+
+        retired = (
+            "metrics and cache reset lack live async backing",
+            "the async production-serving path wiring",
+        )
+        for claim in retired:
+            with self.subTest(claim=claim):
+                self.assertNotIn(
+                    claim,
+                    text,
+                    "docs/STATUS.md still carries a claim about /metrics that "
+                    "the AsyncLLM wiring made false",
+                )
+
+        restored = text.replace(
+            "cache reset lacks live async backing",
+            retired[0],
+            1,
+        ).replace(
+            "The remaining work is the chat/completion",
+            f"The remaining work is {retired[1]}, the chat/completion",
+            1,
+        )
+        self.assertGreater(
+            len(restored),
+            len(text),
+            "the mutation must actually re-add the retired claims; if the "
+            "anchors stopped matching, this test is asserting nothing",
+        )
+        # The char ratchet used to be the second half of this test: reinstating
+        # the claims had to break it. That half is gone with the ratchet
+        # (ENG-RECORD-CONFLICT-SURFACES, #364) and is deliberately NOT replaced
+        # by a weaker assertion, because it was never what made the claim false
+        # -- no size gate can tell a true sentence from a lying one. What
+        # survives is the obligation that actually mattered and that the ratchet
+        # never carried: the retired wording is gone from the live page.
+        self.assertEqual(doc_tables.status_errors(restored), [])
+
+    def test_the_status_ratchet_only_ever_moves_down(self) -> None:
+        """A ratchet that can be RAISED is a budget with extra steps.
+
+        The checker states the rule in prose -- "every limit is pinned to what
+        the page measured ... and may only go DOWN" -- and nothing enforced it.
+        Every other ratchet test here measures the LIVE page, so raising a cap
+        and growing the page by the same amount in one change is green in all of
+        them: raising a cap and growing the page by the same amount in one
+        change was green in all of them. That is the cheap way out the ratchet
+        exists to block. The `chars` key it was written for is gone (#364) --
+        it was the one every STATUS edit touched, which is what made it a merge
+        hotspot -- and the guard still binds the three that remain.
+
+        STATUS_RATCHET_CEILING is the ratchet as it stands. Lowering a cap keeps
+        passing; raising one fails here and can only be unblocked by editing the
+        ceiling in the same change -- a deliberate, reviewable act instead of a
+        silent bump. The caps have in fact only ever fallen (chars 289727 ->
+        243584 over 48 commits), so the ceiling never needs to rise.
+        """
+        ceiling = {
+            "h2_sections": 11,
+            "long_paragraphs": 82,
+            "oversized_cells": 44,
+        }
+        self.assertEqual(
+            set(doc_tables.STATUS_RATCHET),
+            set(ceiling),
+            "every ratcheted metric needs a ceiling here, and a ceiling with no "
+            "metric behind it is a metric that quietly stopped being enforced",
+        )
+        for key, cap in doc_tables.STATUS_RATCHET.items():
+            with self.subTest(metric=key):
+                self.assertLessEqual(
+                    cap,
+                    ceiling[key],
+                    f"the {key} ratchet moved UP to {cap} from {ceiling[key]}; "
+                    "docs/STATUS.md may only shrink. Collapse the superseded "
+                    "narrative instead, and lower this ceiling in the same "
+                    "change that lowers the ratchet -- never the reverse",
+                )

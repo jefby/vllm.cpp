@@ -51,6 +51,30 @@ class Backend {
   // True when host and device share one memory space (CPU, GB10, Apple).
   virtual bool UnifiedMemory() const = 0;
 
+  // True when a pointer returned by Alloc() may be DEREFERENCED BY THE HOST
+  // directly -- loaded, stored, memcpy'd -- with no map/unmap call and no
+  // staging bounce.
+  //
+  // This is STRICTLY NARROWER than UnifiedMemory(), and the difference is the
+  // whole reason it exists. CUDA on GB10 reports unified memory because host and
+  // device address the same physical RAM, yet a plain `cudaMalloc` pointer is
+  // still not host-dereferenceable. Vulkan here allocates every buffer
+  // HOST_VISIBLE|HOST_COHERENT and keeps it persistently mapped, so its pointers
+  // are ordinary host memory that the GPU also reads -- which is already what
+  // this backend's Copy/Memset (plain memcpy/memset) and the portable CPU
+  // reference tier depend on.
+  //
+  // MEASURED consequence (BACKEND-VULKAN-LOADMEM): where this is true, a weight
+  // that has been uploaded needs NO host mirror, because the device allocation
+  // IS a host buffer. Keeping one costs a second full copy of the model --
+  // 16.392 GiB of process RSS for a 7.6 GiB Qwen3-4B, against 8.622 GiB of
+  // Vulkan allocation -- and on a unified box that second copy comes out of the
+  // same RAM the first one does.
+  //
+  // Default false: a backend must OPT IN, because being wrong here hands a
+  // device pointer to a host memcpy and segfaults.
+  virtual bool DeviceMemoryIsHostAddressable() const { return false; }
+
   // --- Device compute capability (BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4) ---
   // The architecture the backend is actually running on, as the familiar
   // `(major, minor)` pair (GB10/sm_121 -> {12, 1}). Before this, the capability
@@ -120,6 +144,46 @@ class Backend {
   // (accelerator-seam S7), CUDA true / base false. Lives on Backend (src/vt, off
   // the DSR scan) so the model file stops naming a device at the aux-stream gate.
   virtual bool SupportsAuxStream() const { return false; }
+
+  // Whether the host may validly read the SAMPLED TOKEN ID back between steps,
+  // which is what the depth-2 async input-combine path requires
+  // (gpu/runner.cpp: QueueSupportsAsyncInputCombine). Base false — a DISCRETE
+  // non-CUDA GPU (e.g. ROCm gfx1201) is the hazard: the non-CUDA leg of
+  // sample_tokens_async Synchronizes and then host-dereferences `dev_ids`, a
+  // device Alloc that is garbage off-device (the "!"-token corruption on the lab
+  // R9700, 2026-08-07), so those queues MUST stay synchronous. Overridden true
+  // by CPU (host and device memory are the same allocation, so the read is
+  // always valid) and by CUDA (the sampled id is device-mirrored,
+  // async_device_mirror()). This is the capability the runner's
+  // `device == kCUDA` gate actually asked; it lives on Backend (src/vt, off the
+  // DSR scan) so the device-agnostic shared layer stops naming a device — the
+  // same move SupportsAuxStream made for the aux-stream gate.
+  // TODO(rocm): an INTEGRATED non-CUDA GPU reports UnifiedMemory()==true (see
+  // row/ROCM-UNIFIED-MEMORY-B), where the alias IS valid; such a backend may
+  // override this true once a HIP sampled-token mirror or a D2H copy of dev_ids
+  // lands.
+  virtual bool SupportsAsyncSampledTokenReadback() const { return false; }
+
+  // Can this backend's causal-conv1d kernels read and write a COMPRESSED (bf16)
+  // conv_state IN PLACE? vLLM's default mamba_cache_dtype="auto" makes the GDN
+  // conv cache the model dtype (bf16 for the gate checkpoints), and a backend
+  // that cannot address it must be handed an f32 working copy instead — which
+  // costs the caller a gather before and a scatter after, per GDN layer, per
+  // token. Overridden true by CUDA and by Vulkan, whose kernels widen the stored
+  // element to f32, accumulate in f32 registers and round once on store; that is
+  // the SAME single bf16->f32->bf16 round trip the gather/scatter arm performs,
+  // so the two arms agree bit-for-bit.
+  // This is the capability the `device == kCUDA` clause in CheckConvCommon
+  // actually asked. It lives on Backend so the shared vt op layer stops naming a
+  // device, exactly as SupportsAsyncSampledTokenReadback did for the runner.
+  virtual bool SupportsCompressedConvState() const { return false; }
+
+  // The GDN recurrent (SSM) state twin of the conv clause above: f16/bf16
+  // [N,Hv,Dv,Dk] state addressed in place by the GdnPrefill/GdnDecode kernels,
+  // read/written in f32 registers (vLLM's mamba_cache_dtype default is bf16).
+  // CheckGdnCommon used to spell this as `device == kCUDA`; asking the backend
+  // keeps the shared op layer device-agnostic.
+  virtual bool SupportsCompressedGdnState() const { return false; }
 
   // Optional graph/command capture (CUDA Graphs / Metal ICB / Vulkan CB).
   virtual bool SupportsGraphCapture() const { return false; }

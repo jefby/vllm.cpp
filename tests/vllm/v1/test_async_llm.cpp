@@ -36,6 +36,7 @@
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/v1/core/sched/async_scheduler.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/async_llm.h"
@@ -43,6 +44,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/metrics/loggers.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vt/dtype.h"
 
@@ -56,6 +58,8 @@ using vllm::tok::MapBytesToUnicode;
 using vllm::tok::Tokenizer;
 using vllm::v1::AsyncLLM;
 using vllm::v1::AsyncRequest;
+using vllm::v1::AsyncStringRequestInput;
+using vllm::v1::AsyncTokensRequestInput;
 using vllm::v1::Executor;
 using vllm::v1::FullAttentionSpec;
 using vllm::v1::get_request_block_hasher;
@@ -65,6 +69,8 @@ using vllm::v1::KVCacheConfig;
 using vllm::v1::ModelRunnerBase;
 using vllm::v1::ModelRunnerOutput;
 using vllm::v1::OutputProcessor;
+using vllm::v1::PublishAsyncRequestWaveIfAlive;
+using vllm::v1::metrics::PrometheusStatLogger;
 using vllm::v1::Scheduler;
 using vllm::v1::SchedulerOutput;
 using vllm::v1::sha256_cbor;
@@ -137,6 +143,21 @@ class CerrRedirect {
   std::streambuf* previous_;
 };
 
+struct ObservableMutex {
+  void lock() {
+    ++lock_calls;
+    locked = true;
+  }
+  void unlock() {
+    ++unlock_calls;
+    locked = false;
+  }
+
+  bool locked = false;
+  int lock_calls = 0;
+  int unlock_calls = 0;
+};
+
 std::unique_ptr<Scheduler> CreateScheduler() {
   SchedulerConfig cfg;
   cfg.max_num_seqs = 128;
@@ -154,7 +175,13 @@ std::unique_ptr<Scheduler> CreateScheduler() {
                                      /*enable_caching=*/true);
 }
 
-Tokenizer BuildFixture() {
+// `with_special_post_processor` adds a TemplateProcessing post-processor that
+// prefixes one <tool> special token. It MUST stay opt-in: it lengthens every
+// encoded prompt by one token, and the shared fixture is used by tests that
+// assert exact prompt-token counts (e.g. the depth-2 IterationStats fold
+// asserts vllm:prompt_tokens_total == 1). Turning it on globally silently
+// broke that assertion, which is why it is a parameter and not the default.
+Tokenizer BuildFixture(bool with_special_post_processor = false) {
   static int counter = 0;
   const std::string path =
       (std::filesystem::temp_directory_path() /
@@ -162,7 +189,10 @@ Tokenizer BuildFixture() {
           .string();
   json doc;
   doc["version"] = "1.0";
-  doc["added_tokens"] = json::array();
+  doc["added_tokens"] =
+      with_special_post_processor
+          ? json::array({{{"id", 21}, {"content", "<tool>"}, {"special", true}}})
+          : json::array();
   doc["normalizer"] = nullptr;
   doc["pre_tokenizer"] = {
       {"type", "Sequence"},
@@ -178,6 +208,19 @@ Tokenizer BuildFixture() {
              {"add_prefix_space", false},
              {"trim_offsets", false},
              {"use_regex", false}}})}};
+  if (with_special_post_processor) {
+    doc["post_processor"] = json::parse(R"json({
+      "type": "TemplateProcessing",
+      "single": [
+        {"SpecialToken": {"id": "<tool>", "type_id": 0}},
+        {"Sequence": {"id": "A", "type_id": 0}}
+      ],
+      "pair": [],
+      "special_tokens": {
+        "<tool>": {"id": "<tool>", "ids": [21], "tokens": ["<tool>"]}
+      }
+    })json");
+  }
   json vocab = {{"h", 0},   {"e", 1},    {"l", 2},     {"o", 3},
                 {"w", 4},   {"r", 5},    {"d", 6},     {"Ġ", 7},
                 {"1", 8},   {"2", 9},    {"ll", 10},   {"he", 11},
@@ -231,6 +274,19 @@ int Drain(AsyncLLM& engine, const AsyncRequest& request,
   }
 }
 
+// Parse the scalar a Prometheus text line carries: find "<series> " and read
+// the value to end of line. Same shape as test_llm_engine.cpp's helper, but
+// this one RETURNS a sentinel instead of failing when the series is absent, so
+// it is safe to call inside a poll loop.
+double MetricValue(const std::string& text, const std::string& series) {
+  const std::string needle = series + " ";
+  const size_t p = text.find(needle);
+  if (p == std::string::npos) return -1.0;
+  const size_t v = p + needle.size();
+  const size_t e = text.find('\n', v);
+  return std::stod(text.substr(v, e - v));
+}
+
 void InitHash() {
   static bool initialized = false;
   if (!initialized) {
@@ -240,6 +296,35 @@ void InitHash() {
 }
 
 }  // namespace
+
+TEST_CASE("async_llm wave guard rejects shutdown after the outer check") {
+  bool alive = true;
+  bool published = false;
+  bool predicate_observed_lock = false;
+  ObservableMutex admission_mutex;
+
+  // Model a submitter that passed the lock-free fast check, then lost the race
+  // to shutdown before entering the admission critical section.
+  REQUIRE(alive);
+  alive = false;
+  CHECK_THROWS_AS(
+      PublishAsyncRequestWaveIfAlive(
+          admission_mutex,
+          [&]() {
+            predicate_observed_lock = admission_mutex.locked;
+            return alive;
+          },
+          [&]() {
+            published = true;
+            return 17;
+          }),
+      vllm::v1::EngineDeadError);
+  CHECK(predicate_observed_lock);
+  CHECK_FALSE(published);
+  CHECK_FALSE(admission_mutex.locked);
+  CHECK(admission_mutex.lock_calls == 1);
+  CHECK(admission_mutex.unlock_calls == 1);
+}
 
 TEST_CASE("async_llm test_load: concurrent requests all finish with unique ids") {
   InitHash();
@@ -268,6 +353,206 @@ TEST_CASE("async_llm test_load: concurrent requests all finish with unique ids")
     CHECK(Drain(engine, request) == kTokens);
   }
   CHECK_FALSE(engine.has_unfinished_requests());
+}
+
+TEST_CASE(
+    "async_llm ordered waves preserve string/token inputs and one-item behavior") {
+  InitHash();
+  // Opts in: this case asserts EncodeWithSpecialTokens differs from Encode.
+  Tokenizer tokenizer = BuildFixture(/*with_special_post_processor=*/true);
+  HfConfig config = MakeConfig();
+  auto scheduler = CreateScheduler();
+  RunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, *scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor));
+
+  const std::vector<std::string> prompts = {"hello", "hello world", "world"};
+  CHECK(tokenizer.EncodeWithSpecialTokens(prompts.front()) !=
+        tokenizer.Encode(prompts.front()));
+
+  std::vector<AsyncStringRequestInput> strings;
+  for (size_t i = 0; i < prompts.size(); ++i) {
+    strings.push_back({"string-" + std::to_string(i), prompts[i],
+                       Params(4, RequestOutputKind::kDelta), 0});
+  }
+  std::vector<AsyncRequest> string_requests =
+      engine.add_request_wave(std::move(strings));
+  REQUIRE(string_requests.size() == prompts.size());
+
+  std::vector<std::vector<int32_t>> string_prompt_ids;
+  std::vector<std::vector<int32_t>> string_output_ids;
+  for (size_t i = 0; i < string_requests.size(); ++i) {
+    CHECK(string_requests[i].request_id == "string-" + std::to_string(i));
+    std::vector<RequestOutput> frames;
+    CHECK(Drain(engine, string_requests[i], &frames) == 4);
+    REQUIRE_FALSE(frames.empty());
+    string_prompt_ids.push_back(frames.front().prompt_token_ids);
+    std::vector<int32_t> generated;
+    for (const RequestOutput& frame : frames) {
+      REQUIRE(frame.outputs.size() == 1);
+      generated.insert(generated.end(), frame.outputs[0].token_ids.begin(),
+                       frame.outputs[0].token_ids.end());
+    }
+    string_output_ids.push_back(std::move(generated));
+  }
+
+  std::vector<AsyncTokensRequestInput> tokens;
+  for (size_t i = 0; i < prompts.size(); ++i) {
+    tokens.push_back({"tokens-" + std::to_string(i),
+                      tokenizer.EncodeWithSpecialTokens(prompts[i]),
+                      Params(4, RequestOutputKind::kDelta), 0});
+  }
+  std::vector<AsyncRequest> token_requests =
+      engine.add_request_wave(std::move(tokens));
+  REQUIRE(token_requests.size() == prompts.size());
+
+  std::vector<std::vector<int32_t>> token_prompt_ids;
+  std::vector<std::vector<int32_t>> token_output_ids;
+  for (size_t i = 0; i < token_requests.size(); ++i) {
+    CHECK(token_requests[i].request_id == "tokens-" + std::to_string(i));
+    std::vector<RequestOutput> frames;
+    CHECK(Drain(engine, token_requests[i], &frames) == 4);
+    REQUIRE_FALSE(frames.empty());
+    token_prompt_ids.push_back(frames.front().prompt_token_ids);
+    std::vector<int32_t> generated;
+    for (const RequestOutput& frame : frames) {
+      REQUIRE(frame.outputs.size() == 1);
+      generated.insert(generated.end(), frame.outputs[0].token_ids.begin(),
+                       frame.outputs[0].token_ids.end());
+    }
+    token_output_ids.push_back(std::move(generated));
+  }
+  CHECK(token_prompt_ids == string_prompt_ids);
+  CHECK(token_output_ids == string_output_ids);
+
+  std::vector<AsyncTokensRequestInput> singleton;
+  singleton.push_back({"singleton", tokenizer.EncodeWithSpecialTokens("hello"),
+                       Params(3, RequestOutputKind::kDelta), 0});
+  std::vector<AsyncRequest> one = engine.add_request_wave(std::move(singleton));
+  REQUIRE(one.size() == 1);
+  CHECK(one.front().request_id == "singleton");
+  CHECK(Drain(engine, one.front()) == 3);
+  CHECK_FALSE(engine.has_unfinished_requests());
+}
+
+TEST_CASE("async_llm wave preparation failure publishes no request") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+  auto scheduler = CreateScheduler();
+  RunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, *scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor));
+
+  SamplingParams invalid = Params(2, RequestOutputKind::kDelta);
+  invalid.max_tokens = 0;
+  std::vector<AsyncStringRequestInput> wave;
+  wave.push_back(
+      {"prepared-before-failure", "hello",
+       Params(2, RequestOutputKind::kDelta), 0});
+  wave.push_back({"invalid", "hello", std::move(invalid), 0});
+  wave.push_back(
+      {"never-prepared", "hello", Params(2, RequestOutputKind::kDelta), 0});
+  CHECK_THROWS_AS(engine.add_request_wave(std::move(wave)), std::runtime_error);
+  CHECK_FALSE(engine.has_unfinished_requests());
+
+  // The first id was prepared but never registered/published and is reusable.
+  AsyncRequest reused = engine.add_request(
+      "prepared-before-failure", "hello",
+      Params(2, RequestOutputKind::kDelta));
+  CHECK(Drain(engine, reused) == 2);
+}
+
+TEST_CASE("async_llm duplicate wave rollback preserves the existing request") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+  auto scheduler = CreateScheduler();
+  RunnerStub runner(std::chrono::milliseconds(1));
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, *scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor));
+
+  AsyncRequest existing = engine.add_request(
+      "existing", "hello", Params(100000, RequestOutputKind::kDelta));
+  std::vector<AsyncStringRequestInput> wave;
+  wave.push_back(
+      {"new-a", "hello", Params(2, RequestOutputKind::kDelta), 0});
+  wave.push_back(
+      {"existing", "hello", Params(2, RequestOutputKind::kDelta), 0});
+  wave.push_back(
+      {"new-b", "hello", Params(2, RequestOutputKind::kDelta), 0});
+  CHECK_THROWS_AS(engine.add_request_wave(std::move(wave)),
+                  std::invalid_argument);
+  CHECK(engine.get_num_unfinished_requests() == 1);
+
+  // Rollback must not strand new-a, publish any failed-wave prefix, or abort
+  // the colliding pre-existing request.
+  std::vector<AsyncStringRequestInput> retry;
+  retry.push_back(
+      {"new-a", "hello", Params(2, RequestOutputKind::kDelta), 0});
+  std::vector<AsyncRequest> admitted =
+      engine.add_request_wave(std::move(retry));
+  REQUIRE(admitted.size() == 1);
+  CHECK(Drain(engine, admitted.front()) == 2);
+  engine.abort(existing.request_id);
+  RequestOutput terminal = engine.get_output(existing);
+  CHECK(terminal.finished);
+  CHECK_FALSE(engine.has_unfinished_requests());
+}
+
+TEST_CASE("async_llm concurrent shutdown accepts or rejects a complete wave") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    auto scheduler = CreateScheduler();
+    RunnerStub runner(std::chrono::milliseconds(1));
+    Executor executor(runner);
+    InputProcessor input(tokenizer, config);
+    OutputProcessor output(&tokenizer);
+    AsyncLLM engine(input, *scheduler, executor, output,
+                    get_request_block_hasher(16, sha256_cbor));
+
+    std::optional<std::vector<AsyncRequest>> accepted;
+    std::exception_ptr submit_error;
+    std::thread submitter([&] {
+      try {
+        std::vector<AsyncStringRequestInput> wave;
+        for (int i = 0; i < 3; ++i) {
+          wave.push_back({"shutdown-wave-" + std::to_string(i), "hello",
+                          Params(1000, RequestOutputKind::kDelta), 0});
+        }
+        accepted = engine.add_request_wave(std::move(wave));
+      } catch (...) {
+        submit_error = std::current_exception();
+      }
+    });
+
+    engine.shutdown();
+    submitter.join();
+    if (accepted.has_value()) {
+      REQUIRE(accepted->size() == 3);
+      for (const AsyncRequest& request : *accepted) {
+        RequestOutput terminal = request.collector->get();
+        CHECK(terminal.finished);
+      }
+    } else {
+      REQUIRE(submit_error != nullptr);
+      CHECK_THROWS_AS(std::rethrow_exception(submit_error),
+                      vllm::v1::EngineDeadError);
+    }
+    CHECK_FALSE(output.has_unfinished_requests());
+  }
 }
 
 TEST_CASE("async_llm test_abort and test_multi_abort leave other requests healthy") {
@@ -522,4 +807,133 @@ TEST_CASE(
   CHECK(second_add_what.find("EngineCore encountered an issue") !=
         std::string::npos);
   CHECK(second_add_what.find("DIAG_ROOT_CAUSE_SENTINEL") == std::string::npos);
+}
+
+// ─── Metrics on the ASYNC-SCHEDULING (depth-2 batch-queue) step path (#277) ───
+// `AsyncLLM` with max_concurrent_batches=2 runs EngineCore::step_with_batch_queue
+// instead of step(). Upstream stamps `scheduler_stats` and `timestamp` inside
+// `Scheduler.update_from_output` (scheduler.py:1938-1951) and
+// `EngineCoreOutputs.__post_init__` (engine/__init__.py:249-251) — a path BOTH
+// step functions share, so upstream's batch-queue path carries them too. Our
+// port stamped them at EngineCore::step() only, so the depth-2 serving path
+// (which is what `LoadedEngine` resolves to when the runner supports async
+// scheduling) published a default-constructed SchedulerStats and timestamp 0.
+//
+// The gauge assertion is a POLL rather than a single scrape: the running batch
+// is only observable while a request is in flight, and the delayed stub keeps
+// one in flight for as long as the poll needs. It also exercises the recorder
+// mutex, since Expose() here runs on the test thread concurrently with the
+// output handler's Record().
+//
+// RED before the stamp: the running gauge never leaves 0 and the poll times out.
+TEST_CASE("async_llm: depth-2 batch-queue step publishes live scheduler stats") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+  KVCacheConfig kv;
+  kv.num_blocks = 10000;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, 1, 1, DType::kF32));
+  vllm::v1::AsyncScheduler scheduler(cfg, kv, /*block_size=*/16,
+                                     /*enable_caching=*/true);
+
+  // 500 us per step keeps a long request in flight for the whole poll window.
+  RunnerStub runner(std::chrono::microseconds(500));
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor),
+                  /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/2);
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  AsyncRequest long_request = engine.add_request(
+      "in-flight", "hello", Params(100000, RequestOutputKind::kDelta));
+
+  // Poll until the running gauge reports the in-flight request. Generous
+  // budget: this box is shared and the assertion is about the value ever being
+  // published at all, not about how fast it appears.
+  bool saw_running = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (MetricValue(logger.Expose(),
+                    "vllm:num_requests_running{model_name=\"m\",engine=\"0\"}") ==
+        1.0) {
+      saw_running = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  CHECK(saw_running);
+
+  engine.abort(long_request.request_id);
+  engine.shutdown();
+}
+
+// The token counters and the engine-core-timestamp-derived histograms on the
+// same depth-2 path. Without the timestamp stamp the TTFT/e2e observations are
+// `0 - arrival_time`, i.e. strongly NEGATIVE, so a positive _sum is the exact
+// discriminator. Counters/observation counts additionally gate the fold itself.
+TEST_CASE("async_llm: depth-2 batch-queue step folds IterationStats") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+  KVCacheConfig kv;
+  kv.num_blocks = 10000;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, 1, 1, DType::kF32));
+  vllm::v1::AsyncScheduler scheduler(cfg, kv, /*block_size=*/16,
+                                     /*enable_caching=*/true);
+
+  RunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor),
+                  /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/2);
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  constexpr int kTokens = 8;
+  AsyncRequest request = engine.add_request(
+      "r", "hello", Params(kTokens, RequestOutputKind::kDelta));
+  CHECK(Drain(engine, request) == kTokens);
+  // Join the output handler so every fold has retired before the scrape.
+  engine.shutdown();
+
+  const std::string t = logger.Expose();
+  const char* kLabels = "{model_name=\"m\",engine=\"0\"}";
+  CHECK(MetricValue(t, std::string("vllm:prompt_tokens_total") + kLabels) == 1.0);
+  CHECK(MetricValue(t, std::string("vllm:generation_tokens_total") + kLabels) ==
+        static_cast<double>(kTokens));
+  CHECK(MetricValue(t, std::string("vllm:time_to_first_token_seconds_count") +
+                           kLabels) == 1.0);
+  CHECK(MetricValue(t, std::string("vllm:e2e_request_latency_seconds_count") +
+                           kLabels) == 1.0);
+  // The discriminator for the timestamp stamp: an unstamped (0.0) engine-core
+  // timestamp makes both of these negative.
+  CHECK(MetricValue(t, std::string("vllm:time_to_first_token_seconds_sum") +
+                           kLabels) > 0.0);
+  CHECK(MetricValue(t, std::string("vllm:e2e_request_latency_seconds_sum") +
+                           kLabels) > 0.0);
 }

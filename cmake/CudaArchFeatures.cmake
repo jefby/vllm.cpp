@@ -197,6 +197,54 @@ function(vt_cuda_archs_denormalize OUT_VAR IN_ARCHS)
   set(${OUT_VAR} "${_out}" PARENT_SCOPE)
 endfunction()
 
+# vt_cuda_gencode_options(<OUT> <CMAKE CUDA arch list>)
+#   Convert an explicit CMake-form architecture list into source-scoped nvcc
+#   gencode options. W1 disables CMake's target-wide CUDA_ARCHITECTURES emission
+#   and applies these options exactly once to each CUDA source, using either the
+#   complete release list (portable TUs) or the feature-table intersection
+#   (architecture-specific TUs). This is the local equivalent of vLLM's
+#   set_gencode_flags_for_srcs helper in cmake/utils.cmake.
+function(vt_cuda_gencode_options OUT_VAR ARCHS)
+  set(_options)
+  set(_archs ${ARCHS})
+  list(REMOVE_DUPLICATES _archs)
+  list(SORT _archs COMPARE NATURAL ORDER ASCENDING)
+  foreach(_arch IN LISTS _archs)
+    set(_emit_ptx OFF)
+    if(_arch MATCHES "\\+PTX$")
+      set(_emit_ptx ON)
+      string(REGEX REPLACE "\\+PTX$" "" _arch "${_arch}")
+    endif()
+    if(NOT _arch MATCHES "^[0-9]+[af]?$")
+      message(FATAL_ERROR
+        "vt_cuda_gencode_options: invalid CUDA architecture '${_arch}'")
+    endif()
+    list(APPEND _options
+      "-gencode=arch=compute_${_arch},code=sm_${_arch}")
+    if(_emit_ptx)
+      list(APPEND _options
+        "-gencode=arch=compute_${_arch},code=compute_${_arch}")
+    endif()
+  endforeach()
+  set(${OUT_VAR} "${_options}" PARENT_SCOPE)
+endfunction()
+
+# vt_cuda_set_source_gencode(<ARCHS> <source>...)
+#   Apply one explicit architecture set to CUDA translation units without
+#   disturbing their existing source-scoped warnings, includes, definitions,
+#   or CUTLASS/FlashInfer options.
+function(vt_cuda_set_source_gencode ARCHS)
+  if(NOT ARGN)
+    return()
+  endif()
+  vt_cuda_gencode_options(_gencode "${ARCHS}")
+  if(NOT _gencode)
+    message(FATAL_ERROR
+      "vt_cuda_set_source_gencode: no architectures for sources [${ARGN}]")
+  endif()
+  set_property(SOURCE ${ARGN} APPEND PROPERTY COMPILE_OPTIONS ${_gencode})
+endfunction()
+
 # ===========================================================================
 # THE FEATURE TABLE — arch -> capability set.
 #
@@ -280,9 +328,12 @@ set(VT_CUDA_FEATURE_TABLE
   "scaledmm-c3x-sm100|10.0a|CUTLASS C3x FP8 scaled-mm tcgen05 GEMM, sm100 build-verify (VT_SCALEDMM_C3X_SM100)"
   # Vendored Marlin NVFP4 W4A16 grouped-MoE GEMM (src/vt/cuda/marlin/).
   # upstream: vLLM MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" (CMakeLists.txt:558) — the
-  # sm80+PTX leg is NOT claimed here: our vendored slice is the bf16 NVFP4
-  # instantiation only and has never been built or run outside sm_12x.
-  "marlin-nvfp4|12.0a,12.1a|vendored Marlin NVFP4 W4A16 MoE GEMM (VT_MARLIN_NVFP4)"
+  # sm80+PTX leg is still NOT claimed: our vendored slice is the bf16 NVFP4
+  # instantiation only, and sm_8x has never been built or run.
+  # sm_110 (Jetson Thor) IS claimed: built and validated on-device — every
+  # __CUDA_ARCH__ guard under src/vt/cuda/marlin/ selects, for 1100, the same
+  # side an already-supported arch selects. See issue #325.
+  "marlin-nvfp4|11.0,12.0a,12.1a|vendored Marlin NVFP4 W4A16 MoE GEMM (VT_MARLIN_NVFP4)"
   # Vendored FlashAttention-2 prefill/decode split-KV kernels.
   # upstream: vLLM builds FA2 for the WHOLE requested CUDA_ARCHS list, incl
   # 8.0;8.6;8.7;8.9 (vllm/cmake/external_projects/vllm_flash_attn.cmake:6-8 @ pin
@@ -354,19 +405,15 @@ function(vt_cuda_report_feature FEATURE RESOLVED_ARCHS)
   if(RESOLVED_ARCHS)
     message(STATUS "  CUDA feature ${FEATURE}: ENABLED for [${RESOLVED_ARCHS}]")
     # A strict subset means the fat build contains archs with no tactic for this
-    # feature. Today that is a LOUD build-time compile failure on the untargeted
-    # arch (there are no cross-family tactic bodies yet), never a silent capability
-    # drop. Narrowing per-source gencode (vLLM's set_gencode_flags_for_srcs,
-    # cmake/utils.cmake:265-345) lands with the first cross-family tactic.
+    # feature. W1 source-scoped gencode compiles this feature only for the named
+    # intersection while the other archs retain their portable sources.
     set(_missing "${_tgt_cmake}")
     list(REMOVE_ITEM _missing ${RESOLVED_ARCHS})
     if(_missing)
       message(WARNING
         "CUDA feature '${FEATURE}' has no tactic for requested arch(es) [${_missing}]. "
-        "It stays ENABLED for [${RESOLVED_ARCHS}]; the sources are still compiled for the "
-        "whole target list, so building this heterogeneous fat binary requires the per-arch "
-        "tactic bodies (and per-source gencode narrowing) first. See "
-        ".agents/specs/cuda-arch-additivity.md.")
+        "It stays ENABLED for [${RESOLVED_ARCHS}]; W1 compiles its source TUs only "
+        "for that intersection and preserves portable fallbacks for the other targets.")
     endif()
   else()
     message(STATUS "  CUDA feature ${FEATURE}: DISABLED (no requested arch in [${_tgt_cmake}] provides it)")

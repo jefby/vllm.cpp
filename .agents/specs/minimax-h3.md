@@ -1,0 +1,1519 @@
+# MiniMax-H3 — omni-modal video+audio diffusion transformer
+
+**Rows:** `MODEL-DIFFUSION-minimax-h3-mini-max-h3-dit` (model-matrix),
+`ROAD-V1-H3` (roadmap portfolio).
+**Claim:** `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`.
+**Upstream:** vLLM-Omni (`vllm-project/vllm-omni`), `vllm_omni/diffusion/models/minimax_h3/`.
+**Checkpoint:** `MiniMaxAI/MiniMax-H3` (gated), ~354 GB, BF16 safetensors.
+**Quantized checkpoints:** `realrebelai/MiniMax-H3_GGUFs` (ComfyUI GGUF),
+`lilcheaty/MiniMax-H3-NVFP4` — these FIT one GB10; see section 0.
+**Status:** W0 spike + W1/W2 (layout, scheduler, DiT forward incl. the bf16
+production stream), W6a (request planning) and W9 shape/geometry (GGUF arm) landed,
+all parity-gated. End-to-end is NOT hardware-blocked on the quantized arms; it is
+gated on the remaining bricks (encoder, VAEs, pipeline).
+
+---
+
+## 0. Honesty statement — what is and is not claimed
+
+MiniMax-H3 is **not an autoregressive LLM**. It is a CFG-distilled joint
+video+audio **diffusion transformer**: one request runs a fixed 50-step
+flow-matching denoise loop in which a 33.1B DiT is forwarded ONCE PER STEP over
+the whole packed sequence, and the resulting latents are decoded to 24 FPS frames
+plus a 32 kHz stereo waveform by two VAEs. There is no KV cache, no sampler, no
+logits, and no token-exact gate — the SACRED near-tie methodology this project
+uses for decoders does not apply to it.
+
+**Hardware — CORRECTED 2026-08-03 (user-directed).** The BF16 release validates on
+**4x NVIDIA B300** at ~133 GB peak per rank (~103 GB with text-encoder TP), and at
+~354 GB of storage it does not fit one GB10 (119 GiB UNIFIED). An earlier revision
+of this spec concluded from that alone that H3 e2e was "impossible on this
+project's hardware". **That was wrong**: it reasoned from the BF16 release only.
+QUANTIZED H3 checkpoints exist and they DO fit:
+
+| Arm | Components | Size |
+|---|---|---|
+| GGUF (ComfyUI format) | DiT `MiniMax-H3-FL2VA-Q3_K_M.gguf` 15.6 GB + Qwen3-VL encoder `qwen3vl-32B-...-Q4_K_M.gguf` 14.6 GB + the two VAEs (fp16 video ~10 GB, fp32 audio ~0.6 GB) | **~41 GB** |
+| NVFP4 (safetensors) | `minimax_h3_ref2va_nvfp4_{full,mixed}.safetensors` + `text_encoders/qwen3vl_32b_..._nvfp4_awq.safetensors` + `vae/minimax_h3_{video_vae_fp16,audio_vae_fp32}.safetensors` | fits, repo 77.2 GB across 3 DiT variants |
+
+Sources: `realrebelai/MiniMax-H3_GGUFs` and `lilcheaty/MiniMax-H3-NVFP4`. Both land
+well inside the 119 GiB pool, so **end-to-end H3 IS reachable here, and therefore
+so is a speed comparison.** NVFP4 is the more interesting arm for this project:
+GB10/sm_121 has native FP4 tensor cores and our NVFP4 stack (cutlass FP4 GEMM,
+Marlin W4A16 grouped MoE, the Laguna arm's tuning) is the most optimized path we
+own. What remains blocked is a like-for-like comparison against vLLM-Omni's own
+published numbers, which were measured on 4x B300 — a different machine class.
+
+**Therefore:** the CORRECTNESS gate is upstream itself executed at REDUCED
+DIMENSIONS on CPU (section 4) — that is available today and is exact. The
+END-TO-END gate is now a matter of finishing the remaining bricks (encoder, VAEs,
+pipeline) and downloading a quantized checkpoint, NOT a hardware wall. Nothing in
+THIS change claims a generated video or a speed figure; what changed is that both
+are now on the critical path rather than out of reach.
+
+## 1. Architecture
+
+From `minimax_h3_transformer.py:47-78` (`MiniMaxH3DiTArchConfig`) — the shipped
+geometry:
+
+| Field | Value | Note |
+|---|---|---|
+| `num_layers` | 50 | AdaLN DiT blocks |
+| `token_refiner_num_layers` | 2 | plain pre-norm blocks over text rows |
+| `hidden_size` | 5376 | |
+| `num_attention_heads` | 56 | **MHA** — `total_num_kv_heads == total_num_heads` |
+| `attention_head_dim` | 128 | |
+| `ffn_hidden_size` | 14336 | SwiGLU, fused `[gate; up]` fc1 |
+| `latents_dim` | 24 | video VAE latent channels |
+| `audio_latents_dim` | 32 | audio VAE latent channels |
+| `patch_size` | (1, 2, 2) | video row width = 24*1*2*2 = **96** |
+| `text_dim` | 5120 | H3-Encoder hidden width |
+| `timestep_input_dim` | 256 | sinusoidal, **cosine before sine** |
+| `time_embed_dim` | 2688 | AdaLN input |
+| `adaln_out_features` | 18*5376 | 6 vectors x 3 modalities x H |
+| `rope_inv_freq_len` | 16 | 3D RoPE rotates 6*16 = **96 of 128** head dims |
+
+Per block: `norm1 -> AdaLN scale/shift -> attention -> AdaLN gated residual ->
+norm2 -> AdaLN scale/shift -> SwiGLU MLP -> AdaLN gated residual`. AdaLN
+parameters are produced per (unique timestep, modality) pair and selected per row
+by `combined_indices = inverse_indices * 3 + token_tags.clamp(min=0)`
+(`minimax_h3_transformer.py:1057`).
+
+Attention is **packed varlen NON-CAUSAL**: rows of all modalities live in one
+sequence, `cu_seqlens = {0, used, seq_len}` gives two documents (content and
+64-alignment padding), and attention never crosses that boundary. This maps
+exactly onto our shared `vt::DFlashBlockAttention(causal=false)` — no new kernel.
+
+12 parameters plus the RoPE buffer stay **FP32** after load
+(`minimax_h3_transformer.py:85-101`, re-asserted by `post_load_weights` at
+`:898-904`): both patch projections, both time-embedder projections, and both
+final output heads. Everything else is BF16.
+
+## 2. Component inventory (the whole chain, not just the DiT)
+
+| Component | Upstream | Size | Our status |
+|---|---|---|---|
+| Omni DiT | `minimax_h3_transformer.py` (1112 L) | 66.3 GB | **W2 LANDED** (CPU reference forward, parity-gated) |
+| Packed layout | `packed_sequence.py` (572 L) | — | **W1 LANDED** (fl2va + ref2va, fp64 grid bit-exact) |
+| Latent packing | `packed_tokens.py` (114 L) | — | **W1 LANDED** (+ round-trip) |
+| Scheduler | `scheduling_..._euler_ancestral.py` (179 L) | — | **W1 LANDED** |
+| Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
+| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 COMPLETE** — text tower at 1.2e-7 (truncation + UNNORMALIZED output + DeepStack), the FULL vision tower at 6.0e-8, and the MM processor as REUSE of our existing Qwen3-VL front end, gated on H3's own processor config |
+| Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
+| Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
+| Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 t2va ASSEMBLED** — the whole path composes and runs (structural e2e gate); fl2va/ref2va conditioning and the torch-RNG noise seed remain |
+| Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **PARTIAL** — condition-noise augmentation DONE and reference-video GEOMETRY + FRAME SCHEDULE DONE; the rest of `reference_video.py` is ffmpeg plumbing (see 5.2) and presentation TOKEN TAGS are done (its tokenization stays with the caller) |
+| Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 DONE (CPU)** — both routes plus `GET /v1/videos/{id}` registered on `ApiServer`, additive and opt-in via `set_video_runner` |
+| GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 DONE** — identity name map (gated on the real 535-tensor manifest) PLUS `LoadMiniMaxH3DitFromGguf`: dequantize through the shared GGUF path, recover the geometry from shapes, bind the forward's views |
+| NVFP4 arm | `lilcheaty/MiniMax-H3-NVFP4` | fits | **W10 LOADER DONE** — `LoadMiniMaxH3DitFromNvfp4` dequantizes the compressed-tensors triple through the project's existing NVFP4 path into a runnable DiT. Previously GROUNDED: — the real 1051-tensor manifest is textbook compressed-tensors NVFP4 (U8 packed + E4M3 group-16 `weight_scale` + F32 `weight_scale_2`), i.e. EXACTLY our existing layout; 258 quantized projections, islands unquantized |
+
+Tasks: `t2va` (text), `fl2va` (first/last-frame), `ref2va` (reference). Duration
+4-15 s snapped to `17n+5` frames at 24 FPS; 50 inference steps; flow shift 12
+(video) / 3 (audio); resolution 1440p or 768p short edge, multiples of 32.
+
+## 3. Dispatch and reuse — what we already have
+
+* **Packed non-causal attention** -> `vt::DFlashBlockAttention(causal=false)`
+  (already CPU + CUDA). Its per-document bidirectional contract IS upstream's
+  varlen FA call; no new attention kernel is needed.
+* **SwiGLU merged gate/up** -> the `layers::MlpGateUpMethodBase` merged-GEMM seam
+  (AGENTS.md "born fused"). The W2 reference forward calls the projections
+  directly; folding onto the seam is part of W2b.
+* **Add+RMSNorm glue** -> `vt::FusedChain` recipes, W2b.
+* **H3-Encoder** -> our existing `qwen3_vl_{text,vision}.cpp` +
+  `multimodal/qwen3vl_processor.cpp`. The deltas are: keep only the first 50
+  decoder layers and consume the UNNORMALIZED hidden state after layer 49; all-ones
+  attention mask; DeepStack injection at the first `len(deepstack_visual_indexes)`
+  layers. This is the single largest reuse in the port.
+* **Multi-GPU** — upstream uses Ulysses sequence parallelism (`--usp 4`) plus
+  optional DiT TP. We have `vt::communicator` / NCCL but no USP; this is W8 and is
+  only reachable on multi-GPU hardware we do not have.
+
+## 4. Gates
+
+**What can be gated on any CPU (and IS, as of W2):** upstream's pure-Python
+modules are imported by file path and executed at reduced dimensions;
+`scripts/gen-minimax-h3-goldens.py` freezes their outputs into
+`tests/vllm/models/minimax_h3_goldens.inc`, and `tests/vllm/models/test_minimax_h3.cpp`
+reproduces them. Weights and inputs are rebuilt on both sides from an identical
+FNV-1a + splitmix64 stream, so not one weight byte is checked in.
+
+Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
+
+| Gate | Result |
+|---|---|
+| fl2va packed layout (ids, tags, positions, masks, cu_seqlens, doc ids) | **exact** |
+| fl2va fp64 position grid | **bit-exact** (all 192 doubles) |
+| ref2va block layout (image + video_audio reference blocks) | **exact**, incl. fp64 grid |
+| patchify / unpatchify / audio pack / unpack | **exact** + round-trip identity |
+| euler-ancestral eta0 scheduler + `rf_v_to_x0` | **exact** (<= 1e-6) |
+| **DiT forward, reduced dims, f32** | **max abs diff 1.6e-7 (video), 1.5e-7 (audio)** |
+| denoise-loop INVARIANTS (pinned rows reset every step, targets advance, finite) | pass |
+| bf16 PRODUCTION stream vs upstream's dtype policy | max abs diff 2.4e-3 (bf16 scale) |
+| request planning (frames, latent shapes, sigma schedules, canvas, task dispatch) | **exact** |
+| **REAL GGUF manifest** (535 tensors of `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | **exact** — every name and logical shape matches our contract, geometry derived from shapes alone equals the shipped H3 config |
+| **AUDIO VAE decoder** vs the checkpoint's OWN remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
+| **AUDIO VAE ENCODER** vs the checkpoint's OWN remote code, STAGE BY STAGE | **conv stack 2.98e-8, `pre_block` AttnProjection 1.64e-7, whole encode-to-latent 1.86e-8** — `DacAudioVAE` exposes only `decode`, so the encode is composed the way vLLM-Omni composes it (vae.py:317-325): preprocess right-pad -> `Encoder` -> `pre_block` -> `mean_proj`. Generator: `scripts/gen-minimax-h3-audio-vae-encoder-goldens.py`. `mean_proj` and never `logs_proj` — a sampled reference would condition differently every run |
+| **REAL NVFP4 manifest** (1051 tensors) | **exact** — compressed-tensors triple, group 16, islands unquantized, names identical to our contract |
+| **REAL video-VAE manifest** (560 tensors) | **exact** — decoder confirmed a 36-block ViT, encoder the 3D CNN |
+| **VIDEO VAE decoder TransformerBlock** vs the checkpoint's OWN remote code | **max abs diff 6.0e-8** |
+| **VIDEO VAE FULL ViT3D decoder** vs the checkpoint's OWN remote code | **max abs diff 8.9e-8** |
+| **ENCODER text tower** (truncation + unnormalized output + DeepStack) | **max abs diff 1.2e-7** |
+| **ENCODER vision block** (LayerNorm, fp32 rotary, varlen non-causal, tanh-GELU) | **max abs diff 6.0e-8** + boundary isolation proven |
+| **ENCODER FULL vision tower** (patch embed -> pos interp -> 2D rotary -> blocks -> mergers), ragged 2-image batch | **max abs diff <= 1e-4**, DeepStack + merged both |
+| **CONDITION-NOISE augmentation** (fl2va/ref2va anchors, visual + audio) | **exact** (<= 1e-6), noise supplied so the gate isolates row accounting from torch RNG |
+| **REFERENCE-VIDEO geometry + frame schedule** | **exact** (canvas, sampled indices, block timestamps) |
+| **VIDEO VAE tiling plan + seam blend** | **exact** (round-robin slack distribution, cross-fade) |
+| **PRESENTATION token tags** (the fl2va vision-span override) | **exact**; VIDEO runs proven to be whole vision blocks |
+| **VAE encoder ResnetBlock3D** (causal Conv3d + GroupNorm3D) | **exact**; causality PROVEN on the bare convolution |
+| **VAE encoder Downsample3D** (asymmetric pre-pad + strided causal conv) | **exact** |
+| **WHOLE VAE 3D-CNN encoder** (conv_in -> levels -> norm -> conv_out) | **exact** |
+| **MM PROCESSOR reuse** (H3's own processor config through our Qwen3-VL front end) | **pass** — image + video bounds, 0.5 normalization, 32-grid |
+| **WAV serialization** of the decoded waveform | **pass** — header fields, channel-major -> interleaved, clamping |
+| **VIDEO OUTPUT: PPM frames + MP4 mux argv** | **pass**; and the built argv was RUN through real ffmpeg 6.1.1, producing a valid h264/yuv420p + AAC-32kHz MP4 (ffprobe-verified) |
+| **`/v1/videos` request contract + job store** | **pass** — defaults, validation, lifecycle transitions, status JSON, thread safety |
+| **`/v1/videos` route dispatch on `ApiServer`** | **pass** — no-runner 500, unknown-id 404, sync success returns the runner's path, a throwing runner fails the job (async worker never terminates the process), malformed body 400 without reaching the runner |
+| **DEVICE-RESIDENT DiT forward** (CPU backend) | **pass** — same goldens, same 2e-5 tolerance as the CPU reference |
+| **DEVICE-RESIDENT DiT forward on a REAL GPU** (Thor, sm_110) | **pass — video 1.49e-7 / audio 8.94e-8** vs upstream; 36/36 cases, and the CUDA case is proven to have RUN (220 assertions execute, not skip) |
+| **AUDIO-VAE CHECKPOINT LOADER** (real 1087-tensor manifest) | **pass** — and it caught TWO silent-failure mismatches: the shipped file uses torch's LEGACY `weight_g`/`weight_v`, not the `parametrizations.weight.original0/1` the decoder reads, and BigVGAN sits under `decoder.` while `dec_in_proj.*` is top level. Mapping asserted INJECTIVE over the real manifest (2770 assertions) + an end-to-end load-and-DECODE over a synthetic file written in the shipped spellings |
+| **Audio-VAE loader accepts ALL THREE weight-norm spellings** | **pass** — (1) LEGACY `weight_g`/`weight_v` (official checkpoint), (2) MODERN `parametrizations.weight.originalN` (what the decoder reads), (3) MATERIALIZED plain `weight` (repackaged community bundles). The third is reconstructed exactly, round-trip **1.49e-08** |
+| **AUDIO-VAE ENCODER LOADER** (same real 1087-tensor manifest) | **pass** — takes the half the decoder loader skips: strip `encoder.`, keep top-level `pre_block.*`/`mean_proj.*`, drop `logs_proj.*`, and accept all three weight-norm spellings (the materialized one reconstructed to <=1e-6 round-trip). The manifest also confirms the SHIPPED encoder geometry from shapes alone: `encoder_rates` [2,4,4,5,5], `latent_dim` 2048, `attn_proj_dim` 32, qkv 3x the INPUT width (the narrowing AttnProjection branch). A plain Linear's `.weight` must NOT be mistaken for a materialized weight-norm, which is asserted |
+| **ref2va AUDIO + VIDEO+AUDIO references WIRED** | **pass** — the last two unwired conditioning modes. Gated on conditioning CHANGING the result: an audio reference moves the AUDIO rows by **0.51**, a video+audio reference by **0.71** against the SILENT same-clip control, a DIFFERENT waveform still by **7.1e-4**, and a DIFFERENT clip with the same audio moves the VIDEO rows by **3.7e-2**. An audio-bearing block with no encoded rows behind it THROWS. Driver `--ref-audio f.wav` on a library `MiniMaxH3ReadWav`, gated against the writer it inverts and REFUSING a non-32 kHz file |
+| **VIDEO-VAE CHECKPOINT LOADER** (real 560-tensor manifest) | **pass** — mapping is just the `decoder.` prefix (no weight-norm spelling change), asserted INJECTIVE. ★ Surfaced a MISSING STEP: `post_quant_conv` (Conv3d 24->24, kernel 1x1x1) sits OUTSIDE `ViT3DDecoder`, so the 8.9e-8 decoder gate never covered it and NOTHING in this port applied it — a decode that runs, looks plausible and is wrong. Now implemented, gated against a hand-computed contraction, AND wired into `MiniMaxH3GenerateT2va` — the pipeline test re-runs t2va with it present and requires the frames to move (0.056) while the waveform stays bit-identical |
+| **ENCODER CHECKPOINT LOADER** (FL2VA/text_encoder, 14 shards / 1058 tensors) | **pass** — the only loader that TRANSFORMS rather than renames: HF ships `self_attn.{q,k,v}_proj` and `mlp.{gate,up}_proj` SEPARATE, the port (like vLLM) consumes them FUSED, so they are row-concatenated as `[q\|k\|v]` and `[gate\|up]`. Gated byte-exact ACROSS SHARDS (one layer deliberately split between two files), plus layer truncation, plus the H3 deltas: `norm.weight` and `lm_head` are NOT loaded, because H3 reads the UNNORMALIZED truncated output. The VISION tower needs no fusion — HF already ships `attn.qkv` fused |
+| **ASSEMBLY driver** (`examples/minimax-h3-gen`) | **pass (LOAD + PLAN)** — composes the DiT + both VAEs + both shipped configs, over real file formats, on both the dequant and keep-quant GGUF paths. Shape planning verified: 768x1344 / 16 = 48x84 latent. ★ A full generation on a REAL checkpoint is still UNRUN (needs the multi-GB download) |
+| **DEVICE-RESIDENT bf16 PRODUCTION stream** (CPU + Thor GPU) | **pass — video 2.41e-3 / audio 2.05e-3** vs the bf16 goldens (tol 5e-3), essentially the CPU reference's own 2.4e-3 / 2.1e-3, so the CAST POINTS agree; the test also asserts the bf16 result DIFFERS from f32 by >1e-5, without which a no-op dtype policy would pass |
+| **TRUE bf16 STORAGE** (activations AND weights) | **pass — video 6.16e-4 / audio 5.21e-4**, a ~4x IMPROVEMENT on the round-in-place figures above. Cause: the bf16 golden was generated with bf16 WEIGHTS (the generator's `to_bf16_weights`), so staging the bf16-stored modules as bf16 — while keeping upstream's fp32 ISLANDS f32 — matches the golden's model, not just its activation cast points |
+| **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
+| **GGUF LOAD -> runnable DiT** (synthetic ComfyUI-format file) | geometry recovered from shapes; a real forward runs off the loaded weights |
+| **NVFP4 LOAD -> runnable DiT** (synthetic compressed-tensors file) | packed [out, in/2] recovered as logical [out, in]; sidecars excluded; a real forward runs |
+| config-parse invariants + weight contract + grouped-qkv reorder | pass |
+
+The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
+last-ulp drift would silently rotate every video token. The port therefore
+reproduces upstream's arithmetic ORDER — `numpy.linspace(endpoint=False)`
+evaluates `i*step + start`; `_temporal_position_span` uses numpy PAIRWISE
+summation while `_video_t_span` uses Python's SEQUENTIAL `sum()`, which upstream
+keeps separate on purpose (`packed_sequence.py:101-113`).
+
+**What cannot be gated here:** any end-to-end video/audio result, any speed
+number, the encoder/VAE numerics (no checkpoint), and the multi-GPU USP path. All
+are recorded PENDING in `docs/BENCHMARKS.md`, not as passes.
+
+**Reference audio, still ungated:** no real-checkpoint render with `--ref-audio` has been run. The encoder numerics, the loader mapping and the wiring are all gated; what is not is a full generation conditioned on a real waveform, which needs the multi-GB download and a GPU.
+
+**Oracle note.** The parity pin (`555967922`, vLLM 0.26.0.dev0) does NOT contain
+MiniMax-H3 — H3 was released after it, and it lives in the separate `vllm-omni`
+repository, which the pin protocol does not currently cover. Advancing the pin
+does not by itself make H3 gateable; a vllm-omni pin is a prerequisite for W3+ and
+is tracked as an open item in 7.
+
+## 5. Known hard parts
+
+### 5.1 The VAEs are REMOTE CODE, not upstream Python
+
+`vae.py:41-53` loads both VAEs with
+`get_class_from_dynamic_module(config["auto_map"]["AutoModel"], component_path)` —
+i.e. the actual VAE implementations ship INSIDE the HF checkpoint and run under
+`--trust-remote-code`. vLLM-Omni only adapts them. A pure-C++ engine cannot do
+that: W4/W5 must **reimplement both VAEs in C++ from the checkpoint's Python
+source**, which must be fetched separately (the VAE modules and their `config.json`
+are small; the 354 GB of weights are not needed to READ the architecture).
+
+**Status 2026-08-05: BOTH VAEs are DONE IN BOTH DIRECTIONS.** Decoders: audio
+(DAC/BigVGAN, 4.2e-9) and the video ViT3D (8.9e-8). Encoders: the video 3D CNN
+(image/video conditioning) and now the AUDIO encoder — the DAC analysis stack
+plus `pre_block` and `mean_proj`, gated stage by stage at 2.98e-8 / 1.64e-7 /
+1.86e-8. That was the last thing standing between ref2va and its audio-bearing
+reference blocks, which are now wired and gated on moving the result.
+
+**Original note: the remote code is IN HAND** (fetched from the checkpoint's
+`FL2VA/{audio,video}_vae/`, ~130 KB of Python, NOT vendored here — it ships under
+the MiniMax H3 Community License). The **audio VAE is DONE** (W5): a DAC-lineage
+BigVGAN vocoder, reimplemented and gated against the checkpoint's own modules at
+4.2e-9 by `scripts/gen-minimax-h3-audio-vae-goldens.py`. The **video VAE (W4)** is the largest remaining brick, but the real
+checkpoint manifest (560 tensors, `FL2VA/video_vae/source/model.safetensors`,
+captured by range request) makes it materially smaller than `klvae.py`'s 48 KB
+suggested: the **ENCODER** is the 3D CNN (116 tensors, rank-5 Conv3d down blocks)
+while the **DECODER** — the half generation actually needs — is a plain **36-block
+TRANSFORMER** (440 tensors: `attn.to_qkv`/`attn.to_out`, `ff.w1`/`ff.w2`, two
+norms and two learned residual scales per block, plus `x_embedder`, `mask_token`,
+`register_tokens`, `norm_out`, `proj_out`). We have every primitive for that. The
+whole checkpoint is fp32.
+
+Contracts already pinned down from the adapter:
+* Video VAE weights stay **FP32**; keyframe encode is seeded
+  (`MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42`) and its normalize+patchify runs on
+  **CPU in FP32** on purpose (`vae.py:185-202`) — doing it on CUDA measurably
+  changes the conditioned video.
+* Latents are normalized by per-channel `latents_mean`/`latents_std` from the
+  component `config.json`, then patchified with (1,2,2).
+* Audio VAE is FP32 for both encode and decode, 32 kHz, 2 channels, and encode
+  runs under a determinism context that disables TF32, cuDNN, and the fused SDP
+  backends (`vae.py:56-94`) — the C++ port must match that numerically, not just
+  structurally.
+
+### 5.2 Output is a container, not tokens
+
+`/v1/videos` returns MP4 (H.264 video + stereo audio). We have no muxer and no
+video/audio ENCODER anywhere in the tree (`third_party/` has blake3, doctest,
+httplib, minja, nlohmann, vulkan). W7 must choose: vendor a minimal MP4 muxer plus
+an encoder, or take a dependency. This is a genuine new dependency decision and is
+called out rather than assumed.
+
+### 5.3 Speed
+
+Upstream reports the DiT at **88% of request latency** and FL2VA at ~87 s E2E for
+an 8.7 s 1248x768 clip on 4x B300, with regional `torch.compile`, cache-dit block
+caching, and USP-4. Matching that needs the device-resident forward (W2b), the
+fusion folds, and multi-GPU. No speed claim is possible before W2b lands and
+hardware exists to measure on.
+
+## 6. Files ported in this change
+
+| Ours | Upstream |
+|---|---|
+| `include/vllm/model_executor/models/minimax_h3.h` | the module's public contracts |
+| `src/vllm/model_executor/models/minimax_h3_packing.cpp` | `packed_tokens.py`, `packed_sequence.py`, `scheduling_..._euler_ancestral.py` |
+| `src/vllm/model_executor/models/minimax_h3.cpp` | `minimax_h3_transformer.py`, `denoise_loop.py` |
+| `scripts/gen-minimax-h3-goldens.py` | executes the above upstream modules as the oracle |
+| `tests/vllm/models/test_minimax_h3.cpp` | `tests/diffusion/models/minimax_h3/test_minimax_h3_{packing,contract}.py` |
+
+**Tests to port (upstream `tests/diffusion/models/minimax_h3/`):**
+`test_minimax_h3_packing.py` (DONE — layout + patchify goldens),
+`test_minimax_h3_contract.py` (PARTIAL — config/weight contract done, pipeline
+contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint),
+`test_minimax_h3_parallel.py` (BLOCKED — needs multi-GPU).
+
+## 7. Work breakdown
+
+| Brick | Scope | Blocked by |
+|---|---|---|
+| **W0** | Spike, component inventory, hardware verdict | — (DONE) |
+| **W1** | Packed layout + latent packing + scheduler, parity-gated | — (DONE) |
+| **W2** | DiT forward + denoise driver, parity-gated on CPU at reduced dims | — (DONE) |
+| **W2b** | Device-resident forward. **LANDED (f32) and VERIFIED ON A REAL GPU** — `MiniMaxH3DitForwardDevice` keeps every activation in device memory across the whole block stack; gated against the SAME upstream goldens on the CPU backend AND on a Thor sm_110 GPU at **video 1.49e-7 / audio 8.94e-8** (tolerance 2e-5). Only 3 H3 kernels were needed (`kMiniMaxH3` table: two indexed AdaLN modulates + ungated SiLU) because the port reuses the tuned shared ops — H3's 3-axis RoPE is plain NeoX rotate_half, so a per-row cos/sin cache feeds `vt::RopeFromCache` with no bespoke kernel. **bf16 PRODUCTION stream LANDED, and then upgraded to TRUE bf16 STORAGE**: activations are bf16 buffers and the bf16-stored modules are staged as bf16 weights (fp32 islands preserved), so the tuned shared ops run their native bf16 paths and activation bytes halve. It is also MORE accurate — 6.16e-4 vs 2.41e-3 — because the golden itself used bf16 weights. That also unlocked the refiner's add+RMSNorm fold onto `vt::kFusedAddRmsNormStd`, previously declined because it would have dropped a cast point; with a bf16 residual the add rounds on store, so the fold is byte-identical. REMAINS: `vt::FusedChain` glue folds, merged gate/up seam, and the FP4 path (which needs sm_121a — PROBED 2026-08-03: the warp-level `mma.sync kind::mxf4nvf4` is CONSUMER-Blackwell only, rejected by ptxas on both sm_110a and sm_100a; sm_110 does support the datacenter `tcgen05` family, but our sm_100 body is CUTLASS ArchTag=Sm100 guarded by `__CUDA_ARCH__ == 1000` — so retargeting compiles to a DEAD STUB — and CUTLASS has **zero** sm110 kernels even at v4.6.1, only capability macros. There is no upstream body to port, so Thor can never be the FP4 venue) | — |
+| **W3** | H3-Encoder. **TEXT TOWER DONE** (1.2e-7): the three H3 deltas — layer truncation `min(num_hidden_layers, 50)`, the UNNORMALIZED layer-49 output (no final RMSNorm), and DeepStack injection into the first N layers — plus interleaved M-RoPE, fused QKV, per-head q/k RMSNorm, causal GQA and the gated-SiLU MLP. **VISION BLOCK also DONE** (6.0e-8): LayerNorm-with-bias, the [q_all, k_all, v_all] qkv layout, fp32 rotary, cu_seqlens-segmented NON-CAUSAL attention (boundary isolation asserted), and the TANH-approximate GELU. REMAINS: the vision surround (Conv3d patch embed, learned pos-embed interpolation, 2D rotary table, patch mergers + DeepStack mergers) and the MM processor | — |
+| **W4** | Video VAE. **DECODER DONE** — the full ViT3D decoder gated at 8.9e-8 (block 6.0e-8), real hyperparameters 36 layers / 32 heads x 64 / rope_theta 100 / rope_dim_ratio 0.75 from the checkpoint's `vit_decoder_kwargs`. **TILING also DONE** (plan + seam blend, exact). **3D-CNN ENCODER primitives also DONE** (causal Conv3d with reflect spatial padding, GroupNorm3D, ResnetBlock3D). **DONE — encoder AND decoder both complete.** The 3D-CNN encoder (conv_in, per-level ResnetBlock3D + Downsample3D, norm_out, conv_out) is gated exact; it serves image/video CONDITIONING, which a t2va path does not need | — |
+| **W5** | Audio VAE reimplementation | **DONE** — DAC-lineage BigVGAN decoder (weight-norm materialization, anti-aliased SnakeBeta with kaiser-sinc up/down resampling, replicate padding, final clamp). Encode-side determinism context is still open |
+| **W6** | Pipeline. **t2va ASSEMBLED** — `MiniMaxH3GenerateT2va` wires layout -> sigma schedules -> denoise loop -> unpatchify/audio-unpack -> denormalize -> both VAE decoders, gated by a structural end-to-end test. REMAINS: fl2va/ref2va conditioning (condition noise, reference video, presentation) and bit-exact torch-RNG noise seeding | — |
+| **W7** | Serving. **DONE (CPU)**: PPM frames + WAV + the MP4 mux argv (validated end-to-end against real ffmpeg); the `/v1/videos` request contract and job store (lifecycle, status JSON, thread-safe); and the routes themselves — `POST /v1/videos` (async, joinable worker drained in `~ApiServer`), `POST /v1/videos/sync`, `GET /v1/videos/{id}` — registered ONLY when `set_video_runner` has been called, so a server without video support is byte-identical to before. The runner is a caller-supplied callback precisely because the ffmpeg invocation lives in `examples/` per the developer's ratified decision: `src/vllm/` never spawns a process | W6 |
+| **W8** | Speed: USP sequence parallelism, block caching, DiT TP | W2b + multi-GPU HW |
+| **W9** | **GGUF arm — DONE.** Identity name map, `ne` reversal, the `comfy.gguf.orig_shape` reshape rule, and `LoadMiniMaxH3DitFromGguf` (shared K-quant dequant -> owned f32 -> bound views), gated by the real 535-tensor manifest plus a synthetic-file load-and-run test | — |
+| **W10** | **NVFP4 arm** — `lilcheaty/MiniMax-H3-NVFP4` onto our existing NVFP4 stack (cutlass FP4 GEMM on sm_121). **LOADER DONE** — `LoadMiniMaxH3DitFromNvfp4` reuses the project's existing NVFP4 dequant, so no new quant code. REMAINS: the DEVICE path that keeps FP4 packed and routes projections through the cutlass FP4 GEMM (that is where the speed is), plus a run on the real file | W9 |
+
+**Open items.** (0) Run the assembled t2va path on a REAL quantized checkpoint — the
+pipeline now composes end to end at reduced dimensions, so what remains is loader
+wiring (W9 dequant / W10 NVFP4), the encoder's vision tower, and a GPU. This
+supersedes the old "hardware-blocked" framing. (0b) Noise seeding is currently an
+INPUT: upstream seeds a torch CPU generator, and matching it bit-exactly decides
+WHICH sample you get, not whether the pipeline is correct.
+(a) A vllm-omni parity pin — the upstream-sync protocol currently
+covers only the vLLM repo; H3 lives outside it. (b) The MP4 dependency decision.
+(c) Hardware: nothing past W2b/W3 can be END-TO-END gated on this project's boxes,
+so W4-W8 should be reviewed as structural ports with unit gates, and the honest
+lifecycle cap for this row is "correctness-complete, hardware-blocked".
+
+## 8. W-FP4 — the fp4 SPEED path (row `row/H3-FP4-SPEED`, 2026-08-06)
+
+Until this change the NVFP4 arm ran the DiT projections in **bf16**: both the
+reference loader (`LoadMiniMaxH3DitFromNvfp4`) and the streaming stager
+(`StreamMiniMaxH3Nvfp4ToDeviceBf16`) DEQUANTIZE every packed FP4 weight to bf16 and
+the device forward calls `vt::MatmulBT`. The sm_121a FP4 tensor-core route had
+never actually run for H3. W-FP4a wires it.
+
+### 8.1 W-FP4a — per-shape routing table (grounded in `dense_nvfp4_gemm.h`)
+
+The `lilcheaty/MiniMax-H3-NVFP4` checkpoint is **weight-only NVFP4 (W4A16)**: every
+quantized projection carries only `weight` (U8 E2M1) + `weight_scale` (E4M3, group
+16) + `weight_scale_2` (F32) and **no `input_activations`** (confirmed
+`minimax_h3_nvfp4.cpp:63-76` and the real manifest, spec §4). Per the dispatcher's
+own contract (`dense_nvfp4_gemm.h:12-22`, mirroring vLLM
+`kernels/linear/__init__.py:879-881` — *"Force a16 (Marlin) when running
+weight-only quantization"*), a W4A16 weight (`Nvfp4Weight::IsTrueW4A4()==false`,
+alpha==0) is **forced to the Marlin W4A16 grouped GEMM**, bypassing the
+capability-based kernel registry. So on sm_121a **every quantized H3 projection
+takes the SAME kernel** — `dense_nvfp4::MatmulNvfp4MarlinD` (single-expert
+`vt::MoeGroupedGemmNvfp4Marlin`), the exact path the Laguna routed-experts
+(`laguna.cpp`) and the dense Qwen3-32B NVFP4 arm (`qwen3_5.cpp`) use.
+**MEASURED CORRECTION (GB10, 2026-08-06):** the PRODUCTION default is one level up —
+`VT_MARLIN_DENSE` is default-ON, so `MatmulNvfp4W4A16D` routes each projection through
+vLLM's OWN **dense** Marlin GEMM (`vt::MarlinDenseGemm`, counter `dense_gemms`), and
+the grouped `MoeGroupedGemmNvfp4Marlin` (`marlin_gemms`) is taken only under
+`VT_MARLIN_DENSE=0`. Both are Marlin W4A16 and both are byte-exact to the bf16 arm;
+dense is marginally faster. See §8.4 + the benchmark record. The
+cutlass-FP4 / true-W4A4 route (`MatmulNvfp4Fp4D`) is NOT taken here: it needs fp4
+ACTIVATIONS this checkpoint does not carry, and is deliberately private to
+`qwen3_5.cpp` (`dense_nvfp4_gemm.h:12-18`).
+
+Real geometry: H=5376, ffn=14336, heads=56×128 (inner=7168), time_embed_dim=2688,
+text_dim=5120, adaln_out=18·H=96768, final_adaln=2·H=10752.
+
+| Projection (per layer unless noted) | `[N, K]` | Route | Why (file:line) |
+|---|---|---|---|
+| `attn.qkv_proj` | `[21504, 5376]` | **Marlin W4A16** | W4A16 forced-Marlin `dense_nvfp4_gemm.h:512-525` |
+| `attn.out_proj` | `[5376, 7168]` | **Marlin W4A16** | same |
+| `mlp.fc1` (merged `[gate;up]`) | `[28672, 5376]` | **Marlin W4A16** → `SiluAndMul` | fc1 is ALREADY merged, so ONE GEMM to `[M,2·ffn]` then `vt::SiluAndMul`; the fused-pair `GateUpFusedMarlinD` does NOT apply (no separate gate/up shards) — `minimax_h3_device.cpp` `MlpDev` |
+| `mlp.fc2` | `[5376, 14336]` | **Marlin W4A16** | same |
+| `adaln_proj.linear` (block) | `[96768, 2688]` | **Marlin W4A16** (+ bias `vt::Add`) | skinny-M (M=num_unique_timesteps): Marlin `block=8` dense tile at M≤8, `dense_nvfp4_gemm.h:273-286` |
+| `condition_proj` | `[5376, 5120]` | **Marlin W4A16** (+ bias) | embed, once |
+| `final_layer.adaln_proj.linear` | `[10752, 2688]` | **Marlin W4A16** (+ bias) | final, once |
+| refiner `qkv/out/fc1/fc2` (×2) | same as block | **Marlin W4A16** | refiner has no adaln |
+| **islands** (`video/audio_patch_proj`, `time_embedder.*`, `final_layer.{video,audio}_out`) + all norms/biases | — | **`vt::MatmulBT` bf16 / f32 (unchanged)** | fp32 island policy (`minimax_h3_transformer.py:85-101`); never quantized in the checkpoint |
+
+All N and K are multiples of 16 (group) and of 128 (Marlin tile) — no shape blocker.
+The activation MUST be bf16 for the Marlin path; in the bf16 production stream it is,
+so the fp4 arm pairs with the bf16 stream. In the f32 parity stream (or any backend
+without the Marlin op — e.g. CPU) the SAME dispatcher falls back to a
+redundant-dequant GEMM, so the arm is correct either way, fast only where Marlin is
+realized (kCUDA sm_121a).
+
+**Implementation (this change, NO new quant code):** `Nvfp4Weight` fp4 carriers on
+`MiniMaxH3DitBlockWeights`/`MiniMaxH3DitWeights`; a new fp4-resident streamer
+`StreamMiniMaxH3Nvfp4ToDeviceFp4` (keeps packed FP4 host-resident, dispatcher
+uploads + repacks lazily on first forward, then frees the fp4 originals — peak
+device memory ~1/4 of the bf16 arm: ~16 GB packed vs ~66 GB bf16); `LinearDev`
+routes a non-Empty fp4 weight through `dense_nvfp4::MatmulNvfp4W4A16D`.
+
+**Gate.** CPU: `test_minimax_h3` "an NVFP4 checkpoint loads into a runnable DiT" now
+also streams the fp4 twin, asserts the loader kept the projections PACKED (fp4 slot
+set, bf16 slot Empty), runs the fp4 and bf16 device forwards on the SAME synthetic
+NVFP4 file, asserts the W4A16 dispatcher executed all 11 quantized GEMMs (the
+"this-path-ran" counter), and bounds the fp4-vs-bf16 delta. On CPU the dispatcher
+has no Marlin op so it falls to the bf16 arm's own dequant+matmul — this is a
+**wiring** gate here. The Marlin kernel's real numeric behaviour is CUDA-gated
+independently by `test_ops_nvfp4_matmul` / `test_linear_method` (2e-3/8e-3 vs a
+bf16 reference). **GB10 leg (fp4-vs-bf16 numeric delta + per-step timing at real
+geometry): PENDING** — see §8.3.
+
+### 8.2 Supports-audit vs vLLM-Omni (source-pinned to `a4ea67a2`, v0.26.0)
+
+vLLM-Omni H3 modules at `vllm_omni/diffusion/models/minimax_h3/`; serving in
+`vllm_omni/entrypoints/openai/`.
+
+| Capability | vLLM-Omni (file:line) | Ours (file:line) | Verdict |
+|---|---|---|---|
+| Async video route `POST /v1/videos` | `api_server.py:3146` | `ApiServer` `/v1/videos` (W7, `minimax_h3` serving) | **DONE** |
+| Sync route `POST /v1/videos/sync` | `api_server.py:3189` | `/v1/videos/sync` | **DONE** |
+| Status `GET /v1/videos/{id}` | `api_server.py:3305` | registered | **DONE** |
+| List / DELETE / `/content` download | `api_server.py:3268,3333,3385` | — | **MISSING** (list/delete/content-GET) |
+| WebSocket `/v1/video/chat/stream`, `/v1/realtime/video` | `api_server.py:1593,1610` | — | **MISSING** (streaming/realtime) |
+| Request schema (prompt, size/w/h, num_frames, fps, seed, steps, refs) | `protocol/videos.py:97-249` | request contract (W7) | **PARTIAL** (core fields; frame-interp/lora/generate_sound absent) |
+| H3 knobs via `extra_params.{task,duration,flow_shift,audio_flow_shift}` | `pipeline:1034,403,1157-1158` | planner reads task/duration/shift | **DONE** |
+| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va reference-row assembly FIXED + gated (§8.10) — ref2va still grids; the NVFP4 fp4 nibble-order loader bug is now FOUND+FIXED (byte-verified, §8.11) but the grid PERSISTS — DIAGNOSED (§8.12): NO discrete load-path defect (activation diff + weight fingerprints: every weight/bias/island/head/RoPE loads quant-noise-close to the coherent GGUF, byte-identical RoPE); residual = the community NVFP4 checkpoint's quant fidelity × the DiT's Qwen massive-activation sensitivity, chaotic — not a loader fix | **PARTIAL** (vision→conditioning scatter + ref2va assembly + NVFP4 nibble loader DONE; ref2va NVFP4 render residual = checkpoint quant fidelity, no loader bug, §8.12) |
+| Output: joint video+audio, 24 fps, 32 kHz stereo | `pipeline:106-111,1187` | frames + WAV + MP4 mux (W7) | **DONE** |
+| Scheduler: euler-ancestral rectified flow (single) | `scheduling_...euler_ancestral.py`; `time_request.py:34-61` | `MiniMaxH3EulerEta0Step` / `MiniMaxH3TimeShiftSigmas` | **DONE** |
+| CFG: distilled, no CFG (guidance params accepted+ignored; `cfg_parallel_size==1`) | `pipeline:250,275-276` | no CFG branch | **DONE** (matches) |
+| Res/frame bounds: mult-32, aspect 1:4–4:1, 17n+5 frames, 24 fps, canvas 768×1344 | `pipeline:399-430`, `time_request.py:5-31` | request planner (17n+5, canvas, sigma) EXACT | **DONE** |
+| Task dispatch t2va/fl2va/ref2va | `pipeline:374-391` | planner dispatch (W6a) | **DONE** |
+| Single-GPU serving | `--num-gpus 1 --enable-cpu-offload` (`recipe:53-74`) | single GB10, quantized-resident | **DONE (ours needs no offload — quantized fits)** |
+| USP / DiT-TP / VAE patch-parallel | `pipeline` collectives (throughput) | `vt::communicator`/NCCL present, USP not ported (W8) | **MISSING** (multi-GPU only) |
+
+### 8.3 Speed statement + comparability verdict (mission #3)
+
+**vLLM-Omni CANNOT serve a quantized H3 on one GPU** (source-pinned, spec-audited):
+it is **BF16-only in practice**. The generic diffusion framework has ModelOpt
+FP8/NVFP4 plumbing and the H3 DiT forwards a `quant_config` to vLLM quant-capable
+linears, but (i) **no quantized H3 checkpoint exists or is referenced** anywhere in
+the repo; (ii) the fp32-island guard `post_load_weights()` (`minimax_h3_transformer.py:898-904`)
+**raises** if the patch/time/output layers are not fp32, so a naive blanket quant
+aborts; (iii) the **text encoder is hard-coded bf16** (`encoder.py:930`, no
+quant_config) and the **VAEs load unquantized**; (iv) GGUF is **not wired into H3's
+bespoke `load_weights`** at all. Single-GPU IS supported — but as **BF16 +
+`--enable-cpu-offload`** (`recipe:53-74`).
+
+**Therefore the comparison is HW/loader-FORCED-INDIRECT** (the DeepSeek-GGUF
+precedent): a like-for-like quant-matched vllm-omni run on one GB10 is impossible
+because vllm-omni has no quantized H3 arm. The honest baselines are our own bf16
+arm (`StreamMiniMaxH3Nvfp4ToDeviceBf16`) and the portable path; vLLM-Omni's own best
+published numbers are **4× B300 BF16**.
+
+**Honesty correction on the "88%":** the *"DiT ≈ 88% of request latency on 4× B300"*
+figure is **NOT documented anywhere in the vllm-omni checkout** (exhaustive grep).
+The real documented anchor is the recipe's *"Validated four-GPU evidence"*
+(`recipes/MiniMaxAI/MiniMax-H3.md:298-311`): FL2VA 209-frame 1248×768 = **86.964 s**
+mean client latency on 4× B300; two-video Ref2VA 362-frame = **784.394 s**. The DiT
+`diffuse` stage share is measurable per-request (`pipeline:255-262`) but no fixed
+percentage is written down. The upstream **reference config** is 50 steps, 24 fps,
+video flow_shift 12 / audio 3, no CFG; default canvas **768×1344**, default frames
+**209** (t2va/fl2va) / **124** (ref2va) — NOT the "864×480 / 124" in the task brief.
+
+### 8.4 Status (this row)
+
+- **W-FP4a: CPU-LANDED + gated** — fp4-resident loader + Marlin-W4A16 routing + the
+  fp4-vs-bf16 wiring gate. No new quant code.
+- **W-FP4a GB10 leg: LANDED (2026-08-06, `row/H3-FP4-GPU-E2E`).** A dedicated CUDA
+  case `minimax_h3: the NVFP4 fp4 forward runs Marlin W4A16 on CUDA (speed)` (the
+  existing "loads into a runnable DiT" case runs the forwards on a CPU queue, so it
+  could never bump the GPU counter) builds the synthetic NVFP4 file at REAL geometry
+  and runs both arms on a CUDA queue. **Marlin RAN:** default `dense_gemms==11`
+  (VT_MARLIN_DENSE is default-ON → vLLM's OWN dense Marlin GEMM, NOT the grouped
+  route §8.1 assumed), `marlin_gemms==11` under VT_MARLIN_DENSE=0, `fallback_gemms==0`
+  in both. **fp4-vs-bf16 delta = 0 (byte-exact).** **Timing crossover** (median/12,
+  cold discarded): per-forward ratio bf16/fp4 = 3.47× @seq64 (fp4 faster,
+  memory-bound), 0.825× @seq4224, 0.788× @seq7040 (fp4 slower, compute-bound). So
+  fp4 W4A16 is a WEIGHT-BANDWIDTH win (decode-like small M) and a ~1.2× LOSS in H3's
+  large-M diffusion forward; its H3 value is MEMORY (~16 GB vs ~66 GB bf16). Benchmark
+  record has the full per-GEMM tables.
+- **W-FP4b real-checkpoint t2va e2e: RUNS on real weights; frame COHERENCE is an open
+  bug.** dgx now has room; the real NVFP4 DiT (`minimax_h3_ref2va_nvfp4_full`,
+  18.75 GB, unpruned) + both VAEs + the GGUF Qwen3-VL-32B encoder were downloaded and
+  the WHOLE t2va chain runs with `--fp4-resident` (new driver flag → the fp4-resident
+  streamer, ~16 GB device vs ~66 GB bf16): encoder → [16,5120] text conditioning →
+  fp4-resident DiT → both VAEs → ffmpeg, producing a valid `h264 256×256 + AAC 32 kHz`
+  mp4 + wav. **But the decoded frame is a structured multicolour patch-grid at the
+  latent-cell scale, NOT a coherent scene — identically at 12/20/50 steps, conditioned
+  or not.**
+  - **ROOT-CAUSED (2026-08-06, `row/H3-RENDER-COHERENCE` PR #70) by latent
+    bisection:** the VAE decoder is **CORRECT** — a real image encode→post_quant_conv→
+    decode round-trip (`--roundtrip`) returns a coherent frame — and the denoise loop
+    moves the latent step-dependently (byte-different finals at 3/12/50 steps). The bug
+    is the **DiT forward emitting a spatially-WHITE latent** at real geometry: adjacent
+    latent-cell cosine is **0.06** vs **0.789** for a real encoded latent, so every VAE
+    token decodes an independent patch = the grid. NOT fp4 (bf16 equally white), NOT the
+    attention kernel (MMA≡chunk, VAE chunk≡warp≡keylane), NOT the init noise. The DiT
+    gate runs spatial 2×3 (matches upstream 1.6e-7); the divergence is real-geometry
+    only (2×3→8×8). Secondary: driver used uniform init noise, not Gaussian
+    (`VT_H3_GAUSSIAN_NOISE`). Exact DiT line pends an upstream-oracle diff at real
+    geometry. See the benchmark record + state entry.
+  - So the composed path is proven to RUN e2e on the real checkpoint, but a
+  coherent render is an OPEN bug (device video-VAE decode and/or denoise convergence
+  at real geometry), independent of the fp4 speed work. **DiT s/step (full 50-layer
+  fp4-resident, per forward):** 5.45 s @512×512/22f, 20.03 s @768×768/61f, 209.09 s
+  @768×1344/209f (the vllm-omni REF canvas). The REF canvas fits in the pool but a full
+  50-step render is ~2.85 h, so it was not run (largest-fitting-config honesty).
+- **Comparability (mission #3):** HW/loader-forced-INDIRECT. 4× B300 BF16 renders a
+  whole 50-step FL2VA 209f in 86.964 s (~1.8 s/forward-equiv); one GB10 fp4-resident
+  is 209 s for ONE forward at the comparable canvas (~116× per-forward) — 4 datacenter
+  GPUs + BF16 + USP-4 + torch.compile + block-caching vs one GB10 + fp4 + none, and
+  vLLM-Omni cannot serve a quantized H3 on one GPU at all. The honest same-box number
+  is the fp4-vs-bf16 ratio (0.79–0.83× per forward, 4× less weight memory).
+### 8.5 DiT-forward GEOMETRY LADDER — the #70 spatial-mixing hypothesis REFUTED (2026-08-06, `row/H3-DIT-SCALE-GATE` PR #74, CPU-only)
+
+The §8.4 render bug (#70) was root-caused to the DiT emitting a spatially-WHITE latent
+at real token geometry, with the DiT parity gate only ever run at spatial 2×3. This row
+tested the leading hypothesis — a spatial-MIXING bug in the position/packing/modulation
+MATH, reproducible with random weights at real TOKEN geometry — by extending the
+reduced-dim DiT gate into a GEOMETRY LADDER.
+
+- **Built:** `emit_dit_ladder` in `scripts/gen-minimax-h3-goldens.py` (7 rungs: 2×3, 4×4,
+  6×6, **8×8**, a 4×8 rectangle, an 8×8×3-frame temporal 3D grid, and a 6×10×5-frame
+  video+audio packed mix), and the permanent gate case `test_minimax_h3.cpp :: "DiT-forward
+  geometry ladder matches upstream (host+device, mixing)"`. Each rung gates the upstream
+  packed-sequence layout (cu_seqlens / fp64 position grid / masks), the HOST forward, the
+  DEVICE-resident forward (the pipeline's own path), and a spatial-MIXING probe.
+- **Result: ours == the RefDiT oracle at EVERY rung**, host AND device, max|diff| ≤ 3e-7
+  vs the 2e-5 gate. The mixing probe: perturbing one video-target token changes EVERY
+  other target token (fraction 1.0 at all rungs) — the packed bidirectional attention
+  (`cu_seqlens=[0,used,seq_len]`, one document) couples all video tokens at real geometry.
+- **Hidden-dim-scale leg:** a second case reruns the geometries at the REAL head_dim=128 /
+  rope_inv_freq_len=16 (rot_dim=96) ratio and requires the DEVICE forward to track the
+  trusted HOST loops — device-vs-host ≤ 1.2e-6 across all rungs (no head_dim/rope-scale
+  device-op assumption).
+- **Why the ladder cannot SHOW #70's symptom:** measured the #70 adjacent-cell COSINE on
+  the CORRECT oracle at reduced dims — adj_cos ≈ random-pair ≈ 0 at every geometry. With
+  RANDOM weights the correct reference is ALREADY white by the cosine metric; spatial
+  coherence is a TRAINED-WEIGHTS property. The harness's valid discriminators are oracle-
+  logit equality and information flow (both green), not the cosine.
+- **VERDICT:** the "spatial-mixing bug in the DiT-forward MATH" hypothesis is **REFUTED**.
+  The #70 white latent is NOT a reduced-dim-reproducible DiT-forward bug — it is a
+  trained-weights / real-scale phenomenon. A GPU re-render is NOT expected to be coherent
+  from this work; nothing in the render path was changed.
+- **Residuals (both beyond the CPU box):** (1) a bug shared identically by our port AND the
+  RefDiT restatement vs TRUE upstream `minimax_h3_transformer.py` (not importable here —
+  no `vllm`/`cache_dit`/`aenum`) is invisible to this ladder; close it on the dgx oracle
+  venv where vllm is installed. (2) the real-scale DiT INPUT wiring (Qwen3-VL encoder
+  embeddings, real fp64 position grid at full canvas, real per-token timesteps) is fed with
+  RANDOM data here; a real-weights activation diff of the DiT inputs is the untested surface.
+  Full tables: benchmark record (`row/H3-DIT-SCALE-GATE`).
+
+## 8.6 RENDER BUG CLOSED — wrong checkpoint PARTITION, not a code bug (2026-08-06, `row/H3-RENDER-CLOSE` PR #77)
+
+The #70/#74 white render was **using the wrong checkpoint partition for the task.**
+MiniMax-H3 ships two independently-served DiT partitions and the task MUST match
+(`recipes/MiniMaxAI/MiniMax-H3.md:50,289`; `pipeline._resolve_task` raises otherwise):
+
+| Partition | Serves | Available quantized DiT |
+|---|---|---|
+| **FL2VA** | **t2va + fl2va** | `MiniMax-H3-FL2VA-Q3_K_M.gguf` (GGUF), FL2VA NVFP4 (not downloaded) |
+| **Ref2VA** | ref2va (image/video + audio references) | `minimax_h3_ref2va_nvfp4_full` (the NVFP4 we had), REF2VA GGUF |
+
+Every render up to #74 ran **t2va on `minimax_h3_ref2va_nvfp4_full` (the Ref2VA
+partition)** — an out-of-distribution task/partition combination upstream rejects. That
+is the white latent, invariant to prompt/steps.
+
+**Verified before switching partitions (all NEW, real 512x512/22f scale, dgx):** the
+t2va DiT INPUTS diff EXACTLY vs upstream `pipeline_minimax_h3.py` (`VT_H3_DUMP_INPUTS`:
+packed layout / fp64 grid / token_tags / inverse+combined AdaLN indices / sigmas all
+byte-equal; tokenization byte-equal); the encoder conditioning is correctly shaped and
+carries the expected Qwen massive-activation; `DequantNvfp4ToBf16` is byte-exact
+(Laguna/Qwen3 + independent torch dequant); and the CUDA device forward == the CPU host
+forward at the REAL render seq (1920) at head_dim=128 (new permanent gate
+`test_minimax_h3 :: "CUDA device forward tracks the host at the REAL render seq (1920)"`,
+28/28) — closing the "CUDA kernel at scale" hole #74's CPU-backend device-vs-host left open.
+
+**Proof:** t2va on `MiniMax-H3-FL2VA-Q3_K_M.gguf` (`--dequant-bf16`, 512x512/22f, prompt
+"an orange cat sitting on a wooden table") renders a **COHERENT photorealistic orange cat
+on a wooden table** — VAE-input latent adj-cell cosine **0.9467** (white was 0.06), frame
+seam16/interior **1.00** (no patch grid), velocity stable ~1.37, final latent rms **1.00**.
+Valid h264 512x512 + AAC 32kHz mp4.
+
+**Fixed in this row:** `MiniMaxH3GenerateT2va` now strips the PREPENDED pinned reference
+rows (ref2va) before unpatchify/unpack — they are zeroed in the DiT output and only the
+trailing target rows are the clip; the old code fed unpatchify the full buffer and hit
+"rows not divisible by t*h*w" (no-op for t2va/fl2va). **Open:** a partition/supported_tasks
+guard mirroring upstream (community files strip the release config); the encoder vision
+tower (W3) is still unported, so image/video-conditioned ref2va/fl2va renders are not yet
+clean (ref2va with a synthetic reference + text-only encoder still grids).
+
+## 8.7 TASK/PARTITION GUARD — mirror `_resolve_task`'s raise (2026-08-06, `row/H3-TASK-PARTITION-GUARD` PR #84)
+
+The #70/#74 white grid cost three campaigns because our driver silently accepted
+`task=t2va` on the Ref2VA-partition checkpoint. Upstream `pipeline._resolve_task`
+RAISES on the mismatch (`pipeline_minimax_h3.py:374-391`, esp. 387-390); the recipe
+documents the split (`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`: "One server loads one
+checkpoint partition … must match the served partition"). This row mirrors the raise 1:1.
+
+**Partition detection — two paths, and the definitive no-discriminator finding.**
+Upstream reads the served-task set from the release config
+(`pipeline_minimax_h3.py:279-282`):
+
+```
+release = model_index.get("_minimax_h3") or {}
+self.partition       = str(release.get("partition", ""))       # "fl2va" | "ref2va"
+self.supported_tasks = frozenset(release.get("tasks") or ())
+```
+
+`MiniMaxH3PartitionFromModelIndex(model_index)` mirrors those exact keys. But community
+GGUF/NVFP4 redistributions STRIP that block, and — measured on the two real manifests
+this spec already captured — there is **NO structural fallback**: the Ref2VA NVFP4
+(1051 tensors) and FL2VA GGUF (535 tensors) carry the **IDENTICAL DiT**. Normalizing the
+NVFP4 `{weight, weight_scale, weight_scale_2}` split, both files reduce to the **SAME 535
+base tensor names AND the SAME shapes** (video_patch_proj `[5376,96]`, audio_patch_proj
+`[5376,32]`, condition_proj `[5376,5120]`, time_embedder.proj_in `[5376,256]` on both;
+`comm -23`/`-13` of the normalized name sets is empty both ways). Ref2VA conditioning is
+achieved by PREPENDING reference rows through the SAME `video/audio_patch_proj` weights,
+so it introduces no reference-specific tensor to key on. A name/shape auto-detector is
+therefore impossible in principle. When the config is stripped the partition must be
+**DECLARED** (`--partition fl2va|ref2va`), never guessed; `MiniMaxH3PartitionFromFlag`
+maps it to the recipe's served-task set (fl2va→{t2va,fl2va}, ref2va→{ref2va}).
+
+**The refuse.** `MiniMaxH3CheckTaskPartition(task, info)` is the raise half of
+`_resolve_task`. The task is what the request ENCODES (`MiniMaxH3TaskOfRequest`:
+`ref_blocks`→ref2va, `keyframe_frame_indices`→fl2va, else t2va), and
+`MiniMaxH3GenerateT2va` calls the pair before denoising. A declared partition refuses a
+task it does not serve; an UNKNOWN partition (stripped file, no `--partition`) refuses
+EVERY task as ambiguous and names the recipe lines. A default-constructed
+`MiniMaxH3PartitionInfo` (`declared=false`) leaves the guard inactive, so the pure
+pipeline-math unit tests are unaffected. Wired at both checkpoint-loading entry points:
+the driver (`--partition`) and the server (`--video-partition`).
+
+**Guard behavior table (task × partition → pass/refuse):**
+
+| task \ partition | FL2VA {t2va,fl2va} | Ref2VA {ref2va} | unknown/stripped |
+|---|---|---|---|
+| **t2va**  | pass | **REFUSE (the #77 mismatch)** | REFUSE (declare `--partition`) |
+| **fl2va** | pass | REFUSE | REFUSE |
+| **ref2va**| REFUSE | pass | REFUSE |
+
+**RED-first proof.** New case `test_minimax_h3 :: "the task/partition guard refuses the
+#77 mismatch"` (38 assertions): the #77 combo `MiniMaxH3CheckTaskPartition("t2va",
+ref2va)` throws; the correct pairings pass; the stripped case refuses every task and
+`--partition` recovers it; `MiniMaxH3TaskOfRequest` maps the three request shapes; and it
+asserts the two real manifests reduce to the identical 535-name set (proving the
+no-discriminator premise in the harness). Neutralizing the guard body (reviewer mutation)
+turned the case RED at 10 assertions, restoring it turned it GREEN — the test has teeth.
+Suite: 67/67 (66 prior + this), 46549 assertions. `test_video_api` 4/4 (server wiring).
+
+## 8.8 ENCODER VISION TOWER — record reconciliation + real-weights wiring (2026-08-06, `row/H3-CONDITIONED-E2E`)
+
+**The contradictory record, reconciled (file:line).** Two prior lanes disagreed. The
+#26/W3 lane recorded the vision tower as **"W3 COMPLETE … the FULL vision tower at
+6.0e-8 … only the MM processor remains"** (this spec lines 101, 162-163); the #77
+residual recorded **"the encoder vision tower (W3) is still unported"** (lines 565-566).
+Reading the actual code resolves it — **both describe different halves and both are
+literally true of what they describe**:
+
+- The vision-tower **MATH exists** as a CPU scalar f32 reference in
+  `minimax_h3_encoder.cpp`: `MiniMaxH3VisionBlockForward` (:311), the surround
+  `MiniMaxH3VisionPosEmbedInterpolate` (:430) / `MiniMaxH3VisionRotary` (:500) /
+  `PatchMerger` (:545) / `MiniMaxH3VisionTowerForward` (:572). It is gated ONLY in
+  `tests/vllm/models/test_minimax_h3.cpp` (:3942, :4041) at **reduced dims with SYNTHETIC
+  weights** (`MakeParam`), block 6.0e-8 / tower ≤1e-4 vs a self-restated oracle.
+- It is **NEVER wired to real weights.** `LoadMiniMaxH3EncoderFromGguf`
+  (`minimax_h3_encoder_gguf.cpp:47`) loads the **TEXT tower only** — it iterates
+  `model.layers.N.*` + `model.embed_tokens.weight` and **skips every `visual.*` tensor**
+  (the comment at :51-52 even names `visual.*` as present-but-unloaded). The device
+  encoder `MiniMaxH3EncoderTextForwardDevice` (`minimax_h3_encoder_device.cpp:103`) runs
+  text only and takes **no deepstack / no visual-mask** argument (the HOST reference
+  `MiniMaxH3EncoderTextForward` does, :113-118). The driver
+  (`examples/minimax_h3_gen/main.cpp:476-547`) and server
+  (`examples/server/main.cpp:659-716`) call only the text path.
+- **So the reconciled truth:** the tower math is CPU-gated at reduced dims with synthetic
+  weights; there is **zero real-weights wiring** — no GGUF `visual.*` loader, no image→patch
+  MM processor on the H3 path, no device vision forward, no merge/DeepStack injection into
+  the encoded prompt. The #26 "only the MM processor remains" understated the gap (loader,
+  real-weights forward, and the merge/inject were ALSO absent); the #77 "still unported" was
+  right in the sense that matters (nothing real ran through it).
+
+**The encoder ARM already carries the vision weights (no download).** The on-box encoder
+`~/h3fp4/ckpt/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` (14 GiB, the ComfyUI-format text-tower
+GGUF that already serves text conditioning) **DOES carry the full vision tower**: measured
+`visual.blocks.{0..26}` (27, Q4_K/Q5_K), `visual.patch_embed.proj` (F16 `[16,16,6,1152]` =
+Conv3d as a linear over `patch_elems`=1536), `visual.pos_embed.weight` (F16 `[2304,1152]` =
+48² grid), `visual.merger.*`, and **`visual.deepstack_merger_list.{0,1,2}`** (3 DeepStack
+mergers). Names map 1:1 to `MiniMaxH3VisionTowerForward` / the reuse target
+`multimodal::Qwen3VLVisionWeights`. So the encoder-arm decision is settled: **reuse the
+in-place encoder GGUF; no new download** (disk floor 15 GiB / ~23 GiB free honoured).
+
+**Vision geometry (from the checkpoint + state.md :23310-23318, the Qwen3.6-27B vision
+config which shares this tower):** hidden **1152**, **16 heads** (head_dim 72), depth **27**,
+intermediate **4304**, out_hidden **5120** (== encoder text dim), patch **16**, temporal **2**,
+merge **2**, num_position_embeddings **2304**, gelu-tanh blocks / exact-erf merger. H3 differs
+from the 27B only by having **3 real DeepStack mergers** (the 27B's are empty). The one
+config value NOT recoverable from the ComfyUI GGUF (weights-only, no arch metadata) is
+`deepstack_visual_indexes` — the WHICH-layers taps — needed for a bit-correct DeepStack
+inject; it is inferred + flagged as the residual for a fully-correct conditioned render.
+
+**The reuse path (mission: "stock Qwen3VLProcessor + our existing front end").** The image
+MM processor already exists and is gated: `multimodal::Qwen3VLImageProcessor::ProcessImage`
+(`qwen3vl_processor.h`, patch 16 / temporal 2 / merge 2 / 0.5 normalize → pixel_values +
+grid_thw), `ExpandImagePlaceholders`, and the device tower
+`multimodal::Qwen3VLVisionForward` (`qwen3_vl_vision.cpp`) with `PrepareVisionDeviceWeights`.
+The only genuinely-new code is the **GGUF `visual.*` → `Qwen3VLVisionWeights` loader**
+(`LoadQwen3VLVisionFromGguf`), mirroring the safetensors `LoadQwen3VLVisionWeights`
+(`qwen3_vl.cpp:417`) but dequantizing the Q4_K/Q5_K blocks (ComfyUI reshapes non-256-aligned
+rows to ne0=256; dequant preserves the flat row-major order the tower reads as `[out,in]`)
+and converting the F16 patch/pos tensors.
+
+**This row's status (honest):** loader + real-image processor reuse + the real-weights
+vision-tower forward gate LAND here (see §8.4-style status in STATUS/BENCHMARKS). The full
+vision-ENRICHED DiT render (DeepStack scatter into the DEVICE text tower changing the frames)
+depends additionally on the exact `deepstack_visual_indexes` and a device-text DeepStack/merge
+extension; its e2e render verdict is recorded honestly in the benchmark record.
+
+**GB10 VERIFIED (2026-08-07, dgx sm_121a).**
+- **Vision-tower probe RAN on real weights:** `--prompt-image` loaded the real `visual.*`
+  tower (27 blocks / 3 DeepStack mergers), processed a 512×512 image → grid [1,32,32], and
+  `Qwen3VLVisionForward` returned [256, 20480] all FINITE + non-degenerate (merged rms 1.45 /
+  maxabs 29.1 — the expected Qwen massive-activation). Deliverable-1 core DONE.
+- **fl2va e2e COHERENT:** FL2VA GGUF (`--dequant-bf16`) + a real first-frame (VAE-keyframe) +
+  `--partition fl2va`, 512×512/22f/12steps → all 22 frames a coherent photorealistic orange
+  cat on a wooden table matching the conditioning frame (no grid). Frame-sanity PASS.
+- **ref2va STILL GRIDS (honest):** Ref2VA NVFP4 (`--fp4-resident`) + a real `--ref-image` +
+  `--partition ref2va` → every frame a multicolour patch grid. Landing the tower LOADER does
+  NOT fix it: the tower is a loader+probe, NOT yet scattered into the DiT render-conditioning,
+  so this render never used it. fl2va (same session, VAE-keyframe) is coherent ⇒ DiT/VAE/
+  partition are sound; the ref2va grid is specific to the ref2va conditioning assembly. The
+  render-conditioning scatter (merge features into prompt_embeds + DeepStack inject into the
+  DEVICE text tower) is the tracked residual that would let the vision-enriched-prompt
+  hypothesis be tested. The `--ref-video` VAE encode is a slow single-thread CPU 3D-CNN path
+  (separate perf limit).
+
+## 8.9 ENCODER VISION SCATTER — merged→prompt_embeds + DeepStack→device text tower (2026-08-07, `row/H3-VISION-SCATTER` PR #90)
+
+Closes the §8.8 residual at the FRAMEWORK level and RE-ATTRIBUTES the ref2va grid with a
+render A/B. Three deliverables.
+
+**`deepstack_visual_indexes` CONFIRMED (was #86-inferred).** The value is `[8, 16, 24]`,
+grounded in the release config: MiniMax-H3's `text_encoder/` IS **Qwen3-VL-32B-Instruct**
+(HF `.../MiniMax-H3/.../Qwen3-VL-32B-Instruct/config.json`), whose
+`vision_config.deepstack_visual_indexes = [8, 16, 24]`, depth 27, text `num_hidden_layers = 64`
+(truncated to 50) — identical to vllm-omni's `Qwen3VLMoeVisionConfig` default and the public
+`Qwen/Qwen3-VL-30B-A3B-Instruct` config. The #86 inference was correct; comment updated in
+`minimax_h3_vision_gguf.cpp:46-52`.
+
+**Deliverable 1 — the DEVICE scatter+inject is WIRED 1:1 + GATED.** `MiniMaxH3EncoderTextForwardDevice`
+(`minimax_h3_encoder_device.cpp:103,216-243`) now takes the optional `visual_pos_mask` + per-tap
+`deepstack` blocks and, after each of the first `len(deepstack)` decoder layers, ADDS each block
+into the masked visual-token rows — the device mirror of the gated host reference and of upstream
+`MiniMaxH3Qwen3VLTextModel._deepstack_process` (`encoder.py:770-800`,
+`hidden_states[visual_pos_masks] += visual_embeds`). The MERGED-feature masked_scatter into
+`inputs_embeds` stays the caller's job (upstream `_encode` scatters it BEFORE the tower runs;
+`encoder.py:1071`), exactly like the host reference. Text-only prompts pass the defaults and are
+byte-identical. **Gate** (`test_minimax_h3.cpp :: "the DEVICE keep-quant encoder matches the host
+f32 reference"`): the device forward now also runs WITH a visual mask + two DeepStack blocks and
+checks device==host-reference (max|diff| **3.8e-4** ≤ 2e-3) AND that DeepStack MOVES the
+conditioning (scale 1.006→1.062) — the surface #86 could not cover. All encoder/vision gates green
+(host text tower + full vision tower + GGUF `visual.*` loader + MM processor).
+
+**Driver wiring — `--cond-image` routes a reference image through the ENCODER vision path**
+(`examples/minimax_h3_gen/main.cpp`, mirroring `_encode`). Reuse-only: `Qwen3VLImageProcessor` →
+`Qwen3VLVisionForward` (real `visual.*` tower) → merged `[nm,5120]` + 3 DeepStack blocks;
+`ExpandImagePlaceholders` inserts `nm` image-pad tokens; merged masked_scatter into the embeds at
+those rows; M-RoPE positions from `Qwen3VLGetRopeIndex` (byte-equivalent to H3's own
+`_get_rope_index` for a single-frame image, t==1 — position math verified: text sequential, image
+block the 3D grid, next-text advances by `max(llm_h,llm_w)`). Additive: without `--cond-image` the
+text-only path is byte-identical.
+
+**GB10 RENDER A/B (2026-08-07, dgx sm_121a, 256×256/22f/12steps).**
+- **Deliverable 3 — fl2va WITH the encoder vision path = COHERENT + matching (PASS).** FL2VA GGUF
+  (`--dequant-bf16`) + `--first-frame` (VAE-keyframe) + **`--cond-image`** (encoder vision) +
+  `--partition fl2va`, prompt "a fluffy orange cat sitting on a windowsill in warm sunlight".
+  Conditioning `[82,5120]` = 16 prompt + a 66-token vision block (64 merged image-pad rows + 2
+  markers). Frame 0 = a coherent photorealistic ORANGE CAT matching the keyframe; frame 21 = the
+  same cat on a **WINDOWSILL in warm sunlight** — the clip EVOLVED toward the text prompt. No grid.
+  The vision-enriched conditioning is SOUND and load-bearing. Artifact `~/h3fp4/out_vs_fl2va.mp4`.
+- **Deliverable 2 — ref2va WITH the vision-enriched prompt STILL GRIDS (honest FAIL).** Ref2VA NVFP4
+  (`--fp4-resident`) + `--ref-image` (VAE reference rows) + **`--cond-image`** (encoder vision) +
+  `--partition ref2va`, same prompt. Conditioning `[82,5120]` (64 merged + 3 DeepStack), 1 reference
+  image, latent 7×16×16. Every frame (0/10/21) is the same multicolour PATCH GRID as #86's
+  text-only ref2va. Artifact `~/h3fp4/out_vs_ref2va.mp4`.
+
+**RE-ATTRIBUTION (with evidence).** The mission's "vision-enriched conditioning fixes the grid"
+hypothesis is **REFUTED**. The ref2va grid is NOT the encoder conditioning: (a) the DiT forward MATH
+is byte-exact vs upstream (§8.5 geometry ladder green every rung; §8.6 device==host at real seq
+1920); (b) the vision scatter+DeepStack is proven sound by the COHERENT fl2va-with-`--cond-image`
+render — the SAME conditioning path; (c) the ref2va grid is INVARIANT to text-only (#86) vs
+vision-enriched (this row) prompts. The ONLY thing that differs between the coherent fl2va and the
+gridding ref2va is that **fl2va PINS output rows (keyframe cond rows) each denoise step** while
+**ref2va PREPENDS free-running reference rows** — so the residual is the **ref2va-specific
+reference-row conditioning ASSEMBLY** (`MiniMaxH3EncodeReferenceImages` VAE-reference rows +
+`minimax_h3_packed_sequence_ref2va_blocks` noised-anchor layout + how the denoise loop conditions
+the un-pinned target rows on them), NOT the prompt_embeds and NOT the DiT forward. Next diagnostic:
+dump the ref2va target-row VAE-input latent adjacency-cosine (like #77 did for the coherent fl2va,
+0.95) to confirm the target rows are white, and A/B the reference-row condition-noise vs a clean
+anchor.
+
+## 8.12 THE #94 RESIDUAL DIAGNOSED — no discrete load-path defect (`row/H3-NVFP4-STREAM-DIFF` PR #95, 2026-08-07)
+
+Ran #94's prescribed identical-weights activation diff (NVFP4-bf16 stream vs FL2VA-GGUF-bf16
+control, byte-identical inputs) plus direct WEIGHT fingerprints via an env-gated per-stage hook
+in `MiniMaxH3DitForwardDevice` (`VT_H3_ACT_DUMP`, byte-inert unset). **Result: there is NO discrete
+load-path materialization bug.** Every weight, bias, fp32 island, output head, q/k-norm, and the
+RoPE cos/sin cache load quant-noise-close to the coherent GGUF (no scramble/transpose/mis-stride/
+wrong-dtype/wrong-shape); the RoPE cache is byte-identical; the dequant is byte-verified (§8.11).
+Both arms run the IDENTICAL forward, so the grid is 100% attributable to the per-weight
+NVFP4-vs-Q3_K quantization difference on the SAME weights.
+
+The divergence FIRST appears (beyond quant noise) at the **token refiner** and the block-0
+attention INPUT — NOT RoPE, NOT a projection/norm weight — and amplifies chaotically through the
+50-block stack, driven by the Qwen massive text activation (`condition_proj` output absmax ~7.4e4);
+the two arms' final latents are DECORRELATED (sample-relative-L2 >1, not scale-related). Render A/B
+re-confirmed in the same byte-inert build: NVFP4 t2va = pale patch grid, FL2VA-GGUF t2va = coherent
+orange cat. **The residual is the community NVFP4 file's quantization fidelity** (same
+`Star Ultimate Model Converter Pro` lineage as the #94 nibble bug; corr to the coherent Q3_K only
+0.85-0.94) times the DiT's massive-activation sensitivity — a CHECKPOINT-quality issue, not a
+loader fix. Definitively separating "poor community quant" from "inherent t2va-OOD sensitivity of
+these fl2va/ref2va finetunes" needs a clean bf16 ground truth (132 GiB host-f32 = OOM on one GB10)
+or a same-finetune REF2VA-GGUF control (disk-blocked, 23 GiB free); the path forward is an official
+modelopt-NVFP4 checkpoint. The fp4-resident Marlin arm's separate grid stays a distinct,
+wiring-gated-only residual (untouched). Full forensics + the divergence profile: the
+`row/H3-NVFP4-STREAM-DIFF` benchmark-record entry.
+
+## 9. W-OAI — the `/v1/videos` OpenAI (Sora) WIRE SHAPE, 2026-08-06
+
+Row `SERVE-VIDEOS-OAI` (engine matrix, Serving surface), claim
+`CLAIM-SERVE-VIDEOS-OAI`, branch `row/SERVE-VIDEOS-OAI`.
+
+Developer-directed: an unmodified OpenAI client must work against `/v1/videos`.
+ADDITIVE — the vLLM-Omni-derived fields keep working, and every body that parsed
+before means exactly what it meant before.
+
+SPLIT, deliberately: this row is the REQUEST/RESPONSE SHAPE only (`model`,
+`size`, `seconds`, and the MP4 download route). It touches no generation code and
+loads no VAE. The REFERENCE CONDITIONING half (`input_reference` -> fl2va, plus
+the two `metadata` reference modalities -> ref2va) is §10, row
+`SERVE-VIDEOS-REFS`, because it is a separate capability that pulls in the VAE
+encoder halves and the runner. Each half is independently reviewable and gated.
+
+### 9.0 Spike contract (`SERVE-VIDEOS-OAI`)
+
+| Section | Content |
+|---|---|
+| Scope | IN: the OpenAI (Sora) REQUEST SPELLINGS `model`, `size`, `seconds` on `/v1/videos`, their precedence against the native fields, the `model`-mismatch warning on the job, and `GET /v1/videos/{id}/content`. OUT: reference conditioning of any modality (§10); OpenAI's status vocabulary / id shape / `progress` / multipart upload; any change to generation, the DiT, the VAEs or the muxer. |
+| Upstream chain | OpenAI's published video API (`POST /v1/videos`, `GET /v1/videos/{video_id}/content`, `size` "WxH", `seconds` string enum) is the request CONTRACT; vLLM-Omni's `/v1/videos` async+sync job pair is the endpoint shape we already mirror. |
+| Our baseline | `ParseVideoRequest` took only the native spellings (`duration`, `height`/`width`, `num_frames`, `num_inference_steps`, `flow_shift`, `audio_flow_shift`, `seed`, plus `extra_params`); an OpenAI client's body parsed to DEFAULT geometry and duration. `VideoJobStore` had no `model`/`warning`. The routes stopped at status: the produced .mp4 was reachable only through the filesystem. |
+| Port map | Request contract -> `include/vllm/entrypoints/openai/video_api.h` (`VideoRequest::model` + `ParseVideoSize`) and `src/vllm/entrypoints/openai/video_api.cpp` (`ParseVideoRequest`, `ReadDuration`, `ParseWholeNumber`). Job record -> `VideoJobStore::Create(model, warning)` + `VideoJobStatusJson`. Download route -> `ApiServer::handle_video_content` + `video_model_warning` + their registration in `src/vllm/entrypoints/openai/api_server.cpp`. |
+| Tests to port | No upstream test module exists for this surface (OpenAI publishes an API, not tests; vLLM-Omni's video endpoint has no ported test). The contract is gated in-tree instead, extending the existing files: `tests/vllm/entrypoints/openai/test_video_api.cpp` (parsing, precedence, the job record) and `tests/vllm/entrypoints/openai/test_api_server.cpp` (routes, content behaviour, additivity over a real socket). Every assertion uses values that DIFFER from the field default. |
+| Gates | CPU, foreground: `test_video_api` 11/11 (125 assertions), `test_openai_api_server` 40/40 (509), `server` builds clean. Content route: 404 unknown / 409 unfinished (no bytes leaked) / 500 failed / 500 vanished / 200 byte-exact `video/mp4`. Additivity: with no `VideoRunner`, `POST /v1/videos` is 404 over a real socket with no `ErrorResponse` envelope; with one, it is 200 and the unknown-id 404 IS ours. Commands: `cmake --build build --target test_video_api test_openai_api_server server -j12`. Real-weights e2e rides §8's GB10/disk window. |
+| Dependencies | Row IDs: the MiniMax-H3 model rows and `row/H3-FP4-SPEED` (UNTOUCHED - no generation code changed); `SERVE-VIDEOS-REFS` (§10) stacks on this row. No new download, no GPU, no toolchain change for the CPU gate. |
+| Work breakdown | (1) alias parsing + precedence + `ParseVideoSize`; (2) `model` recording + the job `warning`; (3) `handle_video_content` + its route; (4) both test files; (5) docs + record. |
+| Risks/decisions | NATIVE-wins precedence: the only direction that leaves every previously-parsing body meaning what it meant. `model` mismatch WARNS rather than 404s: a Sora client cannot know the local model name, so a rejection would defeat the compatibility; silence would hide it. A 409 (never bytes) on an unfinished job: a partially muxed file would reach the client as a valid-looking, truncated MP4. No vLLM-defined behaviour is reopened. |
+
+### 9.1 The aliases and their precedence
+
+| OpenAI | Lands on | Notes |
+|---|---|---|
+| `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
+| `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
+| `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
+
+PRECEDENCE: the NATIVE field WINS (`width`/`height` over `size`, `duration` over
+`seconds`). Both spellings are VALIDATED whichever wins, so a malformed `size` is
+a 400 even when explicit `width`/`height` override it. Precedence is PER-AXIS: an
+explicit `width` alone still lets `size` supply the height it did not specify.
+
+### 9.2 `GET /v1/videos/{id}/content`
+
+Returns the finished MP4 as `video/mp4`. Without it a caller could start and poll
+a job but never fetch the result over HTTP. Unknown id -> 404; queued/running ->
+409 naming the status (never a truncated file); failed -> 500 carrying the
+failure; a vanished output -> 500, not a 200 with zero bytes.
+
+### 9.3 Status
+
+- **CPU-LANDED + gated.** `test_video_api` 11/11 (125 assertions),
+  `test_openai_api_server` 40/40 (509), `server` builds clean. Additivity is
+  gated over a REAL socket: without a `VideoRunner` all four routes are absent
+  (a 404 with no `ErrorResponse` envelope), with one they serve.
+- **Residuals, named.** OpenAI's status vocabulary is not mirrored (ours stays
+  queued/running/succeeded/failed, ids `vid_N`, no `object`/`progress`/
+  `created_at`); reference conditioning is §10 (`SERVE-VIDEOS-REFS`), not this row.
+- **Real-weights leg** rides the same GB10/disk window as §8.
+
+## 10. W-REFS — reference conditioning over `/v1/videos`, 2026-08-06
+
+Row `SERVE-VIDEOS-REFS` (engine matrix, Serving surface), claim
+`CLAIM-SERVE-VIDEOS-REFS`, branch `row/SERVE-VIDEOS-REFS`, stacked on §9.
+
+§9 made an OpenAI client's request PARSE. This row makes its REFERENCES do
+something: an image the video starts from, a clip it continues, a voice it
+carries. Before it, no reference modality was reachable over HTTP at all.
+
+### 10.0 Spike contract (`SERVE-VIDEOS-REFS`)
+
+| Section | Content |
+|---|---|
+| Scope | IN: OpenAI's `input_reference` mapped to fl2va first-frame conditioning; the two reference modalities OpenAI has no slot for carried in `metadata` (`input_reference_video`, `input_reference_audio`) mapped to ref2va blocks; the fl2va/ref2va combination rule enforced at the request boundary; the `examples/server` runner wiring (PPM decode, frame-directory clip, WAV, lazily-loaded VAE encoder halves). OUT: the ref2va IMAGE modality (reachable via the native `task` + the CLI, deliberately not bound to `input_reference`); any change to generation, the DiT, the VAEs or the muxer; OpenAI's multipart upload. |
+| Upstream chain | OpenAI documents `input_reference` as the image the generated video STARTS FROM. The conditioning entry points are ours and already gated: `MiniMaxH3EncodeKeyframeCondRows` (fl2va), `MiniMaxH3EncodeReferenceVideo` / `MiniMaxH3EncodeReferenceAudio` (ref2va), `MiniMaxH3ReadWav`. The exclusivity rule is `src/vllm/model_executor/models/minimax_h3_pipeline.cpp:251`. |
+| Our baseline | After §9 the OpenAI wire shape parses, but every reference field is absent: an image-to-video request silently generated from the prompt alone. |
+| Port map | Request contract -> `include/vllm/entrypoints/openai/video_api.h` (`input_reference*`, `metadata`, the `has_*` predicates) and `src/vllm/entrypoints/openai/video_api.cpp` (`ReadReferenceSource`, `ReadMetadata`, the combination `VT_CHECK`); the `data:` decode REUSES `entrypoints::openai::DecodeDataUri` (chat_mm) rather than a second decoder. Reference wiring (the process boundary keeps it out of the library) -> `examples/server/main.cpp`: `DecodePpmChw`, `ReadReferenceClipChw` (the CLI's `DIR/frame_%06d.ppm` convention), `ReadReferenceBytes`, and the fl2va / ref2va branches with lazily-loaded VAE encoder halves. |
+| Tests to port | No upstream test module exists for this surface. The contract is gated in-tree, extending the same two files: `test_video_api.cpp` (reference parsing, `metadata` passthrough, combination legality) and `test_api_server.cpp` (each modality ARRIVES at the runner, and an illegal pair is a 400 that generates nothing). |
+| Gates | CPU, foreground: `test_video_api` 14/14 (167 assertions), `test_openai_api_server` 41/41 (525), `server` builds clean. Commands: `cmake --build build --target test_video_api test_openai_api_server server -j12`. Real-weights e2e rides §8's GB10/disk window. |
+| Dependencies | Row `SERVE-VIDEOS-OAI` (§9), stacked. Code: `MiniMaxH3Encode{KeyframeCondRows,ReferenceVideo,ReferenceAudio}`, `MiniMaxH3ReadWav`, `DecodeDataUri`. Runtime: `--video-vae` for an image or video reference, `--audio-vae` for an audio reference (both encoder halves, loaded lazily and once). No new download, no GPU. |
+| Work breakdown | (1) `input_reference` parsing (path or `data:` URL) -> fl2va, with the geometry refusal; (2) the `metadata` map + the video/audio reference keys; (3) the combination rule in the parser; (4) the `examples/server` runner branches; (5) both test files; (6) docs + record. |
+| Risks/decisions | `input_reference` -> fl2va, NOT ref2va: OpenAI documents it as the frame the video starts from; ref2va would silently change what the API promises. The two extra modalities go in `metadata` rather than new top-level fields, so a strict client's schema validation still passes. Combination legality is enforced in the PARSER, not left to the pipeline, so a supplied reference is never silently dropped. |
+
+| OpenAI | Lands on | Notes |
+|---|---|---|
+| `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
+| `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
+| `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
+
+## 8.13 The ORIGINAL bf16 release — the multi-shard CHECKPOINT (2026-08-07, `row/H3-BF16-SHARDED-DIT`, CPU-only)
+
+**Why.** Every H3 render so far used a QUANTIZED DiT, and H3 is unusually
+quantization-sensitive: Q3_K_M -> Q4_K_M alone turned a murky lattice-covered
+silhouette into a photoreal close-up (ComfyUI PR 15298 attributes it to the partial
+split-half RoPE producing channel-wise magnitude outliers that corrupt even INT8).
+"What does FULL PRECISION look like?" was unanswerable because every DiT loader took
+a SINGLE file (`LoadMiniMaxH3DitFromGguf`/`...Bf16`/`StreamMiniMaxH3DitToDeviceBf16`
+one GGUF; `LoadMiniMaxH3DitFromNvfp4`/`StreamMiniMaxH3Nvfp4To*` one safetensors),
+while the bf16 release ships **13 safetensors shards totalling 66.3 GB**.
+
+This section is the CHECKPOINT half. The device streamer that makes the real 66.3 GB
+release loadable on a GPU is §8.14, split out as a stacked row so each PR stays inside
+the 900-line review cap.
+
+**What landed.**
+- `MiniMaxH3ShardedCheckpoint::Open(dir)` (`minimax_h3_sharded.cpp`) resolves shards
+  through the checkpoint's own `model.safetensors.index.json` weight map (the
+  `diffusion_pytorch_model.*` spelling is accepted too). Nothing is discovered by
+  scanning. Shape mirrors the in-tree multi-shard template
+  `LoadMiniMaxH3EncoderWeights(const std::vector<SafetensorsFile>&, ...)`: one index
+  over every shard. A tensor the index NAMES but whose shard does not contain it
+  throws BY NAME (skipping it would read as zeros and render).
+- `EnumerateMiniMaxH3ShardedTensors` produces the same names+shapes manifest the GGUF
+  and NVFP4 arms build, so `ParseMiniMaxH3DitParamsFromGgufManifest` derives the
+  geometry from SHAPES ALONE here too, and a sharded checkpoint and a single-file one
+  holding the same tensors produce IDENTICAL params.
+- `LoadMiniMaxH3DitFromShards` is the host-f32 REFERENCE loader (the comparison
+  baseline and the CPU path for reduced checkpoints; ~132 GB on the real release, so
+  not for real runs).
+- The fp32 ISLAND split is single-sourced as `MiniMaxH3IsFp32IslandTensor` and the
+  three pre-existing streamers now call it. It is load-bearing: `vt::MatmulBT` rejects
+  an (f32 activation, bf16 weight) pair, so a tensor on the wrong side fails at the
+  first island GEMM.
+- `examples/minimax_h3_gen`: `--dit <dir>` accepts a shard directory everywhere a DiT
+  file was accepted, for both `--dump-params` and the run path. Every existing `--dit`
+  form is unchanged.
+
+**Gates (CPU, re-run after the rebase onto `f34e0d17`: `test_minimax_h3` 72/72 cases,
+54497 assertions).**
+1. *Index + name mapping, no weights*: a synthetic 4-shard set; every tensor resolves
+   to the shard the index named AND to the bytes written there; a tensor named in the
+   index but missing from its shard THROWS with the tensor name in the message; the
+   derived geometry equals the SINGLE-FILE path over the same tensors, field for field.
+2. *Real geometry without the weights*: a 13-shard release whose headers declare the
+   REAL 535 tensors at their REAL shapes with the payload as a SPARSE hole (61.73 GiB
+   = 66.3 GB declared, 144 KB on disk) parses to the SHIPPED geometry: num_layers 50,
+   hidden 5376, heads 56, head_dim 128, ffn 14336, latents 24, audio_latents 32, patch
+   1x2x2, text_dim 5120 - the same numbers the working GGUF arm derives from shapes
+   alone. `minimax-h3-gen --dit <dir> --dump-params` prints all 20 fields on it.
+
+**Not claimed here.** No device load of the real 66.3 GB release (no streaming device
+loader ships in this row - see §8.14), no measured peak RSS, and no bf16-vs-quantized
+RENDER or SPEED comparison. The bf16-vs-quant quality question is UNBLOCKED, not
+answered.
+
+## 8.14 The ORIGINAL bf16 release — the DEVICE STREAMER (2026-08-07, `row/H3-BF16-SHARDED-STREAM`, CPU-only)
+
+Stacked on §8.13, which landed the multi-shard checkpoint and its host-f32 reference
+loader. Split as its own row so each PR stays inside the 900-line review cap; the seam
+is checkpoint-vs-device.
+
+**Why it must stream.** The reference loader materializes the whole DiT as host f32,
+~132 GB on the real release. The box has 122 GiB of UNIFIED memory — host and device
+draw on ONE pool — so "load to host, then stage" holds the model TWICE against that
+budget, and the non-streaming NVFP4 loader was already OOM-KILLED at anon-rss 125 GB on
+HALF this size. Without a streaming path the 66.3 GB release is not loadable at all.
+
+**What landed.**
+- `StreamMiniMaxH3ShardedToDeviceBf16(queue, ckpt, out_params)` (`minimax_h3_device.cpp`,
+  next to its GGUF and NVFP4 twins so it shares `BindStreamedDitViews`). Manifest first
+  (names+shapes, no payload) so the geometry is known and a wrong name map is caught
+  before anything is allocated; then ONE tensor at a time.
+- PEAK HOST MEMORY, precisely. Two of the three cases cost NOTHING: BF16-on-disk ->
+  bf16 device slot (essentially the whole 66.3 GB) and F32 -> f32 island are both
+  uploaded DIRECTLY out of the read-only mmap, with no host buffer at any point. Only a
+  dtype MISMATCH (a BF16 island widened to f32, an F32 body rounded to bf16, an F16
+  shard) costs one tensor's conversion buffer, freed before the next iteration.
+  `host_peak_bytes` reports the largest such buffer, so the gate asserts the bound
+  rather than trusting the comment.
+- Each source range goes to `MaybeReleaseSourcePages` the moment its copy returns, so
+  the page cache does not accumulate against the same pool the weights live in.
+  `rope.inv_freq` stays HOST-resident (`BuildRopeCosSin` runs before any kernel, so a
+  device pointer there segfaults on the first forward).
+- `MiniMaxH3ShardStreamStats`, mirroring `Nvfp4W4A16Stats`, makes the path OBSERVABLE.
+  This codebase has shipped a never-executing guarded kernel under a green suite before;
+  counters are how that is prevented.
+- `examples/minimax_h3_gen`: `--dit <dir> --device cuda` streams and prints the stats
+  line; `--device cpu` keeps §8.13's host reference loader.
+
+**Gates (CPU, `test_minimax_h3` 73/73, 55203 assertions).**
+1. *Streamed == non-streamed*: over a 3-shard synthetic set whose dtypes exercise all
+   four (on-disk x device) combinations, every one of the 46 weight views is BIT-EXACT
+   (`memcmp == 0`) against `StageMiniMaxH3DitWeights(kBF16)` over the same checkpoint,
+   dtypes included (12 fp32 islands, the rest bf16), and both device forwards return
+   IDENTICAL logits (video and audio max|diff| both exactly 0.0). `rope.inv_freq` is
+   asserted HOST-resident.
+2. *The loader RAN*: the counters are asserted, not merely printed. Observed
+   `shards=3 tensors=46 direct=37 converted=9 bytes=444504 host_peak=8192` — BOTH upload
+   paths taken, every bound view pointing at an allocation this loader owns, and
+   `host_peak_bytes` (one tensor's buffer) under 1/4 of the bytes uploaded, i.e. the peak
+   cannot scale with the model.
+
+**Not claimed here (needs the real weights / a GPU):** the 66.3 GB load itself and its
+measured peak RSS, CUDA `cudaMemcpy` straight from a file-backed mmap (valid
+pageable-source usage, and every copy is followed by a synchronize, but unexercised on
+device), and any bf16-vs-quantized RENDER or SPEED comparison. The quality A/B is now
+runnable; it has not been run.
+
+
+## 8.15 The bf16 TEXT ENCODER — 14 shards, 63 GB, streamed; and `--encoder-only` (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`)
+
+**Why.** §8.13/§8.14 made the full-precision *DiT* loadable, but every H3 render — including
+the ones whose output looks competent-but-generic — conditioned on a **Q4_K_M** text
+encoder (`enc_q4km.gguf`, 14.6 GB, Qwen3-VL-32B). Nobody had ever measured the
+encoder's contribution. That matters because weak conditioning and a
+quantization-damaged conditioning tensor look identical from the outside: the wuxia
+prompt asked for shot/reverse-shot coverage of a martial-arts sect exchanging
+intelligence and got a good generic portrait, and this family is known to be
+quantization-sensitive (ComfyUI PR 15298: H3's partial split-half RoPE produces
+channel-wise magnitude outliers that corrupt even INT8).
+
+The blocker was mechanical: `--encoder` only accepted a GGUF
+(`LoadMiniMaxH3EncoderFromGguf`), while the unquantized tower ships as **14
+safetensors shards + `model.safetensors.index.json`, 63 GB**.
+
+**What landed.**
+
+- `MiniMaxH3EncoderConfigFromShards(ckpt, max_layers)` derives the geometry from the
+  index's SHAPES alone — no payload — using the SAME recovery rules as the GGUF
+  loader (head_dim from `q_norm`, heads from `q_proj` rows), so the two arms cannot
+  disagree about what model they are running. The knobs shapes cannot carry
+  (`rope_theta`, `mrope_section`, `rms_norm_eps`, `selected_layer`) keep the SAME
+  defaults the GGUF arm leaves in place; otherwise an A/B would be comparing two
+  RoPEs, not two quantizations.
+- `StreamMiniMaxH3EncoderShardsToDevice` (`minimax_h3_encoder_sharded.cpp`) fills the
+  same `MiniMaxH3EncoderDeviceWeights::views` map the GGUF arm fills, over bf16
+  instead of ggml blocks. The projections stay **BF16 on the device** and are
+  uploaded DIRECTLY out of the read-only mmap with no host buffer at all; the two row
+  FUSIONS (`[q|k|v]`, `[gate|up]`) are done ON THE DEVICE by uploading each member
+  into its offset of one allocation, so the transform does not cost a host copy
+  either. Only the norms are widened on the host, and those are `[5120]`.
+- `MiniMaxH3EncoderTextForwardDevice` is UNCHANGED in structure and now WIDENS a bf16
+  weight to f32 immediately before its GEMM, into a scratch buffer keyed by element
+  count and reused across all 50 layers. This is a RESIDENCY trick, not a numerics
+  one: `vt::MatmulBT` requires both operands in one dtype and these activations are
+  f32, while staging the 50 layers H3 runs as f32 would be **97.5 GiB** against a
+  **48.8 GiB** bf16 residency on a 122 GiB UNIFIED pool. bf16 -> f32 is EXACT, so the
+  GEMM sees bit-identical inputs to an f32-staged tower — gated below.
+- `MiniMaxH3EncoderEmbedTokensFromShards` gathers a prompt's embedding rows straight
+  out of the mmap (the table is `[151936, 5120]`), the safetensors twin of the GGUF
+  arm's per-row dequantize.
+- `minimax-h3-gen --encoder <dir>` is accepted wherever the GGUF was, and
+  **`--encoder-only`** runs the tower alone — no DiT, no VAEs, no output path — and
+  writes `--save-embeds`. That is what makes the measurement affordable: the DiT was
+  loaded FIRST in the normal path, so asking for conditioning alone used to cost its
+  residency too (~96 GiB peak instead of ~49 GiB on a pool that OOM-reboots the box).
+  Both encoder paths now go through ONE helper, so the conditioning a render consumes
+  and the conditioning the A/B measures are produced by the same code.
+
+**Gates (CPU, re-run after the rebase onto `row/H3-BF16-SHARDED-STREAM`: `test_minimax_h3` 75/75, 55609 assertions).**
+1. *Resolve, fuse and stream*: a synthetic 4-shard encoder at the REAL name spellings
+   (`model.language_model.layers.N.*`, `model.visual.*`, `lm_head.weight`). Geometry
+   from shapes matches; every fused view's bytes are `memcmp`-exact against
+   `q ++ k ++ v` and `gate ++ up` for EVERY layer; `o_proj`/`down_proj` pass through
+   byte-exact; the separate q/k/v and gate/up names are GONE; `norm.weight`,
+   `lm_head.weight` and the vision tower are NOT bound; truncation works; the
+   embedding gather is exact and throws out of range.
+2. *The loader RAN, and it is not the GGUF path*: `MiniMaxH3EncoderShardStreamStats`
+   (mirroring `MiniMaxH3ShardStreamStats`) is asserted on — shards opened, layers
+   streamed, 8 views/layer, 2 fused groups/layer, 7 direct (no-host-copy) uploads and
+   4 conversions per layer, and `host_peak_bytes` equal to ONE norm (so peak cannot
+   scale with the model). The views are `kBF16`, a dtype the GGUF loader can never
+   produce, which is what makes this a proof rather than a coincidence.
+3. *Widening is exact*: the SAME synthetic checkpoint written twice — once BF16, once
+   F32 holding the bf16-rounded values — streams to `kBF16` and `kF32` views
+   respectively (asserted), and the two full encoder forwards are **BIT-IDENTICAL**
+   (`memcmp == 0`), not merely close. Without this, "we measured what quantizing the
+   encoder costs" would be confounded by what the widening itself did.
+
+### 8.8 THE NUMBER — what Q4_K_M does to the conditioning (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`, Thor sm_110, build `d1085374` (built and measured as `d1085374`, amended for the row-branch trailer; IDENTICAL tree `dd9283cf`, so the measurement binary IS this commit))
+
+**Method.** Same prompt (`wuxia.txt`, **233 tokens**), same tokenizer, same 50-layer
+truncation, same `MiniMaxH3EncoderTextForwardDevice`, same f32 activations — only
+the weight bytes differ. Both arms self-report identical geometry
+(`layers=50 hidden=5120 heads=64 kv_heads=8 head_dim=128 ffn=25600`), which is what
+establishes they are the same model. Conditioning is `[233, 5120]` f32 via
+`--encoder-only --save-embeds`. A CALIBRATION arm encodes a ONE-WORD edit of the
+same prompt with the bf16 encoder (`bamboo forest at night` -> `at dawn`, also 233
+tokens), because a cosine has no meaning without a yardstick.
+
+| | max\|diff\| | RMS | rel RMS | rel RMS excl. sink | cos min | cos mean | cos median | angle mean | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** | 154.0 | 0.5045 | **0.03403** | **0.06849** | 0.90916 | **0.99745** | 0.99810 | 3.793° | 24.61° |
+| bf16, one-word edit | 31.1 | 0.2812 | 0.01897 | 0.06666 | 0.84736 | 0.99769 | 0.99963 | 2.228° | 32.07° |
+
+1. **Not a scale change.** Q4 conditioning is uniformly ~1% smaller (norm ratio mean
+   0.99010) but the best single global rescale removes almost none of the difference
+   (0.03403 -> 0.03280). It is DIRECTIONAL, the kind that matters.
+2. **Its energy is on par with a one-word prompt edit** (6.85% vs 6.67% excluding the
+   sink token). Quantizing the encoder moves the conditioning about as much as
+   rewriting a word of the prompt.
+3. **The SHAPE is opposite.** The edit is SPARSE — 172/233 tokens stay above cosine
+   0.999 (median rotation 0.16°), the change concentrating on ~6 tokens, max 32°.
+   Quantization is DIFFUSE — 232/233 tokens fall below 0.999, EVERY token rotates a
+   few degrees (median 3.5°), one token by 24.6°. A smear everywhere, not a different
+   prompt.
+4. **`max|diff|` 154 is the attention SINK, not corruption.** Token 0 has norm 15,522
+   against a 366 mean (42x) and carries 68% of the total squared error, yet its
+   direction is nearly untouched (cosine 0.99962) — the channel-wise magnitude-outlier
+   behaviour ComfyUI PR 15298 attributes to the partial split-half RoPE, showing up
+   concretely. This is why the sink-excluded column is the honest aggregate.
+
+**Verdict.** Q4_K_M does real, measurable, directional damage — comparable in
+magnitude to editing the prompt — but DIFFUSELY. A uniform few-degree rotation of
+every token is the signature that blunts fine-grained compositional instruction
+(coverage, blocking, staging) toward a prompt's average semantics, which is exactly
+the "competent but generic" symptom. The bf16 encoder is worth a render A/B.
+
+**What this does NOT establish.** It does not prove the RENDER changes; nothing here
+measures the DiT's sensitivity to a 3.5°-median rotation. The owed follow-up is a
+byte-identical-everything-else render A/B (same DiT, seed, steps;
+`--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin`), which is exactly what
+`--save-embeds`/`--prompt-embeds` make controllable.
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+load of the checkpoint) and each produced a BYTE-IDENTICAL conditioning file:
+`cond_q4km.bin` md5 `a331232096ef1da2628f885950b2fc55` and `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. So every number above is
+deterministic, not a sample — there is no noise band to argue about, and a
+future change to either path shows up as an md5 change.
+
+**Cost.** Q4_K_M arm 40 s wall, peak **18.0 GiB**. bf16 arm 40 s wall (35 s
+streaming), **45.41 GiB** uploaded, host conversion peak **0.0195 MiB** (one norm —
+the projections never touch a host buffer), total peak **51.95 GiB** of the 122 GiB
+UNIFIED pool. Streamer counters on the real checkpoint:
+`layers=50 tensors=400 direct=350 converted=200 fused=100`, i.e. the shard path ran
+and every projection took the no-host-copy upload.
+
+## 8.16 The REF CANVAS renders COHERENT — 1344x768/124f measured end to end, and the pipeline's own decode OOMs there (2026-08-08, `row/H3-REF-CANVAS-RENDER`, Thor sm_110)
+
+§8.4 left the vllm-omni REF canvas (768x1344, 124f) UNRUN — "a full 50-step render is
+~2.85 h, so it was not run (largest-fitting-config honesty)". This row RAN it, on Thor
+(sm_110, 122.8 GiB unified, no FA2 so the portable fallback attention throughout), and
+measured every stage. **The render is COHERENT at the REF canvas** on the matching
+partition; the §8.4 white latent does NOT reproduce.
+
+**Config:** `MiniMax-H3-FL2VA-Q4_K_M.gguf` (`--dequant-bf16`), `--partition fl2va`,
+task **t2va** (no reference image), 1344x768, 124 frames, 50 steps, seq_len 38080,
+176.3 s/forward, `VT_H3_DUMP_DIR` on.
+
+| Stage | Metric | Value | Reference |
+|---|---|---|---|
+| init noise | adj-cell cosine | **0.0019** | white by construction (control) |
+| init noise | r_W / r_H / r_T | 0.999 / 1.001 / 0.999 | 1.0 == spatially white |
+| VAE-input latent | adj-cell cosine | **0.8924** | §8.4 white 0.06; real encode 0.789; §8.6 coherent 0.9467 |
+| VAE-input latent | r_W / r_H / r_T | 0.347 / 0.313 / 0.311 | well below the 1.0 white floor |
+| decoded frames | period-16 seam ratio | **1.15** | == the known-good 864x480 render (1.15); ref2va-on-FL2VA was 2.28 |
+
+`r` is mean|adjacent diff| / E|X-Y| along one axis: 1.0 for spatially white, lower when
+correlated. Calibrated before use on synthetic latents (white 1.00, smooth field 0.44,
+smooth+30% per-cell noise 0.86), so the instrument is known to separate the two cases.
+
+**Task/partition is what the earlier grids were.** Renders passing `--ref-image` against
+the FL2VA partition are ref2va-on-FL2VA, the combination §8.6 identified and §8.7's guard
+now REJECTS at the CLI. Measured on the same canvas and prompt: ref2va-on-FL2VA **2.28**,
+t2va pre-guard binary **1.87**, t2va on the guarded binary with Gaussian init noise
+**1.15**. The artifact SCALES WITH CANVAS (864x480 showed 1.15 while 1344x768 showed 2.28
+on the same mismatch), which is why small-canvas runs looked acceptable and the REF canvas
+did not.
+
+**NEW BUG — the pipeline decode OOMs at the REF canvas.** The 50-step denoise completed
+and the latent dump was written; VAE decode then exhausted the GPU pool and REBOOTED the
+box (`NVRM: GPU0 ... Out of memory [NV_ERR_NO_MEMORY] ... _memdescAllocInternal`, kernel
+log, ~1 min after the dump, box down ~2 min later). The dequantised bf16 DiT stays
+resident through `MiniMaxH3VideoVaeDecodeTemporalDevice`. Decoding the SAME dumped latent
+standalone — VAE only, no DiT resident — completes with room to spare and produced the
+1.15 frames above. So generation is correct at the REF canvas and the DECODE is what does
+not fit alongside the model.
+
+**FIXED in this row — `DevicePool::Drain` at the phase change.** The scratch pool is
+UNCAPPED on this platform (`cuda.cpp:98`, `device_pool_cap_bytes = 0`), so every block a
+`DBuf` returns across 50 denoise steps is retained forever, keyed by size class. The VAE
+decode then asks for DIFFERENT classes, cannot reuse any of them, and `cudaMalloc`s on
+top. `MiniMaxH3GenerateT2va` now drains the pool once at the denoise -> decode boundary.
+Measured on the REF canvas: **10.25 GiB released**, the render completed (124 frames +
+32 kHz audio, no reboot), and the pool still served **99.92%** of allocations from the
+free list (`hits=98475 misses=75 distinct-classes=8`) — draining at a PHASE boundary does
+not cost the within-phase reuse the pool exists for. Capping the pool platform-wide was
+REJECTED: it would charge every CUDA model the cudaMalloc/cudaFree sync storm the pool was
+built to avoid, for a problem that only appears at one phase change.
+
+`--keep-quant` was tried first as a no-code workaround and is NOT one: it OOM-killed the
+box ~8 min in, during weight staging, before a single denoise step.
+
+**Residuals.** (1) No full 124-frame MP4 with audio at the REF canvas yet — blocked on the
+OOM above. (2) The audio latent has no `VT_H3_DUMP_DIR` hook, so the audio arm is
+unmeasured; it was diagnosed only through the shared-sequence argument. (3) `--roundtrip`
+and `--decode-latent` went with the pre-fold binary (documented at
+`minimax_h3_gen/main.cpp:31-36`), so replaying a dumped latent through the VAE now needs a
+throwaway harness against `MiniMaxH3VideoVaeDecodeTemporalDevice`; a `--decode-latent` on
+the ABI would have turned this row's 3 h re-render into a 2 min decode.
+
+## 8.17 The AUDIO arm CALIBRATED — VAE cleared by round-trip, the DiT latent is OUT OF DISTRIBUTION (2026-08-08, `row/H3-AUDIO-ENCODE-REF`, Thor sm_110)
+
+§8.16's dump (PR #175) gave the audio arm its first measurement: adjacent-time cosine
+**0.5897** against a 0.0855 random-pair baseline, i.e. NOT white. That ruled out the
+video arm's failure mode but could not say whether 0.59 was HEALTHY — the audio arm had
+no equivalent of the video arm's 0.789 real-encode anchor. This row built it.
+
+**The reference.** `MiniMaxH3AudioVaeEncodeToLatent` on real 32 kHz speech (jfk, 11.0 s ->
+440 frames, confirming the 40 Hz geometry) gives the raw-VAE-space latent a healthy signal
+actually looks like. Same space as the pipeline's post-denormalize dump, so the two compare
+directly.
+
+| Latent | adj-time cosine | random-pair | per-channel \|mean\| | per-channel std |
+|---|---|---|---|---|
+| REFERENCE real speech (jfk) | 0.6431 | 0.4285 | 0.4388 | 0.7736 |
+| ENCODE(our generated audio) | 0.4784 | 0.1194 | 0.3028 | 0.9694 |
+| OUR DiT latent (ch0) | 0.5897 | 0.0855 | 0.2406 | 1.0774 |
+| audio_vae config `latents_mean/std` | — | — | 0.1940 | **1.8983** |
+
+**The video VAE was cleared by a round-trip (§8.6); the AUDIO VAE is now cleared the same
+way.** Decoding the jfk REFERENCE latent — one the encoder itself produced — back through
+`MiniMaxH3AudioVaeDecode` returns 440 frames -> 352000 samples (exactly 11.00 s @32 kHz)
+that ASR transcribes WORD-IDENTICALLY to the original ("and so my fellow americans ask not
+what your country can do for you ask what you can do for your country", both). The decoder
+is SOUND; the reported metallic voice is not a decode defect.
+
+**What is wrong is the DiT's audio latent, and it is OUT OF DISTRIBUTION.** A functioning
+VAE satisfies `encode(decode(z)) ~ z`. Decoding our DiT audio latent and RE-ENCODING the
+audio it produced gives cosine **+0.016** (ch0) / **+0.031** (ch1), per-frame mean +0.022 /
++0.036 — no relationship. The decoder maps our latent somewhere, but nowhere the encoder
+would ever have come from. Contrast the reference, which round-trips perfectly.
+
+**The shape of the divergence.** Our latent's per-channel MEAN matches the config
+(0.2406 vs 0.1940) while its per-channel STD is ~**57%** of what full denormalization
+implies (1.0774 vs 1.8983). Since `denormalize` is `value * std + mean`, a correct mean
+with a short std means the DiT's NORMALIZED audio output carries std ~0.57 rather than 1.0
+— an UNDER-DISPERSED latent. Note the video arm, on the same sampler and the same joint
+sequence, is coherent at 0.8924 (§8.16), so whatever this is, it is specific to the audio
+stream rather than the denoise as a whole.
+
+**Ruled out along the way, by measurement, not argument:** the audio latent is not white
+(0.5897 vs 0.0855); there is no latent-rate seam (40 Hz modulation reads 1.83x local
+baseline against a 53 Hz control at 2.14x — no line); and the BigVGAN anti-aliasing IS
+ported (SnakeBeta + kaiser-sinc `UpSample1d`/`LowPassFilter1d`, from `dac_alias_free_*`),
+so aliasing is not the source either.
+
+**Residuals.** (1) WHY the audio stream is under-dispersed is unproven — the two candidates
+are the audio sigma schedule (upstream DERIVES the audio sigma from the video sigma in
+closed form, `model.py:36-39 time_shift_sigma(sigma, 12.0, 3.0)`, where we build
+`sigmas_audio` independently at shift 3.0; these coincide only if both walk the same base
+grid) and an audio-side scale in the DiT head. A dump of the DiT's NORMALIZED audio rows
+before denormalize would separate them in one render. (2) The 512x512 canvas is the right
+bed for this: the artifact is resolution-INDEPENDENT and the loop is 15.4 s/step against
+176 s at the REF canvas.
+
+## 8.18 The audio defect LOCALIZED — denormalize CLEARED, the DiT audio arm REGRESSES TO THE CORPUS MEAN (2026-08-08, `row/H3-AUDIO-PREDENORM-DUMP`)
+
+§8.17 left two candidates for the audio latent being out of distribution: a DiT whose
+normalized audio output is wrong, or a `denormalize` not applying `latents_std`. Both have
+the same post-hoc signature. `VT_H3_DUMP_DIR` now also writes
+`dit_audio_rows_prenorm.f32` — the audio rows as the DiT EMITS them — which separates them
+in one render.
+
+**`denormalize` is CLEARED.** Pre-denormalize std_avg **0.5684**, post **1.0774**; the
+per-channel post/pre ratio is **1.8983** (min 1.492, max 3.299) — bit for bit the config's
+per-channel `latents_std`. The transform does exactly what it says.
+
+**The defect is the per-channel MEAN, not the variance.** Calibrated against three real
+speech encodes rather than one (jfk is a 1961 narrowband recording and a poor variance
+anchor):
+
+| Latent (RAW VAE space) | per-channel std | per-channel \|mean\| |
+|---|---|---|
+| jfk (real) | 0.7736 | **0.4388** |
+| speech (real) | 0.8801 | **0.4787** |
+| test_speech (real) | 0.9337 | **0.5008** |
+| ENCODE(our generated audio) | 0.9694 | 0.3028 |
+| **OURS (DiT)** | 1.0774 | **0.2406** |
+| config `latents_mean` (corpus) | — | 0.1940 |
+
+Variance is only modestly high (1.08 against 0.77-0.93). What separates ours from every
+real clip is the per-channel MEAN: real clips sit at **0.44-0.50**, ours at **0.24** —
+essentially the CORPUS mean (0.194). Real clips deviate strongly from the corpus average
+because those per-channel offsets carry speaker and content identity; ours does not
+deviate. The audio arm REGRESSES TO THE MEAN, which is what a generic, synthetic-sounding
+voice is, and it accounts directly for the §8.17 random-pair gap (real 0.4285 vs ours
+0.0855) since that shared component IS the per-channel mean.
+
+**Cleared along the way, by measurement:** the audio VAE decoder (a real-speech latent
+round-trips to WORD-IDENTICAL ASR, §8.17), `denormalize` (ratio == `latents_std` exactly),
+the sigma schedule (`MiniMaxH3TimeShiftSigmas` is `linspace(1,0,n)` then
+`s*b/(1+(s-1)*b)`, terminating exactly at 0 — algebraically the same curve ComfyUI reaches
+by inverting the video shift and re-applying the audio shift, `model.py:36-39`), the
+latent-rate seam, and the BigVGAN anti-aliasing.
+
+**Residual — the actual root cause is STILL OPEN.** What remains is why the DiT's audio
+stream produces mean-regressed output while the VIDEO stream on the same sampler, the same
+joint sequence and the same 50 steps is coherent at 0.8924 (§8.16). The next probe is the
+audio arm's per-step trajectory: dump the audio rows at several steps and see whether the
+per-channel mean structure is never built (a conditioning/guidance defect) or is built and
+then washed out (a sampler defect). Nothing about the audio path should be "fixed" before
+that reads, and no fix is attempted in this row.
+
+## 8.19 The metallic voice FIXED — the audio latent was denormalized ACROSS THE WRONG AXIS (2026-08-09, `row/H3-AUDIO-FIX`)
+
+§8.17 cleared the audio VAE (a real-speech latent round-trips to word-identical ASR) and
+§8.18 cleared `denormalize`'s arithmetic and localized the defect to a latent that
+regresses to the corpus mean. The cause is a LAYOUT disagreement between two functions
+that each held a self-consistent view of the same buffer.
+
+`MiniMaxH3UnpackAudioTokens` writes `[(c * latent_dim + d) * steps + t]` — the STEREO
+CHANNEL is outermost, `[audio_channel][latent_dim][steps]` — and the per-channel decode
+below reads it back at exactly that stride. But the buffer was handed to the VIDEO-shaped
+`denormalize`, which walks `latent[c * per_channel + i]` with `c` over `latents_dim`. Under
+the real layout its block `c` covers latent dims **{2c, 2c+1} of ONE stereo channel**, so
+every dim took another dim's mean/std. Dim `d` must take `mean[d]`/`std[d]` in BOTH stereo
+channels. The VIDEO arm was never affected: its latent really is `[C][T][H][W]` with C
+outermost, which is why video was coherent (§8.16) while audio was not.
+
+| Measure (stereo ch0, correct `[ac][d][t]` axis) | BEFORE | AFTER | real-speech reference |
+|---|---|---|---|
+| round-trip `encode(decode(z))` vs `z` | +0.4767 | **+0.9890** | ~1.0 for a sound VAE |
+| per-frame round-trip cosine | +0.4847 | **+0.9888** | — |
+| per-latent-dim \|mean\| | 0.2960 | **0.3458** | 0.4388 / 0.4787 / 0.5008 |
+| per-latent-dim std | 1.1785 | **1.0946** | 0.77-0.93 |
+
+The round-trip is the load-bearing number: the decoder now returns a latent the encoder
+reproduces almost exactly, i.e. the DiT's audio latent is back IN DISTRIBUTION. ASR on the
+512x512 verification render is word-perfect ("michael scheduled another all hands it is
+about the printer again").
+
+**Correction to §8.17.** That row reported the round-trip at **+0.016**. That figure was
+computed with the WRONG reshape — `(32, 2, 207)` instead of the true `(2, 32, 207)` — i.e.
+the same axis confusion that caused the bug also corrupted its measurement. Read on the
+correct axis the pre-fix round-trip is **+0.4767**. The defect and the fix are real; the
+severity in §8.17 was overstated.
+
+**Why every structural check passed.** Audio position grid (`w_grid.front()/back()`,
+cursor `text_len`, h=0), per-token timesteps (`t_a` to audio rows, `t_v` to video and
+non-media), the sigma schedule (`linspace(1,0,n)` then `s*b/(1+(s-1)*b)`, ending at 0),
+the Euler update (`advance(audio_rows, ..., t_a, s_a, s_a_next)`), the VAE decoder, the
+BigVGAN anti-aliasing and the frame-span constants (`{1,4,4,4,4}`, `5/3`) are all correct
+and were verified one by one. The defect lived in the INTERPRETATION of a buffer's axes
+between two correct functions — invisible to any check that does not compare the two
+readers against each other. The fix pins the expected size with a `VT_CHECK` so the
+assumption cannot drift again silently.
+
+## 8.20 ALL THREE MODALITIES WORK — the ref2va grid was the QUANTISATION, and §8.9's assembly hypothesis is REFUTED (2026-08-10, `row/H3-REF2VA-WORKS`, Thor sm_110)
+
+Three campaigns fought the ref2va patch grid (#86 text-only, §8.9 vision-enriched, §8.12
+load-path). §8.9 re-attributed it to the **ref2va-specific reference-row conditioning
+ASSEMBLY** (`MiniMaxH3EncodeReferenceImages` + the ref2va packed-block layout + how the
+loop conditions un-pinned target rows), having ruled out the DiT forward and the encoder.
+That attribution is **REFUTED**.
+
+**Every prior ref2va attempt ran on NVFP4** (`minimax_h3_ref2va_nvfp4_full`). The one cell
+nobody filled in was ref2va on the quantisation this project has verified coherent
+everywhere else. `MiniMax-H3-REF2VA-Q4_K_M.gguf` (19,864,208,064 bytes,
+`realrebelai/MiniMax-H3_GGUFs`) renders **COHERENTLY** with the identical assembly code:
+
+| arm | period-16 seam | VAE-input latent adj-cell cosine |
+|---|---|---|
+| ref2va on NVFP4 (§8.9) | grid, every frame | — |
+| **ref2va on Q4_K_M (this row)** | **1.13** | **0.8526** |
+| t2va on Q4_K_M (§8.16) | 1.19 | 0.8924 |
+| fl2va on Q4_K_M (this row) | 1.06-1.44 | — |
+
+512x512/124f/50 steps, `--partition ref2va --ref-image`, seam scale 1.15-1.19 clean /
+2.28 broken, cosine scale 0.06 white / 0.789 real encode / 0.89+ coherent. The decoded
+frame is a coherent office scene with no trace of the multicolour patch grid. §8.12's
+quieter attribution ("100% attributable to the per-weight NVFP4-vs-Q3_K quantization
+difference") was the correct one.
+
+**All three H3 modalities are now verified on Q4_K_M**, each with a rendered artifact:
+t2va (§8.16, 1344x768 + ASR-verified speech), fl2va (this row: first-frame conditioning
+load-bearing at keyframe→frame0 correlation **0.7881**, and the clip evolves away from the
+pin at 0.7653), ref2va (this row).
+
+**Why it survived three investigations.** The FL2VA/Q4_K_M cell was verified and the
+Ref2VA/NVFP4 cell was verified-broken, but the two variables — PARTITION and QUANTISATION —
+were never crossed. Each campaign held quantisation fixed at NVFP4 and searched the ref2va
+code path, which is where the bug was not. The lesson generalises: when a mode fails on
+exactly one checkpoint, vary the CHECKPOINT before searching the mode's code.
+
+**Residual.** The NVFP4 Ref2VA arm is still broken and unexplained at the weight level
+(§8.12 found no discrete load-path defect, so it is the per-weight quantisation error
+itself). `docs/USAGE.md` now steers users to the REF2VA GGUF and warns off NVFP4 rather
+than leaving that trap live.
+
+## 8.21 The PRUNED checkpoints — AdaLN refactored into a timestep CURVE table (2026-08-10, `row/H3-PRUNED`, issue [#241](https://github.com/mudler/vllm.cpp/issues/241))
+
+**Scope.** Load and run the community `pruned` H3 DiT variants — `unsloth/MiniMax-H3-GGUF`
+(`minimax_h3_{fl2va,ref2va}_pruned-{Q2_K,Q3_K,Q4_K,Q5_0,Q6_K,Q8_0,UD-Q2_K_XL,UD-Q3_K_XL}.gguf`)
+and `lilcheaty/MiniMax-H3-NVFP4` (`minimax_h3_{fl2va,ref2va}_pruned_nvfp4.safetensors`).
+`docs/USAGE.md` recorded them as "NOT drop-in"; this row makes them drop-in.
+
+### What "pruned" IS — evidence, not inference
+
+It is **not** lossy pruning. It is a structural refactor of the AdaLN modulation path,
+and it is defined upstream in **ComfyUI** (`comfy/ldm/minimax/model.py`, native H3 support
+since ComfyUI 0.30.0). vLLM-Omni has NO curve form — `grep -rn prune vllm_omni/` returns
+only scheduler/cache hits — so ComfyUI is the upstream anchor for this row and is cited as
+such. The reference lines:
+
+| Anchor | What it says |
+|---|---|
+| `comfy/ldm/minimax/model.py:419` | `use_adaln_curves = adaln_curve_grid is not None` |
+| `:421-422` | `apply_silu = not use_adaln_curves`; `adaln_dtype = float32 if use_adaln_curves else dtype` |
+| `:428-432` | curve form registers buffer `adaln_t_table` **instead of** constructing `time_embedder` |
+| `:610-615` | `pos = t.clamp(0,1) * (grid-1)`; `i0 = floor(pos).clamp(max=grid-2)`; `t_emb = lerp(table[i0], table[i0+1], pos-i0)` |
+| `:193-198` | `AdalnProj.linear(silu(t_emb) if apply_silu else t_emb)` — the ONLY other difference |
+
+Why it exists (`lilcheaty/MiniMax-H3-NVFP4` README, "Why the pruned base is the right one
+to quantize"): modulation depends only on the timestep, so the 2688-wide conditioning
+projection is almost entirely redundant. `adaln_proj` falls from **13.04B (39.4% of 33.12B)
+to 0.04B (0.2%)**, a ~326x reduction, and the whole DiT from 33.12B to **20.11B**. That is
+why a pruned Q8_0 is the same order of size as our unpruned Q4_K_M — and it is the reason
+this row is worth doing.
+
+### Verified against the REAL checkpoints (headers only, no payload downloaded)
+
+GGUF header via HTTP range read + `ggufinfo.py`; safetensors header via range read of its
+JSON prologue.
+
+| | unpruned (`realrebelai` FL2VA-Q4_K_M) | pruned (`unsloth` fl2va-Q8_0) |
+|---|---|---|
+| tensor count | 535 | **532** |
+| `time_embedder.proj_{in,out}.{weight,bias}` | 4 tensors | **absent** |
+| `adaln_t_table` | absent | **F32, torch `[1025, 8]`** |
+| `blocks.N.adaln_proj.linear.weight` | `[96768, 2688]` | **`[96768, 8]`** (F16) |
+| `final_layer.adaln_proj.linear.weight` | `[10752, 2688]` | **`[10752, 8]`** (F16) |
+
+535 − 4 + 1 = 532 exactly. Every other name and shape is IDENTICAL, so the identity name
+map of §W9 still holds. `minimax_h3_fl2va_pruned_nvfp4.safetensors` carries the same
+structure (1132 keys = 532 + 200 quantized × 3 sidecars), with `adaln_t_table F32 [1025,8]`
+and `blocks.N.adaln_proj.linear.weight F16 [96768, 8]`.
+
+**Therefore: a WEIGHT-layout change with a small, contained FORWARD change.** It is not a
+new architecture. Three deltas and nothing else:
+
+1. `t_emb` comes from a clamped-lerp table lookup instead of sinusoidal+MLP;
+2. no SiLU before the AdaLN linear;
+3. the AdaLN linear's `in_features` is 8 instead of `time_embed_dim` 2688.
+
+The index variable is ours already: our per-row timestep is `t = 1 - sigma` in `[0,1]`
+(`minimax_h3.cpp:824`), which is exactly ComfyUI's `t_v = 1 - sigma_v` (`model.py:538`).
+
+### Design
+
+* `MiniMaxH3DitParams::adaln_curve_grid` (0 = unpruned) mirrors ComfyUI's
+  `adaln_curve_grid=None`; `use_adaln_curves()` is the predicate. When the manifest
+  carries `adaln_t_table`, the grid AND `time_embed_dim` are read from its shape, so the
+  geometry still comes only from the checkpoint.
+* `MiniMaxH3DitWeights::adaln_t_table` is a **host-resident** f32 view, bound by the same
+  rule as `rope.inv_freq`: the lerp runs on the host (M ≤ 4 rows), so no device buffer, no
+  new kernel, and every one of the four staging paths keeps its existing shape.
+* The two loaders that name `time_embedder.*` bind it only in the non-curve form; the
+  curve form binds `adaln_t_table` instead. A checkpoint carrying BOTH or NEITHER is a
+  hard error rather than a silent half-load.
+* `MiniMaxH3IsFp32IslandTensor` gains `adaln_t_table` (it is F32 upstream and read on the
+  host — the same category `rope.inv_freq` is in).
+* The NVFP4 loader skips `comfy_quant` (a rank-1 U8 JSON blob the pruned files carry per
+  quantized layer and the unpruned ones do not).
+
+**One exact tracked exception.** ComfyUI pins `adaln_dtype = float32` for curve
+checkpoints (`model.py:422`). Our AdaLN projection runs in the STREAM dtype on both the
+CPU-bf16 and device paths, exactly as our unpruned arm already does, because
+`modulate_scale_shift`/`modulate_gate` take ONE dtype for the stream and its modulation
+vectors — fp32 modulation over a bf16 stream would be a glue-signature change across
+CUDA/CPU. The f32 parity path (`compute_dtype=kF32`) is fp32 throughout and is what the
+goldens gate. Recorded here rather than hidden; revisit if a render shows modulation
+error.
+
+### Gates
+
+* **Contract gate** — a real pruned GGUF manifest (`minimax_h3_pruned_gguf_manifest.inc`,
+  header-only capture of `minimax_h3_fl2va_pruned-Q8_0.gguf`) resolves name-for-name and
+  shape-for-shape onto `EnumerateMiniMaxH3DitTensors` in curve form, and
+  `ParseMiniMaxH3DitParamsFromGgufManifest` recovers `adaln_curve_grid=1025`,
+  `time_embed_dim=8`, 50 blocks, 2 refiner layers, hidden 5376.
+* **Numeric gate** — `MiniMaxH3AdalnCurveEmbed` matches a checked-in golden of upstream's
+  own expression (`torch.lerp` over a clamped fractional grid index), including the
+  `t=1.0` end case that `clamp(max=grid-2)` exists to protect and the out-of-range clamp.
+* **Render gate** — the same prompt/seed on pruned Q8_0 and on our known-good unpruned
+  Q4_K_M, measured by the two numbers this lane uses: period-16 seam ratio on a decoded
+  frame (~1.15-1.19 clean, 2.28 the known-broken lattice) and VAE-input latent
+  adjacent-cell cosine (0.06 white, 0.789 a real encode, 0.89+ coherent).
+
+### Render — MEASURED (Thor sm_110, 2026-08-10)
+
+`minimax_h3_fl2va_pruned-Q8_0.gguf` (21.4 GB) rendered end to end through the
+production path (`--dequant-bf16`, CUDA, `--partition fl2va`) at 512x512 / 124
+frames / 50 steps, on the same prompt and first frame as the lane's known-good
+Q4_K_M reference and with the same default seed.
+
+A CONTROLLED A/B: both arms ran back to back from the SAME binary, prompt, first
+frame, canvas, step count and default seed, and were measured with the same
+script. Only `--dit` changed.
+
+| measure | pruned Q8_0 (21.4 GB) | unpruned Q4_K_M (19.9 GB) | reading |
+|---|---|---|---|
+| tensors streamed | **532/532** | **535/535** | ONE binary takes both forms, and tells them apart |
+| DiT s/step | 15.88-15.96 | 15.94-15.98 | no per-step cost; the curve lerp is a host-side [m, 8] gather |
+| VAE-input latent adjacent cosine | **0.8385** | **0.8391** | 0.06 == white/broken, 0.789 == a real encode |
+| period-16 seam ratio, frame 100 | **0.9941** | **0.9839** | 2.28 is the known-broken lattice |
+| frame 0 luma mean / sd | 119.74 / 66.02 | 119.75 / 66.35 | both anchor on the same first frame |
+| frame 100 luma mean / sd | 115.13 / 57.11 | 112.96 / 56.94 | |
+| frame 0 -> 100 mean abs diff | 46.66 | 45.78 | neither is a frozen video |
+
+The frame is a coherent scene, not a silhouette or a lattice: the cyan llama, the
+office behind it, the blinds and the readable LOCALAI poster all resolve. On every
+number the pruned Q8_0 sits inside the reference's own band.
+
+**What is NOT claimed.** Nothing here says Q8_0 looks BETTER than Q4_K_M. The two
+numbers this lane measures are coherence detectors, not quality metrics, and they
+cannot separate two coherent renders. A quality claim needs a perceptual
+comparison this row did not run.
+
+### Stop conditions
+
+A pruned checkpoint that carries `time_embedder.*` AND `adaln_t_table`, or an
+`adaln_t_table` whose second dim does not equal the AdaLN linear's `in_features`, stops the
+row: that is a third checkpoint form, not this one.

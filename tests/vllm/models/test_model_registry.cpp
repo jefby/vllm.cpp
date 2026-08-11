@@ -44,7 +44,10 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 30);
+  // 30 text archs + the 3 Parakeet transcription-only archs (ARCH-ONE-SURFACE
+  // ROW 1: ParakeetForCTC/ForRNNT/ForTDT, SupportsTranscription mirror) + the
+  // LlamaModel embedding arch (ARCH-ONE-SURFACE ROW 6, is_pooling_model).
+  REQUIRE(registrations.size() == 37);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -136,7 +139,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 30);
+  REQUIRE(supported.size() == 37);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -149,6 +152,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "Gemma4ForConditionalGeneration",
+      "Gemma4UnifiedForConditionalGeneration",
       "GemmaForCausalLM",
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
@@ -159,12 +163,18 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "KimiLinearForCausalLM",
       "LagunaForCausalLM",
       "LlamaForCausalLM",
+      "LlamaModel",
       "MiniCPM3ForCausalLM",
       "MiniCPMForCausalLM",
       "MistralForCausalLM",
+      "MuseGlimmerForCausalLM",
+      "MuseGlimmerForConditionalGeneration",
       "OPTForCausalLM",
       "Olmo2ForCausalLM",
       "Olmo3ForCausalLM",
+      "ParakeetForCTC",
+      "ParakeetForRNNT",
+      "ParakeetForTDT",
       "Phi3ForCausalLM",
       "PhiForCausalLM",
       "Qwen3ForCausalLM",
@@ -189,7 +199,36 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
 TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo") {
   for (const ModelRegistration& registration : ModelRegistry::Registrations()) {
     CAPTURE(registration.architecture);
+    if (registration.architecture.substr(0, 8) == "Parakeet") {
+      // ARCH-ONE-SURFACE ROW 1: the ASR family mirrors SupportsTranscription
+      // (interfaces.py:1110-1118) — transcription-capable, transcription-ONLY,
+      // NOT a text-generation model; the text entrypoints refuse it by task.
+      CHECK_FALSE(registration.info.is_text_generation_model);
+      CHECK(registration.info.supports_transcription);
+      CHECK(registration.info.supports_transcription_only);
+      CHECK_FALSE(registration.info.is_pooling_model);
+      CHECK_FALSE(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
+      continue;
+    }
+    if (registration.architecture == "LlamaModel") {
+      // ARCH-ONE-SURFACE ROW 6: the EMBEDDING conversion of the Llama backbone
+      // (_EMBEDDING_MODELS "LlamaModel" -> ("llama", "LlamaForCausalLM"),
+      // registry.py:230, wrapped by as_embedding_model adapters.py:230) — a
+      // POOLING model with NO text-generation path; the text entrypoints
+      // refuse it by task and vllm_embed / /v1/embeddings serve it.
+      CHECK(registration.info.is_pooling_model);
+      CHECK_FALSE(registration.info.is_text_generation_model);
+      CHECK_FALSE(registration.info.supports_transcription);
+      CHECK_FALSE(registration.info.supports_transcription_only);
+      CHECK_FALSE(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
+      continue;
+    }
     CHECK(registration.info.is_text_generation_model);
+    // No text arch is transcription-capable (SupportsTranscription default).
+    CHECK_FALSE(registration.info.supports_transcription);
+    CHECK_FALSE(registration.info.supports_transcription_only);
     CHECK_FALSE(registration.info.is_pooling_model);
     CHECK_FALSE(registration.info.has_inner_state);
     CHECK(registration.info.score_type == "bi-encoder");
@@ -212,11 +251,19 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       CHECK(registration.info.is_hybrid);
       CHECK_FALSE(registration.info.supports_multimodal);
     } else if (registration.architecture == "Qwen3VLForConditionalGeneration" ||
-               registration.architecture == "Gemma4ForConditionalGeneration") {
-      // Qwen3-VL (MM-ENGINE-FORWARD) + Gemma-4 (CLAIM-GEMMA4-MM-E2E): MULTIMODAL
-      // (SigLIP2 vision tower folded into the registered mm-forward) but the text
-      // backbone is dense full-attention → NOT hybrid (no GDN state). The two
-      // non-hybrid multimodal registrations.
+               registration.architecture == "Gemma4ForConditionalGeneration" ||
+               registration.architecture ==
+                   "Gemma4UnifiedForConditionalGeneration" ||
+               registration.architecture == "MuseGlimmerForCausalLM" ||
+               registration.architecture ==
+                   "MuseGlimmerForConditionalGeneration") {
+      // Qwen3-VL (MM-ENGINE-FORWARD) + Gemma-4 (CLAIM-GEMMA4-MM-E2E) + Muse
+      // Glimmer (CLAIM-MUSE-GLIMMER-W0): MULTIMODAL (a vision tower alongside the
+      // text backbone) but the text backbone is dense attention → NOT hybrid (no
+      // GDN state). Muse Glimmer's iRoPE split is sliding-vs-full ATTENTION, which
+      // is not a recurrent lane, so it belongs here and not with the hybrids; its
+      // vision tower is scaffolded, not yet forwarding. The non-hybrid multimodal
+      // registrations.
       CHECK_FALSE(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
     } else {
@@ -532,13 +579,14 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 30> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 37> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "Gemma4ForConditionalGeneration",
+      "Gemma4UnifiedForConditionalGeneration",
       "GemmaForCausalLM",
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
@@ -549,12 +597,18 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "KimiLinearForCausalLM",
       "LagunaForCausalLM",
       "LlamaForCausalLM",
+      "LlamaModel",
       "MiniCPM3ForCausalLM",
       "MiniCPMForCausalLM",
       "MistralForCausalLM",
+      "MuseGlimmerForCausalLM",
+      "MuseGlimmerForConditionalGeneration",
       "OPTForCausalLM",
       "Olmo2ForCausalLM",
       "Olmo3ForCausalLM",
+      "ParakeetForCTC",
+      "ParakeetForRNNT",
+      "ParakeetForTDT",
       "Phi3ForCausalLM",
       "PhiForCausalLM",
       "Qwen3ForCausalLM",
@@ -635,14 +689,15 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
-      "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
+      "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "
-      "'LlamaForCausalLM', "
-      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
+      "'LlamaForCausalLM', 'LlamaModel', "
+      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', 'MuseGlimmerForCausalLM', 'MuseGlimmerForConditionalGeneration', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
+      "'ParakeetForCTC', 'ParakeetForRNNT', 'ParakeetForTDT', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
       "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
       "'Qwen3_5ForConditionalGeneration', "
@@ -656,14 +711,15 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
-      "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
+      "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "
-      "'LlamaForCausalLM', "
-      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
+      "'LlamaForCausalLM', 'LlamaModel', "
+      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', 'MuseGlimmerForCausalLM', 'MuseGlimmerForConditionalGeneration', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
+      "'ParakeetForCTC', 'ParakeetForRNNT', 'ParakeetForTDT', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
       "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
       "'Qwen3_5ForConditionalGeneration', "

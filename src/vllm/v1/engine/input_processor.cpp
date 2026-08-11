@@ -3,6 +3,7 @@
 // deferrals.
 #include "vllm/v1/engine/input_processor.h"
 
+#include <algorithm>
 #include <chrono>
 #include <set>
 #include <stdexcept>
@@ -24,11 +25,16 @@ double NowSeconds() {
 }  // namespace
 
 InputProcessor::InputProcessor(const tok::Tokenizer& tokenizer,
-                               const HfConfig& config)
+                               const HfConfig& config,
+                               int64_t max_model_len_override)
     : tokenizer_(tokenizer) {
   // model_config.max_model_len. HfConfig has no dedicated max_model_len (rope
-  // scaling etc. are deferred), so max_position_embeddings stands in at T0.
-  max_model_len_ = config.max_position_embeddings;
+  // scaling etc. are deferred), so max_position_embeddings stands in at T0 —
+  // unless the caller already resolved a serving length (LoadedEngine's
+  // --max-model-len override / KV auto-fit), which is what upstream's
+  // model_config.max_model_len actually is.
+  max_model_len_ = max_model_len_override > 0 ? max_model_len_override
+                                              : config.max_position_embeddings;
 
   // renderer.get_eos_token_id() + generation_config["eos_token_id"]: derive the
   // primary eos id and the secondary eos-id list from config.json's
@@ -59,6 +65,66 @@ InputProcessor::InputProcessor(const tok::Tokenizer& tokenizer,
     eos_token_id_ = tokenizer_.EosId();
     generation_config_eos_ids_.push_back(tokenizer_.EosId());
   }
+
+  // Upstream draws update_from_generation_config's id set from
+  // generation_config.json (ModelConfig.try_get_generation_config), which is
+  // usually a SUPERSET of config.json's: Gemma-4-26B ships config.json
+  // [1, 106] against generation_config.json [1, 106, 50], and a port reading
+  // only config.json never stops on 50. Union them, appending only ids not
+  // already present so the PRIMARY eos id resolved above -- which is
+  // generation_config_eos_ids_.front() on the list path -- keeps its position.
+  for (const int32_t id : config.generation_config_eos_ids) {
+    if (std::find(generation_config_eos_ids_.begin(),
+                  generation_config_eos_ids_.end(),
+                  id) == generation_config_eos_ids_.end()) {
+      generation_config_eos_ids_.push_back(id);
+    }
+  }
+}
+
+void InputProcessor::ValidatePromptLen(std::size_t prompt_len) const {
+  // Ported from vllm/v1/engine/input_processor.py:387-432 @ 555967922
+  // (InputProcessor._validate_prompt_len), decoder arm.
+  //
+  // HARNESS ADAPTATION: upstream's early-out is `skip_prompt_length_check`, a
+  // multimodal-processor property. Ours is `max_model_len_ <= 0`, which means
+  // the config carried no context length at all — upstream's ModelConfig always
+  // resolves a positive max_model_len so it has no such state, and checking
+  // against 0 would reject every prompt. The encoder arm (mm_encoder_cache_size)
+  // is deferred with the rest of the encoder/decoder split.
+  if (max_model_len_ <= 0) {
+    return;
+  }
+
+  // input_processor.py:395-396.
+  if (prompt_len == 0) {
+    throw InputValidationError("The decoder prompt cannot be empty");
+  }
+
+  const int64_t len = static_cast<int64_t>(prompt_len);
+  // input_processor.py:404-421. Upstream's `suggestion` has a multimodal
+  // variant; we always take the text one, because the mm path here receives an
+  // ALREADY placeholder-expanded id stream, so `prompt_len` is the text + image
+  // token count upstream's mm suggestion is describing.
+  if (len > max_model_len_) {
+    throw InputValidationError(
+        "The decoder prompt (length " + std::to_string(len) +
+        ") is longer than the maximum model length of " +
+        std::to_string(max_model_len_) +
+        ". Make sure that `max_model_len` is no smaller than the number of "
+        "text tokens.");
+  }
+  // input_processor.py:423-432: exactly at the limit leaves no room for the at
+  // least one output token every generate request asks for.
+  if (len == max_model_len_) {
+    throw InputValidationError(
+        "The decoder prompt (length " + std::to_string(len) +
+        ") plus the number of requested output tokens (at least 1) is longer "
+        "than the maximum model length of " +
+        std::to_string(max_model_len_) +
+        ". Make sure that `max_model_len` is no smaller than the number of "
+        "text tokens (prompt + requested output tokens).");
+  }
 }
 
 void InputProcessor::ValidateParams(SamplingParams& params) const {
@@ -67,6 +133,27 @@ void InputProcessor::ValidateParams(SamplingParams& params) const {
   // __post_init__ to this constructing unit (M1.1), so PostInit() both
   // normalizes the params AND runs Verify() — closing that carry.
   params.PostInit();
+
+  // #249 — _validate_logprobs (sampling_params.py:755-770). Upstream REJECTS a
+  // request whose logprobs exceed the cap; it does not clamp. Without this a
+  // single `{"logprobs": 999999}` reached GatherLogprobs, which partial_sorts k
+  // entries out of a vocab-sized index array and walked off the end — one
+  // unauthenticated request killed the server process.
+  //
+  // Our ModelConfig carries no separate max_logprobs, so the cap is the vocab
+  // size, which is upstream's own meaning for max_logprobs == -1.
+  const int64_t vocab = static_cast<int64_t>(tokenizer_.VocabSize());
+  const auto over_cap = [vocab](int n) { return vocab > 0 && n > vocab; };
+  if (params.logprobs.has_value() && over_cap(*params.logprobs)) {
+    throw std::runtime_error(
+        "Requested sample logprobs of " + std::to_string(*params.logprobs) +
+        ", which is greater than max allowed: " + std::to_string(vocab) + ".");
+  }
+  if (params.prompt_logprobs.has_value() && over_cap(*params.prompt_logprobs)) {
+    throw std::runtime_error(
+        "Requested prompt logprobs of " + std::to_string(*params.prompt_logprobs) +
+        ", which is greater than max allowed: " + std::to_string(vocab) + ".");
+  }
 }
 
 void InputProcessor::UpdateFromGenerationConfig(SamplingParams& params) const {
@@ -172,6 +259,11 @@ EngineCoreRequest InputProcessor::process_inputs(
   std::vector<int32_t> prompt_token_ids =
       tokenizer_.EncodeWithSpecialTokens(prompt);
 
+  // _validate_model_inputs -> _validate_prompt_len (input_processor.py:452).
+  // BEFORE the max_tokens default below, which subtracts the prompt length and
+  // would otherwise go negative for exactly the prompts this rejects.
+  ValidatePromptLen(prompt_token_ids.size());
+
   // params is already our clone (passed by value). If unset max_tokens, then
   // generate up to the max_model_len (input_processor.py:317-321).
   if (!params.max_tokens.has_value()) {
@@ -201,6 +293,9 @@ EngineCoreRequest InputProcessor::process_inputs_tokens(
   // tokens included). Every other step (validate, default max_tokens, eos/stop
   // wiring, request assembly) is byte-for-byte the string path.
   ValidateParams(params);
+
+  // _validate_prompt_len, same as the string path (input_processor.py:452).
+  ValidatePromptLen(prompt_token_ids.size());
 
   const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
 
@@ -233,6 +328,10 @@ EngineCoreRequest InputProcessor::process_inputs_mm(
   // (upstream input_processor.py:370-379 sets mm_features alongside
   // prompt_token_ids). Every other step is byte-for-byte identical.
   ValidateParams(params);
+
+  // _validate_prompt_len over the EXPANDED id stream, which is the text +
+  // placeholder token count upstream's multimodal suggestion text describes.
+  ValidatePromptLen(prompt_token_ids.size());
 
   const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
 

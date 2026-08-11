@@ -62,15 +62,16 @@ void LaunchDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                          const PagedAttentionArgs& args, int64_t hq, int64_t d,
                          int64_t num_reqs, int64_t num_kv_heads,
                          int64_t block_size);
-// VARLEN d128 decode — the exact non-swap flash_attn_varlen_func reduction vLLM
-// runs for Qwen3-dense DECODE (bf16 paged KV, head_dim 128). Toggle
-// VT_FA2_DECODE_QWEN3 (see Fa2DecodeQwen3Enabled()).
+// VARLEN d128 decode for Qwen3-dense DECODE (bf16 paged KV, head_dim 128). Toggle
+// VT_FA2_DECODE_QWEN3 (see Fa2DecodeQwen3Enabled()). gqa_swap selects the vLLM
+// seqlenq_ngroups_swapped grid (VT_FA2_DECODE_GQA_SWAP, see Fa2DecodeGqaSwapEnabled());
+// gqa_swap==false is byte-identical to the shipped plain-varlen reduction.
 void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                                const Tensor& k_cache, const Tensor& v_cache,
                                const Tensor& block_table, const Tensor& seq_lens,
                                const Tensor& query_start_loc, const PagedAttentionArgs& args,
                                int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
-                               int64_t block_size);
+                               int64_t block_size, bool gqa_swap);
 #endif  // VLLM_CPP_FLASH_ATTN
 
 namespace {
@@ -2557,6 +2558,30 @@ bool Fa2DecodeQwen3Enabled() {
   const char* e = std::getenv("VT_FA2_DECODE_QWEN3");
   return e == nullptr || e[0] != '0';
 }
+
+// vLLM's decode GQA group-swap (seqlenq_ngroups_swapped) for the d128 varlen arm.
+// vLLM's paged decode grid is (batch, kv_heads) — the ngroups query heads are
+// packed into seqlen_q and KV is read once per group — while our plain-varlen arm
+// launches (batch, hq), over-waving at batch>=2 (#47: decode flash 63.7us c2 /
+// 218us c8 vs vLLM 41.7/151). This routes the SAME vendored split-KV kernel through
+// the swapped presentation (already proven by the d256 LaunchDecodeFA2Bf16 arm).
+// DEFAULT ON (flipped 2026-08-06, row KERNEL-FA2-GQA-SWAP-FLIP, per
+// parity-enablers-ship-as-defaults): the flip campaign met every condition on GB10
+// — op test 5/5, Qwen3-0.6B/4B SACRED greedy near-tie gate 16/16 token-IDENTICAL to
+// the plain arm swap-ON (the split reduction is a near-tie the model never flips at
+// these lengths), #44 MXFP4-8B smoke token-exact, and the binding q3mxfp4 grid
+// improved with NO regression: total tok/s c2 0.911->0.922, c4 0.919->0.930,
+// c8 0.913->0.942 (each ours-rep beats every swap-OFF rep), c1 flat 0.989->0.990,
+// median TTFT at/above parity, peak GPU mem 2.614x LESS. Mechanism (ours nsys c2):
+// decode flash grid (1,3,64)=batch x query_heads -> (1,5,16)=batch x kv_heads,
+// per-call 63.7->45.3us. It is non-byte-exact vs the plain arm when num_splits>1
+// (split reduction order changes -> near-tie toward vLLM's numerics) and touches the
+// CUDA-graph-captured decode, hence gated: =0 opts OUT (restores the byte-identical
+// plain-varlen reduction) for a same-binary A/B. Read fresh (host path per step).
+bool Fa2DecodeGqaSwapEnabled() {
+  const char* e = std::getenv("VT_FA2_DECODE_GQA_SWAP");
+  return e == nullptr || e[0] != '0';
+}
 #endif  // VLLM_CPP_FLASH_ATTN
 
 // TQ = query dtype, TKV = KV-cache dtype (decoupled: Phase-1 bf16 KV cache keeps
@@ -2583,7 +2608,17 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // so they fall through to the correctness-grade f32 CUDA-core flash below.
   // (Latent bug the first additive dense model, MODEL-TEXT-qwen3, forced out; the
   // gate models keep the WMMA path unchanged — they run d=256, TQ/TKV=bf16.)
-  const bool wmma = is_prefill && d == 256 && PrefillWmmaEnabled() &&
+  // ARCH TERM (required, not an optimisation). The five WMMA prefill kernels are
+  // compiled `#if __CUDA_ARCH__ >= 800` with an `#else __trap()` (W1/W1b) because
+  // bf16 WMMA fragments are Ampere+. This predicate is otherwise entirely
+  // host-side (shape + dtype + env), so on a Turing/Volta/Pascal board it would
+  // still SELECT a kernel whose body is a trap. Gate on the cached device
+  // capability so <sm_80 falls through to the portable CUDA-core flash below,
+  // which is correctness-grade and needs no tensor cores. On sm_80+ this term is
+  // always true, so the gate models' selection is unchanged.
+  // See .agents/specs/cuda-arch-breadth-fp16.md §V0-a / W1c.
+  const bool arch_has_bf16_mma = GetDeviceCaps().sm_major >= 8;
+  const bool wmma = is_prefill && d == 256 && arch_has_bf16_mma && PrefillWmmaEnabled() &&
                     std::is_same<TKV, __nv_bfloat16>::value &&
                     std::is_same<TQ, __nv_bfloat16>::value;
   // GQA K/V reuse: eligible when qpk = hq/num_kv_heads is a multiple of the reuse
@@ -2696,9 +2731,13 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
         LaunchDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                             args, hq, d, num_reqs, num_kv_heads, block_size);
       } else if (fa2_decode_qwen3) {
+        // Group-swap (VT_FA2_DECODE_GQA_SWAP) only when it can matter: true GQA
+        // (qpk>1). The launcher re-checks max_seqlen_q==1; groups==1 (MHA) has
+        // nothing to pack and stays on the plain-varlen reduction.
+        const bool gqa_swap = qpk > 1 && Fa2DecodeGqaSwapEnabled();
         LaunchDecodeVarlenFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                                   query_start_loc, args, hq, d, num_reqs, num_kv_heads,
-                                  block_size);
+                                  block_size, gqa_swap);
       } else  // NOLINT(readability/braces) — chains into the flash2vec ladder below
 #endif
       if (flash2vec) {

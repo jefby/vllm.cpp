@@ -73,20 +73,36 @@ FromFloatFn BlockFromFloat(DType dtype);
 // cpu_quant_dot.cpp.
 VecDotFn BlockVecDot(DType dtype);
 
+// Q8_0 x Q8_0 DotProd variants for KERNEL-CPU-A76-Q8-DOT. The explicit
+// getters are test/benchmark seams; SelectQuantQ8VecDot applies
+// VT_CPU_Q8_DOT=auto|portable|sdot|a76-asm while retaining `portable` as the
+// universal fallback. The assembly getter is ISA-safe on any DotProd core;
+// QuantQ8A76AsmActive additionally reports whether the running CPU is A76.
+// QuantQ8PortableVecDot is the TRUE portable reference (quants.c:400 order),
+// never the runtime-selected kernel: on an A76 the QuantTraits vec_dot IS the
+// assembly tier, so a byte-equality test that used it as its reference would
+// compare the selected kernel against itself.
+VecDotFn QuantQ8PortableVecDot();
+VecDotFn QuantQ8SdotVecDot();
+VecDotFn QuantQ8A76AsmVecDot();
+VecDotFn SelectQuantQ8VecDot(VecDotFn portable);
+bool QuantQ8SdotActive();
+bool QuantQ8A76AsmActive();
+
 // The Arm i8mm (mmla) `nrc == 2` `vec_dot` for a block WEIGHT dtype — QUANT-
 // GGUF-CIQ-GEMM work row G6 (cpu_quant_dot_arm.cpp). Non-null ONLY when the
 // process runs on i8mm-capable aarch64 (compile-time `__ARM_FEATURE_MATMUL_INT8`
 // AND runtime `HWCAP2_I8MM`) AND the dtype is one of the four encodings upstream
 // gives an mmla path (Q8_0, Q4_0, Q4_K, Q6_K). Returns nullptr everywhere else —
-// on any other CPU, when `VT_CPU_QUANT_MMLA=0`, and for q3_K/q5_K (no upstream
+// on any other CPU, when `VT_CPU_QUANT_MMLA=portable`, and for q3_K/q5_K (no upstream
 // mmla) — so the caller falls back to the portable nrc==1 tier. A returned
 // kernel produces a 2x2 output tile: it MUST be called with nrc==2, two
 // consecutive weight rows (stride bx) and two consecutive activation rows
 // (stride by), writing s[0]=(w0,a0), s[1]=(w1,a0), s[bs]=(w0,a1), s[bs+1]=(w1,a1).
 VecDotFn QuantMmlaVecDot(DType dtype);
 
-// True when the Arm i8mm mmla tier is live in this process (i8mm probed present
-// and not defeated by VT_CPU_QUANT_MMLA). Always false off i8mm-capable aarch64.
+// True when the Arm i8mm mmla tier is live in this process. A forced unsupported
+// tier fails closed; auto uses the shared Linux HWCAP/Darwin sysctl probe.
 bool QuantMmlaActive();
 
 // Bytes one quantized ACTIVATION row occupies for a given weight dtype, i.e.
@@ -128,8 +144,8 @@ bool HasQuantDotKernel(DType dtype);
 // kMatmulBTQuant is q8_0); the k-quants keep the mmla tier.
 
 // True when the i8mm repack tier is LIVE in this process: compiled for aarch64
-// with i8mm, `HWCAP2_I8MM` probed present, and not disabled by
-// `VT_CPU_QUANT_REPACK=0|off|false`. Always false off i8mm-capable aarch64, so
+// with i8mm, the exact HWCAP/sysctl bits probed present, and not forced to
+// `VT_CPU_QUANT_REPACK=portable`. Always false off i8mm-capable aarch64, so
 // the loader never repacks and every consumer keeps the portable/mmla path.
 bool QuantRepackActive();
 
@@ -139,6 +155,23 @@ bool QuantRepackActive();
 // K % 32 subsumes the K % 8 one). A weight that fails it stays plain and takes
 // the normal path — correct, just unrepacked.
 bool QuantRepackEligible(DType weight_dtype, int64_t n, int64_t k);
+
+// --- ELEMENTWISE repack-at-load (KERNEL-GEMM-CPU-TILED lever 2) -------------
+// The non-quant sibling of the block repack above, declared here for the same
+// reason: the loader needs it and `src/vt/cpu/cpu_matmul_elem.h` is private.
+//
+// Transposes an ELEMENTWISE (f32/f16/bf16) [N,K] matmul weight into [K,N] so
+// `vt::MatmulBT` reaches the transpose-free `nk`/`nkm` micro-kernels, measured
+// 1.16x to 1.30x on dgx and BYTE-IDENTICAL (both orientations accumulate each
+// output over K in strict increasing order). Pure permutation: same bytes, same
+// count, so no product and no sum can change.
+//
+// The caller must set `Tensor.elem_kn_repacked` on the resulting weight. Only
+// the CPU `MatmulBTKernel` honours that flag, so a repacked buffer handed to
+// any other consumer would be read as [N,K] and be garbage; the loader keeps
+// this opt-in (VT_CPU_ELEM_KN_REPACK=1) for exactly that reason.
+bool ElemRepackEligible(DType weight_dtype, int64_t n, int64_t k);
+void ElemRepackWeight(DType weight_dtype, uint8_t* bytes, int64_t n, int64_t k);
 
 // Repack a [N,K] q8_0 weight buffer IN PLACE into the block_q8_0x4 interleave.
 // `blocks` holds N*(K/32) plain BlockQ8_0 on entry and N/4 groups of (K/32)

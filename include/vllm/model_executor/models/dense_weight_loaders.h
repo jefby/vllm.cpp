@@ -28,9 +28,11 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"  // StTensor, MaybeReleaseSourcePages
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"           // OwnedTensor, TensorResolver
 #include "vllm/model_executor/models/tensor_parallel.h"           // TensorParallel/TpShard (W2)
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace dense_loaders {
@@ -51,41 +53,121 @@ inline OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
 }
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].
-inline void TransposeBf16(const uint16_t* src, int64_t rows, int64_t cols,
+inline void TransposeBf16(const void* src, int64_t rows, int64_t cols,
                           uint16_t* dst) {
+  const auto* bytes = static_cast<const uint8_t*>(src);
   for (int64_t r = 0; r < rows; ++r) {
-    const uint16_t* src_row = src + r * cols;
-    for (int64_t c = 0; c < cols; ++c) dst[c * rows + r] = src_row[c];
+    for (int64_t c = 0; c < cols; ++c) {
+      const int64_t source_index = r * cols + c;
+      dst[c * rows + r] =
+          vt::LoadUnaligned<uint16_t>(bytes + source_index * 2);
+    }
   }
 }
 
+// --- FP8 shard materialization (shared by every BF16 loader below) -----------
+// The 2026-08 Qwen3.6-27B NVFP4 republishes quantize parts of the tower to
+// per-tensor or per-output-channel FP8 while leaving the rest BF16, and they do
+// not agree on WHICH parts: nvidia/Qwen3.6-27B-NVFP4 ships FP8 `linear_attn`
+// in_proj_qkv/in_proj_z/out_proj with scalar F32 scales next to NVFP4 attention
+// and MLP, while unsloth @ccdaab7e went FP8 across the whole tower with BF16
+// per-output-channel scales. Rather than teach each loader its own dtype rules,
+// every BF16 entry point routes its source bytes through this one materializer.
+//
+// Returns a pointer to BF16 [rows, cols] bytes: the mmap'd source itself when the
+// tensor is already BF16 (zero copy, unchanged behavior), or `staging` after
+// dequantization. A per-output-channel scale read as per-tensor would be
+// silently WRONG rather than loud, so the element count decides and anything
+// else is rejected.
+inline const uint8_t* MaterializeBf16Source(const TensorResolver& get,
+                                            const std::string& name,
+                                            const StTensor& t,
+                                            std::vector<uint16_t>* staging) {
+  if (t.dtype == "BF16") return static_cast<const uint8_t*>(t.data);
+  VT_CHECK(t.dtype == "F8_E4M3",
+           "dense loader: unsupported dtype '" + t.dtype + "' for " + name +
+               "; supported: BF16, F8_E4M3 (+ <name>_scale)");
+  VT_CHECK(t.shape.size() == 2,
+           "dense loader: expected 2-D weight for FP8 " + name);
+  const int64_t rows = t.shape[0];
+  const int64_t cols = t.shape[1];
+  const StTensor& sc = get(name + "_scale");
+  const int64_t n_scale =
+      static_cast<int64_t>(sc.nbytes) / (sc.dtype == "BF16" ? 2 : 4);
+  VT_CHECK(n_scale == 1 || n_scale == rows,
+           "dense loader: " + name +
+               "_scale must be per-tensor or one value per output row");
+  staging->resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+  for (int64_t r = 0; r < rows; ++r) {
+    const int64_t si = (n_scale == 1) ? 0 : r;
+    float scale = 1.0F;
+    if (sc.dtype == "BF16") {
+      uint16_t h = 0;
+      std::memcpy(&h, static_cast<const uint8_t*>(sc.data) + si * 2, 2);
+      const uint32_t bits = static_cast<uint32_t>(h) << 16;
+      std::memcpy(&scale, &bits, sizeof(scale));
+    } else {
+      std::memcpy(&scale, static_cast<const uint8_t*>(sc.data) + si * 4,
+                  sizeof(scale));
+    }
+    DequantFp8ToBf16(static_cast<const uint8_t*>(t.data) + r * cols, scale, cols,
+                     staging->data() + static_cast<size_t>(r) * cols);
+  }
+  // Deliberately NOT releasing here: every caller already calls
+  // MaybeReleaseSourcePages(t.data, t.nbytes) exactly once on the same range.
+  return reinterpret_cast<const uint8_t*>(staging->data());
+}
+
 // BF16 tensor copied verbatim (optionally reshaped).
+//
+// ENG-LOAD-DIRECT-UPLOAD (issue #150): this is a whole-range verbatim copy into
+// a same-size destination -- a reshape changes no byte -- so it is one of the
+// call sites that QUALIFIES for the borrow-the-mapping path. When it takes it,
+// no owned buffer is allocated and the device upload reads the file mapping
+// directly; the copy below is the unchanged fallback for every other case.
 inline OwnedTensor LoadBf16Direct(const TensorResolver& get,
                                   const std::string& name,
                                   const std::vector<int64_t>& shape_override = {}) {
   const StTensor& t = get(name);
-  VT_CHECK(t.dtype == "BF16", "dense loader: expected BF16 for " + name);
+  std::vector<uint16_t> staging;
+  const uint8_t* src = MaterializeBf16Source(get, name, t, &staging);
   std::vector<int64_t> shape = shape_override.empty() ? t.shape : shape_override;
+  OwnedTensor borrowed;
+  if (BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, shape)) return borrowed;
   OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
-  VT_CHECK(t.nbytes == o.bytes.size(),
+  const size_t src_bytes =
+      staging.empty() ? t.nbytes : staging.size() * sizeof(uint16_t);
+  VT_CHECK(src_bytes == o.bytes.size(),
            "dense loader: byte-size mismatch for " + name);
-  std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  std::memcpy(o.bytes.data(), src, src_bytes);
   // LOAD-SAFETENSORS: source range now copied-then-dead; drop its resident pages
   // so the owned mirror never double-resides with the mmap (spec §page-lifetime).
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
+// ENG-LOAD-DIRECT-UPLOAD: release the resident pages behind a weight that
+// BORROWED the mapping and whose bytes a merged loader has just copied into its
+// own buffer. Without this the per-shard borrow would keep the source pages
+// resident until the temporary shard dies, which is the residency the windowed
+// release exists to avoid. A no-op for a copied (non-borrowing) shard, whose
+// LoadBf16Direct/LoadCt* already released it.
+inline void ReleaseBorrowedShardSource(const OwnedTensor& shard) {
+  if (shard.mmap_src != nullptr)
+    MaybeReleaseSourcePages(shard.mmap_src, shard.mmap_src_bytes);
+}
+
 // BF16 [out, in] -> owned bf16 [in, out] (Matmul-B layout).
 inline OwnedTensor LoadBf16Transposed(const TensorResolver& get,
                                       const std::string& name) {
   const StTensor& t = get(name);
-  VT_CHECK(t.dtype == "BF16", "dense loader: expected BF16 for " + name);
   VT_CHECK(t.shape.size() == 2, "dense loader: expected 2-D weight for " + name);
+  std::vector<uint16_t> staging;
+  const uint8_t* src = MaterializeBf16Source(get, name, t, &staging);
   const int64_t out_dim = t.shape[0];
   const int64_t in_dim = t.shape[1];
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(reinterpret_cast<const uint16_t*>(t.data), out_dim, in_dim,
+  TransposeBf16(src, out_dim, in_dim,
                 reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
@@ -106,7 +188,14 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
   shards.reserve(names.size());
   for (const std::string& name : names) {
     const StTensor& tensor = get(name);
-    VT_CHECK(tensor.dtype == "BF16", "dense loader: expected BF16 for " + name);
+    // Both new Qwen3.6-27B NVFP4 publishers quantize the GDN in-projections to
+    // per-tensor FP8 while leaving in_proj_a/b BF16 (nvidia/Qwen3.6-27B-NVFP4:
+    // in_proj_qkv F8_E4M3 [10240,5120] + scalar weight_scale/input_scale). The
+    // shard is materialized to BF16 below so the merge, the TP row split and the
+    // nk=true MatmulBT orientation stay exactly as they were for a BF16 shard.
+    VT_CHECK(tensor.dtype == "BF16" || tensor.dtype == "F8_E4M3",
+             "dense loader: unsupported dtype '" + tensor.dtype + "' for " + name +
+                 "; supported: BF16, F8_E4M3 (+ <name>_scale)");
     VT_CHECK(tensor.shape.size() == 2,
              "dense loader: expected 2-D weight for " + name);
     VT_CHECK(tensor.shape[0] > 0 && tensor.shape[1] > 0,
@@ -139,6 +228,50 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     sharded_out_dim += r.size();
   }
 
+  // Materialize any FP8 shard to BF16 before the merge. The scale is either a
+  // single per-tensor F32 scalar (nvidia/Qwen3.6-27B-NVFP4 in_proj_qkv) or one
+  // value per output row (unsloth @ccdaab7e, stored BF16). Reading a per-channel
+  // scale as per-tensor would be silently WRONG rather than loud, so the row
+  // count decides and anything else is rejected.
+  std::vector<std::vector<uint16_t>> staged(shards.size());
+  std::vector<const uint8_t*> src_ptr(shards.size());
+  std::vector<size_t> src_bytes(shards.size());
+  for (size_t i = 0; i < shards.size(); ++i) {
+    const StTensor& shard = *shards[i];
+    if (shard.dtype == "BF16") {
+      src_ptr[i] = static_cast<const uint8_t*>(shard.data);
+      src_bytes[i] = shard.nbytes;
+      continue;
+    }
+    const int64_t rows = shard.shape[0];
+    const int64_t cols = shard.shape[1];
+    const StTensor& sc = get(names[i] + "_scale");
+    const int64_t n_scale =
+        static_cast<int64_t>(sc.nbytes) / (sc.dtype == "BF16" ? 2 : 4);
+    VT_CHECK(n_scale == 1 || n_scale == rows,
+             "dense loader: " + names[i] + "_scale must be per-tensor or one "
+             "value per output row");
+    staged[i].resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+    for (int64_t r = 0; r < rows; ++r) {
+      const int64_t si = (n_scale == 1) ? 0 : r;
+      float scale = 1.0F;
+      if (sc.dtype == "BF16") {
+        uint16_t h = 0;
+        std::memcpy(&h, static_cast<const uint8_t*>(sc.data) + si * 2, 2);
+        const uint32_t bits = static_cast<uint32_t>(h) << 16;
+        std::memcpy(&scale, &bits, sizeof(scale));
+      } else {
+        std::memcpy(&scale, static_cast<const uint8_t*>(sc.data) + si * 4,
+                    sizeof(scale));
+      }
+      DequantFp8ToBf16(static_cast<const uint8_t*>(shard.data) + r * cols, scale,
+                       cols, staged[i].data() + static_cast<size_t>(r) * cols);
+    }
+    MaybeReleaseSourcePages(shard.data, shard.nbytes);
+    src_ptr[i] = reinterpret_cast<const uint8_t*>(staged[i].data());
+    src_bytes[i] = staged[i].size() * sizeof(uint16_t);
+  }
+
   VT_CHECK(sharded_out_dim <= std::numeric_limits<int64_t>::max() / in_dim,
            "dense loader: merged BF16 element count overflow");
   const auto elements =
@@ -151,14 +284,13 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
   for (size_t i = 0; i < shards.size(); ++i) {
     const StTensor& shard = *shards[i];
     const size_t full = static_cast<size_t>(shard.shape[0]) * row_bytes;
-    VT_CHECK(shard.nbytes == full,
+    VT_CHECK(src_bytes[i] == full,
              "dense loader: byte-size mismatch for " + names[i]);
     const ShardRange& r = ranges[i];
     const size_t src_off = static_cast<size_t>(r.begin) * row_bytes;
     const size_t copied = static_cast<size_t>(r.size()) * row_bytes;
-    std::memcpy(merged.bytes.data() + offset,
-                static_cast<const uint8_t*>(shard.data) + src_off, copied);
-    MaybeReleaseSourcePages(shard.data, full);
+    std::memcpy(merged.bytes.data() + offset, src_ptr[i] + src_off, copied);
+    if (shard.dtype == "BF16") MaybeReleaseSourcePages(shard.data, full);
     offset += copied;
   }
   VT_CHECK(offset == merged.bytes.size(),
@@ -296,16 +428,25 @@ inline Nvfp4Weight LoadCtNvfp4W4A16(
   r.weight_global_scale_inv = wgs_disk;  // exact divisor, for merged linears
   r.scale2 = 1.0F / wgs_disk;            // CT stores a divisor -> reciprocate
   r.alpha = 0.0F;                        // W4A16: no activation quant
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "dense loader: packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "dense loader: scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): weight_packed and weight_scale are each
+  // taken VERBATIM into their own same-size destination, so both qualify for the
+  // borrow path; the memcpys are the unchanged fallback.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "dense loader: packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "dense loader: scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
@@ -373,6 +514,10 @@ inline Nvfp4Weight LoadMergedCtNvfp4W4A16(
     std::memcpy(merged.scale.bytes.data() + s_off, s.scale.bytes.data(),
                 s.scale.bytes.size());
     s_off += s.scale.bytes.size();
+    // A concatenation is NOT a verbatim view, so the merged buffer is owned and
+    // any per-shard borrow is now consumed-and-dead.
+    ReleaseBorrowedShardSource(s.packed);
+    ReleaseBorrowedShardSource(s.scale);
   }
   VT_CHECK(p_off == merged.packed.bytes.size() &&
                s_off == merged.scale.bytes.size(),
@@ -438,16 +583,24 @@ inline Nvfp4Weight LoadCtMxfp4W4A16(
   r.is_mxfp4 = true;
   r.scale2 = 0.0F;  // MXFP4 has no global scale (unused)
   r.alpha = 0.0F;   // W4A16: no activation quant
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "dense loader: packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 32});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "dense loader: scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): both payloads are verbatim; see
+  // LoadCtNvfp4W4A16 above.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "dense loader: packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 32})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 32});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "dense loader: scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
@@ -494,6 +647,8 @@ inline Nvfp4Weight LoadMergedCtMxfp4W4A16(
     std::memcpy(merged.scale.bytes.data() + s_off, s.scale.bytes.data(),
                 s.scale.bytes.size());
     s_off += s.scale.bytes.size();
+    ReleaseBorrowedShardSource(s.packed);
+    ReleaseBorrowedShardSource(s.scale);
   }
   VT_CHECK(p_off == merged.packed.bytes.size() &&
                s_off == merged.scale.bytes.size(),

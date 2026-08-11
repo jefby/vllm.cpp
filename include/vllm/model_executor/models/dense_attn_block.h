@@ -190,9 +190,18 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
+    // Issue #150 accounting: this is the ONE host->device weight upload. When
+    // `w.bytes` borrows the safetensors mapping (ENG-LOAD-DIRECT-UPLOAD) the
+    // source of this copy IS the file mapping, so the load moved the bytes once
+    // rather than twice.
+    vllm::load_stats::AddDeviceUpload(nb);
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    // The host mirror is now redundant wherever device memory is host-
+    // addressable (Vulkan). See AdoptDeviceBytesAsHost — this is what keeps a
+    // unified-memory box from holding the whole model twice.
+    AdoptDeviceBytesAsHost(d.b, w);
   }
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }

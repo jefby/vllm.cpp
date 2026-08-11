@@ -13,17 +13,26 @@
 // variables replace asyncio tasks/queues and ZMQ. Queue ordering, per-request
 // single-slot coalescing, abort-final-output behavior, and output-handler order
 // remain the pinned upstream semantics. Parallel sampling, streaming input,
-// pooling, DP, stats/tracing and W3 async scheduling are deferred.
+// pooling and DP are deferred.
+//
+// STATS (SERVE-METRICS, #277, specs/async-metrics.md): the output handler folds
+// each step's SchedulerStats + IterationStats into an ATTACHED
+// PrometheusStatLogger, mirroring async_llm.py:662-702. Opt-in: with no logger
+// attached (the default) the handler takes the same no-stats path it always
+// took. The config-gated metric families (spec-decode / kv-connector / mm /
+// LoRA) remain deferred, as does update_scheduler_stats (LoRA-only upstream).
 #ifndef VLLM_V1_ENGINE_ASYNC_LLM_H_
 #define VLLM_V1_ENGINE_ASYNC_LLM_H_
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "vllm/multimodal/inputs.h"  // multimodal::MultiModalInputs (mm request)
@@ -36,12 +45,48 @@
 
 namespace vllm::v1 {
 
+namespace metrics {
+class PrometheusStatLogger;
+}  // namespace metrics
+
 // The value returned by add_request/generate-start. The collector is shared
 // with OutputProcessor's RequestState until that request finishes or aborts.
 struct AsyncRequest {
   std::string request_id;
   std::shared_ptr<RequestOutputCollector> collector;
 };
+
+// Ordered-wave admission inputs. Separate types make it impossible for one
+// item to carry both prompt forms. The batch API preserves these objects'
+// order in both core publication and returned collectors.
+struct AsyncStringRequestInput {
+  std::string request_id;
+  std::string prompt;
+  SamplingParams params;
+  int priority = 0;
+};
+
+struct AsyncTokensRequestInput {
+  std::string request_id;
+  std::vector<int32_t> prompt_token_ids;
+  SamplingParams params;
+  int priority = 0;
+};
+
+// The second admission check lives on the lock-owned publish route, rather
+// than only at the start of input preparation. This injectable seam lets a
+// deterministic test model shutdown winning after the outer fast check and
+// prove that no registration or core publish callback can run afterward.
+template <typename Lockable, typename AlivePredicate, typename PublishCallback>
+inline decltype(auto) PublishAsyncRequestWaveIfAlive(
+    Lockable& admission_mutex, AlivePredicate&& alive_predicate,
+    PublishCallback&& publish_callback) {
+  std::lock_guard<Lockable> lock(admission_mutex);
+  if (!std::forward<AlivePredicate>(alive_predicate)()) {
+    throw EngineDeadError("request wave submitted to a stopped AsyncLLM");
+  }
+  return std::forward<PublishCallback>(publish_callback)();
+}
 
 class AsyncLLM {
  public:
@@ -61,11 +106,17 @@ class AsyncLLM {
   // through to the EngineCoreProc (grammar_init + the scheduler's bitmask).
   // Null keeps structured output a no-op (backward-compat with tests that
   // build a bare stack).
+  //
+  // `check_for_draft_tokens` is EngineCore's speculative-decode flag, threaded
+  // down to the EngineCoreProc this owns. False (the default) leaves post_step
+  // a no-op, which is byte-identical for a non-speculative engine; a
+  // speculative engine MUST pass true or its drafts are proposed and dropped.
   AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
            Executor& executor, OutputProcessor& output_processor,
            BlockHasher block_hasher = nullptr, int shutdown_timeout_s = 0,
            int max_concurrent_batches = 1,
-           StructuredOutputManager* structured_output_manager = nullptr);
+           StructuredOutputManager* structured_output_manager = nullptr,
+           bool check_for_draft_tokens = false);
   ~AsyncLLM();
 
   AsyncLLM(const AsyncLLM&) = delete;
@@ -88,6 +139,16 @@ class AsyncLLM {
                            std::vector<int32_t> prompt_token_ids,
                            SamplingParams params, int priority = 0);
 
+  // Prepare and atomically publish one complete string or TokensPrompt wave.
+  // Every input/core Request and collector is built before any frontend state
+  // is registered. On duplicate, preparation/enqueue failure, or shutdown,
+  // this call publishes no core prefix and removes only state created by this
+  // call, without producing synthetic terminal outputs.
+  std::vector<AsyncRequest> add_request_wave(
+      std::vector<AsyncStringRequestInput> requests);
+  std::vector<AsyncRequest> add_request_wave(
+      std::vector<AsyncTokensRequestInput> requests);
+
   // add_request for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). Strictly
   // ADDITIVE overload mirroring LLMEngine::add_request(MultiModalInputs): builds
   // the request from the placeholder-EXPANDED prompt ids + mm_features via
@@ -104,6 +165,9 @@ class AsyncLLM {
   RequestOutput get_output(const AsyncRequest& request);
   std::optional<RequestOutput> get_output_nowait(
       const AsyncRequest& request);
+  // Timed wait — nullopt on timeout (for SSE keepalives).
+  std::optional<RequestOutput> get_output_for(
+      const AsyncRequest& request, std::chrono::milliseconds timeout);
 
   // Blocking convenience for non-streaming callers: drain this request's
   // collector until its terminal RequestOutput. Other requests keep running.
@@ -140,11 +204,33 @@ class AsyncLLM {
     return get_num_unfinished_requests() != 0;
   }
 
+  // The stat-logger attach point (async_llm.py:648-652 `logger_ref`, the
+  // mutable one-element list holding self.logger_manager). Mirrors
+  // LLMEngine::set_stat_logger: NON-OWNING. A non-null logger must remain alive
+  // until it is detached or the engine is shut down. Detaching is a quiescence
+  // barrier: after set_stat_logger(nullptr) returns, the output thread no longer
+  // holds or uses the previous pointer. Null (the default) keeps RunOutputHandler
+  // on its byte-identical no-stats path.
+  //
+  // DEVIATION: upstream's one-element list exists to avoid a circular ref from
+  // the handler coroutine back to the AsyncLLM. The attachment mutex makes
+  // pointer publication visible and gives detach its barrier semantics.
+  void set_stat_logger(metrics::PrometheusStatLogger* logger);
+
   // Idempotent teardown. Active requests receive abort-final outputs before
   // the output handler is woken with the engine-dead sentinel and joined.
   void shutdown();
 
  private:
+  struct PreparedRequest {
+    EngineCoreRequest request;
+    std::optional<std::string> prompt;
+    std::shared_ptr<RequestOutputCollector> collector;
+    std::unique_ptr<Request> core_request;
+  };
+
+  std::vector<AsyncRequest> PublishPreparedWave(
+      std::vector<PreparedRequest> prepared);
   void RunOutputHandler();
 
   InputProcessor& input_processor_;
@@ -153,6 +239,9 @@ class AsyncLLM {
   InprocClient engine_core_;
 
   mutable std::mutex output_processor_mutex_;
+  // async_llm.py:650-652 logger_ref. Non-owning; null == log_stats off.
+  mutable std::mutex stat_logger_mutex_;
+  metrics::PrometheusStatLogger* stat_logger_ = nullptr;
   std::thread output_handler_;
   std::atomic<bool> stopping_{false};
   std::atomic<bool> shutdown_started_{false};

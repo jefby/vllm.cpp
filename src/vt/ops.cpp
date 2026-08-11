@@ -4,6 +4,10 @@
 #include <array>
 #include <vector>
 
+// CheckConvCommon asks the BACKEND whether it can address a compressed
+// conv_state in place, rather than naming a device type.
+#include "vt/backend.h"
+
 namespace vt {
 
 namespace {
@@ -843,6 +847,25 @@ void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tenso
       num_tokens_past_padded, topk_weights, args);
 }
 
+void MarlinDenseGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
+                     const Tensor& b_scales, const Tensor& global_scale, Tensor& workspace,
+                     const MarlinDenseArgs& args) {
+  VT_CHECK(a.rank == 2 && c.rank == 2, "marlin_dense: a/c must be rank-2");
+  VT_CHECK(a.dtype == DType::kBF16 && c.dtype == DType::kBF16, "marlin_dense: a/c must be bf16");
+  VT_CHECK(args.size_k % 16 == 0, "marlin_dense: size_k must be a multiple of 16 (group size)");
+  VT_CHECK(args.group_size == 16 || args.group_size == 32,
+           "marlin_dense: group_size must be 16 (nvfp4) or 32 (mxfp4)");
+  VT_CHECK(a.shape[0] == args.size_m && a.shape[1] == args.size_k,
+           "marlin_dense: a shape must be [size_m, size_k]");
+  VT_CHECK(c.shape[0] == args.size_m && c.shape[1] == args.size_n,
+           "marlin_dense: c shape must be [size_m, size_n]");
+  VT_CHECK(b_q_weight.rank == 2, "marlin_dense: b_q_weight must be rank-2 [K/16, N*8/pack]");
+  VT_CHECK(global_scale.dtype == DType::kF32, "marlin_dense: global_scale must be f32");
+  VT_CHECK(workspace.dtype == DType::kI32, "marlin_dense: workspace must be i32 (reduction locks)");
+  reinterpret_cast<MarlinDenseGemmFn>(GetOp(OpId::kMarlinDenseGemm, q.device.type))(
+      q, c, a, b_q_weight, b_scales, global_scale, workspace, args);
+}
+
 void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
   VT_CHECK(gate.Numel() == out.Numel() && up.Numel() == out.Numel(),
            "moe_silu_mul: out/gate/up must have the same element count");
@@ -1555,10 +1578,19 @@ void CheckConvCommon(const Queue& q, const Tensor& out, const Tensor& x, const T
            std::string(name) + ": conv_state must be [N,C,(K-1)+num_spec>=K-1]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
+  // bf16 conv_state is admitted wherever the BACKEND says its conv kernels can
+  // address a compressed row in place (Backend::SupportsCompressedConvState) —
+  // CUDA and Vulkan today. Asking the backend rather than naming a device is
+  // what keeps this shared op layer device-agnostic; the alternative for a
+  // backend that answers false is the caller's f32 gather/compute/scatter, which
+  // is still exactly what CPU does.
+  const Backend* conv_backend = TryGetBackend(q.device.type);
   VT_CHECK(conv_state.dtype == DType::kF32 ||
-               (conv_state.dtype == DType::kBF16 && q.device.type == DeviceType::kCUDA),
+               (conv_state.dtype == DType::kBF16 && conv_backend != nullptr &&
+                conv_backend->SupportsCompressedConvState()),
            std::string(name) +
-               ": conv_state must be f32, or bf16 on CUDA (in/out, in place; bf16 = "
+               ": conv_state must be f32, or bf16 on a backend whose conv kernels "
+               "support a compressed state in place (in/out, in place; bf16 = "
                "vLLM default mamba_cache_dtype, read/written in f32 registers)");
   // out/weight/conv_state stay fully contiguous. x may be a padded-row
   // (inner-contiguous, outer stride >= C) view: the merged qkvz projection feeds
@@ -1610,12 +1642,17 @@ void CheckGdnCommon(const Queue& q, const Tensor& out, const Tensor& q_in, const
   VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
            std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
   if (allow_compressed_state) {
+    // Asking the backend (Backend::SupportsCompressedGdnState) rather than
+    // naming a device — the same device-agnostic pattern CheckConvCommon
+    // already uses for the conv state. CUDA answers for its existing kernels;
+    // ROCm answers for the portable scan's f16/bf16 state arms.
+    const Backend* gdn_backend = TryGetBackend(q.device.type);
     VT_CHECK(state.dtype == DType::kF32 ||
-                 ((state.dtype == DType::kF16 ||
-                   state.dtype == DType::kBF16) &&
-                  q.device.type == DeviceType::kCUDA),
+                 ((state.dtype == DType::kF16 || state.dtype == DType::kBF16) &&
+                  gdn_backend != nullptr && gdn_backend->SupportsCompressedGdnState()),
              std::string(name) +
-                 ": state must be f32, or fp16/bf16 on CUDA (in/out, in place; "
+                 ": state must be f32, or fp16/bf16 on a backend whose GDN kernels "
+                 "support a compressed state in place (in/out, in place; "
                  "read/written in f32 registers)");
   } else {
     VT_CHECK(state.dtype == DType::kF32,
@@ -1657,6 +1694,16 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
   const int64_t n = conv_state.shape[0];
   CheckI32Meta(q, query_start_loc, n + 1, "causal_conv1d_fwd", "query_start_loc");
   CheckBoolMeta(q, has_initial_state, n, "causal_conv1d_fwd", "has_initial_state");
+  VT_CHECK((args.batch_ptr == nullptr) == (args.token_chunk_offset_ptr == nullptr),
+           "causal_conv1d_fwd: batch_ptr and token_chunk_offset_ptr must be supplied together");
+  if (args.batch_ptr != nullptr) {
+    const int64_t programs = args.batch_ptr->shape[0];
+    CheckI32Meta(q, *args.batch_ptr, programs, "causal_conv1d_fwd", "batch_ptr");
+    CheckI32Meta(q, *args.token_chunk_offset_ptr, programs, "causal_conv1d_fwd",
+                 "token_chunk_offset_ptr");
+    VT_CHECK(programs > 0,
+             "causal_conv1d_fwd: exact chunk descriptor must not be empty");
+  }
   reinterpret_cast<CausalConv1dFwdFn>(GetOp(OpId::kCausalConv1dFwd, q.device.type))(
       q, out, x, weight, bias, conv_state, query_start_loc, has_initial_state, args);
 }
@@ -1805,6 +1852,100 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
   CheckI32Meta(q, query_start_loc, state.shape[0] + 1, "gdn_prefill", "query_start_loc");
   reinterpret_cast<GdnPrefillFn>(GetOp(OpId::kGdnPrefill, q.device.type))(
       q, out, q_in, k, v, g, beta, state, query_start_loc, args);
+}
+
+void KdaGatedDeltaRule(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                       const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                       const Tensor& query_start_loc, const GdnArgs& args) {
+  constexpr const char* name = "kda_gated_delta_rule";
+  // Same contracts as GdnPrefill EXCEPT g is per-K-channel [T,Hv,Dk].
+  VT_CHECK(q_in.rank == 3 && k.rank == 3 && v.rank == 3 && out.rank == 3 && g.rank == 3 &&
+               beta.rank == 2 && state.rank == 4,
+           std::string(name) +
+               ": q/k [T,Hk,Dk], v/out [T,Hv,Dv], g [T,Hv,Dk], beta [T,Hv], state [N,Hv,Dv,Dk]");
+  const int64_t t = q_in.shape[0], hk = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv = v.shape[1], dv = v.shape[2];
+  VT_CHECK(k.shape[0] == t && k.shape[1] == hk && k.shape[2] == dk,
+           std::string(name) + ": k shape must match q");
+  VT_CHECK(v.shape[0] == t, std::string(name) + ": v token count must match q");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hv && out.shape[2] == dv,
+           std::string(name) + ": out must be [T,Hv,Dv]");
+  VT_CHECK(g.shape[0] == t && g.shape[1] == hv && g.shape[2] == dk,
+           std::string(name) + ": g must be [T,Hv,Dk] (per-K-channel decay)");
+  VT_CHECK(beta.shape[0] == t && beta.shape[1] == hv,
+           std::string(name) + ": beta must be [T,Hv]");
+  VT_CHECK(hk >= 1 && hv % hk == 0,
+           std::string(name) + ": Hv must be a multiple of Hk (GQA broadcast)");
+  VT_CHECK(state.shape[1] == hv && state.shape[2] == dv && state.shape[3] == dk,
+           std::string(name) + ": state must be [N,Hv,Dv,Dk]");
+  VT_CHECK(IsFloat(q_in.dtype) && IsFloat(k.dtype) && IsFloat(v.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float q/k/v, f32/bf16 out");
+  VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
+           std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
+  VT_CHECK(state.dtype == DType::kF32,
+           std::string(name) + ": state must be f32 (fresh-zeros or persistent, read/written f32)");
+  VT_CHECK(q_in.IsContiguous() && k.IsContiguous() && v.IsContiguous() && out.IsContiguous() &&
+               g.IsContiguous() && beta.IsContiguous() && state.IsContiguous(),
+           std::string(name) + ": contiguous required");
+  VT_CHECK(q_in.device == q.device && k.device == q.device && v.device == q.device &&
+               out.device == q.device && g.device == q.device && beta.device == q.device &&
+               state.device == q.device,
+           std::string(name) + ": device mismatch (q/k/v/out/g/beta/state/queue)");
+  VT_CHECK(args.scale > 0.0f, std::string(name) + ": args.scale must be set (> 0)");
+  CheckI32Meta(q, query_start_loc, state.shape[0] + 1, name, "query_start_loc");
+  reinterpret_cast<KdaGatedDeltaRuleFn>(GetOp(OpId::kKdaGatedDeltaRule, q.device.type))(
+      q, out, q_in, k, v, g, beta, state, query_start_loc, args);
+}
+
+void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                     const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                     const Tensor& query_start_loc, const GdnArgs& args) {
+  constexpr const char* name = "kda_chunk_prefill";
+  // Same tensor contracts as KdaGatedDeltaRule EXCEPT the gate is supplied RAW
+  // (g_raw + a_log + dt_bias fused on-device by kda_gate_cumsum), not pre-gated.
+  VT_CHECK(q_in.rank == 3 && k.rank == 3 && v.rank == 3 && out.rank == 3 && g_raw.rank == 3 &&
+               beta.rank == 2 && state.rank == 4,
+           std::string(name) +
+               ": q/k [T,Hk,Dk], v/out [T,Hv,Dv], g_raw [T,Hv,Dk], beta [T,Hv], state [N,Hv,Dv,Dk]");
+  const int64_t t = q_in.shape[0], hk = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv = v.shape[1], dv = v.shape[2];
+  VT_CHECK(k.shape[0] == t && k.shape[1] == hk && k.shape[2] == dk,
+           std::string(name) + ": k shape must match q");
+  VT_CHECK(v.shape[0] == t, std::string(name) + ": v token count must match q");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hv && out.shape[2] == dv,
+           std::string(name) + ": out must be [T,Hv,Dv]");
+  VT_CHECK(g_raw.shape[0] == t && g_raw.shape[1] == hv && g_raw.shape[2] == dk,
+           std::string(name) + ": g_raw must be [T,Hv,Dk] (raw per-K-channel gate projection)");
+  VT_CHECK(beta.shape[0] == t && beta.shape[1] == hv,
+           std::string(name) + ": beta must be [T,Hv]");
+  VT_CHECK(hk >= 1 && hv % hk == 0,
+           std::string(name) + ": Hv must be a multiple of Hk (GQA broadcast)");
+  VT_CHECK(state.shape[0] == 1 && state.shape[1] == hv && state.shape[2] == dv &&
+               state.shape[3] == dk,
+           std::string(name) + ": state must be [1,Hv,Dv,Dk] (single prefill sequence)");
+  VT_CHECK(IsFloat(q_in.dtype) && IsFloat(k.dtype) && IsFloat(v.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float q/k/v, f32/bf16 out");
+  VT_CHECK(g_raw.dtype == DType::kF32 && beta.dtype == DType::kF32,
+           std::string(name) + ": g_raw/beta must be f32");
+  VT_CHECK(a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
+           std::string(name) + ": a_log/dt_bias must be f32");
+  VT_CHECK(a_log.rank == 1 && a_log.shape[0] == hv,
+           std::string(name) + ": a_log must be [Hv]");
+  VT_CHECK(dt_bias.rank == 1 && (dt_bias.shape[0] == hv * dk || dt_bias.shape[0] == 0),
+           std::string(name) + ": dt_bias must be [Hv*Dk] or empty");
+  VT_CHECK(state.dtype == DType::kF32, std::string(name) + ": state must be f32");
+  VT_CHECK(q_in.IsContiguous() && k.IsContiguous() && v.IsContiguous() && out.IsContiguous() &&
+               g_raw.IsContiguous() && beta.IsContiguous() && state.IsContiguous(),
+           std::string(name) + ": contiguous required");
+  VT_CHECK(q_in.device == q.device && k.device == q.device && v.device == q.device &&
+               out.device == q.device && g_raw.device == q.device && beta.device == q.device &&
+               state.device == q.device,
+           std::string(name) + ": device mismatch (q/k/v/out/g_raw/beta/state/queue)");
+  VT_CHECK(args.scale > 0.0f, std::string(name) + ": args.scale must be set (> 0)");
+  CheckI32Meta(q, query_start_loc, state.shape[0] + 1, name, "query_start_loc");
+  reinterpret_cast<KdaChunkPrefillFn>(GetOp(OpId::kKdaChunkPrefill, q.device.type))(
+      q, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, query_start_loc, args);
 }
 
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
@@ -2153,8 +2294,12 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
   VT_CHECK(IsFloat(expert_out.dtype) && IsOutFloat(out.dtype),
            "moe_combine_gate: float expert_out, f32/bf16 out");
   VT_CHECK(weights.dtype == DType::kF32, "moe_combine_gate: weights must be f32");
-  VT_CHECK(sd.dtype == DType::kF32 && sd.rank == 2 && sd.shape[0] == t && sd.shape[1] == h,
-           "moe_combine_gate: sd must be f32 [T,H]");
+  // sd may be bf16: the shared down-proj GEMM produces bf16 and the gate
+  // re-rounds through bf16 anyway, so reading it directly is bit-identical to
+  // casting to f32 first (VT_SHARED_DOWN_BF16).
+  VT_CHECK((sd.dtype == DType::kF32 || sd.dtype == DType::kBF16) && sd.rank == 2 &&
+               sd.shape[0] == t && sd.shape[1] == h,
+           "moe_combine_gate: sd must be f32/bf16 [T,H]");
   VT_CHECK(gl.dtype == DType::kF32 && gl.Numel() == t,
            "moe_combine_gate: gl must be f32 with T elements");
   VT_CHECK(expert_out.IsContiguous() && weights.IsContiguous() && out.IsContiguous() &&
@@ -2194,6 +2339,135 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
            "attention: device mismatch (query/key/value/out/queue)");
   reinterpret_cast<AttentionFn>(GetOp(OpId::kAttention, q.device.type))(q, out, query, key,
                                                                         value, args);
+}
+
+// --- Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3) --------
+// Upstream mirror: transformers 5.3.0
+// transformers/models/parakeet/modeling_parakeet.py (:357 subsampling Conv2d,
+// :116 convolution module depthwise Conv1d, :259 relative-position attention),
+// which is the module vLLM itself runs (parakeet.py:37,62). The validation here
+// mirrors torch's own shape contracts for nn.Conv2d / nn.Conv1d(groups=C) so a
+// caller that passes what the Python module passes is accepted verbatim.
+
+void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv2dArgs& args) {
+  VT_CHECK(x.rank == 4 && out.rank == 4, "conv2d: x/out must be rank-4 [N,C,H,W]");
+  VT_CHECK(weight.rank == 4, "conv2d: weight must be rank-4 [Cout,Cin/groups,KH,KW]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv2d: groups must be >= 1");
+  const int64_t n = x.shape[0], cin = x.shape[1], hin = x.shape[2], win = x.shape[3];
+  const int64_t cout = weight.shape[0], cin_g = weight.shape[1];
+  const int64_t kh = weight.shape[2], kw = weight.shape[3];
+  VT_CHECK(n >= 0 && cin > 0 && hin > 0 && win > 0, "conv2d: x extents must be positive");
+  VT_CHECK(cout > 0 && kh > 0 && kw > 0, "conv2d: weight extents must be positive");
+  VT_CHECK(cin % g == 0 && cout % g == 0, "conv2d: groups must divide both Cin and Cout");
+  VT_CHECK(cin_g == cin / g, "conv2d: weight dim 1 must be Cin/groups");
+  VT_CHECK(args.stride_h >= 1 && args.stride_w >= 1, "conv2d: stride must be >= 1");
+  VT_CHECK(args.dilation_h >= 1 && args.dilation_w >= 1, "conv2d: dilation must be >= 1");
+  VT_CHECK(args.pad_h >= 0 && args.pad_w >= 0, "conv2d: padding must be >= 0");
+  const int64_t hout = (hin + 2 * args.pad_h - args.dilation_h * (kh - 1) - 1) / args.stride_h + 1;
+  const int64_t wout = (win + 2 * args.pad_w - args.dilation_w * (kw - 1) - 1) / args.stride_w + 1;
+  VT_CHECK(hout > 0 && wout > 0, "conv2d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[0] == n && out.shape[1] == cout && out.shape[2] == hout &&
+               out.shape[3] == wout,
+           "conv2d: out must be [N,Cout,Hout,Wout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "conv2d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv2d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv2d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout, "conv2d: bias must be rank-1 [Cout]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "conv2d: bias must be a contiguous float tensor on the queue device");
+  }
+  reinterpret_cast<Conv2dFn>(GetOp(OpId::kConv2d, q.device.type))(q, out, x, weight, bias, args);
+}
+
+void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const DepthwiseConv1dArgs& args) {
+  VT_CHECK(x.rank == 3 && out.rank == 3, "depthwise_conv1d: x/out must be rank-3 [N,C,L]");
+  // torch's depthwise parameter is [C, 1, K]; the flat [C, K] form is accepted
+  // because that is how vt::CausalConv1dFwd already carries a per-channel filter.
+  VT_CHECK(weight.rank == 3 || weight.rank == 2,
+           "depthwise_conv1d: weight must be [C,1,K] (torch) or [C,K]");
+  const int64_t n = x.shape[0], c = x.shape[1], lin = x.shape[2];
+  const int64_t k = weight.shape[weight.rank - 1];
+  VT_CHECK(c > 0 && lin > 0 && k > 0, "depthwise_conv1d: C/L/K must be positive");
+  VT_CHECK(weight.shape[0] == c, "depthwise_conv1d: weight dim 0 must be C (groups == C)");
+  if (weight.rank == 3) {
+    VT_CHECK(weight.shape[1] == 1, "depthwise_conv1d: weight dim 1 must be 1 (in_channels/groups)");
+  }
+  VT_CHECK(args.stride >= 1, "depthwise_conv1d: stride must be >= 1");
+  VT_CHECK(args.dilation >= 1, "depthwise_conv1d: dilation must be >= 1");
+  VT_CHECK(args.padding >= 0, "depthwise_conv1d: padding must be >= 0");
+  const int64_t lout = (lin + 2 * args.padding - args.dilation * (k - 1) - 1) / args.stride + 1;
+  VT_CHECK(lout > 0, "depthwise_conv1d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[0] == n && out.shape[1] == c && out.shape[2] == lout,
+           "depthwise_conv1d: out must be [N,C,Lout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "depthwise_conv1d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "depthwise_conv1d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "depthwise_conv1d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == c, "depthwise_conv1d: bias must be rank-1 [C]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "depthwise_conv1d: bias must be a contiguous float tensor on the queue device");
+  }
+  reinterpret_cast<DepthwiseConv1dFn>(GetOp(OpId::kDepthwiseConv1d, q.device.type))(
+      q, out, x, weight, bias, args);
+}
+
+void AttentionRelPos(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                     const Tensor& value, const Tensor& rel_key, const Tensor* bias_u,
+                     const Tensor* bias_v, const Tensor* key_mask,
+                     const AttentionRelPosArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3 &&
+               rel_key.rank == 3,
+           "attention_relpos: query/key/value/rel_key/out rank-3 [T,H,D]");
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  VT_CHECK(t > 0 && hq > 0 && d > 0, "attention_relpos: T/Hq/D must be positive");
+  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
+           "attention_relpos: query/key/value token count must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention_relpos: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention_relpos: key/value must share the kv-head count");
+  VT_CHECK(hk >= 1 && hq % hk == 0,
+           "attention_relpos: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
+           "attention_relpos: out must be [T,Hq,D] matching query");
+  // P == 2T-1: the relative-position table spans offsets T-1 .. -(T-1), exactly
+  // what ParakeetEncoderRelPositionalEncoding emits (modeling_parakeet.py:78
+  // `arange(seq_length-1, -seq_length, -1)`), and what _rel_shift assumes.
+  VT_CHECK(rel_key.shape[0] == 2 * t - 1 && rel_key.shape[1] == hq && rel_key.shape[2] == d,
+           "attention_relpos: rel_key must be [2*T-1, Hq, D]");
+  VT_CHECK(args.scale > 0.0f, "attention_relpos: scale must be set (> 0), e.g. head_dim^-0.5");
+  VT_CHECK(IsFloat(query.dtype) && IsFloat(key.dtype) && IsFloat(value.dtype) &&
+               IsFloat(rel_key.dtype),
+           "attention_relpos: query/key/value/rel_key must be f32, f16 or bf16");
+  VT_CHECK(IsFloat(out.dtype), "attention_relpos: out must be f32, f16 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               rel_key.IsContiguous() && out.IsContiguous(),
+           "attention_relpos: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               rel_key.device == q.device && out.device == q.device,
+           "attention_relpos: device mismatch (query/key/value/rel_key/out/queue)");
+  for (const Tensor* b : {bias_u, bias_v}) {
+    if (b == nullptr) continue;
+    VT_CHECK(b->rank == 2 && b->shape[0] == hq && b->shape[1] == d,
+             "attention_relpos: bias_u/bias_v must be rank-2 [Hq,D]");
+    VT_CHECK(IsFloat(b->dtype) && b->IsContiguous() && b->device == q.device,
+             "attention_relpos: bias_u/bias_v must be contiguous float on the queue device");
+  }
+  if (key_mask != nullptr) {
+    CheckBoolMeta(q, *key_mask, t, "attention_relpos", "key_mask");
+  }
+  reinterpret_cast<AttentionRelPosFn>(GetOp(OpId::kAttentionRelPos, q.device.type))(
+      q, out, query, key, value, rel_key, bias_u, bias_v, key_mask, args);
 }
 
 void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
@@ -3238,8 +3512,10 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
   VT_CHECK(out.rank == 2, "shared_expert_gate: out rank-2 [T,H]");
   const int64_t t = out.shape[0], h = out.shape[1];
   VT_CHECK(out.dtype == DType::kBF16, "shared_expert_gate: out must be bf16");
-  VT_CHECK(sd.dtype == DType::kF32 && gl.dtype == DType::kF32,
-           "shared_expert_gate: sd/gl must be f32");
+  // sd may be bf16 (VT_SHARED_DOWN_BF16): widening in-kernel is exact and the
+  // store is bf16 either way, so both forms are bit-identical.
+  VT_CHECK((sd.dtype == DType::kF32 || sd.dtype == DType::kBF16) && gl.dtype == DType::kF32,
+           "shared_expert_gate: sd must be f32/bf16 and gl f32");
   VT_CHECK(sd.Numel() == t * h, "shared_expert_gate: sd must have T*H elements matching out");
   VT_CHECK(gl.Numel() == t, "shared_expert_gate: gl must have T elements (one gate per token)");
   VT_CHECK(out.IsContiguous() && sd.IsContiguous() && gl.IsContiguous(),

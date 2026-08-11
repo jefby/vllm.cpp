@@ -29,11 +29,13 @@ endfunction()
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
+vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
 vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
+vllm_cpp_add_test(test_load_direct_upload vllm/test_load_direct_upload.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
 vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_awq_gptq_dequant vllm/test_awq_gptq_dequant.cpp)
@@ -49,8 +51,18 @@ vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
+vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
+# ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
+# pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
+# branch base (frames + WAV byte-identical, mux argv pinned).
+vllm_cpp_add_test(test_minimax_h3_video_fold vllm/models/test_minimax_h3_video_fold.cpp)
+target_compile_definitions(test_minimax_h3_video_fold PRIVATE
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
+vllm_cpp_add_test(test_device_selection
+  vllm/entrypoints/test_device_selection.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
@@ -63,13 +75,39 @@ vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_forward vllm/models/test_qwen3_dflash_forward.cpp)
 target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
+vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
+target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W3: speculators-format DSpark config translation.
+vllm_cpp_add_test(test_qwen3_dspark_config vllm/models/test_qwen3_dspark_config.cpp)
+target_include_directories(test_qwen3_dspark_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W3: the DSpark draft weight loader (Markov head + d2t).
+vllm_cpp_add_test(test_qwen3_dspark_weights vllm/models/test_qwen3_dspark_weights.cpp)
+target_include_directories(test_qwen3_dspark_weights PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W4: sequential Markov sampling + the anchor block layout.
+vllm_cpp_add_test(test_dspark_sample vllm/v1/spec_decode/test_dspark_sample.cpp)
+target_include_directories(test_dspark_sample PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
 target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# FUSION-DENSE-MIGRATE: executed CPU coverage for the four DENSE model TUs whose
+# gate-up MLP now routes through layers::UnquantizedMlpGateUpMethod (their only
+# other gates are checkpoint-gated + dgx-only).
+vllm_cpp_add_test(test_dense_gate_up_seam_forward
+  vllm/models/test_dense_gate_up_seam_forward.cpp)
+target_include_directories(test_dense_gate_up_seam_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+# ARCH-ONE-SURFACE fold ROW 6: embeddings through the registry/runner path on
+# the committed tiny LlamaModel fixture (see scripts/mm/llama_embed_fixture_gen.py).
+vllm_cpp_add_test(test_llama_embedding_fold
+  vllm/models/test_llama_embedding_fold.cpp)
+target_compile_definitions(test_llama_embedding_fold PRIVATE
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
 vllm_cpp_add_test(test_mistral_forward vllm/models/test_mistral_forward.cpp)
 target_include_directories(test_mistral_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_gemma3_load vllm/models/test_gemma3_load.cpp)
@@ -162,6 +200,70 @@ vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
+vllm_cpp_add_test(test_muse_glimmer_scaffold vllm/models/test_muse_glimmer_scaffold.cpp)
+vllm_cpp_add_test(test_muse_glimmer_vision vllm/models/test_muse_glimmer_vision.cpp)
+target_include_directories(test_muse_glimmer_vision PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# Muse Glimmer W1 TEXT TOWER gate: the whole text forward vs an INDEPENDENT fp32
+# reference transcribed from vllm#51655 head 075d645af, plus a property test per
+# mechanism (weightless embed_norm, QK-norm, query pre-scale, the iRoPE NoPE/sliding
+# split, split pre/post eps, the offset-free final norm, the attention output gate,
+# the output multiplier and the soft-cap). CPU-only, no checkpoint. No speed axis
+# exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
+# ...and the SAME gate on the HAND-CALL arm. `FusedChainAdoptEnabled()` defaults ON
+# and is read once per process into a function-local static, so the three
+# `else vt::RmsNorm(...)` fallbacks in muse_glimmer.cpp (input layernorm,
+# pre-feedforward layernorm, final norm) are UNREACHABLE in a default-env run —
+# mutating one of them left every gate green — and a same-process env flip cannot
+# reach them either. A SECOND ctest registration of the same binary is the only way
+# to gate that arm, and it is the arm that runs wherever the fusion recipes are
+# unavailable, so both must be green. The `... the fusion arm the environment
+# selected` case inside the binary is what proves this registration really took the
+# other branch instead of silently repeating the first.
+add_test(NAME test_muse_glimmer_text_fallback COMMAND test_muse_glimmer_text)
+set_tests_properties(test_muse_glimmer_text_fallback PROPERTIES
+  ENVIRONMENT "VT_FUSED_CHAIN_ADOPT=0")
+
+# Muse Glimmer W4 WIRING gate: the REAL-CHECKPOINT structural contract (every name
+# EnumerateMuseGlimmerTensors produces exists in the released 1436-tensor
+# Muse-Glimmer-30B index at the right shape, and nothing in the checkpoint is
+# unaccounted) plus the perception-encoder wiring (vision load with the q|k|v merge
+# order and every bias, the soft-token projection, the masked scatter onto the
+# image/video rows, and the mm forward branch). The structural half runs off a
+# COMMITTED header-only fixture so CI never needs the NAS; a second case re-reads
+# the live checkpoint when VLLM_MUSE_CKPT points at it. CPU-only, no GPU, no tensor
+# bytes. NOT an image e2e correctness gate — the pinned oracle cannot load this
+# model at all, so no speed or token-exactness claim exists (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.cpp)
+target_compile_definitions(test_muse_glimmer_wiring PRIVATE
+  MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
+# Muse Glimmer REAL-WEIGHT gate. Loads the released 30B bf16 checkpoint (or a
+# reduced-depth model assembled from its REAL tensors) through the real loader,
+# forwards it on CPU, and compares against a standalone torch transcription of
+# vllm#51655 head 075d645af produced by scripts/mm/muse_glimmer_text_ref.py.
+# Every case SKIPs unless its env var names a fixture directory, so CI never
+# depends on the 59.55 GB NAS asset. This is NOT a token-exact gate against the
+# model's own runtime — no such runtime exists on this box (released
+# transformers does not register `muse_glimmer` and the pin has no Muse code) —
+# and it makes no speed claim whatsoever (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_real_weights
+  vllm/models/test_muse_glimmer_real_weights.cpp)
+target_compile_definitions(test_muse_glimmer_real_weights PRIVATE
+  VLLM_MUSE_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models")
+
+# Muse Glimmer GGUF K-QUANT gate (.agents/porting-a-model.md §2). The quantized
+# arm the port was missing: config-from-GGUF, the canonical<->GGUF name map, the
+# three convert-time transforms this loader inverts (the +1 sandwich-norm
+# pre-offset, the query pre-scale folded into attn_q_norm, the iRoPE mask on
+# sliding_window_pattern), and STRUCTURAL ACCOUNTING in both directions against
+# COMMITTED header-only manifests of the real 731/809/58-tensor files, so CI
+# needs no asset. A live case runs when VLLM_MUSE_GGUF names the 16.76 GB
+# k-quant. No forward, no e2e, and NO SPEED AXIS: the pinned oracle cannot load
+# `muse_glimmer` in any weight format (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_gguf vllm/models/test_muse_glimmer_gguf.cpp)
+target_include_directories(test_muse_glimmer_gguf PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
@@ -178,6 +280,8 @@ vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffol
 # N tokens with the context advancing). The DEVICE forward stays refuse-by-name
 # (born-on-runner W6/W7). .agents/specs/kimi-linear.md §5.
 vllm_cpp_add_test(test_kimi_linear_forward vllm/models/test_kimi_linear_forward.cpp)
+vllm_cpp_add_test(test_kimi_linear_paged vllm/models/test_kimi_linear_paged.cpp)
+vllm_cpp_add_test(test_kimi_linear_fold_gate vllm/models/test_kimi_linear_fold_gate.cpp)
 
 # KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
 # reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B
@@ -215,10 +319,19 @@ vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forwar
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
+# Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —
+# ARCH-ONE-SURFACE ROW 1 W1(a); gates against the pre-refactor DecodeIds
+# reference on the committed parakeet_e2e fixture tokenizers.
+vllm_cpp_add_test(test_tokenizer_metaspace_split
+  vllm/test_tokenizer_metaspace_split.cpp)
+target_compile_definitions(test_tokenizer_metaspace_split PRIVATE
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
+# issue #371: the recurrent-state budget (spec widens GDN state by k+1).
+vllm_cpp_add_test(test_kv_state_budget vllm/v1/core/test_kv_state_budget.cpp)
 vllm_cpp_add_test(test_prefix_match_unit vllm/v1/test_prefix_match_unit.cpp)
 vllm_cpp_add_test(test_kv_cache_interface vllm/v1/test_kv_cache_interface.cpp)
 vllm_cpp_add_test(test_block_pool vllm/v1/test_block_pool.cpp)
@@ -337,6 +450,56 @@ target_compile_definitions(test_qwen3vl_video_e2e PRIVATE
 vllm_cpp_add_test(test_audio_processor vllm/multimodal/test_audio_processor.cpp)
 target_compile_definitions(test_audio_processor PRIVATE
   MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
+# P4 (MODEL-AUDIO-PARAKEET-ENCODER) — the Parakeet log-mel FRONT END. Gates the
+# mel filter bank against a dump of transformers `audio_utils.mel_filter_bank`
+# (the exact function vLLM's ParakeetExtractor calls) AND against librosa's
+# float32 bank (what HF's own ParakeetFeatureExtractor uses), then the full
+# `input_features` against a dump of ParakeetFeatureExtractor.__call__ on a fixed
+# waveform. Fixture COMMITTED (228 KiB), so it runs in CI with no download
+# (scripts/mm/p4_parakeet_extractor_ref.py). CPU-only.
+vllm_cpp_add_test(test_parakeet_audio_processor
+  vllm/multimodal/test_parakeet_audio_processor.cpp)
+target_compile_definitions(test_parakeet_audio_processor PRIVATE
+  MM_PARAKEET_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/parakeet_audio")
+# P4 — the ParakeetEncoder/ParakeetForCTC MODULE gate: the forward vs an
+# INDEPENDENT in-test scalar reference written from the transformers definition
+# (and performing `_rel_shift` LITERALLY, so agreement is evidence for
+# vt::AttentionRelPos's closed form). No fixture, no checkpoint, CPU-only.
+vllm_cpp_add_test(test_parakeet_encoder vllm/models/test_parakeet_encoder.cpp)
+# P4 — the e2e gate: the whole encoder + CTC head + greedy collapse vs a dumped
+# HuggingFace `ParakeetForCTC` ORACLE (transformers 5.3.0 — the module vLLM
+# itself runs). Stage-by-stage rel-L2 plus EXACT greedy and collapsed token ids.
+# The oracle is a small SEEDED, RANDOMLY-INITIALISED model, not a pretrained
+# checkpoint, so the gate is on logits and ids and never on a transcript; the
+# pretrained-checkpoint arm is the separate VLLM_PARAKEET_CKPT case, skipped
+# when unset. Fixture COMMITTED (464 KiB, scripts/mm/p4_parakeet_oracle_dump.py).
+vllm_cpp_add_test(test_parakeet_ctc_engine vllm/models/test_parakeet_ctc_engine.cpp)
+target_compile_definitions(test_parakeet_ctc_engine PRIVATE
+  PARAKEET_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet")
+
+# ARCH-ONE-SURFACE ROW 1 fold gate: the library transcription seam
+# (ParakeetTranscriber) byte-identical to the PRE-refactor example pipeline
+# AND to the committed goldens captured from the pre-refactor binary; plus the
+# registry refuse-by-task contract. Fixture committed
+# (scripts/mm/parakeet_e2e_fixture_gen.py).
+vllm_cpp_add_test(test_parakeet_transcription_fold
+  vllm/models/test_parakeet_transcription_fold.cpp)
+target_compile_definitions(test_parakeet_transcription_fold PRIVATE
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
+# P5: the RNN-T / TDT TRANSDUCER gate: the LSTM prediction network, the joint
+# (with the TDT duration head) and the greedy transducer loop vs a dumped
+# HuggingFace `ParakeetForRNNT` / `ParakeetForTDT` ORACLE from transformers
+# `main`: which DOES implement them, contrary to what the P4 spike recorded off
+# the locally installed 5.3.0. Decoder and joint tensors by rel-L2; the emitted
+# sequence and the per-step durations EXACT. Also gates the LSTM cell against an
+# independent in-test scalar reference. The oracle is a small SEEDED,
+# RANDOMLY-INITIALISED model, so nothing is claimed about a transcript; the
+# pretrained arm (VLLM_PARAKEET_TRANSDUCER_CKPT + _REF) gates ids against a real
+# `generate()` run and is skipped when unset. Fixture COMMITTED (1.1 MiB,
+# scripts/mm/p5_parakeet_transducer_oracle_dump.py). CPU-only.
+vllm_cpp_add_test(test_parakeet_transducer vllm/models/test_parakeet_transducer.cpp)
+target_compile_definitions(test_parakeet_transducer PRIVATE
+  PARAKEET_TRANSDUCER_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_transducer")
 # M3d — NEAR-TIE-ROBUST e2e VIDEO->text token gate on the Qwen3.6-27B GDN-hybrid
 # gate model: the full pipeline (video processor -> tower per-frame windowed attn,
 # 27B vision config -> merge -> forked GDN-hybrid video MRoPE greedy decode) vs the
@@ -384,6 +547,9 @@ vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 # vllm#49343 eagle-draft max_position_embeddings clamp (config/speculative.h).
 vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
   vllm/config/test_speculative_draft_max_position_embeddings.cpp)
+# SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
+# lookahead slots, draft identity).
+vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)
@@ -461,6 +627,7 @@ target_compile_definitions(test_chat_mm PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
+vllm_cpp_add_test(test_sse_keepalive vllm/entrypoints/openai/test_sse_keepalive.cpp)
 vllm_cpp_add_test(test_openai_run_batch
   vllm/entrypoints/openai/test_run_batch.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream
@@ -565,6 +732,10 @@ vllm_cpp_add_test(test_tool_parser_gemma4
   vllm/entrypoints/openai/tool_parsers/test_gemma4.cpp)
 vllm_cpp_add_test(test_tool_parser_seed_oss
   vllm/entrypoints/openai/tool_parsers/test_seed_oss.cpp)
+vllm_cpp_add_test(test_tool_parser_muse_glimmer
+  vllm/entrypoints/openai/tool_parsers/test_muse_glimmer_tool_parser.cpp)
+vllm_cpp_add_test(test_reasoning_muse_glimmer
+  vllm/entrypoints/openai/reasoning_parsers/test_muse_glimmer_reasoning_parser.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
 # The real Qwen3.5 chat template (extracted from the GGUF) lives under
 # tests/fixtures/; hand its absolute path to the test so it resolves regardless
@@ -574,6 +745,15 @@ target_compile_definitions(test_chat_template PRIVATE
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
+  # library transcription seam on the committed parakeet_e2e fixture
+  # (ARCH-ONE-SURFACE ROW 1).
+  target_compile_definitions(test_openai_api_server PRIVATE
+    PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
+    # /v1/embeddings dispatch + socket smoke run against the REAL engine path
+    # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
+    # (ARCH-ONE-SURFACE ROW 6).
+    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
@@ -601,6 +781,10 @@ target_include_directories(test_bench PRIVATE ${CMAKE_SOURCE_DIR}/examples/bench
 # engine via the internal MakeEngineHandle hook (reached under src/).
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_capi PRIVATE
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
@@ -646,6 +830,24 @@ vllm_cpp_add_test(test_backend vt/test_backend.cpp)
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
 # exactness checks) on a plain CPU build.
 vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
+# The ROCm GCN-arch capability parse (BACKEND-ROCM W0). UNCONDITIONAL by design:
+# include/vt/rocm/rocm_arch.h is deliberately free of HIP headers so the one part
+# of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
+# AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
+vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+vllm_cpp_add_test(test_triton_aot_arch_dispatch
+  vt/test_triton_aot_arch_dispatch.cpp)
+target_include_directories(test_triton_aot_arch_dispatch PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_cpu_isa_x86 vt/test_cpu_isa_x86.cpp)
+target_include_directories(test_cpu_isa_x86 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_cpu_isa_arm vt/test_cpu_isa_arm.cpp)
+target_include_directories(test_cpu_isa_arm PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(VLLM_CPP_HIP)
+  # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
+  # case no-ops when the build has HIP but the box has no AMD GPU.
+  vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
 endif()
@@ -656,6 +858,13 @@ if(VLLM_CPP_VULKAN)
   # COMMITTED SPIR-V table and the probed float-controls. Same escape hatch
   # test_model_registry already uses above.
   target_include_directories(test_vulkan_backend PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
+if(VLLM_CPP_TENSTORRENT)
+  # Plain C++ (no ttnn/tt-metal header): every assertion goes through the
+  # public vt:: seam, same rationale as test_vulkan_backend.cpp's own comment.
+  # Each case SKIPS (not fails) when the build has the backend compiled in but
+  # the box has no Blackhole card.
+  vllm_cpp_add_test(test_tenstorrent_backend vt/test_tenstorrent_backend.cpp)
 endif()
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 # BACKEND-ACCEL-PROVIDER: the acceleration-provider seam (include/vt/op_provider.h)
@@ -681,6 +890,13 @@ target_link_libraries(test_communicator PRIVATE Threads::Threads)
 # W1 CPU communicator; RED-first (a dropped all-reduce is the wrong partial).
 vllm_cpp_add_test(test_tp_forward vt/test_tp_forward.cpp)
 target_link_libraries(test_tp_forward PRIVATE Threads::Threads)
+# BACKEND-DISTRIBUTED-TP TP-W1 (tensor-parallelism-spike.md §S4): the rank-layout
+# group math == vLLM's arange(world).reshape(...).view(-1, tp) (an independent
+# reshape oracle in-test), + tp=1 inertness + the thread-local current-rank
+# accessors. Pure integer math; uses std::thread only for the thread_local
+# isolation check.
+vllm_cpp_add_test(test_parallel_layout vllm/distributed/test_parallel_layout.cpp)
+target_link_libraries(test_parallel_layout PRIVATE Threads::Threads)
 # Scale-out W2 multi-device backend registry: Device{type,index} addressability
 # and the byte-neutral device-0 proof (a second backend at index 1 leaves index 0
 # and the type-level API identical). Hardware-free (a fake backend on kXPU).
@@ -752,6 +968,11 @@ target_include_directories(test_gdn_packed_reg_tile PRIVATE ${CMAKE_SOURCE_DIR}/
 # src/vt/cuda/cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h{48,32}).
 vllm_cpp_add_test(test_gdn_packed_decode_triton vt/test_gdn_packed_decode_triton.cpp)
 target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the opt-in fused-GDN decode BV16 value tile. Reaches
+# the CUDA-free selector/geometry header under src/; the executing kernel lives
+# in cuda_gdn.cu and is covered by same-process byte-exact CUDA comparisons.
+vllm_cpp_add_test(test_gdn_decode_fused vt/test_gdn_decode_fused.cpp)
+target_include_directories(test_gdn_decode_fused PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load
 # fast-path flags (VT_FP4_QUANT_FAST + VT_SILU_FP4_FAST, both default OFF /
 # '1'-opt-in). Reaches the internal header under src/ (not public API); the
@@ -858,6 +1079,10 @@ if(VLLM_CPP_TRITON)
     COMMAND test_ops_gdn
       "--test-case=CUDA gdn Triton AOT concurrent first load is safe across two queues")
 endif()
+vllm_cpp_add_test(test_ops_kda_recurrence vt/test_ops_kda_recurrence.cpp)
+target_include_directories(test_ops_kda_recurrence PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_kda_chunk_prefill vt/test_ops_kda_chunk_prefill.cpp)
+target_include_directories(test_ops_kda_chunk_prefill PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
@@ -886,6 +1111,20 @@ vllm_cpp_add_test(test_ops_mla_absorb vt/test_ops_mla_absorb.cpp)
 vllm_cpp_add_test(test_mla_attention_block
   vllm/model_executor/layers/attention/test_mla_attention_block.cpp)
 vllm_cpp_add_test(test_ops_moe_router_grouped vt/test_ops_moe_router_grouped.cpp)
+# Conformer / FastConformer audio-encoder kernels (spike
+# .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Each gate is
+# BYTE-IDENTITY against an INDEPENDENT in-test scalar reference (never against
+# the kernel), across dtype x shape x thread count, matching the
+# test_ops_matmul_elem.cpp discipline. The relpos-attention reference performs
+# the upstream `_rel_shift` LITERALLY, so byte-identity is what proves the
+# kernel's closed-form index. They reach src/ for the threadpool test hook
+# (Threadpool::SwapForTesting) used by the determinism cases. CPU-only.
+vllm_cpp_add_test(test_ops_conv2d vt/test_ops_conv2d.cpp)
+target_include_directories(test_ops_conv2d PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_conv1d_depthwise vt/test_ops_conv1d_depthwise.cpp)
+target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
+target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)
@@ -915,6 +1154,16 @@ target_compile_definitions(test_tokenizer_parity_deepseek PRIVATE
 # is what unblocks the Mistral paged-engine SACRED gate.
 vllm_cpp_add_test(test_tokenizer_parity_mistral vllm/test_tokenizer_parity_mistral.cpp)
 target_compile_definitions(test_tokenizer_parity_mistral PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
+# TOK-LLAMA4-PRE (issue #347) — the GPT-4o / o200k tokenizer parity gate. This
+# family is what a GGUF tags `tokenizer.ggml.pre = "llama4"` (Muse Glimmer 30B).
+# It shares kLlama3's `\p{N}{1,3}` digit grouping but splits CamelCase and keeps
+# the contraction as a word suffix, so an alias would mistokenize silently —
+# only comparing IDS against HF `tokenizers` catches that, which is what this
+# gate does.
+vllm_cpp_add_test(test_tokenizer_parity_gpt4o vllm/test_tokenizer_parity_gpt4o.cpp)
+target_compile_definitions(test_tokenizer_parity_gpt4o PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
@@ -1089,6 +1338,12 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.
+# Synthetic (no checkpoint, no GPU) BECAUSE test_qwen27_paged_engine runs the
+# unsloth @890bdef7 snapshot, whose head is BF16 — that gate cannot see this path.
+vllm_cpp_add_test(test_qwen27_dense_lmhead_fp4
+  parity/test_qwen27_dense_lmhead_fp4.cpp)
+
 # SPEC-DFLASH D2 — the DFlash draft-forward parity gate vs the dumped vLLM DFlash
 # draft reference (fc combine + context-free block forward per-stage hidden +
 # proposed ids). GPU + z-lab-draft + NVFP4-target + fixture gated (skips on CPU/CI).
@@ -1157,6 +1412,8 @@ target_include_directories(test_qwen27_spec_decode_concurrent PRIVATE
 # battery through the paged engine and checks per-(prompt,pos) set membership vs
 # the vLLM 0.25.0 oracle's K-run greedy set (STRICT where vLLM is deterministic).
 # Checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot/goldens are absent.
+vllm_cpp_add_test(test_moe_two_engines vllm/models/test_moe_two_engines.cpp)
+target_include_directories(test_moe_two_engines PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3coder_paged_engine vllm/models/test_qwen3coder_paged_engine.cpp)
 target_compile_definitions(test_qwen3coder_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
@@ -1214,6 +1471,9 @@ target_include_directories(test_mistral_paged_engine PRIVATE
 # 0 multi-valued cells). Checkpoint-gated, dgx-only.
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
   vllm/models/test_qwen3_32b_nvfp4a16_load.cpp)
+
+vllm_cpp_add_test(test_qwen3_5_lm_head_dtypes
+  vllm/models/test_qwen3_5_lm_head_dtypes.cpp)
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine
   vllm/models/test_qwen3_32b_nvfp4a16_paged_engine.cpp)
 target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE

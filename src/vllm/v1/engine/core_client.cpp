@@ -14,9 +14,10 @@ namespace vllm::v1 {
 
 InprocClient::InprocClient(Scheduler& scheduler, Executor& executor,
                            StructuredOutputManager* structured_output_manager,
-                           int max_concurrent_batches, int shutdown_timeout_s)
+                           int max_concurrent_batches, int shutdown_timeout_s,
+                           bool check_for_draft_tokens)
     : proc_(scheduler, executor, structured_output_manager,
-            max_concurrent_batches, shutdown_timeout_s) {
+            max_concurrent_batches, shutdown_timeout_s, check_for_draft_tokens) {
   // The in-proc analog of launching the background engine process
   // (core_client.py launch_core_engines -> core.py:1154 run_engine_core):
   // one dedicated thread runs the busy loop under the fatal-error guard —
@@ -71,6 +72,23 @@ void InprocClient::add_request_async(std::unique_ptr<Request> request) {
     item.enqueue_ts = MonotonicSeconds();
   }
   proc_.input_queue.put_nowait(std::move(item));
+}
+
+void InprocClient::add_requests_async(
+    std::vector<std::unique_ptr<Request>> requests) {
+  if (requests.empty()) return;
+
+  std::vector<EngineCoreInputItem> items;
+  items.reserve(requests.size());
+  static const bool kLoopTrace = std::getenv("VT_LOOP_TRACE") != nullptr;
+  for (std::unique_ptr<Request>& request : requests) {
+    EngineCoreInputItem item;
+    item.type = EngineCoreRequestType::kAdd;
+    item.request = std::move(request);
+    if (kLoopTrace) item.enqueue_ts = MonotonicSeconds();
+    items.push_back(std::move(item));
+  }
+  PublishEngineCoreInputWaveAtomically(proc_.input_queue, std::move(items));
 }
 
 void InprocClient::abort_requests_async(

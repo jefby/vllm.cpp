@@ -12,12 +12,15 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   dgx-online-serving.sh --dry-run [--claim-root DIR] [--client PATH] [--vllm-cpp-sha SHA]
-  dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
+  dgx-online-serving.sh --prepare-corpus --model 27|27n|35 --source-corpus DIR --evidence DIR
   dgx-online-serving.sh --trace-only --model 27 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N] \
     [--trace-concurrency 2|16] [--gdn-ba-mode both] [--gdn-packed-mode both]
-  dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
+  dgx-online-serving.sh --execute --model 27|27n|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
+  dgx-online-serving.sh --startup-only --model 27|27n|35|q3mxfp4 --snapshot DIR \
+    --source-corpus DIR --evidence DIR --build-dir DIR --configure-log FILE \
+    [--client PATH] [--port N]
 EOF
 }
 
@@ -38,10 +41,16 @@ max_num_batched_tokens=""
 trace_concurrency=16
 gdn_ba_mode=""
 gdn_packed_mode=""
+# Readiness cadence. 0.2 s resolves a startup of a few tens of seconds to well
+# under 1%; the previous 5 s cadence was itself ~12% of the measured quantity,
+# which is why launch->ready was never a reportable number. The 1800 s budget is
+# the old 360 x 5 s timeout, preserved exactly.
+ready_poll_interval=0.2
+ready_timeout_seconds=1800
 
 while (($#)); do
   case "$1" in
-    --dry-run|--prepare-corpus|--trace-only|--execute)
+    --dry-run|--prepare-corpus|--trace-only|--execute|--startup-only)
       [[ -z ${mode} ]] || { echo "choose exactly one mode" >&2; exit 2; }
       mode=${1#--}
       shift
@@ -98,11 +107,15 @@ if [[ ${mode} == dry-run ]]; then
   exit 0
 fi
 
-[[ ${model} == 27 || ${model} == 35 ]] || { echo "--model must be 27 or 35" >&2; exit 2; }
-if [[ ${model} == 27 ]]; then
-  max_num_batched_tokens=2048
-else
+[[ ${model} == 27 || ${model} == 27n || ${model} == 35 || ${model} == q3mxfp4 ]] || {
+  echo "--model must be 27, 27n, 35 or q3mxfp4" >&2; exit 2; }
+# 35B MoE prefills a wider chunk; the 27B NVFP4 dense arms (27 = unsloth,
+# 27n = nvidia/ModelOpt) and the q3mxfp4 MXFP4 dense 8B all use the dense 2048
+# batched-token gate value.
+if [[ ${model} == 35 ]]; then
   max_num_batched_tokens=8192
+else
+  max_num_batched_tokens=2048
 fi
 [[ -n ${evidence} ]] || { echo "--evidence is required" >&2; exit 2; }
 [[ -n ${source_corpus} ]] || { echo "--source-corpus is required" >&2; exit 2; }
@@ -128,14 +141,18 @@ if [[ ${mode} == prepare-corpus ]]; then
   exit 0
 fi
 
-[[ ${mode} == execute || ${mode} == trace-only ]] || { usage; exit 2; }
+[[ ${mode} == execute || ${mode} == trace-only || ${mode} == startup-only ]] || { usage; exit 2; }
 # The H1d-era unconditional --execute hold was LIFTED 2026-07-15: its stated
 # precondition (H1d/G4 complete; separate production and trace builds) was met
 # on 2026-07-13, and the W1D3 closure (b80663a) authorized the fresh
 # binding/exact-grid rerun. Timed grids still require a production
 # (profile-control-OFF) build via the recorded configure contract.
+# The refusal below is about WHICH CHECKPOINT, not which architecture: 27n is a
+# Qwen3.6-27B dense graph too. TRACE_PRIMARY_GRAPH_CONTRACTS holds node and
+# kernel-family counts captured on the unsloth @890bdef7 27B alone, so no other
+# key has a contract to validate a trace against.
 if [[ ${mode} == trace-only && ${model} != 27 ]]; then
-  echo "H1d trace-only control is defined only for the Qwen3.6-27B dense graph; 35B performance remains held" >&2
+  echo "H1d trace-only control is defined only for the unsloth Qwen3.6-27B NVFP4 checkpoint (--model 27), the only key with captured graph contracts; 35B performance remains held" >&2
   exit 2
 fi
 if [[ ${mode} == trace-only && ${trace_concurrency} != 2 && ${trace_concurrency} != 16 ]]; then
@@ -173,7 +190,13 @@ fi
 python3 "${repo_root}/tools/bench/online_gate.py" validate-plan \
   "${evidence}/manifest.json" \
   --vllm-cpp-sha "${vllm_cpp_sha}" >/dev/null
-prepare_corpus
+if [[ ${mode} == startup-only ]]; then
+  # No timed request is issued, so no corpus is built; the directory still has
+  # to exist because the cache-drop inventory is a fixed four-root artifact.
+  mkdir -p "${source_corpus}"
+else
+  prepare_corpus
+fi
 
 # The execution manifest validates this environment before the GPU lock.  Run
 # every model-bearing command from a fixed allowlist instead of inheriting an
@@ -221,10 +244,26 @@ if [[ ${mode} == trace-only ]]; then
 else
   execution_manifest="${execution_dir}/${model}.json"
 fi
-if [[ ${model} == 27 ]]; then
+if [[ ${model} == 27 || ${model} == 27n ]]; then
+  # Both dense 27B arms precondition on the same paged-engine suite, whose
+  # committed goldens are the unsloth @890bdef7 checkpoint's -- so for 27n this
+  # is BUILD SANITY, not a golden for @0893e160, and a 27n correctness claim
+  # additionally owes a greedy continuation against the pinned oracle there.
+  # This comment is NOT the record: record-model-gate writes golden_revision,
+  # model_revision and golden_covers_benched_checkpoint into
+  # preflight/model-gate/<key>.json and the summary revalidates them.
   test_name=test_qwen27_paged_engine
-else
+  gate_target=${test_name}
+elif [[ ${model} == 35 ]]; then
   test_name=test_qwen36_paged_engine
+  gate_target=${test_name}
+else
+  # q3mxfp4 (MXFP4 W4A16 keep-quant dense 8B) has no committed npy near-tie
+  # paged-engine golden; its correctness precondition is the #44 MXFP4 e2e smoke
+  # battery (vllm-cli greedy vs docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json),
+  # so the model gate builds + runs vllm-cli instead of a ctest binary.
+  test_name=mxfp4_smoke_battery
+  gate_target=vllm-cli
 fi
 cmake_home=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${build_dir}/CMakeCache.txt")
 [[ -n ${cmake_home} && $(realpath -e "${cmake_home}") == "$(realpath -e "${repo_root}")" ]] || {
@@ -246,9 +285,15 @@ build_log="${execution_dir}/${model}-build.log"
   exit 1
 }
 build_jobs=$(nproc)
+# --startup-only runs no model gate (it compares no token), so the gate binary
+# is not built: on a full box that target is pure disk and wall-clock cost.
+build_targets=(server)
+if [[ ${mode} != startup-only ]]; then
+  build_targets+=("${gate_target}")
+fi
 build_cmd=(
   cmake --build "${build_dir}"
-  --target server "${test_name}"
+  --target "${build_targets[@]}"
   --parallel "${build_jobs}"
 )
 printf '%q ' "${build_cmd[@]}" >"${build_command}"
@@ -257,8 +302,18 @@ if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then
   cat "${build_log}" >&2
   exit 1
 fi
-[[ -x ${build_dir}/examples/server ]] || {
-  echo "provenance-recorded build did not produce examples/server" >&2
+# The `server` target's OUTPUT_NAME became `vllm-server` when the release
+# packaging landed (examples/CMakeLists.txt, W6), so a current build tree has no
+# `examples/server`. Resolve the new name first and keep the old one as a
+# fallback so an evidence tree built before that rename still replays.
+server_bin="${build_dir}/examples/vllm-server"
+[[ -x ${server_bin} ]] || server_bin="${build_dir}/examples/server"
+[[ -x ${server_bin} ]] || {
+  echo "provenance-recorded build did not produce examples/vllm-server (nor the pre-rename examples/server)" >&2
+  exit 1
+}
+[[ ${model} != q3mxfp4 || -x ${build_dir}/examples/vllm-cli ]] || {
+  echo "provenance-recorded build did not produce examples/vllm-cli" >&2
   exit 1
 }
 # Timed grids record the production (profile-control-OFF) build; the H1d
@@ -285,6 +340,8 @@ profile_control_flag=$([[ ${mode} == trace-only ]] && echo on || echo off)
 
 spid=""
 mpid=""
+startup_launch_epoch=""
+startup_ready_epoch=""
 profiled_pid=""
 profiled_pgid=""
 cleanup_server() {
@@ -340,14 +397,17 @@ drop_caches() {
   python3 -m tools.bench.drop_file_cache \
     --root "${snapshot}" \
     --root "${source_corpus}" \
-    --root "${build_dir}/examples/server" \
+    --root "${server_bin}" \
     --root "${client}" \
     --output "${output}"
 }
 
 wait_ready() {
   local log=$1
-  for _ in $(seq 1 360); do
+  local deadline
+  deadline=$(awk -v now="$(date +%s.%N)" -v budget="${ready_timeout_seconds}" \
+    'BEGIN{printf "%.3f", now + budget}')
+  while :; do
     if curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       return 0
     fi
@@ -356,7 +416,11 @@ wait_ready() {
       tail -n 80 "${log}" >&2 || true
       return 1
     fi
-    sleep 5
+    if awk -v now="$(date +%s.%N)" -v deadline="${deadline}" \
+      'BEGIN{exit !(now > deadline)}'; then
+      break
+    fi
+    sleep "${ready_poll_interval}"
   done
   echo "server readiness timed out" >&2
   return 1
@@ -375,7 +439,7 @@ start_server() {
   local -a server_cmd
   if [[ ${engine} == ours ]]; then
     server_cmd=(
-      "${build_dir}/examples/server"
+      "${server_bin}"
       --model "${snapshot}"
       --port "${port}"
       --num-blocks "${num_blocks}"
@@ -383,6 +447,22 @@ start_server() {
       --max-num-batched-tokens "${max_num_batched_tokens}"
       --no-enable-prefix-caching
       --served-model-name gate
+    )
+  elif [[ ${model} == q3mxfp4 ]]; then
+    # MXFP4 dense 8B oracle. On sm_121 GB10 the default FlashInfer cute-dsl mxf4
+    # backend aborts engine start (BackendSupportedError mm_fp4 cap 121), so we
+    # force the Marlin W4A16 keep-quant kernel our arm mirrors. Dense Qwen3 has no
+    # mamba SSM state, so the hybrid-only SSM cache-dtype flag is omitted here.
+    server_cmd=(
+      env "PATH=$(dirname "${client}"):${PATH}"
+      "VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel"
+      "${client}" serve "${snapshot}"
+      --served-model-name gate
+      --gpu-memory-utilization 0.6
+      --max-num-seqs "${max_num_seqs}"
+      --max-num-batched-tokens "${max_num_batched_tokens}"
+      --no-enable-prefix-caching
+      --port "${port}"
     )
   else
     server_cmd=(
@@ -399,6 +479,12 @@ start_server() {
   fi
   printf '%q ' "${server_cmd[@]}" >"${command_file}"
   printf '\n' >>"${command_file}"
+  # The launch stamp is taken immediately before the spawn so nothing else is
+  # attributed to startup. The memory sampler below IS inside the measured
+  # window, but it is launched identically on both arms, so it cancels in the
+  # ratio; only the absolute number carries its (sub-100 ms) cost.
+  local startup_status=0
+  startup_launch_epoch=$(date +%s.%N)
   setsid "${server_cmd[@]}" >"${log}" 2>&1 &
   spid=$!
   python3 "${repo_root}/tools/bench/sample_process_memory.py" \
@@ -407,7 +493,59 @@ start_server() {
     --interval 0.1 \
     --include-gpu >"${memory_dir}/r${repetition}.summary.json" &
   mpid=$!
-  wait_ready "${log}"
+  wait_ready "${log}" || startup_status=$?
+  startup_ready_epoch=$(date +%s.%N)
+  return "${startup_status}"
+}
+
+startup_elapsed_seconds() {
+  awk -v ready="${startup_ready_epoch}" -v launch="${startup_launch_epoch}" \
+    'BEGIN{printf "%.3f", ready - launch}'
+}
+
+# One cold launch->ready measurement. No timed client runs: the axis is server
+# lifecycle, and paying for a full bench grid to read a startup number would
+# make the measurement cost hours instead of minutes. Both arms go through the
+# SAME start_server, so the launched commands are the grid's verbatim.
+run_startup_leg() {
+  local engine=$1 repetition=$2
+  local memory_dir="${evidence}/startup-memory/${model}/${engine}"
+  local cache_dir="${evidence}/startup-cache-drop/${model}/${engine}"
+  local startup_dir="${evidence}/startup/${model}/${engine}"
+  local before_cache="${cache_dir}/r${repetition}-before.json"
+  local idle_ok=0 elapsed
+  mkdir -p "${memory_dir}" "${cache_dir}" "${startup_dir}"
+
+  gpu_idle || {
+    echo "GPU is not idle before startup ${model}/${engine}/r${repetition}" >&2
+    return 1
+  }
+  drop_caches "${before_cache}"
+  start_server "${engine}" "${repetition}" "${memory_dir}"
+  elapsed=$(startup_elapsed_seconds)
+  cleanup_server
+
+  for _ in $(seq 1 120); do
+    if gpu_idle; then
+      idle_ok=1
+      break
+    fi
+    sleep 1
+  done
+  ((idle_ok == 1)) || {
+    echo "GPU did not return after startup ${model}/${engine}/r${repetition}" >&2
+    return 1
+  }
+  python3 "${repo_root}/tools/bench/online_gate.py" record-startup \
+    --output "${startup_dir}/r${repetition}.json" \
+    --engine "${engine}" \
+    --model-key "${model}" \
+    --repetition "${repetition}" \
+    --elapsed-seconds "${elapsed}" \
+    --poll-interval-seconds "${ready_poll_interval}" \
+    --probe-url "http://127.0.0.1:${port}/health" \
+    --cache-drop-report "${before_cache}"
+  echo "startup ${model}/${engine}/r${repetition}: ${elapsed}s" >&2
 }
 
 run_leg() {
@@ -436,8 +574,13 @@ run_leg() {
     --minimum-spread 0.05 \
     --output "${preflight_dir}/r${repetition}-stream.json"
 
+  # q3mxfp4 (MXFP4 W4 row) is scoped to the low-concurrency decode regime; the
+  # NVFP4 gate models sweep the full six points. Kept in lockstep with
+  # online_gate.points_for so the summary never flags a missing result group.
+  local concurrency_points="1 2 4 8 16 32"
+  [[ ${model} == q3mxfp4 ]] && concurrency_points="1 2 4 8"
   local concurrency
-  for concurrency in 1 2 4 8 16 32; do
+  for concurrency in ${concurrency_points}; do
     kill -0 "${spid}" 2>/dev/null || {
       echo "server died before c${concurrency}" >&2
       return 1
@@ -565,13 +708,17 @@ run_paired_traces() {
     done
     mkfifo --mode=600 "${shutdown_fifo}"
     local -a server_cmd=(
-      "${build_dir}/examples/server"
+      "${server_bin}"
       --model "${snapshot}"
       --port "${port}"
       --num-blocks "${num_blocks}"
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"
-      --max-model-len 262144
+      # No --max-model-len: the KV pool here is num_blocks x 32 tokens
+      # (4736 x 32 = 151552), so a pinned 262144 asked for four times the
+      # context the pool could ever hold and is now refused at startup by the
+      # KV sizing check. Leaving it unset auto-fits the serving length to the
+      # pool, which is the length this server could actually serve either way.
       --no-enable-prefix-caching
       --cuda-profile-graph-replays 4
     )
@@ -904,6 +1051,27 @@ exec 9>/tmp/gpu
 flock 9
 gpu_idle || { echo "GPU has a compute owner after acquiring /tmp/gpu" >&2; exit 1; }
 
+# --startup-only measures ONE axis: cold launch -> first /health, interleaved
+# ours/vLLM under this single lock. It deliberately skips the token model gate
+# and the timed grid: no generated token is compared and no throughput number is
+# produced, so neither is a precondition for it (and running the gate here would
+# collide with a real grid's gate evidence in the same root).
+if [[ ${mode} == startup-only ]]; then
+  # Loop variable is deliberately NOT the grid's `repetition`: the --execute
+  # contract test anchors on that exact loop header to isolate the timed tail.
+  for startup_repetition in 1 2 3; do
+    run_startup_leg ours "${startup_repetition}"
+    run_startup_leg vllm "${startup_repetition}"
+  done
+  python3 "${repo_root}/tools/bench/online_gate.py" summarize-startup \
+    --evidence "${evidence}" \
+    --model-key "${model}" \
+    --repetitions 1 2 3 \
+    --output "${evidence}/startup/${model}/summary.json"
+  cat "${evidence}/startup/${model}/summary.json"
+  exit 0
+fi
+
 gate_dir="${evidence}/preflight/model-gate"
 gate_log="${gate_dir}/${model}.log"
 gate_status="${gate_dir}/${model}.json"
@@ -912,8 +1080,24 @@ mkdir -p "${gate_dir}"
   echo "refusing to overwrite model-gate evidence for ${model}" >&2
   exit 1
 }
-if ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
-  ctest --test-dir "${build_dir}" -R "^${test_name}$" --output-on-failure \
+if [[ ${model} == q3mxfp4 ]]; then
+  # MXFP4 correctness precondition = the #44 e2e smoke battery (default config,
+  # async ON + the classic-dense device-mirror fix). vllm-cli links vllm::shared
+  # (build-tree RPATH) and needs the operator CUDA environment, so it runs in the
+  # script shell rather than the ultra-clean measurement env used for timed legs.
+  if ! python3 "${repo_root}/tools/bench/mxfp4_smoke_gate.py" \
+    --vllm-cli "${build_dir}/examples/vllm-cli" \
+    --snapshot "${snapshot}" \
+    --golden "${repo_root}/docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json" \
+    >"${gate_log}" 2>&1; then
+    cat "${gate_log}" >&2
+    exit 1
+  fi
+# -V, not just --output-on-failure: a checkpoint-gated parity test emits a loud
+# SKIP MESSAGE and returns 0, so a PASSING run must also land its own output in
+# the log, or record-model-gate cannot tell a real gate from a skipped one.
+elif ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
+  ctest --test-dir "${build_dir}" -R "^${test_name}$" -V --output-on-failure \
   >"${gate_log}" 2>&1; then
   cat "${gate_log}" >&2
   exit 1

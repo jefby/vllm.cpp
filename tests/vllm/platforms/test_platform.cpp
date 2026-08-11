@@ -15,6 +15,7 @@
 
 using vllm::platforms::CurrentPlatform;
 using vllm::platforms::DeviceCapability;
+using vllm::platforms::FindPlatformByName;
 using vllm::platforms::GetPlatform;
 using vllm::platforms::HasPlatform;
 using vllm::platforms::Platform;
@@ -67,6 +68,23 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK(cpu.is_unified_memory());
   CHECK(cpu.needs_weight_staging() != cpu.is_unified_memory());
 
+  // ISSUE #125 REGRESSION GUARD: `needs_weight_staging()` is NOT "am I a device".
+  //
+  // qwen3_5.cpp aliased host weight bytes into a device-tagged tensor whenever
+  // `!needs_weight_staging()`, reasoning that only a non-device would skip
+  // staging. That is true of CUDA and false of every OTHER device backend, which
+  // all inherit the base `false` -- so Vulkan, Metal and XPU were handed HOST
+  // pointers and died on the first native kernel. The correct predicate for
+  // "may I alias host memory" is `is_cpu()`.
+  //
+  // This pins the two properties that make the distinction real, so the shape of
+  // the bug cannot come back silently:
+  //   * on CPU the two predicates AGREE (alias is correct either way), and
+  //   * the base default for a non-CPU platform does NOT stage, which is exactly
+  //     why the old predicate misclassified every non-CUDA device.
+  CHECK(cpu.is_cpu());
+  CHECK(cpu.is_cpu() == !cpu.needs_weight_staging());
+
   // supported_dtypes order (bf16 default fallback first).
   const std::vector<DType> expected{DType::kBF16, DType::kF16, DType::kF32};
   CHECK(cpu.supported_dtypes() == expected);
@@ -85,6 +103,21 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK(cpu.get_attn_backend_priority() == cpu_priority);
 }
 
+TEST_CASE("platform registry resolves canonical names without device-specific callers") {
+  REQUIRE(FindPlatformByName("cpu") != nullptr);
+  CHECK(FindPlatformByName("cpu")->device_type() == DeviceType::kCPU);
+  CHECK(FindPlatformByName("not-a-platform") == nullptr);
+
+  size_t count = 0;
+  const DeviceType* priority = vllm::platforms::CurrentPlatformPriority(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (!HasPlatform(priority[i])) continue;
+    CAPTURE(vt::DeviceTypeName(priority[i]));
+    CHECK(FindPlatformByName(vt::DeviceTypeName(priority[i])) ==
+          &GetPlatform(priority[i]));
+  }
+}
+
 TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") {
   // CurrentPlatform() answers the PROCESS-level "what accelerator is this
   // process on" question (interface.h:104): accelerator-first, CPU fallback. It
@@ -94,8 +127,9 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   // (or the DGX CUDA build) an accelerator IS registered and wins.
   Platform& current = CurrentPlatform();
   const bool has_accelerator =
-      HasPlatform(DeviceType::kCUDA) || HasPlatform(DeviceType::kXPU) ||
-      HasPlatform(DeviceType::kVULKAN) || HasPlatform(DeviceType::kMETAL);
+      HasPlatform(DeviceType::kCUDA) || HasPlatform(DeviceType::kROCM) ||
+      HasPlatform(DeviceType::kXPU) || HasPlatform(DeviceType::kVULKAN) ||
+      HasPlatform(DeviceType::kMETAL);
   if (has_accelerator) {
     // Accelerator-first: the process platform is the accelerator, not CPU.
     CHECK_FALSE(current.is_cpu());
@@ -106,6 +140,32 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   }
   // Device-correct invariant on every tier: the CPU platform is always CPU.
   CHECK(GetPlatform(DeviceType::kCPU).is_cpu());
+}
+
+// The ratchet for the ONE place a new platform is not additive (BACKEND-ROCM W0,
+// found while adding kROCM: the platform registered correctly and would never
+// have been selected, because CurrentPlatform() walks a hardcoded array and no
+// -Werror=switch fires on an array). Two properties, both cheap, both on the
+// CPU tier:
+//   1. EVERY DeviceType appears in the walk. This is the one that would have
+//      caught the omission.
+//   2. CPU is LAST. The walk is accelerator-first by contract; a CPU entry that
+//      drifted earlier would shadow every accelerator behind it.
+TEST_CASE("every DeviceType is in the CurrentPlatform priority walk, CPU last") {
+  size_t count = 0;
+  const DeviceType* priority = vllm::platforms::CurrentPlatformPriority(count);
+  REQUIRE(priority != nullptr);
+  REQUIRE(count == vt::kNumDeviceTypes);
+
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    const DeviceType type = static_cast<DeviceType>(i);
+    bool found = false;
+    for (size_t j = 0; j < count; ++j) {
+      if (priority[j] == type) found = true;
+    }
+    CHECK_MESSAGE(found, "DeviceType missing from the walk: ", vt::DeviceTypeName(type));
+  }
+  CHECK(priority[count - 1] == DeviceType::kCPU);
 }
 
 // A reserved DeviceType with no platform behind it must throw, never hand back a
@@ -173,6 +233,21 @@ TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:441-4
   // the defaults live on the base and the CUDA ANSWERS live in the CUDA leg.
   CHECK_FALSE(sm121.supports_fp8());
   CHECK_FALSE(sm121.cutlass_fp4_supported());
+  // ISSUE #125, THE MISCLASSIFIED CLASS ITSELF. This stub is a NON-CPU platform
+  // that does NOT stage -- exactly the combination Vulkan, Metal and XPU inherit,
+  // and exactly the one `!needs_weight_staging()` mistook for "host memory, safe
+  // to alias". Both predicates are false here, so they DIVERGE, and any code
+  // using the staging flag to decide whether it may alias host bytes is wrong for
+  // every platform shaped like this.
+  //
+  // (CUDA is the other half and cannot be asserted from a CPU build -- CudaPlatform
+  // only compiles into a CUDA one -- but cuda.cpp overrides needs_weight_staging()
+  // to true while is_cpu() stays false, so both predicates route it to UPLOAD and
+  // the qwen3_5.cpp fix cannot change CUDA behaviour.)
+  CHECK_FALSE(sm121.is_cpu());
+  CHECK_FALSE(sm121.needs_weight_staging());
+  CHECK(sm121.is_cpu() == sm121.needs_weight_staging());
+
   CHECK_FALSE(sm121.opaque_attention_op());
   CHECK_FALSE(sm121.support_static_graph_mode());
   // S7 additions default false on the base too (the CUDA ANSWER lives in the leg).

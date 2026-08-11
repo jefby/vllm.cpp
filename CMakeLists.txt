@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.24)
-project(vllm_cpp VERSION 0.0.1 LANGUAGES CXX)
+
+# FIRST, before project() enables a compiler and before anything else can spend
+# minutes getting to a failure that names the wrong thing: an in-source `cmake .`
+# collides every examples/ executable with the source directory it was built
+# from and dies in the linker (issue #85). cmake/InSourceGuard.cmake explains
+# the collision; cmake/InSourceGuardTest.cmake pins when it fires.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+include(InSourceGuard)
+vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+
+project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +38,9 @@ option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
 # deviation, NOT a compute/ML dependency (consistent with the no-pytorch/no-ggml
 # rule).
 option(VLLM_CPP_SERVER "Build the OpenAI HTTP server (needs third_party/httplib/httplib.h)" ON)
+option(VLLM_CPP_LITERAL_STATIC
+  "Link the CPU-only server as a literal static executable (experimental musl release lane only)"
+  OFF)
 if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib/httplib.h")
   message(WARNING "VLLM_CPP_SERVER=ON but third_party/httplib/httplib.h is missing; "
     "disabling the server target. Vendor cpp-httplib to enable it.")
@@ -49,6 +62,33 @@ set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUT
 # and into tests/vt/test_backend_cross_device.cpp during the CUDA regressions it
 # must not touch. So Vulkan is opt-in: -DVLLM_CPP_VULKAN=ON.
 set(VLLM_CPP_VULKAN "AUTO" CACHE STRING "Build the Vulkan backend: ON, OFF, or AUTO (=OFF)")
+# Tri-state like Vulkan/ROCm below (BACKEND-TENSTORRENT W0). AUTO resolves OFF:
+# unlike Vulkan (headers vendored, dlopen at runtime), this backend needs a real
+# external tt-metal install (find_package(TT-NN)/find_package(TT-Metalium), via
+# -DCMAKE_PREFIX_PATH pointing at a built tt-metal's install tree) that nothing
+# on a stock box provides, so probing by default would be a silent no-op
+# everywhere except a developer's own tt-metal checkout.
+set(VLLM_CPP_TENSTORRENT "AUTO" CACHE STRING "Build the Tenstorrent backend: ON, OFF, or AUTO (=OFF)")
+# Tri-state like the three above (BACKEND-ROCM W0). AUTO resolves OFF for the
+# same reason Vulkan's does, plus one specific to this skeleton: it has NEVER
+# BEEN COMPILED by anyone (no AMD GPU on the authoring machine), so AUTO-enabling
+# it wherever /opt/rocm happens to exist would turn a green build red on a
+# machine whose owner asked for nothing. Opt in with -DVLLM_CPP_HIP=ON, which is
+# exactly what a contributor on issue #41 is asked to do first.
+set(VLLM_CPP_HIP "AUTO" CACHE STRING "Build the ROCm/HIP backend: ON, OFF, or AUTO (=OFF)")
+# Target gfx architecture(s), semicolon-separated, e.g. "gfx1100" or
+# "gfx1100;gfx1151". EMPTY (the default) means: pass no --offload-arch at all and
+# let hipcc target the installed GPU. That is the right default for a contributor
+# building on the machine they will run on, which is every case today. The
+# validated set is upstream's HIP_SUPPORTED_ARCHS (vllm/CMakeLists.txt:52 @ pin
+# 555967922); a value outside it configures with a WARNING rather than an error,
+# because a newer ROCm may know an arch that list does not.
+set(VLLM_CPP_HIP_ARCHITECTURES "" CACHE STRING
+  "Target gfx arch(es) for the ROCm backend, e.g. gfx1100 (empty = hipcc default)")
+# ROCm installation prefix. Mirrors upstream's ROCM_PATH (vllm/CMakeLists.txt:54-60)
+# with the same default and the same override, so a TheRock/nightly install in a
+# non-standard prefix is one flag away.
+set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation prefix")
 # The MLX acceleration PROVIDER for the Metal dense GEMM (BACKEND-ACCEL-PROVIDER
 # work row M5, .agents/specs/metal-mlx-reuse-study.md §6.2). Default OFF and
 # deliberately NOT tri-state: unlike a PLATFORM, a provider is a CONFIGURATION
@@ -68,9 +108,13 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 sm_120 board exists on this hardware. See backend-matrix.md
 #                 BACKEND-CUDA-SM120 for exactly what is and is not proven.
 #   120a;121a     same-family FAT binary; builds clean and carries both SASS
-#                 targets. NOTE: incompatible with -DVLLM_CPP_TRITON=ON, because a
-#                 vendored AOT cubin is single-arch (TritonAOT.cmake explains and
-#                 diagnoses this); the portable CUDA kernels cover the fat build.
+#                 targets. VLLM_CPP_TRITON=ON is FINE here (and is the default):
+#                 a vendored AOT cubin is single-arch, but the W2 builder embeds
+#                 EVERY vendored tree and picks one by exact SM at runtime, so
+#                 sm_120a — which has no tree — simply uses the portable CUDA
+#                 kernels. This is what the shipped ten-SM release archive and
+#                 the cuda-fat-gencode CI job build. The single-arch FATAL_ERROR
+#                 in TritonAOT.cmake guards the MAINTAINER regen flow only.
 #   90a           Hopper (H100/H200) — a DIFFERENT family. Single-arch only, and
 #                 PORTABLE-KERNELS-ONLY: all five accelerated features resolve
 #                 DISABLED (we have no Hopper wgmma/TMA kernel body, so no
@@ -93,10 +137,10 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 build-supported — they need a real fp16/non-tensor-core kernel
 #                 body, a scoped follow-up. See backend-matrix.md
 #                 BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and §W10.
-# A cross-FAMILY FAT list (e.g. "90a;121a") resolves its features honestly but
-# does NOT compile — the sources are gencode'd for the whole list, so the sm12x
-# fp4 PTX is rejected on compute_90a; per-source gencode narrowing (spec W7) is
-# what a fat cross-family binary needs. See .agents/specs/cuda-arch-additivity.md.
+# Cross-family fat lists use release-W1 per-source gencode: portable TUs receive
+# every requested target while feature TUs receive their exact feature-table
+# intersection. The ten-SM archive gate below proves both the commands and the
+# linked cubins. See .agents/specs/release-binary-matrix.md W1.
 set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"
@@ -222,6 +266,173 @@ else()
   set(VLLM_CPP_VULKAN OFF)
 endif()
 
+# Resolve the tri-state VLLM_CPP_TENSTORRENT (BACKEND-TENSTORRENT W0). AUTO
+# resolves OFF (see the option's comment above). ON is where detection happens
+# and FAILS LOUDLY rather than silently downgrading to a CPU-only build — the
+# same contract VLLM_CPP_HIP below uses, for the same reason: a contributor who
+# typed -DVLLM_CPP_TENSTORRENT=ON and got a green CPU-only build would have no
+# way to notice the backend was not built.
+if(VLLM_CPP_TENSTORRENT STREQUAL "AUTO")
+  set(VLLM_CPP_TENSTORRENT OFF)
+elseif(VLLM_CPP_TENSTORRENT)
+  find_package(TT-Metalium QUIET)
+  find_package(TT-NN QUIET)
+  if(NOT TT-Metalium_FOUND OR NOT TT-NN_FOUND)
+    message(FATAL_ERROR "VLLM_CPP_TENSTORRENT=ON but TT-Metalium/TT-NN were not "
+      "found. Point -DCMAKE_PREFIX_PATH at a built tt-metal install tree's "
+      "lib64/cmake and share/cmake dirs (both are needed - the latter carries "
+      "nlohmann_json/xtensor), or configure with -DVLLM_CPP_TENSTORRENT=OFF.")
+  endif()
+  set(VLLM_CPP_TENSTORRENT ON)
+else()
+  set(VLLM_CPP_TENSTORRENT OFF)
+endif()
+
+# Resolve the tri-state VLLM_CPP_HIP (BACKEND-ROCM W0). Unlike Vulkan there IS
+# something to detect — a HIP toolchain — but AUTO still resolves OFF (see the
+# option's comment). ON is where detection happens, and it FAILS LOUDLY rather
+# than silently downgrading: a contributor who typed -DVLLM_CPP_HIP=ON and got a
+# green CPU-only build would have no way to notice the backend was not built,
+# which is the exact failure mode the CUTLASS note in docs/BUILD.md exists for.
+if(VLLM_CPP_HIP STREQUAL "AUTO")
+  set(VLLM_CPP_HIP OFF)
+elseif(VLLM_CPP_HIP)
+  # F1/F3 ABSORPTION (issue #41, jimmykarily's gfx1151 findings; layout also
+  # confirmed by arch-btw on gfx1103/TheRock). Arch and TheRock dist layouts
+  # install the compiler at ${ROCM_PATH}/lib/llvm/bin instead of
+  # ${ROCM_PATH}/llvm/bin, so clang's walk-up-from-InstalledDir autodetection
+  # derives the ROCm root as ${ROCM_PATH}/lib and finds neither the HIP headers
+  # (F1) nor the hip-lang CMake package (F3: CMakeDetermineHIPCompiler
+  # hard-fails). The unidentified-compiler fallout also broke the LINKER:
+  # prefix expansion on the --whole-archive link options further down (F2) —
+  # one root cause, three unrelated-looking failures. The report's finding:
+  # ROCM_PATH was advertised by our own FATAL_ERROR below but only ever used
+  # for find_library, so on those layouts the documented flag did not do what
+  # its error message promised.
+  #
+  # Fix: derive the three hints the report set by hand from ROCM_PATH — and
+  # ONLY where unset, so an explicit -DCMAKE_HIP_FLAGS /
+  # -DCMAKE_HIP_COMPILER_ROCM_ROOT / exported HIPFLAGS/ROCM_PATH environment
+  # always wins, and a machine whose ROCM_PATH does not exist on disk (hipcc
+  # found elsewhere on PATH) configures byte-identically to before. On the
+  # standard /opt/rocm layout the values filled are exactly what clang/CMake
+  # autodetect anyway. Upstream vLLM honours ROCM_PATH the same way
+  # (vllm/CMakeLists.txt:54-60 @ pin 555967922). All three must be set BEFORE
+  # check_language/enable_language: the report measured that the ROOT hint
+  # alone regresses the compiler identification, because the identification
+  # try-compile then has no --rocm-path.
+  if(EXISTS "${ROCM_PATH}")
+    # CMake's own ROCm-root probe (F3), consulted by CMakeDetermineHIPCompiler.
+    if(NOT DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
+      set(CMAKE_HIP_COMPILER_ROCM_ROOT "${ROCM_PATH}")
+    endif()
+    # clang's own ROCm-root flag (F1). Rides CMAKE_HIP_FLAGS so the
+    # compiler-identification try-compile sees it too; pre-seeded as the cache
+    # entry enable_language(HIP) would otherwise create empty. Skipped when the
+    # user passed -DCMAKE_HIP_FLAGS or exported HIPFLAGS, which must keep
+    # winning.
+    if(NOT DEFINED CACHE{CMAKE_HIP_FLAGS} AND NOT DEFINED ENV{HIPFLAGS})
+      set(CMAKE_HIP_FLAGS "--rocm-path=${ROCM_PATH}" CACHE STRING
+        "Flags used by the HIP compiler during all build types.")
+    endif()
+    # hipcc/hipconfig read ROCM_PATH from the environment (the mechanism the
+    # report validated: `ROCM_PATH=/opt/rocm hipcc` compiles where bare hipcc
+    # cannot), and the environment also reaches check_language's sub-configure
+    # below, which forwards no cache variables.
+    if(NOT DEFINED ENV{ROCM_PATH})
+      set(ENV{ROCM_PATH} "${ROCM_PATH}")
+    endif()
+  endif()
+  # CMake's own HIP language support (>= 3.21; we require 3.24) understands .hip
+  # sources, which is why upstream calls enable_language(HIP) explicitly rather
+  # than leaning on torch's setup (vllm/CMakeLists.txt:196-202).
+  include(CheckLanguage)
+  check_language(HIP)
+  if(NOT CMAKE_HIP_COMPILER)
+    message(FATAL_ERROR
+      "VLLM_CPP_HIP=ON but no HIP compiler was found.\n"
+      "  Install ROCm (hipcc), or point at it with -DROCM_PATH=<prefix> / "
+      "-DCMAKE_HIP_COMPILER=<path to hipcc>, or configure with -DVLLM_CPP_HIP=OFF.\n"
+      "  Looked with ROCM_PATH=${ROCM_PATH}.")
+  endif()
+  enable_language(HIP)
+  # Matches upstream's CMAKE_HIP_STANDARD 20 (vllm/CMakeLists.txt:20-21). The vt
+  # headers the .hip TUs include are C++20.
+  set(CMAKE_HIP_STANDARD 20)
+  set(CMAKE_HIP_STANDARD_REQUIRED ON)
+  # The same IEEE-as-written pin every other language in this build gets. It is
+  # NOT cosmetic here: tests/vt/test_backend_cross_device.cpp compares this
+  # backend against the CPU kernels at NMSE <= 5e-4, and a contracted multiply-add
+  # in the RmsNorm reduction is exactly the kind of drift that budget is meant to
+  # catch rather than absorb.
+  add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>)
+  # Floor HIP DEVICE code at -O1 when nothing else sets an optimisation level.
+  #
+  # This is not a performance preference, it is a correctness workaround for the
+  # ROCm runtime (issue #132, VikashLoomba, 4x gfx1100 / ROCm 7.14). The
+  # documented first build — `cmake -S . -B build-hip -DVLLM_CPP_HIP=ON`, no
+  # CMAKE_BUILD_TYPE — passes no -O at all, so hipcc compiles at -O0. At -O0 all
+  # eight RmsNorm specialisations come out with AMDHSA metadata
+  # `.uses_dynamic_stack: true` plus `hidden_hostcall_buffer` / `hidden_heap_v1`,
+  # even though the kernel performs no hostcall. That makes CLR create a hostcall
+  # buffer and start a listener thread on the first launch.
+  #
+  # CLR's listener startup/termination handshake is racy (the shared state is
+  # `volatile`, not atomic, and the upstream source still carries its own
+  # `FIXME_lmoriche: fix termination handshake`): under host CPU saturation a
+  # delayed listener can overwrite the `kExit` written by terminate(), and DSO
+  # finalisation then spins forever waiting for a thread that has already exited.
+  # The symptom is `test_backend_cross_device` hanging AFTER printing
+  # `Status: SUCCESS!` — 11/11 cases, 39/39 assertions, then no exit.
+  #
+  # The report's controlled A/B, relinking the same library with ONLY
+  # rocm_rmsnorm.hip.o changed, on a 48-thread host:
+  #   -O0 object (dynamic stack, hidden hostcall + heap): 14/20 teardown timeouts
+  #   -O1 object (no dynamic stack, no hostcall/heap):    20/20 clean exits
+  # The same finaliser loop also reproduces in a standalone raw-HIP program that
+  # links neither vllm.cpp nor doctest, so the defect is CLR's, not the harness'.
+  # The definitive fix belongs upstream in CLR; this keeps our documented build
+  # off the path that triggers it.
+  #
+  # Deliberately yields to any explicit choice: if the developer set a build type
+  # or put an -O in CMAKE_HIP_FLAGS, that wins and nothing is added here.
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" _vllm_hip_build_type)
+  if((_vllm_hip_build_type STREQUAL "" OR _vllm_hip_build_type STREQUAL "DEBUG")
+     AND NOT "${CMAKE_HIP_FLAGS}" MATCHES "(^| )-O")
+    add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-O1>)
+    message(STATUS
+      "HIP device code floored at -O1: -O0 marks kernels as dynamic-stack users "
+      "and trips the ROCm CLR hostcall-listener teardown deadlock (issue #132)")
+  endif()
+  unset(_vllm_hip_build_type)
+  set(VLLM_CPP_HIP ON)
+else()
+  set(VLLM_CPP_HIP OFF)
+endif()
+
+if(VLLM_CPP_HIP)
+  # Upstream's validated arch list, verbatim (vllm/CMakeLists.txt:52 @ pin
+  # 555967922). Used only to WARN: an unknown value is passed through to hipcc,
+  # which is the component that actually knows what it supports.
+  set(VLLM_CPP_HIP_SUPPORTED_ARCHS
+    "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201")
+  foreach(arch IN LISTS VLLM_CPP_HIP_ARCHITECTURES)
+    if(NOT arch IN_LIST VLLM_CPP_HIP_SUPPORTED_ARCHS)
+      message(WARNING "VLLM_CPP_HIP_ARCHITECTURES contains '${arch}', which is not in "
+        "upstream vLLM's validated set. Passing it to hipcc anyway.")
+    endif()
+  endforeach()
+  if(VLLM_CPP_HIP_ARCHITECTURES)
+    message(STATUS "ROCm backend: ENABLED for arch(es) [${VLLM_CPP_HIP_ARCHITECTURES}]")
+  else()
+    message(STATUS "ROCm backend: ENABLED, hipcc default arch (set "
+      "-DVLLM_CPP_HIP_ARCHITECTURES=gfx#### to target explicitly)")
+  endif()
+  message(STATUS "ROCm backend: NEVER COMPILED UPSTREAM OF YOU — this skeleton has no "
+    "build report from any machine. Please report success or failure on "
+    "https://github.com/mudler/vllm.cpp/issues/41")
+endif()
+
 if(VLLM_CPP_METAL)
   enable_language(OBJCXX)
   set(CMAKE_OBJCXX_STANDARD 20)
@@ -234,7 +445,18 @@ endif()
 if(VLLM_CPP_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
-  set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES})
+  # CACHE ... FORCE, not a plain set(): `enable_language(CUDA)` has just written
+  # its own detected default into the CACHE, and a normal variable only SHADOWS
+  # that for the rest of the configure. The build was always correct — the
+  # gencode lines in build.ninja are the truth and they follow this value — but
+  # `CMakeCache.txt` kept reporting the detected default (`75`) even for an
+  # explicit `-DVLLM_CPP_CUDA_ARCHITECTURES=110` build, so the obvious way to
+  # confirm which architecture a build targets silently told you the wrong thing
+  # (issue #168, Jetson AGX Thor). Forcing the cache to agree costs nothing:
+  # every reader already resolved to this value.
+  set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES} CACHE STRING
+      "CUDA architectures actually compiled; mirrors VLLM_CPP_CUDA_ARCHITECTURES"
+      FORCE)
   # Per-arch capability resolution (BACKEND-CUDA-ARCH-ADDITIVITY). Every
   # arch-gated feature below asks the FEATURE TABLE instead of regex-matching the
   # whole arch list, so adding an architecture cannot silently disable fp4 /
@@ -293,8 +515,22 @@ if(VLLM_CPP_CUDA)
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
+    # SOURCE_SUBDIR names a directory that does not exist IN CUTLASS ON PURPOSE.
+    # That is the documented way to tell FetchContent "populate, but do not
+    # add_subdirectory": we consume CUTLASS as HEADERS ONLY — every consumer
+    # below `-isystem`s ${VLLM_CPP_CUTLASS_DIR}/include and nothing in this tree
+    # links a CUTLASS CMake target — so configuring CUTLASS's own build system
+    # buys nothing and can only fail.
+    #
+    # And it does fail. Building for sm_80 with CUDA 13 dies inside CUTLASS's
+    # tools/library with duplicate sm_100f flags, which forced the A100 reporter
+    # to add -DCUTLASS_ENABLE_TOOLS=OFF by hand before they could get to the
+    # actual bugs (issue #193). Not configuring those targets at all is both the
+    # narrower fix and the faster configure: the tools/library/examples/tests
+    # trees are the bulk of what add_subdirectory would walk.
     FetchContent_Declare(cutlass GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-      GIT_TAG v4.5.0 GIT_SHALLOW ON)
+      GIT_TAG v4.5.0 GIT_SHALLOW ON
+      SOURCE_SUBDIR vllm-cpp-consumes-cutlass-headers-only)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
@@ -379,31 +615,52 @@ if(VLLM_CPP_CUDA)
     set(VLLM_CPP_CUTLASS_NVFP4_SM100 OFF)
     set(VLLM_CPP_SCALEDMM_C3X_SM90 OFF)
     set(VLLM_CPP_SCALEDMM_C3X_SM100 OFF)
-    message(STATUS "CUTLASS not found / no CUTLASS-dependent feature for this arch; "
-                   "NVFP4 GEMM + FA2 disabled "
-                   "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
+    # Two very different situations reach this branch, and only one of them is
+    # benign. If VT_FA2_ARCHS resolved, the requested arch DOES support FA2 and
+    # the build is about to drop it purely because no CUTLASS tree was found —
+    # a silently slower binary, which is the failure a first-time builder hits
+    # (they read "CUDA feature fa2: ENABLED for [86]" in the table above and
+    # never notice the STATUS line that takes it away). Warn there. If no arch
+    # wanted a CUTLASS-dependent feature in the first place, nothing is lost.
+    if(VT_FA2_ARCHS)
+      message(WARNING
+        "CUTLASS headers NOT found, so FlashAttention-2 will NOT be built even "
+        "though arch(es) [${VT_FA2_ARCHS}] support it. Attention falls back to "
+        "the portable path and decode/prefill will be slower. Fix with "
+        "-DVLLM_CPP_CUTLASS_FETCH=ON (downloads CUTLASS 4.5.0) or "
+        "-DVLLM_CPP_CUTLASS_DIR=<path to a CUTLASS >=4.5.0 checkout).")
+    else()
+      message(STATUS "CUTLASS not found / no CUTLASS-dependent feature for this arch; "
+                     "NVFP4 GEMM + FA2 disabled "
+                     "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
+    endif()
   endif()
   # Marlin NVFP4 W4A16 grouped-MoE GEMM drop-in (the 35B expert kernel). Vendored
   # torch-free slice of vLLM's moe/marlin_moe_wna16 under src/vt/cuda/marlin/
   # (marlin-dropin-feasibility.md). NO external dependency — the kernel is
-  # standalone CUDA + inline PTX. Enabled on sm_12xa (compiles to native sm_121
-  # SASS). The two vendored TUs + the vt launcher are isolated with their own
-  # compile options (see below); gated by VT_MARLIN_NVFP4.
-  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa)" ON)
+  # standalone CUDA + inline PTX. Enabled on whichever architectures the
+  # `marlin-nvfp4` FEATURE-TABLE cell resolves to — sm_12xa (native sm_121 SASS)
+  # and, since the Thor bring-up, sm_110. The arch set is DATA, so these strings
+  # report the resolved cell instead of hardcoding one architecture; the previous
+  # "sm_12xa"-only wording went stale the moment the cell gained a second arch.
+  # The two vendored TUs + the vt launcher are isolated with their own compile
+  # options (see below); gated by VT_MARLIN_NVFP4.
+  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (marlin-nvfp4 archs)" ON)
   if(VLLM_CPP_MARLIN AND VT_MARLIN_NVFP4_ARCHS
      AND EXISTS "${CMAKE_SOURCE_DIR}/src/vt/cuda/marlin/core/scalar_type.hpp")
     set(VLLM_CPP_MARLIN ON)
-    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored, sm_12xa)")
+    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored) for [${VT_MARLIN_NVFP4_ARCHS}]")
   else()
     set(VLLM_CPP_MARLIN OFF)
-    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs sm_12xa + vendored slice)")
+    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs a marlin-nvfp4 arch + vendored slice)")
   endif()
 endif()
 
 include(cmake/CompilerWarnings.cmake)
 # Triton AOT kernels (cubins embedded in C launchers, CUDA-only), VENDORED
 # per-arch under src/vt/cuda/triton_aot_vendored/. Defines the gated option
-# VLLM_CPP_TRITON (default OFF; consumes the vendored artifacts — NO Python) +
+# VLLM_CPP_TRITON (default COMPUTED: ON for a CUDA build whose vendored trees are
+# present, OFF otherwise; consumes the vendored artifacts — NO Python) +
 # the maintainer knob VLLM_CPP_TRITON_REGEN (regenerates them with Python+Triton;
 # scripts/regen-triton-aot.sh) + add_triton_kernel()/triton_aot_finalize(); with
 # the option OFF this include is inert (no sources added). Wired below under
@@ -416,7 +673,9 @@ add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
+  src/vllm/lora/layers.cpp
   src/vllm/config/scheduler.cpp
+  src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -441,6 +700,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
   src/vllm/model_executor/models/qwen3_dflash.cpp
+  src/vllm/model_executor/models/qwen3_dspark.cpp
+  src/vllm/model_executor/models/qwen3_dspark_weights.cpp
   src/vllm/model_executor/models/qwen3_dflash_gguf.cpp
   src/vllm/model_executor/models/qwen3_dflash_weights.cpp
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
@@ -463,9 +724,37 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/laguna_device.cpp
   src/vllm/model_executor/models/laguna_shared_fp4.cpp
   src/vllm/model_executor/models/laguna.cpp
+  src/vllm/model_executor/models/muse_glimmer_registry.cpp
+  src/vllm/model_executor/models/muse_glimmer_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer.cpp
+  src/vllm/model_executor/models/muse_glimmer_vision.cpp
+  src/vllm/model_executor/models/muse_glimmer_mm.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
+  src/vllm/model_executor/models/minimax_h3.cpp
+  src/vllm/model_executor/models/minimax_h3_packing.cpp
+  src/vllm/model_executor/models/minimax_h3_planner.cpp
+  src/vllm/model_executor/models/minimax_h3_gguf.cpp
+  src/vllm/model_executor/models/minimax_h3_nvfp4.cpp
+  src/vllm/model_executor/models/minimax_h3_sharded.cpp
+  src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
+  src/vllm/model_executor/models/minimax_h3_video_vae.cpp
+  src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
+  src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder.cpp
+  src/vllm/model_executor/models/minimax_h3_pipeline.cpp
+  src/vllm/model_executor/models/minimax_h3_wav.cpp
+  src/vllm/model_executor/models/minimax_h3_mux.cpp
+  src/vllm/model_executor/models/minimax_h3_device_resolve.cpp
+  src/vllm/model_executor/models/minimax_h3_device.cpp
+  src/vllm/model_executor/models/minimax_h3_vae_loader.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder_gguf.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder_sharded.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
+  src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp
+  src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
@@ -480,11 +769,13 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/opt_weights.cpp
   src/vllm/model_executor/models/opt.cpp
   src/vllm/model_executor/models/llama_registry.cpp
+  src/vllm/model_executor/models/llama_embedding_registry.cpp
   src/vllm/model_executor/models/llama_weights.cpp
   src/vllm/model_executor/models/mistral_registry.cpp
   src/vllm/model_executor/models/mistral_weights.cpp
   src/vllm/model_executor/models/gemma4_registry.cpp
   src/vllm/model_executor/models/gemma4_weights.cpp
+  src/vllm/model_executor/models/gemma4_moe.cpp
   src/vllm/model_executor/models/gemma4.cpp
   src/vllm/model_executor/models/gemma4_mm.cpp
   src/vllm/model_executor/models/gemma3_registry.cpp
@@ -535,6 +826,32 @@ add_library(vllm STATIC
   src/vllm/multimodal/hasher.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
+  # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
+  # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone
+  # forward composed from the P1-P3 vt:: kernels, NOT a registry architecture —
+  # vLLM does not register one either (parakeet.py is a component of
+  # nano_nemotron_vl.py, and it delegates the encoder itself to transformers).
+  src/vllm/model_executor/models/parakeet_encoder.cpp
+  # The RNN-T / TDT transducer heads over that encoder (row P5). Upstream after
+  # all: transformers `main` implements ParakeetRNNTDecoder / ParakeetForRNNT /
+  # ParakeetForTDT, which the P4 spike wrongly recorded as absent because it
+  # measured the LOCALLY INSTALLED 5.3.0. Corrected in the spike.
+  src/vllm/model_executor/models/parakeet_transducer.cpp
+  src/vllm/model_executor/models/parakeet_weights.cpp
+  src/vllm/multimodal/parakeet_audio_processor.cpp
+  # The ONE transcription seam every consumer drives (C ABI vllm_transcribe,
+  # the server's /v1/audio/transcriptions, the parakeet-transcribe example) —
+  # ARCH-ONE-SURFACE ROW 1: absorbs the pipeline examples/parakeet_transcribe
+  # used to own privately. The refuse-by-task registry TU registers the three
+  # Parakeet head archs so config.json RESOLVES (SupportsTranscription mirror).
+  src/vllm/multimodal/parakeet_transcription.cpp
+  src/vllm/model_executor/models/parakeet_registry.cpp
+  # The ONE video-generation seam every consumer drives (C ABI vllm_video_*,
+  # the server's /v1/videos, the minimax-h3-gen example) — ARCH-ONE-SURFACE
+  # ROW 2: absorbs the assembly pipeline examples/minimax_h3_gen and the
+  # server's private /v1/videos twin. Builds artifacts + the ffmpeg argv and
+  # SPAWNS NOTHING (the ratified process boundary).
+  src/vllm/multimodal/minimax_h3_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
@@ -553,6 +870,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
+  src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
@@ -647,6 +965,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp
+  src/vllm/entrypoints/openai/request_logger.cpp
   src/vllm/entrypoints/openai/serving_models.cpp
   src/vllm/entrypoints/openai/run_batch.cpp
   src/vllm/entrypoints/openai/tool_parsers/abstract.cpp
@@ -701,6 +1020,8 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
+  src/vllm/entrypoints/openai/tool_parsers/muse_glimmer.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.cpp
   src/vllm/parser/engine/incremental_lexer.cpp
   src/vllm/parser/engine/token_id_scanner.cpp
   src/vllm/parser/engine/streaming_parser_engine.cpp
@@ -719,21 +1040,32 @@ add_library(vllm STATIC
   src/vt/op_provider.cpp
   src/vt/communicator.cpp
   src/vt/ops.cpp
+  src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
   src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/cpu/cpu_minimax_h3.cpp
+  src/vt/cpu/cpu_isa_arm.cpp
+  src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
+  src/vt/cpu/cpu_quant_dot_sdot.cpp
   src/vt/cpu/cpu_quant_dot_arm.cpp
   src/vt/cpu/cpu_quant_repack.cpp
   src/vt/cpu/cpu_quant_repack_arm.cpp
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
+  # Conformer / FastConformer audio-encoder kernels (spike
+  # .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Self-registering
+  # translation units, reached through vllm's INTERFACE --whole-archive option.
+  src/vt/cpu/cpu_conv2d.cpp
+  src/vt/cpu/cpu_conv1d_depthwise.cpp
+  src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_mla_prefill.cpp
@@ -748,7 +1080,45 @@ add_library(vllm::vllm ALIAS vllm)
 # tier's per-function `target("f16c")`): every other TU stays on the default
 # baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
 # binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
+# KERNEL-GEMM-CPU-ELEM-X86WIDE W1: the AVX2 elementwise tier needs the ISA
+# enabled so <immintrin.h> exposes the 256-bit intrinsics. Same surgical shape
+# as the aarch64 i8mm block below and the same discipline llama.cpp uses when it
+# builds the CPU backend once per ISA level (ggml/src/CMakeLists.txt:371-401):
+# build ONLY this TU wide, leave every other TU on the baseline, and gate entry
+# on a runtime __builtin_cpu_supports probe so the binary still runs on
+# pre-AVX2 x86-64 (the SSE2 tier serves those). The global -ffp-contract=off
+# still applies on top, which is what keeps mul-then-add non-fused and therefore
+# byte-identical to the portable tier.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  # x86-only TUs: <immintrin.h> does not exist on aarch64, so they are ADDED
+  # here rather than in the unconditional source list.
+  target_sources(vllm PRIVATE
+    src/vt/cpu/cpu_matmul_elem_avx2.cpp
+    src/vt/cpu/cpu_matmul_elem_avx512.cpp)
+  set_source_files_properties(
+    src/vt/cpu/cpu_matmul_elem_avx2.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx2;-mf16c>")
+  set_source_files_properties(
+    src/vt/cpu/cpu_matmul_elem_avx512.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  # The portable Q8 DotProd C++ tier is valid on Linux and Darwin. Compile only
+  # its TU with DotProd enabled; runtime entry is gated by Linux HWCAP or Darwin
+  # sysctl. The separately scheduled A76 assembly remains Linux-only below.
+  set_source_files_properties(
+    src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
+    COMPILE_DEFINITIONS VT_CPU_ARM_Q8_DOT=1
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
+  # KERNEL-CPU-A76-Q8-DOT is Linux-only because its dispatch uses HWCAP/MIDR
+  # and the hand-written file carries ELF assembler directives. Other arm64
+  # platforms compile the generic stub and retain their existing portable tier.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    enable_language(ASM)
+    target_sources(vllm PRIVATE src/vt/cpu/cpu_quant_dot_a76.S)
+    set_property(SOURCE src/vt/cpu/cpu_quant_dot_sdot.cpp APPEND PROPERTY
+      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1)
+  endif()
   # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this
   # per-file -march, which is what keeps the repack gemm/gemv's non-fused
@@ -884,8 +1254,160 @@ if(VLLM_CPP_VULKAN)
     src/vt/vulkan/vulkan_loader.cpp
     src/vt/vulkan/vulkan_context.cpp
     src/vt/vulkan/vulkan_backend.cpp
-    src/vt/vulkan/vulkan_ops.cpp)
+    src/vt/vulkan/vulkan_ops.cpp
+    # GENERATED by scripts/gen-vulkan-spirv.py, alongside vulkan_spirv.h. The
+    # SPIR-V words are here rather than in the header so that adding shaders costs
+    # ONE TU's compile time instead of every TU that includes the table.
+    src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
+endif()
+# --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
+# Mostly ADDITIVE like the Metal/Vulkan/ROCm blocks above: a source list, a
+# PUBLIC compile definition, and one link library. TTNN::TTNN is TT-NN's own
+# exported IMPORTED target and pulls in TT::Metalium/xtensor/nlohmann_json
+# transitively per its own package config — no separate find_dependency needed
+# here.
+#
+# tenstorrent_ops.cpp is the ONE exception, isolated as its own OBJECT library
+# rather than a plain `vllm` source (same pattern as
+# vllm_rocm_platform_syntax_check below). It includes
+# ttnn/operations/matmul/matmul.hpp, which transitively pulls in tt-metal's
+# tt_stl/reflection.hpp — that header uses nlohmann::json as a COMPLETE type
+# without itself including the full <nlohmann/json.hpp> (it relies on some
+# other TU in tt-metal's own build having already done so). `vllm`'s own
+# vendored nlohmann 3.12.0 (ABI-tagged json_abi_v3_12_0, third_party/, SYSTEM
+# PUBLIC on `vllm` a few hundred lines up) is on the include path for every
+# `vllm` source, so an angle-bracket `<nlohmann/json.hpp>` reached from
+# tt-metal's headers in a `vllm`-target TU resolves to vllm's copy instead of
+# tt-metal's own (ABI-tagged json_abi_v3_11_3) — two incompatible ABI-tagged
+# versions of the same library visible in one TU, "implicit instantiation of
+# undefined template" and "reference to basic_json is ambiguous". Nothing else
+# in this backend (or in `vllm` generally) needs matmul.hpp, so giving this one
+# file its own include set — TTNN's dirs, no `third_party` — resolves it
+# without touching include order for the other ~370 files in the vllm target,
+# which must keep resolving vllm's OWN vendored version.
+if(VLLM_CPP_TENSTORRENT)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_TENSTORRENT)
+  target_sources(vllm PRIVATE
+    src/vllm/platforms/tenstorrent.cpp
+    src/vt/tenstorrent/tenstorrent_device.cpp
+    src/vt/tenstorrent/tenstorrent_backend.cpp)
+  add_library(vllm_tenstorrent_ops OBJECT src/vt/tenstorrent/tenstorrent_ops.cpp)
+  target_include_directories(vllm_tenstorrent_ops PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(vllm_tenstorrent_ops PRIVATE TTNN::TTNN)
+  target_compile_features(vllm_tenstorrent_ops PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_tenstorrent_ops)
+  target_sources(vllm PRIVATE $<TARGET_OBJECTS:vllm_tenstorrent_ops>)
+  target_link_libraries(vllm PUBLIC TTNN::TTNN)
+endif()
+# --- ROCm/HIP backend (BACKEND-ROCM W0 skeleton) ------------------------------
+# Purely ADDITIVE like the Metal and Vulkan blocks above: a source list, a PUBLIC
+# compile definition the tests gate on, and one link library. No existing source
+# file and no line of the CPU/CUDA/Metal/Vulkan build changes when it is on.
+#
+# **NEVER COMPILED.** These four TUs have no build report from any machine. The
+# arch parse they depend on (include/vt/rocm/rocm_arch.h) is deliberately NOT
+# here: it is a HIP-free header compiled and unit-tested in every build,
+# including CPU-only CI. See tests/vt/test_rocm_arch.cpp.
+if(VLLM_CPP_HIP)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_HIP)
+  target_sources(vllm PRIVATE
+    src/vllm/platforms/rocm.cpp
+    src/vt/rocm/rocm_backend.hip
+    src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_embedding.hip
+    src/vt/rocm/rocm_dense_basic.hip
+    src/vt/rocm/rocm_matmul_hipblaslt.hip
+    src/vt/rocm/rocm_paged_attn.hip
+    src/vt/rocm/rocm_gemma4_experts.hip
+    src/vt/rocm/rocm_gemma4_fused_experts.hip
+    src/vt/rocm/rocm_gemma4_expert_geglu.hip
+    src/vt/rocm/rocm_fp8_channel_gemv.hip
+    src/vt/rocm/rocm_moe_router.hip
+    src/vt/rocm/rocm_sample.hip
+    src/vt/rocm/rocm_gdn_state.hip
+    src/vt/rocm/rocm_gdn_conv.hip
+    src/vt/rocm/rocm_gdn_postconv.hip
+    src/vt/rocm/rocm_gdn_scan.hip
+    src/vt/rocm/rocm_gdn_fused.hip
+    src/vt/rocm/rocm_ops.hip)
+  if(VLLM_CPP_HIP_ARCHITECTURES)
+    set_source_files_properties(
+      src/vt/rocm/rocm_backend.hip
+      src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_embedding.hip
+      src/vt/rocm/rocm_dense_basic.hip
+      src/vt/rocm/rocm_matmul_hipblaslt.hip
+      src/vt/rocm/rocm_paged_attn.hip
+      src/vt/rocm/rocm_gemma4_experts.hip
+      src/vt/rocm/rocm_gemma4_fused_experts.hip
+      src/vt/rocm/rocm_gemma4_expert_geglu.hip
+      src/vt/rocm/rocm_fp8_channel_gemv.hip
+      src/vt/rocm/rocm_moe_router.hip
+      src/vt/rocm/rocm_sample.hip
+      src/vt/rocm/rocm_gdn_state.hip
+      src/vt/rocm/rocm_gdn_conv.hip
+      src/vt/rocm/rocm_gdn_postconv.hip
+      src/vt/rocm/rocm_gdn_scan.hip
+      src/vt/rocm/rocm_gdn_fused.hip
+      src/vt/rocm/rocm_ops.hip
+      PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
+  endif()
+  # Prefer the absolute path inside ${ROCM_PATH}/lib, fall back to the bare name,
+  # which is upstream's own resolution order (vllm/CMakeLists.txt:335-341).
+  find_library(VLLM_CPP_AMDHIP64_LIB NAMES amdhip64 libamdhip64.so
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64)
+  if(VLLM_CPP_AMDHIP64_LIB)
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_AMDHIP64_LIB})
+  else()
+    target_link_libraries(vllm PUBLIC amdhip64)
+  endif()
+  # hipBLAS + hipBLASLt — dense GEMM (ROCm math libraries).
+  find_path(VLLM_CPP_HIPBLAS_INCLUDE hipblas/hipblas.h
+    PATHS ${ROCM_PATH}/include /opt/rocm/include)
+  find_library(VLLM_CPP_HIPBLAS_LIB NAMES hipblas
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64 /opt/rocm/lib /opt/rocm/lib64)
+  find_path(VLLM_CPP_HIPBLASLT_INCLUDE hipblaslt/hipblaslt.h
+    PATHS ${ROCM_PATH}/include /opt/rocm/include)
+  find_library(VLLM_CPP_HIPBLASLT_LIB NAMES hipblaslt
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64 /opt/rocm/lib /opt/rocm/lib64)
+  if(VLLM_CPP_HIPBLAS_INCLUDE AND VLLM_CPP_HIPBLAS_LIB)
+    target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLAS_INCLUDE})
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLAS_LIB})
+    message(STATUS "ROCm hipBLAS: ${VLLM_CPP_HIPBLAS_LIB}")
+  else()
+    message(FATAL_ERROR "VLLM_CPP_HIP=ON requires hipBLAS (libhipblas + hipblas/hipblas.h).")
+  endif()
+  if(VLLM_CPP_HIPBLASLT_INCLUDE AND VLLM_CPP_HIPBLASLT_LIB)
+    target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_INCLUDE})
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_LIB})
+    message(STATUS "ROCm hipBLASLt: ${VLLM_CPP_HIPBLASLT_LIB}")
+  endif()
+else()
+  # BIT-ROT GUARD (BACKEND-ROCM W0). The ROCm platform leg is deliberately plain
+  # C++ with no HIP header, which means it CAN be compiled on a machine with no
+  # ROCm — and if we do not, nothing on any maintainer machine ever compiles it,
+  # so the next change to the `Platform` interface breaks it silently and the
+  # breakage is discovered by a contributor mid-bring-up. Compiling it as an
+  # OBJECT library that is never linked keeps it honest at the cost of one TU.
+  #
+  # Not linked ANYWHERE on purpose: the object is built and discarded, so the
+  # platform's static registrar cannot run and a non-HIP build is byte-identical
+  # to what it was. This is a syntax/type gate, not a build of the backend — the
+  # HIP TUs still have no build report from anyone.
+  # The HIP-gated TEST is in here for the same reason: it is the first thing a
+  # contributor runs, it is also plain C++, and a stale assertion in it would
+  # read as a backend bug on their machine rather than as our drift.
+  add_library(vllm_rocm_platform_syntax_check OBJECT
+    src/vllm/platforms/rocm.cpp
+    tests/vt/test_rocm_backend.cpp)
+  target_include_directories(vllm_rocm_platform_syntax_check PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include)
+  target_include_directories(vllm_rocm_platform_syntax_check SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_rocm_platform_syntax_check PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_rocm_platform_syntax_check)
 endif()
 if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)
@@ -913,7 +1435,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
-    src/vt/cuda/cuda_laguna.cu)
+    src/vt/cuda/cuda_laguna.cu
+    src/vt/cuda/cuda_minimax_h3.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
@@ -1108,7 +1631,14 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/marlin_mm_moe.cu
       src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu
       src/vt/cuda/cuda_moe_marlin.cu
-      src/vt/cuda/cuda_marlin_repack.cu)
+      src/vt/cuda/cuda_marlin_repack.cu
+      # DENSE marlin (row KERNEL-MARLIN-DENSE-PORT): the dense marlin_mm dispatcher
+      # (`namespace marlin`) + its bf16 NVFP4/MXFP4 kernel instantiations (SAME 12-param
+      # Marlin<> template as the MoE TUs, distinct namespace + direct-A kernel body) +
+      # the vt::Tensor launcher. Same nvcc options as the MoE TUs below.
+      src/vt/cuda/marlin/libtorch_stable/quantization/marlin/marlin_mm_dense.cu
+      src/vt/cuda/marlin/libtorch_stable/quantization/marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu
+      src/vt/cuda/cuda_marlin_dense.cu)
     target_sources(vllm PRIVATE ${_MARLIN_SRCS})
     target_compile_definitions(vllm PUBLIC VT_MARLIN_NVFP4=1)
     set_source_files_properties(${_MARLIN_SRCS} PROPERTIES
@@ -1116,7 +1646,8 @@ if(VLLM_CPP_CUDA)
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
   endif()
 
-  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default OFF)
+  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default ON
+  # for a CUDA build) ─────────────────────────────────────────────────────────
   # The FLA chunk_delta_h state-recurrence kernel as an embedded cubin in libvllm
   # (VENDORED per-arch — the build needs no Python; VLLM_CPP_TRITON_REGEN=ON is
   # the maintainer regen); runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
@@ -1320,6 +1851,64 @@ if(VLLM_CPP_CUDA)
       target_include_directories(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS_INCLUDE_DIR})
     endforeach()
 
+    # ── SANCTIONED Triton AOT: KDA chunk-prefill family (Kimi-Linear; H=32) ──────
+    # FLA ops/kda.py chunk_kda_with_fused_gate forward chain (5 net-new kernels +
+    # a NEW pin of chunk_delta_h.py). Dispatch TryKdaChunkPrefill (VT_KIMI_DEVICE_
+    # KDA_CHUNK) in cuda_gdn.cu (vt::KdaChunkPrefill); the #104 recurrent
+    # vt::KdaGatedDeltaRule stays the portable/decode fallback. Signatures pinned
+    # to the Kimi KDA geometry (H=32, K=V=128, BT=64, BC=16, NC=4); scalar
+    # constants (scale=K^-0.5, softplus beta/threshold, RCP_LN2, DOT_PRECISION)
+    # are baked as kernel literals (Triton AOT mis-packs fp32 scalars). Each line
+    # is byte-identical to the cmake/TritonAOTKernels.cmake declaration (the drift
+    # check compares the two). See .agents/specs/kimi-linear.md §17.
+    set(_KDA_GATE_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/kda_gate_cumsum.py")
+    set(_KDA_KKT_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_kda_kkt.py")
+    set(_KDA_WU_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/recompute_w_u_kda.py")
+    set(_KDA_DELTAH_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_delta_h.py")
+    set(_KDA_GLAO_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_gla_o.py")
+
+    add_triton_kernel(VT_KDA_GATE_CUMSUM_SRCS
+      "${_KDA_GATE_KPY}" kda_gate_cumsum_fwd_kernel kda_gate_cumsum
+      "*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 64, 1, 1"
+      "2,NT,32" 4 2)
+    target_sources(vllm PRIVATE ${VT_KDA_GATE_CUMSUM_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_GATE_CUMSUM_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_KKT_INTER_SRCS
+      "${_KDA_KKT_KPY}" chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter kda_kkt_inter
+      "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 64, 4, 1"
+      "NT,16,32" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_KKT_INTER_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_KKT_INTER_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_KKT_INTRA_SRCS
+      "${_KDA_KKT_KPY}" chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra kda_kkt_intra
+      "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 128, 1"
+      "NT,4,32" 4 2)
+    target_sources(vllm PRIVATE ${VT_KDA_KKT_INTRA_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_KKT_INTRA_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_WU_SRCS
+      "${_KDA_WU_KPY}" recompute_w_u_fwd_kernel kda_wu
+      "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 0, 1, 1"
+      "NT,32,1" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_WU_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_WU_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_DELTAH_H32_SRCS
+      "${_KDA_DELTAH_KPY}" chunk_gated_delta_rule_fwd_kernel_h_blockdim64 kda_deltah_h32
+      "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 32, 128, 128, 64, 64, 0, 1, 1, 1, 1, 1, 1"
+      "2,NH,1" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_DELTAH_H32_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_DELTAH_H32_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_GLA_O_SRCS
+      "${_KDA_GLAO_KPY}" chunk_gla_fwd_kernel_o kda_gla_o
+      "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 1"
+      "2,NT,32" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_GLA_O_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_GLA_O_SRCS_INCLUDE_DIR})
+
     # Vendored-tree bookkeeping (call ONCE, after the LAST add_triton_kernel):
     # REGEN writes the MANIFEST (generator versions + triton_kernels/*.py hashes
     # + per-base generation params); the normal builder path verifies those
@@ -1368,6 +1957,32 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     target_compile_definitions(vllm PUBLIC VLLM_CPP_FLASH_ATTN)
+    # NOTE (QUANT-CT-MXFP4-FLASH-AUDIT #68 + FLASH-OCCUPANCY #75): the c8 decode
+    # flash gap vs vLLM (ours ~168-174 vs vLLM ~156 us/call) is a COMPILER-CODEGEN
+    # gap, MEASURED to a verdict — NOT occupancy, NOT L2, NOT num_splits, and NOT a
+    # flag we can set. The owed matched-c8 ncu (both engines, IDENTICAL grid
+    # 1x3x64) shows occupancy is IDENTICAL 8.33% (both smem-limited to 1 CTA/SM by
+    # the byte-identical 81.92 KB kSmemSize — the 216-vs-241 reg delta is moot),
+    # L2 hit ~1% on BOTH (KV streamed from DRAM: no adjacency/warmth to win), and
+    # the same ~60% short-scoreboard stall structure. The ONLY difference: vLLM's
+    # SASS executes ~13% FEWER instructions (3.27M vs 3.70M) in this latency-bound
+    # ~1-warp/scheduler regime — but that instruction count is NOT the cause. #75
+    # built the exact vLLM recipe: compiling the kernel TUs for compute_80 PTX +
+    # -use_fast_math REPRODUCES vLLM's SASS profile EXACTLY (241 reg, 17,008 instr
+    # vs vLLM 241/17,020) and is STILL ~167 us — the SAME as our native ~165 us and
+    # still ~10 us slower than vLLM's ~157 us. So matching vLLM's arch, fast-math,
+    # register AND instruction counts does NOT close the gap: the kernel is not
+    # instruction-bound, and the residual is vLLM's wheel-`ptxas` SASS-SCHEDULING
+    # quality, not reachable from our nvcc 13.0. (native+fast-math REGRESSES to
+    # 189.8 us, #68; compute_80 PTX driver-JIT alone is neutral, #75 Build B.) So
+    # we keep the plain native sm_121a compile and pass no -use_fast_math. #82
+    # (FLASH-PTXAS) then ARBITRATED the "ptxas lineage" claim to a NO and CORRECTED
+    # it: the wheel ships NO sm_12x cubin — only CUDA-13.0 (PTX ISA 9.0) sm_80 PTX
+    # driver-JIT'd on GB10 — so there is no old-CUDA-12.x ptxas in vLLM's path (and
+    # ptxas 12.8 cannot even target sm_121a); a same-params cuModule A/B ties our
+    # PTX and vLLM's OWN PTX at ~144 us across driver-JIT / ptxas 13.0 / 13.2, so the
+    # +10 us/call gap is ENGINE CONTEXT (neighbour L2/orchestration), not this
+    # kernel's codegen. See .agents/benchmark-record.md (#75, #82).
     set_source_files_properties(
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS} PROPERTIES
@@ -1375,6 +1990,74 @@ if(VLLM_CPP_CUDA)
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-DFLASH_NAMESPACE=flash;-include;${_FA2_ROOT}/fa2_compat_prelude.h;-isystem;${_FA2_ROOT}/src;-isystem;${_FA2_ROOT}/stubs;-isystem;${VLLM_CPP_CUTLASS_DIR}/include>")
     message(STATUS "FlashAttention-2 prefill/decode: ENABLED for arch(es) [${VT_FA2_ARCHS}] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)")
   endif()
+
+  # RELEASE W1: CMake's target-wide CUDA_ARCHITECTURES property would compile
+  # every CUDA TU for every requested SM, including architecture-specific
+  # CUTLASS/Marlin/FA2 bodies that ptxas rejects outside their feature-table
+  # cells. Disable target-wide emission for libvllm and give every CUDA source
+  # exactly one explicit gencode set: portable sources receive the complete
+  # requested list, feature sources receive only their resolved intersection.
+  # This mirrors vLLM's set_gencode_flags_for_srcs rather than inventing a
+  # release-only compilation path.
+  set_property(TARGET vllm PROPERTY CUDA_ARCHITECTURES OFF)
+  set(_VT_CUDA_FEATURE_SOURCES)
+
+  if(VT_FP4_MMA_ARCHS)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_nvfp4_sm12x.cu)
+    vt_cuda_set_source_gencode("${VT_FP4_MMA_ARCHS}"
+      src/vt/cuda/cuda_nvfp4_sm12x.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_nvfp4_sm12x.cu)
+  endif()
+
+  if(_NVFP4_CUTLASS_SOURCES)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_ARCHS}"
+      ${_NVFP4_CUTLASS_SOURCES})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_NVFP4_CUTLASS_SOURCES})
+  endif()
+  if(_FP8_CUTLASS_SOURCES)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_FP8_ARCHS}"
+      ${_FP8_CUTLASS_SOURCES})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_FP8_CUTLASS_SOURCES})
+  endif()
+  if(VLLM_CPP_CUTLASS_NVFP4_SM100)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_SM100_ARCHS}"
+      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+  endif()
+  if(VLLM_CPP_SCALEDMM_C3X_SM90)
+    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM90_ARCHS}"
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+  endif()
+  if(VLLM_CPP_SCALEDMM_C3X_SM100)
+    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM100_ARCHS}"
+      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+  endif()
+  if(_MARLIN_SRCS)
+    vt_cuda_set_source_gencode("${VT_MARLIN_NVFP4_ARCHS}" ${_MARLIN_SRCS})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_MARLIN_SRCS})
+  endif()
+  if(_FA2_KERNEL_SRCS)
+    set(_VT_FA2_SOURCES
+      src/vt/cuda/cuda_flash_attn_fa2.cu
+      ${_FA2_KERNEL_SRCS})
+    vt_cuda_set_source_gencode("${VT_FA2_ARCHS}" ${_VT_FA2_SOURCES})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_VT_FA2_SOURCES})
+  endif()
+
+  get_target_property(_VT_VLLM_TARGET_SOURCES vllm SOURCES)
+  set(_VT_CUDA_PORTABLE_SOURCES ${_VT_VLLM_TARGET_SOURCES})
+  list(FILTER _VT_CUDA_PORTABLE_SOURCES INCLUDE REGEX "\\.cu$")
+  list(REMOVE_ITEM _VT_CUDA_PORTABLE_SOURCES ${_VT_CUDA_FEATURE_SOURCES})
+  vt_cuda_set_source_gencode("${VLLM_CPP_CUDA_ARCHITECTURES}"
+    ${_VT_CUDA_PORTABLE_SOURCES})
+  message(STATUS
+    "CUDA per-source gencode: ${VLLM_CPP_CUDA_ARCHITECTURES} portable; "
+    "feature TUs narrowed by VT_CUDA_FEATURE_TABLE")
 endif()
 
 # OpenAI HTTP server (M3.1 Task 4): the api_server.cpp translation unit pulls in
@@ -1383,6 +2066,10 @@ endif()
 if(VLLM_CPP_SERVER)
   find_package(Threads REQUIRED)
   target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)
+  # ARCH-ONE-SURFACE: the server ENTRY POINT (flag parsing + engine/serving
+  # construction) lives in the library so examples/server can be a thin client of
+  # the C ABI's vllm_server_main (v17). It shares api_server.cpp's httplib gate.
+  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/server_main.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party

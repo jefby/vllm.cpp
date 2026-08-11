@@ -86,7 +86,7 @@ enum class EngineShutdownState : int {
 // BlockingQueue: in-proc analog of Python's unbounded queue.Queue — the type
 // of EngineCoreProc.input_queue / output_queue (core.py:915-916). Blocking
 // get(), non-blocking put_nowait()/try_get(), thread-safe.
-template <typename T>
+template <typename T, typename ConditionVariable = std::condition_variable>
 class BlockingQueue {
  public:
   void put_nowait(T item) {
@@ -94,6 +94,26 @@ class BlockingQueue {
       std::lock_guard<std::mutex> lock(mutex_);
       items_.push_back(std::move(item));
     }
+    cv_.notify_one();
+  }
+
+  // Publish one ordered request wave while holding the queue mutex across the
+  // complete append. A consumer therefore observes either the previous queue
+  // or the previous queue followed by the whole batch, never a prefix. If an
+  // element move/allocation throws, remove only the suffix appended by this
+  // call before releasing the mutex. A successful non-empty wave emits one
+  // wakeup regardless of its size.
+  void put_many_nowait(std::vector<T> items) {
+    if (items.empty()) return;
+    std::unique_lock<std::mutex> lock(mutex_);
+    const std::size_t original_size = items_.size();
+    try {
+      for (T& item : items) items_.push_back(std::move(item));
+    } catch (...) {
+      while (items_.size() > original_size) items_.pop_back();
+      throw;
+    }
+    lock.unlock();
     cv_.notify_one();
   }
 
@@ -131,7 +151,7 @@ class BlockingQueue {
 
  private:
   mutable std::mutex mutex_;
-  std::condition_variable cv_;
+  ConditionVariable cv_;
   std::deque<T> items_;
 };
 
@@ -173,9 +193,16 @@ class EngineCoreProc : public EngineCore {
   // shutdown_timeout_s mirrors VllmConfig.shutdown_timeout
   // (vllm/config/vllm.py:377, default 0): 0 => "abort" shutdown mode,
   // > 0 => "drain" (core.py:1330-1358).
+  //
+  // `check_for_draft_tokens` forwards EngineCore's speculative-decode flag. It
+  // MUST be threaded: without it the base defaulted to false on this path, so
+  // post_step returned immediately and EVERY speculator's proposed drafts were
+  // dropped on the production CLI/server path (found by SPEC-DSPARK W6:
+  // 24 proposals, 0 installs).
   EngineCoreProc(Scheduler& scheduler, Executor& executor,
                  StructuredOutputManager* structured_output_manager = nullptr,
-                 int max_concurrent_batches = 1, int shutdown_timeout_s = 0);
+                 int max_concurrent_batches = 1, int shutdown_timeout_s = 0,
+                 bool check_for_draft_tokens = false);
 
   // The IO queue split (core.py:915-916). Public exactly like the upstream
   // attributes: the in-proc client shares them directly (no socket relay).

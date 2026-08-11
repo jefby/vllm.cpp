@@ -109,10 +109,29 @@ struct HfConfig {
   int64_t max_position_embeddings = 0;
   std::string torch_dtype;
   nlohmann::json raw;  // full doc for fields we don't type yet
+  // eos_token_id from the sibling generation_config.json, sorted and unique.
+  // Upstream ModelConfig.try_get_generation_config (config/model.py) loads that
+  // file whenever --generation-config is "auto" (the default) or "vllm", and
+  // SamplingParams.update_from_generation_config (sampling_params.py:645-655)
+  // merges its ids into stop_token_ids. It is a SEPARATE field rather than a
+  // rewrite of raw["eos_token_id"] because the two have different roles: the
+  // checkpoint's own eos_token_id supplies the PRIMARY eos id, while these are
+  // secondary stop ids gated on ignore_eos. Empty when the file is absent,
+  // unparseable, or carries no eos_token_id.
+  std::vector<int32_t> generation_config_eos_ids;
 };
 
 // Loads and parses `path`. Throws std::runtime_error (message includes the
 // path) on missing file, malformed JSON, or missing required fields.
 HfConfig LoadHfConfig(const std::string& path);
+
+// Cheap, non-throwing peek at config.json's `architectures` array — empty on
+// any parse/read problem. Exists for TASK dispatch BEFORE the full text-model
+// HfConfig parse: a SupportsTranscription-only checkpoint (Parakeet) nests its
+// fields under `encoder_config`, so LoadHfConfig's required-field errors would
+// fire before the registry's refuse-by-task message could (ARCH-ONE-SURFACE
+// ROW 1). Callers that need the parsed config still go through LoadHfConfig;
+// this never replaces it.
+std::vector<std::string> PeekHfArchitectures(const std::string& path);
 
 }  // namespace vllm

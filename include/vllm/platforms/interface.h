@@ -303,6 +303,12 @@ void RegisterPlatform(DeviceType type, Platform* platform);
 Platform& GetPlatform(DeviceType type);
 bool HasPlatform(DeviceType type);
 
+// Find a registered platform by vt::DeviceTypeName(), or nullptr when that
+// canonical user-facing name has no usable platform in this process. This is
+// the shared explicit-device seam: callers name a platform without branching
+// on a backend-specific DeviceType literal.
+Platform* FindPlatformByName(std::string_view name);
+
 // The process's active compute platform: the highest-priority registered
 // accelerator, else CPU — mirrors vLLM resolving `current_platform` by probing
 // for an accelerator and falling back to CPU. This answers ONLY the process-level
@@ -311,5 +317,15 @@ bool HasPlatform(DeviceType type);
 // operated on, so a CPU queue/tensor on a GPU box would wrongly read as CUDA. For
 // per-object device dispatch use `GetPlatform(<obj>.device.type)` (BACKEND-PLATFORM).
 Platform& CurrentPlatform();
+
+// The ORDER CurrentPlatform() probes device types in, exposed so it can be
+// ASSERTED rather than trusted (BACKEND-ROCM W0). This walk is the one place
+// adding a platform is not additive: a DeviceType missing from it registers
+// fine, answers every query correctly, and is then simply never selected — and
+// unlike a missing enum case, no compiler diagnostic fires. Exposing it lets
+// tests/vllm/platforms/test_platform.cpp assert that every DeviceType appears,
+// so the next backend cannot reintroduce that silence. Returns a pointer to a
+// static array of `count` entries.
+const DeviceType* CurrentPlatformPriority(size_t& count);
 
 }  // namespace vllm::platforms

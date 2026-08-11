@@ -8,18 +8,22 @@
 #ifndef VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 #define VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
+#include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
-#include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft bundle
+#include "vllm/model_executor/models/qwen3_dflash.h"
+#include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft bundle
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -45,7 +49,15 @@ namespace vllm::entrypoints {
 // draft config + k) and the LoadedEngine hands a borrow to the runner. Owned by
 // LoadedEngine, declared before runner_ so the borrow outlives it.
 struct DflashDraft {
+  // The plain DFlash draft. EMPTY when `dspark` is set: a DSpark draft owns its
+  // backbone inside Qwen3DSparkWeights, so there is exactly one copy either way.
   vllm::Qwen3DFlashWeights weights;
+  // SPEC-DSPARK W5: set only for method=="dspark". DSpark IS a DFlash draft plus
+  // a Markov head (Qwen3DSparkModel(DFlashQwen3Model)), so it rides the same
+  // struct, the same loader seam and the same runner wiring; the two extra fields
+  // are the head itself and the query-block layout the checkpoint selects.
+  std::unique_ptr<vllm::Qwen3DSparkWeights> dspark;
+  bool sample_from_anchor = false;
   vllm::HfConfig config;
   int k = 0;
 };
@@ -55,9 +67,38 @@ struct DflashDraft {
 // valid.
 struct EngineParams {
   int block_size = 32;     // KV block size (tokens/block).
-  int num_blocks = 256;    // KV blocks to allocate.
+  // KV pool sizing (ROAD-V1-MEM). Precedence mirrors vLLM's cache knobs, applied
+  // in ResolveNumBlocks (model_loader.cpp):
+  //   1. num_blocks > 0            -> used verbatim (vLLM num_gpu_blocks_override)
+  //   2. kv_cache_memory_bytes > 0 -> num_blocks = kv_cache_memory_bytes /
+  //                                   KVBytesPerBlock(kv_cfg) (absolute pool size,
+  //                                   IGNORES gpu_memory_utilization, cache.py:189)
+  //   3. otherwise                 -> the gpu_memory_utilization profile path,
+  //                                   which needs a device profile run (M3, not
+  //                                   yet implemented) and so falls back to 256.
+  // num_blocks now defaults to 0 ("auto") so a caller can reach knob 2/3 without
+  // an explicit override; the resolved fallback when nothing sizes the pool is
+  // still 256, so the default path is byte-identical to before this field's
+  // default changed.
+  int num_blocks = 0;      // 0 => auto (resolved: override > bytes > 256).
+  // Fraction of free device memory the whole engine may consume (weights +
+  // activations + KV), mirroring vLLM CacheConfig.gpu_memory_utilization
+  // (cache.py:68). Used only by the M3 profile path; inert until that lands.
+  double gpu_memory_utilization = 0.92;
+  // Absolute KV-pool size in bytes (0 = unset). When > 0 it sizes the block
+  // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
+  // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
+  int64_t kv_cache_memory_bytes = 0;
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
-  int max_num_seqs = 8;    // max concurrent sequences.
+  // max concurrent sequences. vLLM's default is 1024 (EngineArgs.max_num_seqs);
+  // ours was 8, which put c8 EXACTLY on the batch ceiling so the 8th stream
+  // could not co-batch -- measured as a throughput ratio that stayed flat to c4
+  // then collapsed at c8. Raising to 32 recovers it (c8 51.66 -> 64.41 tok/s,
+  // +24.7%, ratio vs vLLM flat ~0.74x instead of degrading to 0.59x).
+  // NOT vLLM's 1024: max_num_seqs scales KV demand, and GB10's unified memory
+  // has a narrow usable band (see gb10 OOM/thrash notes). 32 is the value
+  // MEASURED clean at --gpu-memory-utilization 0.55; higher is unverified.
+  int max_num_seqs = 32;
   // Per-step token budget (the chunked-prefill knob). 0 => the bounded PER-ARCH
   // default (see LoadedEngine::ResolveMaxNumBatchedTokens): dense arch 2048 flat
   // (vLLM's DEFAULT_MAX_NUM_BATCHED_TOKENS, vllm/config/scheduler.py:42 @
@@ -114,7 +155,27 @@ struct EngineParams {
   // only enables the seam. Non-safetensors (GGUF) checkpoints lack `mtp.*`, so an
   // MTP config over a GGUF source is rejected.
   std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt;
+
+  // ARCH-ONE-SURFACE fold ROW 8: explicit device selection, the mirror of
+  // vLLM's DeviceConfig.device (vllm/config/device.py). kAuto (default) keeps
+  // the accelerator-first probe that has always selected the queue — the
+  // byte-identical default. kCPU forces the CPU queue without consulting the
+  // probe. The INTERNAL value Device::kNamedPlatform is the tag for the stable
+  // PUBLIC/WIRE request whose value and name remain 2="cuda"; it resolves that
+  // canonical name through the platform registry and fails LOUD when CUDA is
+  // absent (never a silent fallback — an explicit device is assigned verbatim
+  // upstream, device.py:61-66). Exposed on the C ABI as
+  // vllm_model_params.device (ABI v14: 0=auto, 1=cpu, 2=cuda) and on the
+  // server as --device.
+  vllm::Device device = vllm::Device::kAuto;
 };
+
+// The shared queue-selection seam used by every LoadedEngine construction
+// path. Exposed from this internal header so the explicit named-platform path
+// can be gated with a distinctive registered platform/backend rather than a
+// parallel pure-policy copy.
+vt::Queue SelectQueueForModel(std::string_view architecture,
+                              vllm::Device device);
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
 // runner -> Executor -> EngineCore; Input/OutputProcessor -> LLMEngine) for a
@@ -168,10 +229,56 @@ class LoadedEngine {
   // the default policy without a disk load.
   static int ResolveMaxNumBatchedTokens(const EngineParams& params,
                                         int max_model_len, bool is_dense_arch);
+  // The serving `max_model_len`, resolved AGAINST the KV pool that will hold it.
+  // Mirrors vllm/v1/core/kv_cache_utils.py:2160-2174 @ 555967922, which runs
+  // both halves at engine init:
+  //   - `params.max_model_len <= 0` (the caller did not pin a length) ->
+  //     auto_fit_max_model_len (kv_cache_utils.py:1967-2027): serve the
+  //     checkpoint's context, reduced to what the pool holds.
+  //   - `params.max_model_len > 0` (pinned) -> check_enough_kv_cache_memory
+  //     (kv_cache_utils.py:751-788): THROW std::invalid_argument when the pool
+  //     cannot hold one sequence that long, naming the sizes and the flags.
+  // Either way the post-condition is the one the scheduler and the admission
+  // check both rely on: a request of max_model_len tokens fits in KV. Without
+  // it an over-long prompt is admitted, never allocates, and the engine spins
+  // at model_executed=0 with an idle GPU (issue #83 M4; external PR #227).
+  // Exposed, like ResolveMaxNumBatchedTokens above, for testing the policy
+  // without a disk load.
+  static int ResolveMaxModelLen(const EngineParams& params,
+                                const HfConfig& config,
+                                const vllm::v1::KVCacheConfig& kv_cfg,
+                                int block_size);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
+  // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
+  // behind SelectQueue, factored pure over the "is the CUDA platform
+  // registered" probe answer so the CPU tier can gate the whole matrix without
+  // registering fake global platforms:
+  //   * kCPU  -> vt::DeviceType::kCPU unconditionally — an explicit CPU ask
+  //     never consults the accelerator probe, even when CUDA is registered;
+  //   * kNamedPlatform -> the DeviceType returned by the canonical-name
+  //     platform lookup, else
+  //     THROWS std::runtime_error naming the device (fail LOUD; the mirror of
+  //     vLLM assigning an explicit device verbatim and never substituting
+  //     another — vllm/config/device.py:61-66);
+  //   * kAuto is NOT resolved here (it resolves through the accelerator-first
+  //     probe inside SelectQueue, byte-identical to pre-ROW-8) and throws
+  //     std::invalid_argument if passed.
+  // SelectQueue routes its explicit arms through THIS function, so the gate on
+  // it pins the production policy, not a parallel copy.
+  static vt::DeviceType ResolveExplicitDeviceType(
+      vllm::Device requested,
+      std::optional<vt::DeviceType> named_platform_type);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
+  // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
+  // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
+  // this — text-generation refuses on a pooling engine (naming vllm_embed /
+  // /v1/embeddings) and embed refuses on a text engine — the mirror of vLLM
+  // validating runner_type against the model class (config/model.py:607-613).
+  bool is_pooling_model() const {
+    return model_->registration().info.is_pooling_model;
+  }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,
   // online/server callers use this frontend rather than the synchronous
   // LLMEngine over the same scheduler/executor.
@@ -217,8 +324,12 @@ class LoadedEngine {
   // CPU construction-matrix test can assert it directly over the
   // runner_supports_async x VT_ASYNC_SCHED matrix without a disk load. Applies
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
+  // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
+  // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
+  // byte-identical text path.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
-                                  bool runner_supports_async);
+                                  bool runner_supports_async,
+                                  bool is_pooling_model = false);
 
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight
@@ -257,6 +368,24 @@ class LoadedEngine {
   static vllm::v1::KVCacheConfig MakeKVCacheMaybeSpec(
       const LoadedModel& model, const HfConfig& config, int block_size,
       int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec);
+  // ROAD-V1-MEM M1: resolve the KV block count from the sizing knobs against the
+  // model's own per-block byte geometry. `probe` is a KVCacheConfig already
+  // built for this model (its num_blocks is ignored; only the group/page
+  // geometry is read). Precedence: num_blocks override > absolute
+  // kv_cache_memory_bytes / KVBytesPerBlock(probe) > the gpu_memory_utilization
+  // profile path (M3, not yet implemented) which falls back to 256. Throws
+  // VLLM_ERR-shaped std::runtime_error when an absolute byte budget is smaller
+  // than a single KV block.
+  static int ResolveNumBlocks(const EngineParams& params,
+                              const vllm::v1::KVCacheConfig& probe);
+  // ROAD-V1-MEM M1: MakeKVCacheMaybeSpec with the block count resolved from the
+  // sizing knobs (builds a probe config to read the per-block geometry, then
+  // rebuilds at the resolved count only when it differs — the geometry itself is
+  // block-count-independent, so this is at most one extra metadata build).
+  static vllm::v1::KVCacheConfig MakeKVCacheResolved(
+      const LoadedModel& model, const HfConfig& config, int block_size,
+      const EngineParams& params,
+      const std::optional<vllm::SpeculativeConfig>& spec);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
@@ -286,6 +415,13 @@ class LoadedEngine {
   // the ctor body once runner_ geometry is known; see model_loader.cpp.
   std::unique_ptr<vllm::v1::kv_offload::KVConnector> kv_connector_;
   tok::Tokenizer tokenizer_;
+  // kv_cfg_ is declared BEFORE max_model_len_: the serving length is resolved
+  // AGAINST the KV pool (ResolveMaxModelLen auto-fits it down to what the pool
+  // holds, or refuses an explicit --max-model-len the pool cannot serve), and
+  // every consumer below — max_num_batched_tokens_, runner_, scheduler_,
+  // input_processor_ — takes the already-resolved value. MakeKVCacheResolved
+  // depends only on model_/config_/resolved_spec_config_, all declared above.
+  vllm::v1::KVCacheConfig kv_cfg_;
   int max_model_len_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
@@ -293,7 +429,6 @@ class LoadedEngine {
   // EngineParams::enable_jump_forward + the VT_ENABLE_JUMP_FORWARD env override.
   // Depends only on params + env (no member deps), so its init order is free.
   bool jump_forward_enabled_;
-  vllm::v1::KVCacheConfig kv_cfg_;
   // runner_ is declared BEFORE the scheduler (W3): the async-scheduling flip is
   // resolved from runner_.runner_supports_async(), so the runner must be fully
   // constructed before async_scheduling_enabled_ / scheduler_ are initialized.

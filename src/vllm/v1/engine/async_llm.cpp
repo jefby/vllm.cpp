@@ -7,10 +7,12 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
-#include "vllm/v1/metrics/stats.h"  // IterationStats (VT_TTFT_DUMP diagnostic)
+#include "vllm/v1/metrics/loggers.h"  // PrometheusStatLogger::Record
+#include "vllm/v1/metrics/stats.h"    // IterationStats
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
@@ -19,12 +21,14 @@ AsyncLLM::AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
                    Executor& executor, OutputProcessor& output_processor,
                    BlockHasher block_hasher, int shutdown_timeout_s,
                    int max_concurrent_batches,
-                   StructuredOutputManager* structured_output_manager)
+                   StructuredOutputManager* structured_output_manager,
+                   bool check_for_draft_tokens)
     : input_processor_(input_processor),
       output_processor_(output_processor),
       block_hasher_(std::move(block_hasher)),
       engine_core_(scheduler, executor, structured_output_manager,
-                   max_concurrent_batches, shutdown_timeout_s),
+                   max_concurrent_batches, shutdown_timeout_s,
+                   check_for_draft_tokens),
       output_handler_() {
   // Start only after every member (including the stop flags) is constructed;
   // the thread blocks on get_output until the first request arrives.
@@ -32,6 +36,11 @@ AsyncLLM::AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
 }
 
 AsyncLLM::~AsyncLLM() { shutdown(); }
+
+void AsyncLLM::set_stat_logger(metrics::PrometheusStatLogger* logger) {
+  std::lock_guard<std::mutex> lock(stat_logger_mutex_);
+  stat_logger_ = logger;
+}
 
 AsyncRequest AsyncLLM::add_request(const std::string& request_id,
                                    const std::string& prompt,
@@ -121,6 +130,123 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   return AsyncRequest{request.request_id, std::move(collector)};
 }
 
+std::vector<AsyncRequest> AsyncLLM::add_request_wave(
+    std::vector<AsyncStringRequestInput> requests) {
+  if (requests.empty()) return {};
+  if (shutdown_started_.load() || errored_.load() ||
+      engine_core_.engine_dead()) {
+    throw EngineDeadError("request wave submitted to a stopped AsyncLLM");
+  }
+
+  std::set<std::string> request_ids;
+  for (const AsyncStringRequestInput& input : requests) {
+    if (!request_ids.insert(input.request_id).second) {
+      throw std::invalid_argument("duplicate request id in wave: " +
+                                  input.request_id);
+    }
+  }
+
+  std::vector<PreparedRequest> prepared;
+  prepared.reserve(requests.size());
+  for (AsyncStringRequestInput& input : requests) {
+    EngineCoreRequest request = input_processor_.process_inputs(
+        input.request_id, input.prompt, std::move(input.params),
+        /*arrival_time=*/std::nullopt, input.priority);
+    auto collector = std::make_shared<RequestOutputCollector>(
+        request.sampling_params.output_kind, request.request_id);
+    auto core_request = std::make_unique<Request>(
+        Request::FromEngineCoreRequest(request, block_hasher_));
+    prepared.push_back(PreparedRequest{
+        std::move(request), std::move(input.prompt), std::move(collector),
+        std::move(core_request)});
+  }
+  return PublishPreparedWave(std::move(prepared));
+}
+
+std::vector<AsyncRequest> AsyncLLM::add_request_wave(
+    std::vector<AsyncTokensRequestInput> requests) {
+  if (requests.empty()) return {};
+  if (shutdown_started_.load() || errored_.load() ||
+      engine_core_.engine_dead()) {
+    throw EngineDeadError("request wave submitted to a stopped AsyncLLM");
+  }
+
+  std::set<std::string> request_ids;
+  for (const AsyncTokensRequestInput& input : requests) {
+    if (!request_ids.insert(input.request_id).second) {
+      throw std::invalid_argument("duplicate request id in wave: " +
+                                  input.request_id);
+    }
+  }
+
+  std::vector<PreparedRequest> prepared;
+  prepared.reserve(requests.size());
+  for (AsyncTokensRequestInput& input : requests) {
+    EngineCoreRequest request = input_processor_.process_inputs_tokens(
+        input.request_id, std::move(input.prompt_token_ids),
+        std::move(input.params), /*arrival_time=*/std::nullopt, input.priority);
+    auto collector = std::make_shared<RequestOutputCollector>(
+        request.sampling_params.output_kind, request.request_id);
+    auto core_request = std::make_unique<Request>(
+        Request::FromEngineCoreRequest(request, block_hasher_));
+    prepared.push_back(PreparedRequest{
+        std::move(request), std::nullopt, std::move(collector),
+        std::move(core_request)});
+  }
+  return PublishPreparedWave(std::move(prepared));
+}
+
+std::vector<AsyncRequest> AsyncLLM::PublishPreparedWave(
+    std::vector<PreparedRequest> prepared) {
+  std::vector<AsyncRequest> result;
+  std::vector<std::string> rollback_ids;
+  std::vector<std::unique_ptr<Request>> core_requests;
+  result.reserve(prepared.size());
+  rollback_ids.reserve(prepared.size());
+  core_requests.reserve(prepared.size());
+  for (PreparedRequest& item : prepared) {
+    result.push_back(AsyncRequest{item.request.request_id, item.collector});
+    rollback_ids.push_back(item.request.request_id);
+    core_requests.push_back(std::move(item.core_request));
+  }
+
+  return PublishAsyncRequestWaveIfAlive(
+      output_processor_mutex_,
+      [&]() {
+        return !shutdown_started_.load() && !errored_.load() &&
+               !engine_core_.engine_dead();
+      },
+      [&]() -> std::vector<AsyncRequest> {
+        // Reject every collision before creating the first new frontend state.
+        // This keeps a colliding pre-existing request outside the rollback set.
+        for (const PreparedRequest& item : prepared) {
+          if (output_processor_.has_request(item.request.request_id)) {
+            throw std::invalid_argument("duplicate live request id: " +
+                                        item.request.request_id);
+          }
+        }
+
+        std::size_t rollback_count = 0;
+        try {
+          for (std::size_t i = 0; i < prepared.size(); ++i) {
+            // Include the current id in rollback before registration:
+            // add_request may have inserted one of its maps before a later
+            // allocation fails.
+            rollback_count = i + 1;
+            PreparedRequest& item = prepared[i];
+            output_processor_.add_request(item.request, item.prompt,
+                                          /*request_index=*/0, item.collector);
+          }
+          engine_core_.add_requests_async(std::move(core_requests));
+        } catch (...) {
+          rollback_ids.resize(rollback_count);
+          output_processor_.rollback_requests(rollback_ids);
+          throw;
+        }
+        return std::move(result);
+      });
+}
+
 AsyncRequest AsyncLLM::add_request(const std::string& request_id,
                                    multimodal::MultiModalInputs mm_inputs,
                                    SamplingParams params, int priority) {
@@ -175,6 +301,14 @@ std::optional<RequestOutput> AsyncLLM::get_output_nowait(
     throw std::invalid_argument("AsyncLLM request has no collector");
   }
   return request.collector->get_nowait();
+}
+
+std::optional<RequestOutput> AsyncLLM::get_output_for(
+    const AsyncRequest& request, std::chrono::milliseconds timeout) {
+  if (request.collector == nullptr) {
+    throw std::invalid_argument("AsyncLLM request has no collector");
+  }
+  return request.collector->get_for(timeout);
 }
 
 RequestOutput AsyncLLM::generate(const std::string& prompt,
@@ -262,26 +396,43 @@ void AsyncLLM::RunOutputHandler() {
     for (;;) {
       // async_llm.py:651: one blocking EngineCoreOutputs pull.
       EngineCoreOutputs outputs = engine_core_.get_output();
+
+      // async_llm.py:648-652 logger_ref[0] — read ONCE per iteration so the
+      // build decision and the fold below cannot disagree if the logger is
+      // detached mid-step.
+      // Keep the attachment stable through the complete stats fold. In
+      // particular, a terminal output is visible to generate() before Record
+      // below finishes; holding this lock makes a concurrent detach wait until
+      // the last possible use of the old non-owning pointer has retired.
+      std::unique_lock<std::mutex> logger_lock(stat_logger_mutex_);
+      metrics::PrometheusStatLogger* logger = stat_logger_;
+
+      // async_llm.py:664-665
+      //   iteration_stats = IterationStats() if (log_stats and num_outputs)
+      // — `log_stats` is "a logger is attached" here, exactly as the sync site
+      // reads it (llm_engine.cpp:190-193).
+      //
+      // DIAGNOSTIC (VT_TTFT_DUMP): keeps its own independent trigger, so a
+      // no-logger run with the env unset is instruction-identical to before
+      // this row (process_outputs takes its byte-identical no-stats path).
+      static const bool kTrackAsyncStats =
+          std::getenv("VT_TTFT_DUMP") != nullptr;
+      const bool track_stats =
+          (logger != nullptr && !outputs.outputs.empty()) || kTrackAsyncStats;
+
+      IterationStats iteration_stats;
       OutputProcessorOutput processed;
       {
         std::lock_guard<std::mutex> lock(output_processor_mutex_);
         // RequestOutputs are pushed to their collectors by OutputProcessor;
         // the synchronous return list must therefore stay empty.
         //
-        // DIAGNOSTIC (VT_TTFT_DUMP): the production async frontend passes
-        // nullptr, so process_outputs skips the per-request timing block
-        // (queued/prefill/decode intervals + engine-core events) entirely — the
-        // SERVE-RESPONSE-METRICS residual. Under the diagnostic, pass a throwaway
-        // IterationStats so req_state timing is populated for the TTFT-split dump
-        // (paired with the async timestamp stamp in EngineCore::step_with_batch_
-        // queue). Observational only; generation is byte-identical, and the
-        // default (unset) path is instruction-identical to production.
-        static const bool kTrackAsyncStats =
-            std::getenv("VT_TTFT_DUMP") != nullptr;
-        if (kTrackAsyncStats) {
-          IterationStats async_iteration_stats;
-          processed =
-              output_processor_.process_outputs(outputs, &async_iteration_stats);
+        // async_llm.py:676-678 process_outputs(outputs_slice, outputs.timestamp,
+        // iteration_stats). Our process_outputs reads the engine-core timestamp
+        // off the EngineCoreOutputs itself (output_processor.cpp:367).
+        if (track_stats) {
+          processed = output_processor_.process_outputs(outputs,
+                                                        &iteration_stats);
         } else {
           processed = output_processor_.process_outputs(outputs);
         }
@@ -289,6 +440,19 @@ void AsyncLLM::RunOutputHandler() {
       // Stop-string finishes detected by the detokenizer must be reflected in
       // EngineCore after leaving the OutputProcessor critical section.
       engine_core_.abort_requests_async(processed.reqs_to_abort);
+
+      // async_llm.py:697-702 — fold this step's SchedulerStats + IterationStats
+      // into the registry. Upstream records whenever a logger exists; every
+      // EngineCoreOutputs our proc queues came from a map entry that exists
+      // only when `outputs` is non-empty (core.cpp:91-94), so this is also the
+      // sync site's `len(outputs.outputs) > 0` guard (llm_engine.py:321-323).
+      //
+      // Deliberately OUTSIDE output_processor_mutex_: the logger's own mutex is
+      // then a leaf lock that can never take part in a cycle with the
+      // output-processor lock or a collector's condition variable.
+      if (logger != nullptr && !outputs.outputs.empty()) {
+        logger->Record(outputs.scheduler_stats, iteration_stats);
+      }
     }
   } catch (...) {
     if (!stopping_.load()) {

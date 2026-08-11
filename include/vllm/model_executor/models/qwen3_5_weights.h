@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,10 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
+
+namespace vt {
+class Backend;
+}  // namespace vt
 
 namespace vllm {
 
@@ -66,12 +71,26 @@ struct OwnedTensor {
   // Same total bytes; set only on the owned (copy) residency (the transform
   // rewrites the buffer, so it cannot ride the read-only mmap borrow).
   bool q8_0_aligned = false;
+  // KERNEL-GEMM-CPU-TILED lever 2: the [N,K] elementwise bytes were transposed
+  // to [K,N] at load. Carried to vt::Tensor::elem_kn_repacked; shape stays
+  // [N,K]. Opt-in (VT_CPU_ELEM_KN_REPACK=1) and CPU-only, see the flag comment.
+  bool elem_kn_repacked = false;
 
   // A synchronized direct-device load may discard the host staging buffer while
   // retaining an authoritative d_dev/d_dev_f32 copy. Empty() is used as model
   // dispatch metadata, so host reclamation must not make a populated weight look
   // absent. Mutable because ReleaseHost is logically const, like lazy residency.
   mutable bool host_released = false;
+
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150). Non-null when `bytes` BORROWS a
+  // read-only safetensors mmap taken verbatim from the checkpoint instead of
+  // being copied into an owned buffer, and records the exact source range so
+  // the windowed page release can run once a device copy exists. It is the
+  // discriminator between the two borrow producers: this one may be adopted
+  // onto the device allocation after upload, whereas a GGUF-mmap or
+  // tied-expansion borrow must not be (see AdoptDeviceBytesAsHost).
+  mutable const void* mmap_src = nullptr;
+  mutable size_t mmap_src_bytes = 0;
 
   bool Empty() const { return bytes.empty() && !host_released; }
   bool HasHostBytes() const { return !bytes.empty(); }
@@ -99,6 +118,71 @@ struct OwnedTensor {
   // activation is f32). The shared_ptr deleter frees through the vt Backend.
   mutable std::shared_ptr<void> d_dev;
   mutable std::shared_ptr<void> d_dev_f32;
+};
+
+// ADOPT the device-resident copy AS the host buffer, where the backend says its
+// allocations are host-addressable (vt::Backend::DeviceMemoryIsHostAddressable).
+//
+// THE DEFECT THIS CLOSES (BACKEND-VULKAN-LOADMEM). `ResidentWeight` uploads a
+// weight and keeps `bytes` as well, so on Vulkan the model became resident
+// TWICE. That is invisible on a discrete GPU -- the two copies are in different
+// memories -- but GB10 is unified, so both come out of the same 119 GiB of
+// system RAM. MEASURED on Qwen3-4B (7.6 GiB on disk): 8.622 GiB of Vulkan
+// allocation and 16.392 GiB of process VmHWM, i.e. a whole second copy, and
+// 17.1 GiB off MemAvailable. Extrapolated to the 27B (50.89 GiB) that is over
+// 100 GiB, which is why loading it could take the machine down rather than fail.
+// `src/vllm/platforms/vulkan.cpp` even REASONED that there is "exactly one copy
+// of the bytes"; this is what makes that true.
+//
+// It is an ADOPTION, not a free: `bytes` is re-pointed at the device allocation
+// (persistently mapped, host-coherent) and keeps it alive through `d_dev`, so
+// every existing `.bytes` reader -- `ResidentWeightF32`'s upcast, the portable
+// CPU reference tier, `Numel`/`View` -- reads the SAME bytes it read before,
+// from the surviving copy. Nothing is dropped that anyone could still want, so
+// unlike `ReleaseHost()` this needs no "is the device path committed" proof.
+//
+// A no-op unless the backend opts in, and a no-op on an already-BORROWED buffer
+// (a GGUF mmap or a tied-weight expansion): those own no anonymous pages, and a
+// tied pair must keep sharing one keep-alive.
+//
+// `VT_ADOPT_DEVICE_BYTES=0` is the same-binary A/B back to the two-copy
+// behavior (house convention for a default-on residency change).
+void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
+
+// Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
+// #237).
+//
+// The forward paths build per-weight constants once — arrays of per-expert
+// device pointers, Marlin repacks, token row maps — and reuse them on every
+// subsequent step. That state used to live in `static` maps keyed on the ADDRESS
+// of the weight, built on first touch and never erased, on the assumption that a
+// process holds one engine for its lifetime.
+//
+// The assumption is false and it corrupts output. Destroy a `LoadedEngine` and
+// build another in the same process, and the allocator can hand the new weights
+// the address the old ones had; the new weights then inherit an entry marked
+// ready whose device pointers were `cudaFree`d with the old engine. Nothing in
+// this tree destroys the CUDA context, so those pointers stay *mapped* — they
+// just now belong to whatever the new engine allocated there, which is how it
+// surfaced: not a crash, but zeroed and corrupted output token ids, only in a
+// test ordering that builds a second engine.
+//
+// Holding the state here ties it to the weights it describes, so it cannot
+// outlive them and an address cannot be inherited. Deliberately opaque: the
+// resident types are CUDA-path implementation details of the model .cpp files,
+// and `shared_ptr<void>` keeps them out of this header while still running the
+// correct destructor.
+//
+// This does NOT change the lifetime of the DEVICE allocations those types point
+// at. They were leaked for the process before and are leaked now; freeing them
+// is a separate question about backend teardown order, and widening this fix to
+// touch that would put a shutdown-ordering hazard on the critical path of a
+// correctness fix.
+struct ResidentSlot {
+  // Mutable because building the resident state is logically const: it is a
+  // cache of what the weight already contains, populated on first use from a
+  // const forward.
+  mutable std::shared_ptr<void> state;
 };
 
 // Device-resident NVFP4 W4A16 weight (M2.2b). The modelopt packed fp4 codes +
@@ -154,6 +238,22 @@ struct Nvfp4Weight {
   // path. Uploaded once from the persistent `alpha` member; the diagnostic host
   // scalar path leaves this null.
   mutable std::shared_ptr<void> d_alpha;
+  // OPT-IN lifetime residency for the DEQUANTIZED bf16 [K=in, N=out] Matmul-B
+  // operand the backends with NO fp4 GEMM multiply against (CPU / Vulkan / Metal /
+  // HIP / Tenstorrent; CUDA never dequantizes). Default OFF, and it must stay a
+  // per-WEIGHT opt-in: the operand is a bf16 expansion of ~4x the packed bytes, so
+  // holding one per tower projection is the double-residency that OOM-reboots a
+  // Spark on Vulkan (#203). The dense loader opts in the OUTPUT HEAD alone — one
+  // weight, re-read whole every step (~2.54 GB a step rebuilt per call at the
+  // 27B's 248320x5120); everything else keeps a per-call copy.
+  bool keep_dequant_b = false;
+  mutable std::shared_ptr<void> d_dequant_b;
+
+  // Resident Marlin constants (issue #237; see ResidentSlot). `resident_marlin`
+  // is this weight's own repack; `resident_marlin_pair` is the fused gate+up
+  // repack, held on the GATE weight of the pair (it is the pair's cache key).
+  ResidentSlot resident_marlin;
+  ResidentSlot resident_marlin_pair;
 };
 
 // Device-resident per-tensor FP8 (W8A8) weight — the 35B attn q/k/v/o + GDN
@@ -225,6 +325,20 @@ struct GdnLayerWeights {
   Fp8Weight in_proj_qkv_fp8;  // [N=conv_dim, K=H]
   Fp8Weight in_proj_z_fp8;    // [N=value_dim, K=H]
   Fp8Weight out_proj_fp8;     // [N=H, K=value_dim]
+
+  // PERF-27B-GDN-FP8-QKVZ: the FP8 analogue of `in_proj_qkvz`. vLLM runs ONE
+  // merged qkvz GEMM per GDN layer, so the two RAW fp8 shards above are
+  // N-concatenated ONCE into a single device operand — i8 [conv_dim+value_dim,
+  // H], qkv rows first — and the forward issues one fp8 GEMM instead of two.
+  // Built lazily-once (and eagerly, PRE-CAPTURE, by
+  // Qwen3_5DenseModel::PrepareGdnFp8Resident) exactly like Fp8Weight::d_packed;
+  // the shard-local `d_packed` residents are then never built, so the merged
+  // arm costs no duplicate device bytes. `d_qkvz_fp8_alpha` is the f32
+  // [conv_dim+value_dim] per-output-column folded alpha and stays NULL in the
+  // common case where both shards fold the SAME alpha (it is then folded into
+  // the GEMM scalar instead). Empty on every non-fp8 owner.
+  mutable std::shared_ptr<void> d_qkvz_fp8_packed;
+  mutable std::shared_ptr<void> d_qkvz_fp8_alpha;
 };
 
 // Full (dense causal) attention layer weights.
@@ -328,6 +442,13 @@ struct MoeBlockWeights {
   Nvfp4Weight shared_gate_proj_fp4;  // [N=Is, K=H]
   Nvfp4Weight shared_up_proj_fp4;    // [N=Is, K=H]
   Nvfp4Weight shared_down_proj_fp4;  // [N=H, K=Is]
+
+  // Resident MoE constants, one slot per forward path (issue #237; see
+  // ResidentSlot). Exactly one is populated on a given engine — whichever path
+  // this block's experts route through — and all three die with the block.
+  ResidentSlot resident_fused;   // MoeFusedResident   (fp4 fused)
+  ResidentSlot resident_bf16;    // MoeBf16Resident    (bf16 fast)
+  ResidentSlot resident_marlin;  // MoeMarlinResident  (Marlin grouped)
 };
 
 // One decoder layer: input/post norms + one attention variant + the MoE block.
@@ -366,6 +487,47 @@ struct Qwen3_5MoeWeights {
 
 // Resolves a tensor name to its StTensor (across shards). Throws if absent.
 using TensorResolver = std::function<const StTensor&(const std::string&)>;
+
+// --- ENG-LOAD-DIRECT-UPLOAD (issue #150) -------------------------------------
+//
+// THE DEFECT THIS CLOSES. Loading a checkpoint copies the weights TWICE: the
+// loader `memcpy`s each tensor out of the read-only safetensors mmap into an
+// owned anonymous buffer, and `ResidentWeight` later copies that buffer into a
+// device allocation and drops it. For a 27B that is two full passes over tens
+// of GiB where one would do, and the intermediate pass also costs the kernel a
+// fresh anonymous page (and its zero-fill) for every page of the model.
+//
+// THE MECHANISM. For a tensor the device consumes VERBATIM, the owned buffer is
+// never allocated at all: `bytes` borrows the mapping (OwnedBytes::Borrow, with
+// StTensor::mapping as the keep-alive, so the mapping cannot be unmapped out
+// from under it), and the device upload reads straight from the file mapping.
+//
+// WHAT QUALIFIES, BY CONSTRUCTION. Only a call site that would have performed a
+// plain `memcpy` of the WHOLE source range into a freshly allocated destination
+// of the SAME size may call this — no transpose, no dtype conversion, no
+// dequant, no concatenation of several sources into one buffer, and no
+// load-time repack (`repacked`/`q8_0_aligned`/`elem_kn_repacked`, which mutate
+// the buffer and are set only on the GGUF path). The size identity is re-checked
+// here (`numel(shape) * sizeof(dtype) == t.nbytes`) and the call FAILS CLOSED,
+// returning false so the caller runs its normal copy, whenever anything does
+// not line up. A reshape is fine: it changes no byte.
+//
+// Returns true when `o` was made to borrow (its dtype/rank/shape are then set
+// from `dtype`/`shape` and its bytes are the mapping's); false when the caller
+// must fall back to its existing copy. `VT_LOAD_DIRECT_UPLOAD=0` forces false
+// (same-binary A/B, house convention).
+bool BorrowStTensorBytes(OwnedTensor& o, const StTensor& t, vt::DType dtype,
+                         const std::vector<int64_t>& shape);
+
+// Process-cached gate behind `BorrowStTensorBytes`. Exposed so a test can assert
+// which arm it is measuring.
+bool LoadDirectUploadEnabled();
+
+namespace detail {
+// Test-only override of the direct-upload decision, bypassing the env cache so
+// one test binary can exercise both arms. std::nullopt restores the default.
+void SetLoadDirectUploadOverrideForTesting(std::optional<bool> value);
+}  // namespace detail
 
 // Load one decoder layer's weights from real tensors. `layer_type` is
 // "linear_attention" or "full_attention"; `num_experts` drives the expert loop.

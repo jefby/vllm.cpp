@@ -3,6 +3,9 @@
 // deviations and deferrals.
 #include "vllm/v1/engine/core.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <cassert>
 #include <cstdlib>
 #include <memory>
@@ -56,6 +59,10 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // execute_model returns None ("forward done"), so we always call sample_tokens.
   std::optional<ModelRunnerOutput> model_output =
       executor_.execute_model(scheduler_output);
+  // Chunked-prefill progress, AFTER the forward so its elapsed_s is real wall
+  // time rather than the cost of scheduling. No-op unless
+  // VT_SERVER_PREFILL_PROGRESS / VT_SERVER_VERBOSE is on.
+  scheduler_.LogPrefillAfterExecute(scheduler_output);
   // core.py:492 grammar_output = self.scheduler.get_grammar_bitmask(...). Nullopt
   // when no structured request is scheduled (or no manager is wired); threaded to
   // sample_tokens (Task 3 consumes it).
@@ -107,6 +114,12 @@ void EngineCore::post_step(bool model_executed) {
     return;
   }
   std::optional<DraftTokenIds> draft_token_ids = executor_.take_draft_token_ids();
+  static const bool spec_post_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+  if (spec_post_trace) {
+    std::fprintf(stderr, "[spec-post_step] pulled=%d rows=%zu\n",
+                 draft_token_ids.has_value() ? 1 : 0,
+                 draft_token_ids.has_value() ? draft_token_ids->req_ids.size() : 0);
+  }
   if (draft_token_ids.has_value()) {
     scheduler_.update_draft_token_ids(*draft_token_ids);
   }
@@ -135,6 +148,8 @@ EngineCore::step_with_batch_queue() {
     // done). A failed eager forward throws here, through the engine-fatal guard.
     std::optional<ModelRunnerOutput> exec_out =
         executor_.execute_model(scheduler_output);
+    // Same diagnostic as the synchronous path above.
+    scheduler_.LogPrefillAfterExecute(scheduler_output);
     // core.py:552-553 model_executed = total_num_scheduled_tokens > 0
     // (is_ec_consumer is always true for us — no EC transfer).
     model_executed = scheduler_output.total_num_scheduled_tokens > 0;
@@ -207,17 +222,22 @@ EngineCore::step_with_batch_queue() {
         BatchQueueItem{std::move(sampled), std::move(*deferred_scheduler_output)});
   }
 
-  // DIAGNOSTIC (VT_TTFT_DUMP): unlike the synchronous step() (which stamps
-  // scheduler_stats + timestamp at core.py parity above), the batch-queue path
-  // leaves engine_core_outputs.timestamp at 0, so the frontend's TTFT/prefill/
-  // decode intervals (engine_core_timestamp - arrival/last_token) are wrong on
-  // the async serving path. That is the SERVE-RESPONSE-METRICS residual (async
-  // per-request stats are never tracked). Stamp it only under the diagnostic so
-  // the production async path stays byte-AND-instruction-identical when unset.
-  static const bool kStampAsyncTs = std::getenv("VT_TTFT_DUMP") != nullptr;
-  if (kStampAsyncTs) {
-    engine_core_outputs.timestamp = MonotonicSeconds();
-  }
+  // Attach this step's scheduler snapshot + engine-core timestamp, identically
+  // to the synchronous step() above. Upstream stamps BOTH inside the path the
+  // two step functions share — scheduler_stats in Scheduler.update_from_output
+  // (scheduler.py:1938-1951) and timestamp in EngineCoreOutputs.__post_init__
+  // (engine/__init__.py:249-251) — so upstream's step_with_batch_queue
+  // (core.py:622-720) stamps nothing extra precisely because it already has
+  // them.
+  //
+  // Until #277 this path stamped NEITHER: the async-scheduling serving stack
+  // (LoadedEngine resolves max_concurrent_batches=2 whenever the runner
+  // supports it) published a default-constructed SchedulerStats — every gauge
+  // 0 — and a timestamp of 0.0, which turns every TTFT/e2e observation into
+  // `-arrival_time`. The former VT_TTFT_DUMP-only timestamp stamp is subsumed
+  // here; the diagnostic reads exactly the value it always did.
+  engine_core_outputs.scheduler_stats = scheduler_.make_stats();
+  engine_core_outputs.timestamp = MonotonicSeconds();
 
   std::map<int, EngineCoreOutputs> outputs_by_client;
   if (!engine_core_outputs.outputs.empty()) {

@@ -215,12 +215,20 @@ void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
 // `hidden` DBuf reassignment (RunLayer's `hidden = MlpBlock(...)`) never disturbs
 // the persistent embedding — the copy is a pure device->device data move, so the
 // layer sequence and its output are BYTE-IDENTICAL to the pre-split forward.
+// `return_hidden` (ARCH-ONE-SURFACE ROW 6, default false = byte-identical
+// text path): when true, STOP after the final RMSNorm (+ the logits_indices
+// gather) and return the [n_out, H] hidden rows upcast to f32 — the pooling
+// forward of an embedding conversion, whose model has NO lm_head at all
+// (adapters.py:135-151: as_embedding_model replaces the output layer with a
+// missing-layer stage; the pooler consumes the post-final-norm hidden). Every
+// existing caller leaves the default, so the lm_head tail is untouched.
 DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const std::vector<int32_t>& positions,
                    const CommonAttentionMetadata& attn_meta,
                    const std::vector<PagedKvCache>& attn_kv,
                    const Qwen3DenseWeights& weights, const HfConfig& config,
-                   const std::vector<int32_t>& logits_indices) {
+                   const std::vector<int32_t>& logits_indices,
+                   bool return_hidden = false) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -254,13 +262,6 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
-  // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
-  // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
-  // Matmul-B [H,vocab] lm_head via vt::Matmul.
-  const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
-  Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
-                   : ResidentWeight(d, weights.lm_head);
-
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   Tensor src = dnorm.t();
@@ -272,6 +273,23 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     src = dgather.t();
   }
   const int64_t n_out = src.shape[0];
+
+  // ARCH-ONE-SURFACE ROW 6 pooling tail: the post-final-norm hidden rows,
+  // upcast bf16 -> f32 (vt::CastF32), with NO lm_head — an embedding-converted
+  // checkpoint has no output layer to multiply by. Never taken by any text
+  // caller (return_hidden defaults false).
+  if (return_hidden) {
+    DBuf dhid(d, DType::kF32, {n_out, H});
+    vt::CastF32(d.q, dhid.t(), src);
+    return dhid;
+  }
+
+  // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
+  // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
+  // Matmul-B [H,vocab] lm_head via vt::Matmul.
+  const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
+  Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
+                   : ResidentWeight(d, weights.lm_head);
   DBuf logits(d, DType::kF32, {n_out, vocab});
   if (tied)
     vt::MatmulBT(d.q, logits.t(), src, lm);
@@ -289,12 +307,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Qwen3DenseWeights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 bool return_hidden = false) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   DBuf hidden(d, DType::kBF16, {T, config.hidden_size});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, attn_kv, weights, config,
-                       logits_indices);
+                       logits_indices, return_hidden);
 }
 
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -410,6 +429,30 @@ ForwardLogits Qwen3DenseModel::ForwardDevice(
                              config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
+}
+
+ForwardLogits Qwen3DenseModel::ForwardHidden(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
+    const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+    const std::vector<int32_t>& logits_indices) {
+  // ARCH-ONE-SURFACE ROW 6: the POOLING forward — the same embed + layer stack
+  // as Forward/ForwardDevice, stopping after the final RMSNorm (+ gather) with
+  // NO lm_head, mirroring an as_embedding_model conversion whose output layer
+  // is a missing-layer stage (adapters.py:135-151). The [n_out, H] f32 rows are
+  // downloaded to the host carrier: the landed pooler ops are host-side, and an
+  // embedding batch is one prefill (no per-step decode loop to keep resident).
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dhidden = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
+                             config, logits_indices, /*return_hidden=*/true);
+  const int64_t n_out = dhidden.t().shape[0];
+  const int64_t H = config.hidden_size;
+  ForwardLogits fl;
+  fl.rows = n_out;
+  fl.vocab = H;  // the carrier's row width IS the hidden size on this path
+  fl.host.resize(static_cast<size_t>(n_out) * static_cast<size_t>(H));
+  dhidden.Download(d, fl.host.data());
+  return fl;
 }
 
 // ─── Qwen3DenseDecodeGraph (shared pure-dense decode CUDA-graph driver) ───────
@@ -610,12 +653,18 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   return fl;
 }
 
-// Per-family opt-in gate (see qwen3.h). DEFAULT OFF: the shared dense decode graph
-// is a same-binary opt-in until its per-model SACRED token-exact gate has been run
-// on GB10; when off, the dense factories' forward is byte-identical to before.
+// Per-family gate (see qwen3.h). DEFAULT ON (row QUANT-CT-MXFP4-MARLIN-STRUCT step 1,
+// parity-enabler): the shared dense decode CUDA-graph is byte-coherent + token-exact
+// vs the eager forward on both dense checkpoints — test_qwen3_paged_engine 184/184
+// (Qwen3-0.6B near-tie + Qwen3-4B) and test_qwen3_dense_async_serving 82/82, graph
+// ON == OFF — and on the Qwen3-8B-MXFP4 #44 smoke (deterministic 3/3 token-exact +
+// coherent), all captured on GB10. An explicit VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH=0
+// opts back out to the eager path (byte-identical to the pre-graph forward); the
+// framework kill switch VLLM_CPP_CUDAGRAPH=0 additionally forces eager inside the
+// driver (Impl::enabled), so the graph never captures under either opt-out.
 bool DenseDecodeGraphEnabled() {
   const char* value = std::getenv("VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH");
-  return value != nullptr && value[0] != '0';
+  return !(value != nullptr && value[0] == '0');
 }
 
 std::optional<ForwardLogits> DenseDecodeGraphForward(
@@ -627,6 +676,30 @@ std::optional<ForwardLogits> DenseDecodeGraphForward(
   // for larger batches / when the framework kill switch is set.
   if (!DenseDecodeGraphEnabled() || !input.pure_decode ||
       !platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
+    return std::nullopt;
+  }
+  // #323 — CORRECTNESS FIRST. `Step()` below replays against the HOST
+  // `input.token_ids` and never reads `input.device_token_ids`. On the depth-2
+  // async path the combine has patched the DEVICE ids and `token_ids` is
+  // deliberately stale for decode rows (runner.cpp), so the replay generates
+  // from stale ids and every concurrent request past slot 0 degenerates — the
+  // #31 signature, reproduced on Mistral-7B-v0.3 and InternLM2-chat-1.8B and
+  // latent for EVERY classic-dense model, since the graph is default-ON.
+  //
+  // Measured, same binary, 4-concurrent battery vs a batch-1 sync anchor:
+  //   depth-1, graph ON   PASS 78/78      (no async pipelining)
+  //   depth-2, graph OFF  PASS 82/82      (eager path honours the scope)
+  //   depth-2, graph ON   FAIL, slots 1-3 degenerate
+  // Both conditions are required, which is why the registry-level
+  // DeviceTokenIdsScope (60e71a0e) did not close it: this path returns BEFORE
+  // the eager forward ever runs.
+  //
+  // Declining the graph while the mirror is live falls back to that
+  // proven-correct eager path. This is a MITIGATION, not the end state — the
+  // real fix is for Step() to read the ids at REPLAY time (a stable device
+  // buffer), which restores graphed decode for async serving. Until then a
+  // correct stream outranks the graph's throughput.
+  if (input.device_token_ids != nullptr) {
     return std::nullopt;
   }
   // gdn_state_slots carries max_num_reqs for EVERY arch (the runner sets it from

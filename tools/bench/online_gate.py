@@ -30,6 +30,7 @@ import platform
 import re
 import shlex
 import sqlite3
+import statistics
 import subprocess
 import sys
 from collections import Counter
@@ -65,6 +66,18 @@ NSYS_CUDA_GRAPH_TRACE = "node:host-only"
 NSYS_CUDA_FLUSH_INTERVAL_MS = 0
 NSYS_PRODUCT_VERSION = "2025.3.2.474"
 DGX_CUDA_COMPILER = pathlib.Path("/usr/local/cuda-13.0/bin/nvcc")
+
+
+def server_binary(build_dir: pathlib.Path) -> pathlib.Path:
+    """The built OpenAI server.
+
+    `examples/CMakeLists.txt` renamed the `server` target's OUTPUT_NAME to
+    `vllm-server` with the release packaging, so a current build tree has no
+    `examples/server`. Prefer the current name and fall back to the pre-rename
+    one so an evidence tree built before that rename still replays.
+    """
+    current = build_dir / "examples" / "vllm-server"
+    return current if current.exists() else build_dir / "examples" / "server"
 DGX_CUDA_COMPILER_VERSION = "13.0.88"
 NVFP4_PLAN_FIXTURE_SHA256 = (
     "e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd"
@@ -200,21 +213,77 @@ REPETITIONS = (1, 2, 3)
 # accepted domain so the component can reuse ``OnlineRun`` / ``build_client_command``.
 MAX_ONLINE_REPETITION = 5
 POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
+# Bench-only additive model keys may sweep a reduced low-concurrency point set.
+# The NVFP4 gate models ("27"/"35") keep the full six-point sweep (the default);
+# the MXFP4 W4 throughput row ("q3mxfp4", a dense 8B keep-quant vehicle) benches
+# only c1/c2/c4/c8 (the decode/low-concurrency regime the row is scoped to). The
+# concurrency -> num_prompts mapping is a strict prefix of POINTS, so prompts_for
+# stays unchanged; only the SET of benched concurrencies narrows per model.
+POINTS_BY_MODEL = {
+    "q3mxfp4": ((1, 6), (2, 6), (4, 12), (8, 24)),
+}
+# "27" and "27n" are DIFFERENT MODELS, not two spellings of one. The unsloth
+# repo @890bdef7 ships a BF16 lm_head and a different mixed-precision layout;
+# the nvidia ModelOpt repo @0893e160 is NVFP4 MLP + FP8 W8A8 tower + NVFP4 head.
+# They do not share goldens and their ratios are not comparable.
 MODEL_REVISIONS = {
     "27": "890bdef7a42feba6d83b6e17a03315c694112f2a",
+    "27n": "0893e1606ff3d5f97a441f405d5fc541a6bdf404",
     "35": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
+    "q3mxfp4": "b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47",
 }
 MODEL_REPOSITORIES = {
     "27": "unsloth/Qwen3.6-27B-NVFP4",
+    "27n": "nvidia/Qwen3.6-27B-NVFP4",
     "35": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    "q3mxfp4": "Yi30/Qwen3-8B-MXFP4",
 }
 MAX_NUM_SEQS = 32
-MAX_NUM_BATCHED_TOKENS = {"27": 2048, "35": 8192}
-MAX_MODEL_LEN = {"27": 262144, "35": 262144}
+MAX_NUM_BATCHED_TOKENS = {"27": 2048, "27n": 2048, "35": 8192, "q3mxfp4": 2048}
+MAX_MODEL_LEN = {"27": 262144, "27n": 262144, "35": 262144, "q3mxfp4": 40960}
+# Every correctness precondition the driver can dispatch, and the two facts that
+# make its recorded PASS falsifiable.
+#
+# `proof` is a line the gate prints ONLY after it has compared tokens. It is not
+# decoration: a checkpoint-gated parity test emits a loud MESSAGE and returns
+# with status 0 when its snapshot is absent, so `ctest` exit 0 says nothing about
+# whether anything was compared. Without the proof line a model gate can be
+# recorded as passed with zero tokens compared.
+#
+# `golden_revision` is the checkpoint the gate's committed goldens were captured
+# against, when the gate pins one, and `None` when it resolves its snapshot
+# without pinning a revision. Comparing it to `MODEL_REVISIONS[model_key]` is
+# what tells a reader whether the precondition is a golden FOR THE BENCHED MODEL
+# or build sanity on a neighbour -- the deliberate case for key "27n".
+MODEL_GATE_CONTRACTS = {
+    "test_qwen27_paged_engine": {
+        # tests/parity/hf_snapshot.h `kQwen27NvfP4Revision`: the 27B goldens are
+        # the unsloth @890bdef7 checkpoint's, for BOTH dense 27B keys.
+        "golden_revision": "890bdef7a42feba6d83b6e17a03315c694112f2a",
+        "proof": "qwen27_paged_engine: full production stream 16/16 token-exact vs vLLM",
+    },
+    "test_qwen36_paged_engine": {
+        # Find35BSnapshot() takes the first cached snapshot of the 35B repo and
+        # pins no revision, so this records an honest "unknown" rather than
+        # asserting a match nothing checks.
+        "golden_revision": None,
+        "proof": "qwen36_paged_engine M0-EXIT: produced ",
+    },
+    "mxfp4_smoke_battery": {
+        # docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json records no
+        # source revision.
+        "golden_revision": None,
+        "proof": "MXFP4 smoke battery: PASS",
+    },
+}
 ENGINES = ("ours", "vllm")
 PERCENTILE_METRICS = ("ttft", "tpot", "itl", "e2el")
 PERCENTILES = (50, 90, 99)
 CACHE_DROP_METHOD = "posix_fadvise-dontneed+mincore"
+# A readiness probe coarser than this cannot resolve a startup of a few tens of
+# seconds to better than ~10%, which is the size of the effect being measured.
+STARTUP_MAX_POLL_INTERVAL_SECONDS = 1.0
+STARTUP_ENGINES = ("ours", "vllm")
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _NSYS_ALLOWED_DIAGNOSTIC = re.compile(
@@ -275,6 +344,20 @@ def prompts_for(concurrency: int) -> int:
         return dict(POINTS)[concurrency]
     except KeyError as error:
         raise HarnessError(f"unsupported online-gate concurrency: {concurrency}") from error
+
+
+def points_for(model_key: str) -> tuple[tuple[int, int], ...]:
+    """The (concurrency, num_prompts) sweep for ``model_key``.
+
+    Defaults to the full six-point :data:`POINTS`; a key present in
+    :data:`POINTS_BY_MODEL` uses its reduced set (a prefix of POINTS, so the
+    per-concurrency prompt counts are identical). This is the single source of
+    truth both this module and :mod:`online_gate_summary` consult so a bench-only
+    model key never triggers a spurious "missing result group" for a concurrency
+    it was never scoped to sweep.
+    """
+
+    return POINTS_BY_MODEL.get(model_key, POINTS)
 
 
 def trace_primary_graph_contract(
@@ -804,7 +887,7 @@ def prepare_corpus_views(
     files: list[dict[str, Any]] = []
     prompt_hashes: set[str] = set()
     for repetition in repetitions:
-        for concurrency, expected in POINTS:
+        for concurrency, expected in points_for(model_key):
             source = source_root / f"c{concurrency}-r{repetition}.jsonl"
             rows = list(read_jsonl(source))
             if len(rows) < expected:
@@ -1113,6 +1196,119 @@ def _validated_cache_drop_artifact(path: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def record_startup(
+    output: pathlib.Path,
+    *,
+    engine: str,
+    model_key: str,
+    repetition: int,
+    elapsed_seconds: float,
+    poll_interval_seconds: float,
+    probe_url: str,
+    cache_drop_report: pathlib.Path,
+) -> dict[str, Any]:
+    """Record one server-lifecycle startup measurement.
+
+    ``elapsed_seconds`` is elapsed wall time from immediately before the server
+    process is spawned to the first successful readiness probe.  Both engines
+    are measured with the identical probe, so the number answers "how long
+    until this server can serve", which is the startup question a user asks.
+
+    The measurement is only interpretable cold, and it is dominated by weight
+    paging, so the leg's cache-drop report is embedded and validated here: a
+    startup artifact cannot exist for a leg whose page cache was still warm.
+    """
+    if output.exists():
+        raise HarnessError(f"refusing to overwrite startup evidence: {output}")
+    if engine not in STARTUP_ENGINES:
+        raise HarnessError(f"unknown startup engine: {engine}")
+    if model_key not in MODEL_REVISIONS:
+        raise HarnessError(f"unknown startup model key: {model_key}")
+    if not isinstance(repetition, int) or repetition <= 0:
+        raise HarnessError("startup repetition must be a positive integer")
+    if not elapsed_seconds > 0:
+        raise HarnessError("startup elapsed seconds must be positive")
+    if not 0 < poll_interval_seconds <= STARTUP_MAX_POLL_INTERVAL_SECONDS:
+        raise HarnessError(
+            "startup readiness poll interval must be in "
+            f"(0, {STARTUP_MAX_POLL_INTERVAL_SECONDS}] seconds, "
+            f"got {poll_interval_seconds}"
+        )
+    if not probe_url.endswith("/health"):
+        raise HarnessError(
+            f"startup readiness must be the /health probe, got {probe_url}"
+        )
+    cache_drop = _validated_cache_drop_artifact(cache_drop_report)
+    result = {
+        "cache_drop": cache_drop,
+        "cold": True,
+        "engine": engine,
+        "model_key": model_key,
+        "poll_interval_seconds": poll_interval_seconds,
+        "probe_url": probe_url,
+        "repetition": repetition,
+        "startup_seconds": elapsed_seconds,
+    }
+    write_json_atomic(output, result)
+    return result
+
+
+def summarize_startup(
+    evidence: pathlib.Path,
+    *,
+    model_key: str,
+    repetitions: Sequence[int],
+) -> dict[str, Any]:
+    """Aggregate the interleaved startup legs into a paired ratio.
+
+    Every requested repetition must exist for BOTH engines: an incomplete
+    series is refused rather than summarized, because a missing leg silently
+    biases the median toward whichever arm happened to finish.
+    """
+    if not repetitions:
+        raise HarnessError("startup summary needs at least one repetition")
+    if model_key not in MODEL_REVISIONS:
+        raise HarnessError(f"unknown startup model key: {model_key}")
+    summary: dict[str, Any] = {
+        "model_key": model_key,
+        "repetitions": list(repetitions),
+    }
+    medians: dict[str, float] = {}
+    for engine in STARTUP_ENGINES:
+        seconds: list[float] = []
+        for repetition in repetitions:
+            path = (
+                evidence / "startup" / model_key / engine / f"r{repetition}.json"
+            )
+            if not path.is_file():
+                raise HarnessError(f"startup leg is absent: {path}")
+            leg = _load_json_object(path)
+            if leg.get("model_key") != model_key:
+                raise HarnessError(f"startup leg records another model: {path}")
+            if leg.get("engine") != engine:
+                raise HarnessError(f"startup leg records another engine: {path}")
+            if leg.get("repetition") != repetition:
+                raise HarnessError(
+                    f"startup leg records another repetition: {path}"
+                )
+            if leg.get("cold") is not True:
+                raise HarnessError(f"startup leg is not cold: {path}")
+            value = leg.get("startup_seconds")
+            if not isinstance(value, (int, float)) or not value > 0:
+                raise HarnessError(f"startup leg has no positive elapsed: {path}")
+            seconds.append(float(value))
+        medians[engine] = statistics.median(seconds)
+        summary[engine] = {
+            "max_seconds": max(seconds),
+            "median_seconds": medians[engine],
+            "min_seconds": min(seconds),
+            "seconds": seconds,
+        }
+    # > 1 means ours reaches readiness sooner than vLLM.
+    summary["startup_speedup_vs_vllm"] = medians["vllm"] / medians["ours"]
+    return summary
+
+
 def record_model_gate(
     output: pathlib.Path,
     *,
@@ -1125,13 +1321,37 @@ def record_model_gate(
         raise HarnessError(f"refusing to overwrite model-gate evidence: {output}")
     if model_key not in MODEL_REVISIONS:
         raise HarnessError(f"unknown model key: {model_key}")
+    contract = MODEL_GATE_CONTRACTS.get(test_name)
+    if contract is None:
+        raise HarnessError(
+            f"no model-gate contract for {test_name}: a gate with no proof marker "
+            "cannot be distinguished from one that never ran"
+        )
     _require_full_sha(vllm_cpp_sha, "vllm.cpp SHA")
     if not log.is_file() or log.stat().st_size == 0:
         raise HarnessError(f"model-gate log is absent or empty: {log}")
+    # A checkpoint-gated gate exits 0 whether it compared sixteen tokens or none,
+    # so the exit status is not the evidence -- this line is.
+    if contract["proof"] not in log.read_text(encoding="utf-8", errors="replace"):
+        raise HarnessError(
+            f"{test_name} compared no token: its log never printed "
+            f"{contract['proof']!r}, so the checkpoint was absent, the gate was "
+            "skipped, or its output was not captured"
+        )
+    golden_revision = contract["golden_revision"]
+    model_revision = MODEL_REVISIONS[model_key]
     result = {
+        # None when the gate pins no revision; otherwise whether its committed
+        # goldens belong to the checkpoint this campaign actually benches. False
+        # is legitimate and deliberate for key "27n" -- and now readable.
+        "golden_covers_benched_checkpoint": (
+            None if golden_revision is None else golden_revision == model_revision
+        ),
+        "golden_revision": golden_revision,
         "log": str(log),
         "log_sha256": sha256_file(log),
         "model_key": model_key,
+        "model_revision": model_revision,
         "passed": True,
         "test_name": test_name,
         "vllm_cpp_sha": vllm_cpp_sha,
@@ -3450,7 +3670,7 @@ def record_execution_manifest(
         "compile_commands": build_dir / "compile_commands.json",
         "model_config": snapshot / "config.json",
         "oracle_manifest": oracle_manifest,
-        "server": build_dir / "examples" / "server",
+        "server": server_binary(build_dir),
         "tokenizer": snapshot / "tokenizer.json",
     }
     oracle = _load_json_object(oracle_manifest)
@@ -3610,7 +3830,7 @@ def record_execution_manifest(
             "CUTLASS NVFP4 compile command profile-control definition differs"
         )
 
-    server_path = build_dir / "examples" / "server"
+    server_path = server_binary(build_dir)
     for marker in (b"MatmulNvfp4Cutlass", b"[VT_FP4_CACHE] prepared"):
         if not _file_contains(server_path, marker):
             raise HarnessError(f"server binary omits target marker {marker!r}")
@@ -3661,7 +3881,7 @@ def record_execution_manifest(
         "cache_drop_roots": [
             str(snapshot.absolute()),
             str((output.parent.parent / "corpus" / model_key).absolute()),
-            str((build_dir / "examples" / "server").absolute()),
+            str(server_binary(build_dir).absolute()),
             str(client.absolute()),
         ],
         "bench_dependencies": expected_bench_dependencies,
@@ -3766,6 +3986,28 @@ def _parser() -> argparse.ArgumentParser:
         "--after-cache-drop-report", type=pathlib.Path, required=True
     )
     memory_return.add_argument("--gpu-idle", action="store_true")
+
+    startup = commands.add_parser("record-startup")
+    startup.add_argument("--output", type=pathlib.Path, required=True)
+    startup.add_argument("--engine", choices=STARTUP_ENGINES, required=True)
+    startup.add_argument(
+        "--model-key", choices=tuple(MODEL_REVISIONS), required=True
+    )
+    startup.add_argument("--repetition", type=int, required=True)
+    startup.add_argument("--elapsed-seconds", type=float, required=True)
+    startup.add_argument("--poll-interval-seconds", type=float, required=True)
+    startup.add_argument("--probe-url", required=True)
+    startup.add_argument("--cache-drop-report", type=pathlib.Path, required=True)
+
+    startup_summary = commands.add_parser("summarize-startup")
+    startup_summary.add_argument("--evidence", type=pathlib.Path, required=True)
+    startup_summary.add_argument(
+        "--model-key", choices=tuple(MODEL_REVISIONS), required=True
+    )
+    startup_summary.add_argument(
+        "--repetitions", type=int, nargs="+", default=(1, 2, 3)
+    )
+    startup_summary.add_argument("--output", type=pathlib.Path, required=True)
 
     model_gate = commands.add_parser("record-model-gate")
     model_gate.add_argument("--output", type=pathlib.Path, required=True)
@@ -3948,6 +4190,28 @@ def main() -> int:
             after_cache_drop_report=args.after_cache_drop_report,
             gpu_idle=args.gpu_idle,
         )
+    elif args.command == "record-startup":
+        result = record_startup(
+            args.output,
+            engine=args.engine,
+            model_key=args.model_key,
+            repetition=args.repetition,
+            elapsed_seconds=args.elapsed_seconds,
+            poll_interval_seconds=args.poll_interval_seconds,
+            probe_url=args.probe_url,
+            cache_drop_report=args.cache_drop_report,
+        )
+    elif args.command == "summarize-startup":
+        if args.output.exists():
+            raise HarnessError(
+                f"refusing to overwrite startup summary: {args.output}"
+            )
+        result = summarize_startup(
+            args.evidence,
+            model_key=args.model_key,
+            repetitions=tuple(args.repetitions),
+        )
+        write_json_atomic(args.output, result)
     elif args.command == "record-model-gate":
         result = record_model_gate(
             args.output,

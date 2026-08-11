@@ -49,7 +49,8 @@ what vLLM has vs what we have:
 | `RequestOutput` / `CompletionOutput` (public result carriers; FinishReason→string) | `vllm/outputs.py` | T0 ✅ `4d477eb` (+ prompt_logprobs opaque placeholder at M1.1 close-out; logprobs payloads deferred to sampler unit) |
 | `step_with_batch_queue` (pipelined batch queue, deferred sampling) | `v1/engine/core.py` | T1 |
 | Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 ✅ `core_proc.{h,cpp}` + `core_client.{h,cpp}` (W1 `ENG-CORE-BUSY-LOOP`: EngineCoreProc busy loop, shutdown drain/abort, WAKEUP + ENGINE_CORE_DEAD sentinels, InprocClient engine thread; tests `test_engine_core_proc.cpp` ← upstream `tests/v1/engine/test_engine_core_client.py`; GPU G1/G4 gating pending; UTILITY/DP/aborts-queue/batch-queue deferred) |
-| InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) |
+| InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) + `_validate_prompt_len` decoder arm (`input_processor.py:387-432`) landed: empty prompt and prompt ≥ `max_model_len` raise `InputValidationError` → HTTP 400 (`serve/utils/error_response.py:62-65`); tests `tests/vllm/v1/test_input_processor.cpp`, `tests/vllm/entrypoints/openai/test_api_server.cpp`. Encoder arm + out-of-vocab check still deferred |
+| Startup KV sizing: `_check_enough_kv_cache_memory` / `estimate_max_model_len` / `max_memory_usage_bytes` / `_auto_fit_max_model_len` | `v1/core/kv_cache_utils.py:751-788, :791-798, :800-851, :1967-2027` | T0 ✅ `vllm::v1::check_enough_kv_cache_memory` etc. in `v1/core/kv_cache_utils.{h,cpp}`, applied at `LoadedEngine::ResolveMaxModelLen`: a pinned `--max-model-len` the KV pool cannot hold is REFUSED at startup, an unpinned one is auto-fitted down to the pool. Deviations: the two upstream `Callable`s are passed as values (both are pure arithmetic here) and `estimate_max_model_len`'s binary search is written closed-form (our per-block geometry is linear in the block count). Tests `tests/vllm/v1/test_kv_cache_utils.cpp`, `tests/vllm/entrypoints/test_loaded_engine_dense.cpp`. Issue #83 M4 |
 | OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` baseline + W2 `GATING`: process_outputs detokenize/string-stop/DELTA-CUMULATIVE-FINAL_ONLY plus thread-safe single-slot `RequestOutputCollector`, per-request queue handoff, abort-final output and error propagation; logprobs/pooling/parallel-sampling remain deferred |
 | AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 🚧 W2 `ACTIVE`: `AsyncLLM` owns the EngineCoreProc/output-handler threads, concurrent add/generate/abort, collector streams and clean shutdown. The c32 cpp-httplib defect now has fixed `max_num_seqs + 4` delivery workers plus a legacy A/B toggle; the 32-client control-reserve test is 100×/sanitizer-green. Exact GPU G1/G3-G6 remain. Synchronous `LLMEngine` stays for offline/compatibility use |
 | Unified scheduler: token-budget, **no prefill/decode distinction** | `v1/core/sched/scheduler.py` | T0 ✅ `4f12158` (schedule() running-first + chunked prefill + FCFS preemption; update_from_output + check_stop; priority/spec/structured/async deferred behind 1:1 stubs) |
@@ -214,9 +215,12 @@ RandomSample) + penalties/min-p/logit-bias/token-mask/allowed-ids, CPU+CUDA (CUD
 dgx-pending). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
 from T1 below — the OpenAI-serving MVP needs them). Greedy = bit-exact parity gate;
 random RNG = exponential-noise gumbel-max, distribution-correct, **torch-Philox
-bit-exact parity deferred to T1**. Deferred (marked stubs): logprob_token_ids
-(generative-scoring), spec-decode bonus-token, thinking-budget, logprobs_mode
-variants beyond raw/processed. **InputBatch-side tracking of seeds/min_p/min_tokens/
+bit-exact parity deferred to T1**. Deferred (marked stubs): spec-decode
+bonus-token, thinking-budget. **logprob_token_ids (generative scoring) LANDED
+2026-08-10** and is no longer a stub — `SAMPLE-LOGPROB-TOKEN-IDS` in
+engine-matrix.md, [specs/logprob-token-ids.md](specs/logprob-token-ids.md).
+(The `logprobs_mode` variants left the same stub list when #238 landed; the
+sentence is corrected here because this edit rewrites it.) **InputBatch-side tracking of seeds/min_p/min_tokens/
 logit_bias/allowed/bad_words + num_logprobs is an M1.8 wiring dependency**
 (make_sampling_metadata emits empty defaults today — the InputBatch doesn't store
 them yet; SamplingMetadata carries the fields ready to populate).
@@ -247,7 +251,7 @@ reasoning-gating, spec-decode multi-row, optional object properties, strict-comp
 separators, the `has_xgrammar_unsupported_json_features` guard +
 `validate_xgrammar_grammar` feeding the `auto` fallback, production wiring, GPU
 oracle parity.
-T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
+T1: `prompt_logprobs` (`logprob_token_ids` LANDED 2026-08-10), additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection
 sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/
@@ -567,6 +571,38 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `gptq_marlin_moe_repack` + `marlin_permute_scales` +
     `nvfp4_marlin_process_scales`/`_global_scale`), the `moe_align_block_size`
     port, the 35B forward wiring, 16/16 parity, and the A/B TFLOPS measurement.
+
+    **DENSE Marlin (row `KERNEL-MARLIN-DENSE-PORT`, gated OFF `VT_MARLIN_DENSE`,
+    2026-08-06)**: the byte-preserving E=1 route. `src/vt/cuda/marlin/libtorch_stable/
+    quantization/marlin/` now also vendors vLLM's OWN dense marlin (a DISTINCT
+    kernel from the moe one — direct-A, `lda`, no sorted_token_ids/expert_ids/top_k
+    gather, its own par-split fp32 C_tmp reduce), all from vLLM @ `555967922`
+    `csrc/libtorch_stable/quantization/marlin/`:
+      * `kernel.h` ← `kernel.h` (verbatim; `namespace marlin`, dense `MARLIN_KERNEL_PARAMS` with `lda`)
+      * `marlin_template.h` ← `marlin_template.h:1-2081` (verbatim dense kernel; the
+        SHARED `marlin.cuh`/`marlin_dtypes.cuh`/`dequant.h`/`marlin_mma.h` it includes
+        are byte-identical to our existing vendored copies — diff-verified)
+      * `marlin_mm_dense.{h,cu}` ← `marlin.cu:326-541` `marlin::marlin_mm` + config
+        helpers (`get_marlin_kernel`/`determine_exec_config`/`is_valid_config`/…);
+        the torch::stable `marlin_gemm` host wrapper (`marlin.cu:545-894`) is stripped,
+        replaced by the torch-free launcher `vt::MarlinDenseGemm`
+        (`src/vt/cuda/cuda_marlin_dense.cu`, mirrors `cuda_moe_marlin.cu`). Only the
+        original's redundant inner `is_a_8bit` shadow is dropped (identical value,
+        avoids `-Wshadow`). `STD_TORCH_CHECK` → `vt_marlin_check.h` as for the moe TU.
+      * `kernel_selector.h`, `sm80_kernel_bfloat16_fe2m1f_bfloat16.cu` ←
+        `generate_kernels.py` output. KEY: the dense kernel is the SAME 12-param
+        `Marlin<>` template as the moe one, so these are the SAME instantiation set —
+        the dense kernel BODY + `namespace marlin` come from the local dense
+        `kernel.h`/`marlin_template.h` this TU includes.
+    New op `vt::OpId::kMarlinDenseGemm` + `MarlinDenseArgs` (ops.h, appended before
+    `kCount` — no id shift); routing in `dense_nvfp4_gemm.h` reuses the EXISTING
+    resident weights + workspace (same `marlin_permute` repack for dense and moe —
+    CONFIRMED via the shared repack ops; no shim needed) with rank-2 operand views
+    and NO moe_align. **Compile-VERIFIED GB10 sm_121a (2026-08-06): all 3 new dense
+    `.cu` compile clean under the exact production flags** (`-Werror=all-warnings`,
+    `-static-global-template-stub=false`, `--generate-code=…sm_121a`). GPU exec gates
+    (unit RED-first battery, strict token battery dense-ON, nsys 48-CTA, binding
+    c1..c8) are the dgx follow-up; extracted tree kept at dgx `~/dense_check/vllm.cpp`.
 
 11. **Vendored FlashAttention-2 (head-dim-256 GQA prefill implemented; ratio-6
     split-KV decode `ACTIVE`)**: `src/vt/cuda/flash_attn/` is a byte-identical,
@@ -901,6 +937,124 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     out-of-core plugin compiled ONLY into the test executable (not the library, so
     the counted 28-arch registry is untouched): `test_plugin_system` 1 case / 29
     assertions, RED-first. Spec [specs/plugin-system.md](specs/plugin-system.md).
+
+12. **Mirror source is HF transformers, not vLLM, for the Parakeet /
+    FastConformer audio encoder** (2026-08-07, `CLAIM-PARAKEET-MODEL-P4`, model
+    row `MODEL-AUDIO-PARAKEET-ENCODER`, spike
+    [specs/parakeet-conformer-encoder.md](specs/parakeet-conformer-encoder.md)).
+    vLLM DOES NOT implement this encoder: `vllm/model_executor/models/
+    parakeet.py:14` does `from transformers import ParakeetEncoder` and `:61`
+    (`ProjectedParakeet.__init__`) instantiates it, as the audio component of
+    `nano_nemotron_vl.py` (`registry.py:511-513`). There is therefore no vLLM
+    source to mirror for the encoder, the conformer block, the attention, the
+    subsampling stack or the CTC head, and every ported file cites transformers
+    5.3.0 `transformers/models/parakeet/modeling_parakeet.py` instead. This is a
+    provenance deviation, not a behavioral one: HF IS what vLLM runs, so mirroring
+    HF mirrors vLLM's behavior exactly. The vLLM-NATIVE halves ARE mirrored where
+    they exist — the log-mel front end follows `ParakeetExtractor:138` and
+    `vllm/transformers_utils/configs/parakeet.py ExtractorConfig:41`. Three
+    sub-deviations, each stated in the ported file's header: (a) the front end has
+    no torch/torchaudio/librosa, so its STFT is a direct DFT of the 257 needed
+    bins rather than an FFT (float summation order only — the same deviation, and
+    justification, as the Whisper path), and it CONSTRUCTS the slaney mel bank in
+    double from transformers `audio_utils.mel_filter_bank:453`, which is exactly
+    what vLLM calls, while HF's own `ParakeetFeatureExtractor:94-97` uses
+    librosa's float32 bank and says at `:83-93` that the only difference is the
+    precision; (b) vLLM's 30-second clip splitting (`parakeet.py:253-284`) belongs
+    to the Nemotron-VL token budget, not to the ASR model, so the extractor
+    processes one clip and a caller that wants the splitting slices first; (c) the
+    RNN-T / TDT transducer is a SEPARATE row,
+    `MODEL-AUDIO-PARAKEET-TRANSDUCER`, landed 2026-08-07 as spike work item P6.
+
+    **CORRECTION, 2026-08-07.** Sub-deviation (c) used to read "the RNN-T / TDT
+    transducer is deliberately NOT ported: it has no upstream in either vLLM or
+    HF and is a product call the spike left open, so this row is CTC only". That
+    was measured against the transformers INSTALLED on the box, 5.3.0, which
+    ships only `ParakeetForCTC`. Upstream `main` implements the entire transducer
+    stack (`modeling_parakeet.py` `ParakeetRNNTDecoder:831`,
+    `ParakeetRNNTJointNetwork:879`, `ParakeetForRNNT:922`,
+    `ParakeetTDTJointNetwork:1035`, `ParakeetForTDT:1052`, plus the greedy loops
+    at `generation_parakeet.py:125` / `:271`), so it was never a product call and
+    never a deviation: it is mirror work, and it is now ported. The provenance
+    deviation is if anything STRONGER for the transducer than for the encoder:
+    vLLM wraps only the encoder and has no transducer call site at all, so HF is
+    the sole possible source. **Method rule this earns: a grep against the
+    installed package is not evidence about upstream. Record the version you
+    measured, and check `main` before writing "no upstream" into the record.**
+14. **ROCm integrated-APU managed allocation (`BACKEND-ROCM` W1, approach (b)
+    from issue #41 F6, maintainer-ratified 2026-08-08).** On a device probing
+    `hipDeviceAttributeIntegrated=1` + `ManagedMemory=1` +
+    `ConcurrentManagedAccess=1`, `RocmBackend::Alloc` uses
+    `hipMallocManaged(hipMemAttachGlobal)` and `UnifiedMemory()` returns true
+    exactly then, so the CPU reference tier's host-dereference contract is
+    API-guaranteed on XNACK-less RDNA3 APUs (gfx1151/gfx1103 measure
+    `PageableMemoryAccess=0`, vetoing the CUDA-shaped W0 probe even though the
+    aliasing holds). **No upstream analog exists to mirror:** allocation is
+    torch's job in vLLM, `vllm/platforms/rocm.py` knows the APUs only as
+    device-name map entries (`rocm.py:75-77`) plus `is_navi`
+    (`rocm.py:909-910`), and `csrc/` has no `hipMallocManaged` call at the
+    pin — so this is ADDITIVE, grounded in the issue-41 measurements
+    (community F6 report), not in an upstream file. Discrete devices are
+    byte-identical to W0 (`Integrated=0` kills the branch). Spec:
+    `specs/rocm-unified-memory-b.md`; blind-written, community compile+ctest
+    evidence PENDING.
+15. **Extension platform: Tenstorrent Blackhole (`BACKEND-TENSTORRENT`,
+    `DeviceType::kTENSTORRENT` — deliberately not `kBLACKHOLE`, which collides
+    with this codebase's pervasive NVIDIA Blackwell/GB10 references).** No
+    upstream analog: vLLM has no Tenstorrent platform anywhere, so this is an
+    extension platform in the same sense as item 8's Metal/Vulkan — added
+    through the mirrored Platform/vt-op seams so it behaves as a vLLM platform
+    would. Strategy: mirror decision E1 ([backends.md](backends.md)) rather
+    than E2 — Tenstorrent's Tensix cores are a dataflow multicore chip, not a
+    SIMT device, so `vt::tt` is proposed as a thin adapter over **ttnn**
+    (Tenstorrent's own C++ tensor-op library, confirmed externally
+    consumable via its exported `TT-NN` CMake package), the same move Apple's
+    MLX was for Metal, rather than hand-written Tensix kernels. `Backend::
+    UnifiedMemory()` is `false` (discrete PCIe device) — this DISABLES the
+    portable CPU reference tier (`op_provider.h`), so unlike a unified-memory
+    backend there is no partial-coverage safety net; every op the target
+    model touches must be registered or the run throws. Full design, the ttnn
+    op-coverage evidence, and the one identified open risk (`vt::Tensor` is a
+    bare device-pointer view; `ttnn::Tensor`'s device-side constructors take
+    no equivalent raw-pointer-attach path) are in
+    [tenstorrent-backend.md](specs/tenstorrent-backend.md). **STATUS:
+    `ACTIVE` — W0 skeleton landed 2026-08-09 (`vt::tenstorrent::Backend`, a
+    `Platform` registrar), growing toward OPT-125m: ALL NINE of OPT-125m's ops now
+    registered (`kMatmul`..`kPagedAttention`; attention is a host-staged f32
+    oracle while Alloc is host memory), 11/11 test cases passing on real
+    Blackhole hardware
+    (`tests/vt/test_tenstorrent_backend.cpp`). Not yet reviewed or accepted
+    by a maintainer. `ACTIVE` means a gated skeleton here, not a supported
+    backend — same caveat Metal/Vulkan's own `ACTIVE` status carries.**
+
+16. **Off-pin upstream anchor: Muse Glimmer is ported from an UNMERGED vLLM PR
+    (2026-08-10, `MODEL-MUSE-GLIMMER`, issue
+    [#268](https://github.com/mudler/vllm.cpp/issues/268)).** Meta released
+    Muse Glimmer on 2026-08-08, well after the parity pin `555967922`
+    (2026-07-26). There is no `muse_glimmer` code at the pin — `grep -ril
+    'muse\|glimmer' vllm/model_executor/models/` at the pin returns nothing —
+    and none on vLLM `main` either. The ONLY upstream implementation is
+    [vllm#51655](https://github.com/vllm-project/vllm/pull/51655), OPEN and
+    approved but unmerged, with 3 of 20 CI checks red, at head `075d645af`
+    (a descendant of the pin). Every `file:line` this row cites therefore points
+    at a **branch head, not the pin** — a deliberate exception to "port from the
+    pinned oracle", taken on explicit developer direction (2026-08-10). It is
+    recorded here, and argued for in the commit that introduced it, because no
+    checker enforces the anchor rule and the waiver registry has since been
+    retired (`a4f72f86`): an exception now lives in the commit message that
+    needs it, attached to the diff it excuses. Consequences, all binding while this stands:
+    (a) the anchor is mutable — a force-push or review round on #51655 rewrites
+    what we cite, so the fetched ref is kept and re-diffed before every
+    re-anchor; (b) upstream's own gates have NOT fully passed, so where our
+    HF-reference gate disagrees with #51655 the HF reference wins and the
+    divergence is reported upstream rather than mirrored; (c) **no speed axis is
+    claimable for this model** — the pinned oracle cannot load `muse_glimmer`
+    at all (and the checkpoint wants transformers 5.15.0.dev0 vs the pin's
+    5.14.1), so there is no honest denominator and every performance axis is an
+    OPEN GAP by construction, not a waived one. The exception is discharged by
+    #51655 merging plus a pin advance that includes it; until then the row
+    carries this deviation. Scope and gates: [muse-glimmer
+    spec](specs/muse-glimmer.md) §0.
 
 ## 10. E2E test suites (T0 deliverable)
 

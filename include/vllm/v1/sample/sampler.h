@@ -27,9 +27,17 @@
 // Task 2/3 host-array-then-op pattern. CPU is the correctness gate at T0; a
 // CUDA-Queue run is dgx-pending.
 //
-// DEFERRED (marked 1:1 stubs, see sampler.cpp): logprob_token_ids gather
-// (generative-scoring), spec-decode bonus-token (predict_bonus_token),
-// thinking-budget, and the logprobs_mode variants beyond raw_logprobs.
+// Step 8 has a SECOND form (`SAMPLE-LOGPROB-TOKEN-IDS`): when a request carries
+// `logprob_token_ids` (generative scoring), gather_specific_token_logprobs
+// returns the sampled token plus EXACTLY the requested vocab ids — padded to the
+// batch-wide width with -inf — with the sampled token's rank still over the FULL
+// vocab. It also drives whether the step-1 snapshot is taken at all
+// (sampler.py:86), and it WINS over a logprobs count when a request supplies
+// both (sampler.py:133-136).
+//
+// DEFERRED (marked 1:1 stubs, see sampler.cpp): spec-decode bonus-token
+// (predict_bonus_token), thinking-budget, and the logprobs_mode variants beyond
+// raw_logprobs.
 #ifndef VLLM_V1_SAMPLE_SAMPLER_H_
 #define VLLM_V1_SAMPLE_SAMPLER_H_
 
@@ -46,11 +54,17 @@ namespace vllm::v1 {
 // LogprobsMode (vllm/config/model.py::LogprobsMode). Only raw_logprobs is
 // implemented at T0; the raw_logits / processed_* modes are marked stubs (the
 // all-greedy processed-logprobs branch and the raw_logits clone are deferred).
+// Which tensor the returned logprobs are read from (model.py:82,221 /
+// sampler.py:87-93,255-302). The RAW pair is snapshotted before any logits
+// processor runs, so it describes the MODEL's distribution; the PROCESSED pair
+// is taken after temperature and top-k/top-p, so it describes the distribution
+// actually SAMPLED from — a token top-k masked away reads -inf there and its
+// true value in the raw modes. Both distinctions are user-visible.
 enum class LogprobsMode {
   kRawLogprobs,       // default: compute_logprobs(logits) before any mutation
-  kRawLogits,         // STUB (deferred): clone the raw logits
-  kProcessedLogprobs, // STUB (deferred): logprobs after temperature/top-k/top-p
-  kProcessedLogits,   // STUB (deferred): logits after temperature/top-k/top-p
+  kRawLogits,         // the raw logits themselves, before any mutation
+  kProcessedLogprobs, // logprobs after temperature/top-k/top-p
+  kProcessedLogits,   // logits after temperature/top-k/top-p
 };
 
 // Sampler (sampler.py::Sampler). Stateless apart from the logprobs_mode; the
@@ -83,10 +97,34 @@ class Sampler {
                         const SamplingMetadata& sampling_metadata,
                         vt::Tensor* sampled_ids_out = nullptr) const;
 
+  // compute_logprobs + gather_logprobs over PROMPT positions
+  // (gpu_model_runner.py:5688-5697, SAMPLE-PROMPT-LOGPROBS). `logits` is a
+  // read-only [n, vocab] f32 view of the rows the forward produced for prompt
+  // positions; `target_token_ids` [n] names the token each row is scored
+  // against — the token that FOLLOWS that position, since a prompt logprob asks
+  // how likely the token that actually came next was.
+  //
+  // Prompt positions bypass every logits processor, which is why upstream notes
+  // that the raw_* and processed_* logprobs_modes coincide here (:5691-5693);
+  // the logits are consequently never mutated. Deliberately the same
+  // log_softmax op and the same gather the sampled path runs, so a prompt
+  // logprob and a sampled logprob over the same distribution agree bit-for-bit.
+  LogprobsTensors compute_prompt_logprobs(
+      vt::Queue& q, const vt::Tensor& logits, int num_logprobs,
+      const std::vector<int64_t>& target_token_ids) const;
+
  private:
   // Sampler.sample. Runs steps 7a-7f; returns the [num_reqs] host token ids.
+  //
+  // `processed_out` (sampler.py:246-248,262-271,286-302): when non-null AND the
+  // mode is one of the processed_* pair, sample() fills it with the [n, vocab]
+  // host snapshot taken at the point upstream takes it — after the logits
+  // processors on the all-greedy early return, and after temperature and
+  // top-k/top-p otherwise. Left EMPTY under the raw_* modes, which snapshot in
+  // forward() before any mutation.
   std::vector<int64_t> sample(vt::Queue& q, vt::Tensor& logits,
-                              const SamplingMetadata& sampling_metadata) const;
+                              const SamplingMetadata& sampling_metadata,
+                              std::vector<float>* processed_out = nullptr) const;
 
   // GreedyArgmax over `logits` -> [n] host int64 ids, reusing a PERSISTENT
   // device + pinned-host scratch (grow-only) so the greedy decode hot path does

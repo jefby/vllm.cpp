@@ -54,13 +54,38 @@ using ElemNk16Fn = void (*)(const float* af, const void* b, int64_t k, int64_t n
 using ElemBtMFn = void (*)(const float* af, int64_t a_stride, const void* b, int64_t k,
                            float* acc);
 
+// The same [K,N] kernel over `mr` ACTIVATION ROWS at once (acc is mr*16, row
+// major). The [K,N] orientation needs no transpose, so what M blocking
+// amortizes here is the WEIGHT LOAD itself: one 16-wide load per p is reused by
+// every activation row instead of being re-read once per row. Like ElemBtMFn it
+// touches no output's accumulation order (lane l still accumulates output l
+// over p in strict increasing order), so it is bit-exact.
+//
+// Before this existed, cpu_ops.cpp forced mr=1 on the [K,N] path, so a
+// 131-row activation re-read the whole weight 131 times.
+using ElemNkMFn = void (*)(const float* af, int64_t a_stride, const void* b, int64_t k,
+                           int64_t n, float* acc);
+
 struct ElemGemmTierTable {
   ElemBt16Fn bt[static_cast<int>(ElemKind::kCount)];
   ElemNk16Fn nk[static_cast<int>(ElemKind::kCount)];
   ElemBtMFn btm[static_cast<int>(ElemKind::kCount)];
-  int mr;  // activation rows per btm call (1 = no M blocking)
+  ElemNkMFn nkm[static_cast<int>(ElemKind::kCount)];
+  int mr;  // activation rows per btm/nkm call (1 = no M blocking)
   const char* name;
 };
+
+// Wide-x86 tiers (KERNEL-GEMM-CPU-ELEM-X86WIDE). Each lives in its own TU built
+// with that ISA's flags, mirroring llama.cpp's per-ISA CPU build; they are
+// always COMPILED on x86-64 and only ever ENTERED when the runtime probe in
+// BuildTier() says the CPU supports them. Defined in cpu_matmul_elem_avx2.cpp.
+#if defined(__x86_64__) || defined(_M_X64)
+void FillAvx2Tier(ElemGemmTierTable* t);
+void FillAvx512Tier(ElemGemmTierTable* t);  // cpu_matmul_elem_avx512.cpp
+#endif
+
+// The [N,K] -> [K,N] load-time repack entry points are declared in the PUBLIC
+// vt/quant.h (the loader needs them and this header is private).
 
 // Selected ONCE per process: compile-time ISA plus a runtime feature probe
 // (mirrors ggml's `ggml_cpu_has_*` discipline, ggml-cpu.c). The portable
@@ -70,6 +95,8 @@ const ElemGemmTierTable& ElemGemmTier();
 // VT_CPU_MATMUL_TIER selects the tier for a SAME-BINARY A/B:
 //   "ref"      — the historical one-accumulator scalar chunk kernel
 //   "portable" — tier 0 only (no arch SIMD)
+//   "sse2", "sse2+f16c", "avx2", "avx512" — exact x86 tier; an unavailable
+//                  tier fails closed after CPUID + XCR0 validation
 //   unset      — the best tier this CPU probes into (production default)
 const char* ElemGemmTierName();
 

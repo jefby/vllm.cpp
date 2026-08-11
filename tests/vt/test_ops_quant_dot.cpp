@@ -204,6 +204,13 @@ float RunVecDot(vt::DType wtype, const uint8_t* wq, const uint8_t* aq,
   return s;
 }
 
+float RunVecDotFn(vt::cpu::VecDotFn fn, const uint8_t* wq,
+                  const uint8_t* aq, int64_t k) {
+  float s = 0.0F;
+  fn(static_cast<int>(k), &s, 0, wq, 0, aq, 0, 1);
+  return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -583,6 +590,133 @@ TEST_CASE("G3 dot_product_error within upstream bound (test-quantize-fns:86)") {
   CHECK(err < kMaxDotProductError);
 }
 
+TEST_CASE("KERNEL-CPU-A76-Q8-DOT explicit SDOT and assembly match portable") {
+  const vt::cpu::VecDotFn sdot = vt::cpu::QuantQ8SdotVecDot();
+  const vt::cpu::VecDotFn assembly = vt::cpu::QuantQ8A76AsmVecDot();
+  CHECK((sdot == nullptr) == (assembly == nullptr));
+  if (sdot == nullptr) {
+    CHECK_FALSE(vt::cpu::QuantQ8SdotActive());
+    CHECK_FALSE(vt::cpu::QuantQ8A76AsmActive());
+    return;
+  }
+  CHECK(vt::cpu::QuantQ8SdotActive());
+
+  // The TRUE portable reference. QuantTraits(kQ8_0).vec_dot is the SELECTED
+  // kernel — on a real A76 that is the assembly tier, and referencing it here
+  // made every byte-equality CHECK below a self-comparison.
+  const vt::cpu::VecDotFn portable = vt::cpu::QuantQ8PortableVecDot();
+  for (int blocks : {1, 2, 3, 5, 64}) {
+    CAPTURE(blocks);
+    const int64_t k = 32 * blocks;
+    std::vector<uint8_t> wq =
+        RandomBlocks(kWeightCases[1], blocks, 0xA760U + blocks);
+    std::vector<float> act(static_cast<size_t>(k));
+    GenerateData(0.75F, act.size(), act.data());
+    std::vector<uint8_t> aq =
+        QuantizeActivation(vt::DType::kQ8_0, act.data(), k);
+
+    // Offset both buffers by one byte: Q8 blocks are 34 bytes and therefore
+    // alternate natural alignment in real rows. All three tiers must accept
+    // an unaligned block base without reading beyond the final block.
+    std::vector<uint8_t> wu(wq.size() + 2, 0xA5);
+    std::vector<uint8_t> au(aq.size() + 2, 0x5A);
+    std::memcpy(wu.data() + 1, wq.data(), wq.size());
+    std::memcpy(au.data() + 1, aq.data(), aq.size());
+    const float ref = RunVecDotFn(portable, wu.data() + 1, au.data() + 1, k);
+    CHECK(RunVecDotFn(sdot, wu.data() + 1, au.data() + 1, k) == ref);
+    CHECK(RunVecDotFn(assembly, wu.data() + 1, au.data() + 1, k) == ref);
+  }
+
+  auto check_edge_blocks = [&](uint16_t wd, uint16_t ad, bool zero_payload) {
+    constexpr int blocks = 2;
+    constexpr int block_bytes = 34;
+    std::vector<uint8_t> wq(blocks * block_bytes);
+    std::vector<uint8_t> aq(blocks * block_bytes);
+    for (int ib = 0; ib < blocks; ++ib) {
+      uint8_t* wb = wq.data() + ib * block_bytes;
+      uint8_t* ab = aq.data() + ib * block_bytes;
+      std::memcpy(wb, &wd, sizeof(wd));
+      std::memcpy(ab, &ad, sizeof(ad));
+      for (int j = 0; j < 32; ++j) {
+        wb[2 + j] = zero_payload
+                        ? 0
+                        : static_cast<uint8_t>((j & 1) != 0 ? 127 : -128);
+        ab[2 + j] = zero_payload
+                        ? 0
+                        : static_cast<uint8_t>((j & 2) != 0 ? -128 : 127);
+      }
+    }
+    const float ref = RunVecDotFn(portable, wq.data(), aq.data(), 64);
+    CHECK(RunVecDotFn(sdot, wq.data(), aq.data(), 64) == ref);
+    CHECK(RunVecDotFn(assembly, wq.data(), aq.data(), 64) == ref);
+  };
+  check_edge_blocks(vt::F32ToF16(1.0F), vt::F32ToF16(1.0F), true);
+  check_edge_blocks(/*maximum finite f16=*/0x7BFFU,
+                    /*minimum normal negative f16=*/0x8400U, false);
+
+  std::vector<uint8_t> one(34, 0);
+  float out = 0.0F;
+  CHECK_THROWS(sdot(33, &out, 0, one.data(), 0, one.data(), 0, 1));
+  CHECK_THROWS(assembly(32, &out, 0, one.data(), 0, one.data(), 0, 2));
+}
+
+TEST_CASE(
+    "KERNEL-CPU-A76-Q8-DOT portable seam pins the quants.c:400 order on every "
+    "platform") {
+  // The A76 case above can only execute its byte-equality CHECKs on a DotProd
+  // core (the sdot/assembly getters are null elsewhere). This case pins the
+  // reference arm ITSELF everywhere: QuantQ8PortableVecDot must be the exact
+  // per-block accumulation order of the portable kernel — an independent
+  // scalar transcription here, compared byte-equal — so a perturbation of the
+  // portable order (or a seam regression back to the SELECTED kernel wired to
+  // a different tier) is RED on x86 too, not only on a physical A76.
+  const vt::cpu::VecDotFn portable = vt::cpu::QuantQ8PortableVecDot();
+  REQUIRE(portable != nullptr);
+  for (int blocks : {1, 3, 64}) {
+    CAPTURE(blocks);
+    const int64_t k = 32 * blocks;
+    const std::vector<uint8_t> wq =
+        RandomBlocks(kWeightCases[1], blocks, 0x9700U + blocks);
+    std::vector<float> act(static_cast<size_t>(k));
+    GenerateData(0.25F, act.size(), act.data());
+    const std::vector<uint8_t> aq =
+        QuantizeActivation(vt::DType::kQ8_0, act.data(), k);
+
+    // Two references sharing the SAME per-block order, differing only in
+    // whether the final multiply-add is fused: the portable TU may legally
+    // compile `sumf += sumi * dx * dy` either way (-ffp-contract), and pinning
+    // one form would break on the other compiler regime. An accumulation-ORDER
+    // mutation moves BOTH candidates, so the pin holds in both regimes.
+    constexpr int kBlockBytes = 34;  // f16 scale + 32 int8 payload
+    float ref_mul = 0.0F;
+    float ref_fma = 0.0F;
+    for (int ib = 0; ib < blocks; ++ib) {
+      const uint8_t* xb = wq.data() + static_cast<size_t>(ib) * kBlockBytes;
+      const uint8_t* yb = aq.data() + static_cast<size_t>(ib) * kBlockBytes;
+      uint16_t xd = 0;
+      uint16_t yd = 0;
+      std::memcpy(&xd, xb, sizeof(xd));
+      std::memcpy(&yd, yb, sizeof(yd));
+      int sumi = 0;
+      for (int j = 0; j < 32; ++j) {
+        sumi += static_cast<int>(static_cast<int8_t>(xb[2 + j])) *
+                static_cast<int>(static_cast<int8_t>(yb[2 + j]));
+      }
+      // quants.c:400 order: the two f16 scales multiply FIRST, then sumi.
+      const float d = vt::F16ToF32(xd) * vt::F16ToF32(yd);
+      // volatile pins the separately-rounded product so THIS TU cannot itself
+      // be contracted into the fma form.
+      volatile float prod = static_cast<float>(sumi) * d;
+      ref_mul += prod;
+      ref_fma = std::fmaf(static_cast<float>(sumi), d, ref_fma);
+    }
+    const float got = RunVecDotFn(portable, wq.data(), aq.data(), k);
+    CAPTURE(got);
+    CAPTURE(ref_mul);
+    CAPTURE(ref_fma);
+    CHECK((got == ref_mul || got == ref_fma));
+  }
+}
 // ---------------------------------------------------------------------------
 // G3 — the GEMM wiring (kMatmulBTQuant), ported MUL_MAT cases
 // ---------------------------------------------------------------------------
@@ -843,5 +977,171 @@ TEST_CASE("G3 MatmulBTQuant matches per-row vec_dot exactly (no GEMM drift)") {
         CHECK(f.out[static_cast<size_t>(i * n + j)] == expect);
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GROUPED keep-quant GEMM (kMatmulBTQuantGrouped) — the ACTIVATION/OUTPUT DTYPE
+// contract.
+//
+// `vt::MatmulBTQuantGrouped` accepts ANY float activation (`IsFloat`) and an
+// f32/bf16 output (`IsOutFloat`) — ops.cpp:220-221 — and the CUDA provider
+// honours all three activation dtypes (cuda_quant_dot.cu:1868-1871). Every
+// pre-existing caller and test happened to pass f32/f32, so the CPU provider's
+// f32-only row addressing was never exercised; qwen3_5's grouped MoE
+// (`KqGrouped`, bf16 activations) was the first bf16 caller and produced
+// garbage on CPU.
+//
+// The contract, stated once per dtype: grouped over the stacked [E*N,K] tower
+// is BIT-IDENTICAL to `vt::MatmulBTQuant` on the per-expert [N,K] row-slice,
+// for the SAME activation bytes. Any dtype the op ACCEPTS must satisfy it.
+namespace {
+
+// The stacked tower + P (token,expert) pairs the grouped op consumes.
+struct GroupedFixture {
+  std::vector<uint8_t> tower;  // [E*N, K] block-quant
+  std::vector<float> a_f32;    // [P, K] activation, f32 master copy
+  std::vector<int32_t> eids;   // [P]
+};
+
+GroupedFixture MakeGrouped(const WeightCase& c, int64_t E, int64_t N, int64_t K,
+                           int64_t P, uint32_t seed) {
+  GroupedFixture f;
+  f.tower = RandomBlocks(c, E * N * (K / c.block_elems), seed);
+  f.a_f32.resize(static_cast<size_t>(P * K));
+  GenerateData(1.0F, f.a_f32.size(), f.a_f32.data());
+  f.eids.resize(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p)
+    f.eids[static_cast<size_t>(p)] = static_cast<int32_t>((p * 3 + 1) % E);
+  return f;
+}
+
+// One expert's [N,K] row-slice of the stacked tower, as kMatmulBTQuant sees it.
+vt::Tensor ExpertSlice(const GroupedFixture& f, const WeightCase& c, int64_t e,
+                       int64_t N, int64_t K, vt::Device dev) {
+  vt::Tensor w{};
+  w.data = const_cast<uint8_t*>(f.tower.data()) +
+           static_cast<size_t>(e) * N * vt::RowSizeBytes(c.dtype, K);
+  w.dtype = c.dtype;
+  w.device = dev;
+  w.rank = 2;
+  w.shape[0] = N;
+  w.shape[1] = K;
+  w.stride[0] = K;
+  w.stride[1] = 1;
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("grouped keep-quant GEMM == per-expert slice for EVERY accepted "
+          "activation dtype (f32/f16/bf16)") {
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t E = 4;
+  const int64_t N = 6;
+  const int64_t P = 5;
+
+  for (const WeightCase& c : kWeightCases) {
+    CAPTURE(std::string(c.name));
+    const int64_t K = 2 * c.block_elems;
+    const GroupedFixture f = MakeGrouped(c, E, N, K, P, 0xA5A5U);
+
+    for (vt::DType adt : {vt::DType::kF32, vt::DType::kF16, vt::DType::kBF16}) {
+      CAPTURE(static_cast<int>(adt));
+
+      // The SAME activation values in the dtype under test. f16/bf16 round the
+      // f32 master, so both arms below read the identical rounded bytes — any
+      // difference is the op's row addressing, never the rounding.
+      std::vector<float> a32(f.a_f32.size());
+      std::vector<uint16_t> a16(f.a_f32.size());
+      for (size_t i = 0; i < f.a_f32.size(); ++i) {
+        if (adt == vt::DType::kF32) {
+          a32[i] = f.a_f32[i];
+        } else if (adt == vt::DType::kF16) {
+          a16[i] = vt::F32ToF16(f.a_f32[i]);
+        } else {
+          a16[i] = vt::F32ToBF16(f.a_f32[i]);
+        }
+      }
+      void* adata = adt == vt::DType::kF32 ? static_cast<void*>(a32.data())
+                                           : static_cast<void*>(a16.data());
+
+      // (A) ONE grouped launch over the stacked tower.
+      std::vector<float> og(static_cast<size_t>(P * N), 0.0F);
+      {
+        std::vector<int32_t> ids = f.eids;
+        vt::Tensor at = vt::Tensor::Contiguous(adata, adt, q.device, {P, K});
+        vt::Tensor ot =
+            vt::Tensor::Contiguous(og.data(), vt::DType::kF32, q.device, {P, N});
+        vt::Tensor eid =
+            vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+        vt::Tensor wt = vt::Tensor::Contiguous(const_cast<uint8_t*>(f.tower.data()), vt::DType::kF32,
+                                               q.device, {E * N, K});
+        wt.dtype = c.dtype;  // block dtype: elementwise strides are inert
+        vt::MatmulBTQuantGrouped(q, ot, at, wt, eid);
+      }
+
+      // (B) P per-expert kMatmulBTQuant calls on the same slices/rows.
+      std::vector<float> op(static_cast<size_t>(P * N), 0.0F);
+      for (int64_t p = 0; p < P; ++p) {
+        void* arow = adt == vt::DType::kF32
+                         ? static_cast<void*>(a32.data() + p * K)
+                         : static_cast<void*>(a16.data() + p * K);
+        vt::Tensor at = vt::Tensor::Contiguous(arow, adt, q.device, {1, K});
+        vt::Tensor ot = vt::Tensor::Contiguous(op.data() + p * N,
+                                               vt::DType::kF32, q.device, {1, N});
+        vt::Tensor wt = ExpertSlice(f, c, f.eids[static_cast<size_t>(p)], N, K,
+                                    q.device);
+        vt::MatmulBTQuant(q, ot, at, wt);
+      }
+
+      REQUIRE(og.size() == op.size());
+      CHECK(std::memcmp(og.data(), op.data(), og.size() * sizeof(float)) == 0);
+    }
+  }
+}
+
+TEST_CASE("grouped keep-quant GEMM == per-expert slice for a BF16 output") {
+  // `IsOutFloat` accepts bf16, and StoreOutF32 writes it — but the grouped
+  // kernel must also STRIDE the output rows by the output dtype.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t E = 4;
+  const int64_t N = 6;
+  const int64_t P = 5;
+
+  for (const WeightCase& c : kWeightCases) {
+    CAPTURE(std::string(c.name));
+    const int64_t K = 2 * c.block_elems;
+    const GroupedFixture f = MakeGrouped(c, E, N, K, P, 0x1234U);
+
+    std::vector<uint16_t> og(static_cast<size_t>(P * N), 0);
+    {
+      std::vector<int32_t> ids = f.eids;
+      vt::Tensor at = vt::Tensor::Contiguous(
+          const_cast<float*>(f.a_f32.data()), vt::DType::kF32, q.device, {P, K});
+      vt::Tensor ot =
+          vt::Tensor::Contiguous(og.data(), vt::DType::kBF16, q.device, {P, N});
+      vt::Tensor eid =
+          vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+      vt::Tensor wt = vt::Tensor::Contiguous(const_cast<uint8_t*>(f.tower.data()), vt::DType::kF32,
+                                             q.device, {E * N, K});
+      wt.dtype = c.dtype;
+      vt::MatmulBTQuantGrouped(q, ot, at, wt, eid);
+    }
+
+    std::vector<uint16_t> op(static_cast<size_t>(P * N), 0);
+    for (int64_t p = 0; p < P; ++p) {
+      vt::Tensor at = vt::Tensor::Contiguous(
+          const_cast<float*>(f.a_f32.data()) + p * K, vt::DType::kF32, q.device,
+          {1, K});
+      vt::Tensor ot = vt::Tensor::Contiguous(op.data() + p * N, vt::DType::kBF16,
+                                             q.device, {1, N});
+      vt::Tensor wt =
+          ExpertSlice(f, c, f.eids[static_cast<size_t>(p)], N, K, q.device);
+      vt::MatmulBTQuant(q, ot, at, wt);
+    }
+
+    REQUIRE(og.size() == op.size());
+    CHECK(std::memcmp(og.data(), op.data(), og.size() * sizeof(uint16_t)) == 0);
   }
 }

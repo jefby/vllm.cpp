@@ -1,72 +1,59 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-06 -->
+<!-- now-updated: 2026-08-11 -->
 
-Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
-the gate being chased, what to do next. Never a log — evidence lives in the
-append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md) and the
-benchmark record. Budget: 100 lines.
+Snapshot, not log. History is git; evidence:
+[parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
+characters.
 
 ## Live claims
 
-Working head: `bench/qwen35-upstream-rebenchmark-20260805`, one benchmark
-checkpoint on `upstream/main` at `59674cf1d`.
+Rendered on demand: **`scripts/now.py`**. It assembles every `SPIKE`/`ACTIVE`
+row, its claim and PR, and the row's own next step from the matrices,
+`.agents/claims/`, and each row spec's `## Now`.
 
-| Claim / track | State | Next command or step |
-|---|---|---|
-| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (44.46 vs 43.10, byte-exact, default). Root cause = bf16 weight residency via `VT_LAGUNA_RESIDENT_BF16W` (default-ON). Detail in benchmark record | Residual: formal vLLM K-run set when convenient |
-| DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W` on, byte-exact). Phase-2 routed-expert residency NEGATIVE 2026-08-05 (−3.4%), HELD default-OFF. See state | — |
-| f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
-| Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13, f32-loader block CLEARED): CPU+CUDA 13/13·656; host RSS peak 1.7 GiB, min-avail 21 GiB, no OOM. **Token gate NEAR-TIE 106/128** (6/8 prompts token-exact; numerics near-tie vs deterministic oracle, not a bug) | STRICT path = device GDN/MLA islands + bf16 stream (W7-speed residuals); 1.59 tok/s; default OFF |
-| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
-| Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED + dgx-VERIFIED** (`f9c969ae`): #31 async mirror ported to classic dense `Qwen3ForCausalLM`. Async gate RED→GREEN 0.6B+4B, SACRED 184/184, memcheck 0, MXFP4 default e2e 3/4 + near-tie RATIFIED | Residual: **W4 throughput bench** (online_gate lacks Yi30/8B key); sibling scope one-liner |
-
-In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
-(fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
+They are NOT listed here any more (ENG-NOW-DERIVED, #374). A per-row table in
+this file made it a surface every row-advancing PR had to write, which is a lock
+under `AGENTS.md` §Records; it conflicted in 5 of the 16 conflicting open PRs
+measured at `d928e2c3`. What remains below is authored at operator cadence, so
+no per-row change needs to touch this file at all.
 
 ## Current gate
 
-Unchanged: token-exact (or the ratified distributional gate) against the pinned
-vLLM oracle, AND ≥ vLLM on every throughput axis / ≤ on latency and memory, on
-both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
-[benchmark-protocol.md](benchmark-protocol.md). Parity pin: vLLM `555967922`
-(0.26.0.dev0).
+Token-exact (or ratified distributional) vs pinned vLLM; ≥ throughput and ≤
+latency/memory on every axis, both gate models, reproduced 2–3x idle. See
+[verification](verification.md). Pin: vLLM `555967922` (0.26.0.dev0).
 
-Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
-throughput ⇒ audit the context; scan the REFERENCE's own rationale; per-shape
-MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL comparisons).
 
 ## Next actions
 
-1. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
-   speed-pending; bind the default-ON async-serving path against the same oracle
-   before attributing the remaining TPOT gap.
-2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
-   CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
-3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
-   f32-out caller) once the Laguna fix proves the mechanism.
-4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
-   (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Claim triage DONE; `docs/STATUS.md`
-   under a shrink-only ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING:
-   anchor backfill (98 rows `SPIKE`/`ACTIVE`, need code/test anchors; 6 model rows
-   need a DECISION, architecture unregistered); record-era rollover BLOCKED on
-   `check-agent-record.py` binding `DONE` rows to `parity-ledger.md` LINE anchors
-   (re-anchor by ROW ID first; `state.md`/`benchmark-record.md` can roll now).
+0. **35B mid-band: first lever LANDED** (+1.31% c8, +1.38% c4). The fused
+   shared gate_up sink still took the MoE-marlin route (20320 launches = 5.4%
+   GPU); `VT_MARLIN_DENSE_PAIR` ON. Second lever LANDED: shared down-proj emits
+   bf16, **+2.05% BIT-IDENTICAL**. SiLU [spec](specs/moe-silu-vectorize.md)
+   **NEGATIVE**: the 9.2x was a MEAN over a bimodal kernel (min 1.34/max 979us);
+   decode SiLU already beats vLLM's. ~5% UNATTRIBUTED; needs decode-only, 1 tool.
+1. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
+   of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
+2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
+   transducer half is NOT in vLLM: separate call).
+3. **Qwen3.5-4B #206:** +2.83% `PENDING`; latency/VRAM open.
+4. **Invocation-parity prevention:** CI guard + checklist; build-verify
+   `kGemvHeuristicAlgos` on dgx.
+5. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
+6. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
+   `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
+   DECISION); record-era rollover BLOCKED on `DONE` rows bound to
+   `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
 
-**Operator/helper protocol**
-([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
-into a lock or worktree+PR; operator merges PRs first and does features only via
-sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
-START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` still opt-in. Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
-**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
-drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
-OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
-(`ROAD-V1-D6`).
+**Operator/helper protocol** ([spec](workflow.md)): roles are a coordinator
+record or worktree+PR; helpers claim `row/<ROW-ID>` with a DRAFT PR. Role gates
+ENFORCE `agent-start.py` → claim → preflight. Review FAIL loops to a fresh
+implementer until PASS. Queue: 10 rows; backfill 79, 30 anchored.
+**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
+SM060/061/070 below vLLM's floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL
+unported work; **all 362 archs have rows**; llama.cpp's 11 extra devices IN
+SCOPE (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 
@@ -80,4 +67,6 @@ OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now h
 - GPU: park `local-ai-worker`, flock `$HOME/gpu.lock`, single-load
   steady-state, never reload per rep, named tmux.
 - Never weaken a checker to pass; repair the record.
-- Feature code needs a `row/*` PR (enforced); integration paths push direct.
+- Work happens in its own worktree on a task branch; the shared checkout stays
+  clean on `main`, never a work surface. Land via `row/*` PR or authorized
+  local merge; remove the worktree after.

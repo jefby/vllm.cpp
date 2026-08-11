@@ -10,6 +10,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
 
@@ -32,6 +33,29 @@ class TempJson {
 
  private:
   std::string path_;
+};
+
+// Writes config.json (+ optional generation_config.json) into a unique temp
+// DIRECTORY and returns the config.json path, so sibling-file resolution is
+// exercised the way a real checkpoint lays out. Removed in the destructor.
+class TempModelDir {
+ public:
+  TempModelDir(const std::string& config_body, const std::string& gen_body) {
+    static int counter = 0;
+    dir_ = (std::filesystem::temp_directory_path() /
+            ("vllm_hf_model_test_" + std::to_string(counter++)))
+               .string();
+    std::filesystem::create_directories(dir_);
+    std::ofstream(dir_ + "/config.json", std::ios::binary) << config_body;
+    if (!gen_body.empty()) {
+      std::ofstream(dir_ + "/generation_config.json", std::ios::binary) << gen_body;
+    }
+  }
+  ~TempModelDir() { std::filesystem::remove_all(dir_); }
+  std::string config_path() const { return dir_ + "/config.json"; }
+
+ private:
+  std::string dir_;
 };
 
 // Qwen3-Next-like hybrid MoE config (key names per upstream
@@ -389,6 +413,116 @@ TEST_CASE("LoadHfConfig mirrors sliding_window normalization from the text confi
   }
 }
 
+// ROW 7 / kimi-linear.md §20.3 B1 — KV enablement for the shared paged runner.
+// Kimi-Linear's config carries NO `layer_types` and NONE of the qwen3_5-style
+// explicit `linear_*` GDN-geometry keys: its KDA/full-attn split lives in the
+// nested `linear_attn_config` (transformers_utils/configs/kimi_linear.py:34-148,
+// `is_kda_layer(l) := (l+1) in kda_layers` :144-148 — the lists are 1-INDEXED).
+// LoadHfConfig must SYNTHESIZE the runner-facing fields from it so the runner's
+// MambaSpec shape check (runner.cpp:489-493) and the per-layer KDA-state /
+// MLA-page allocation loop (runner.cpp:625-) see the same geometry
+// MakeKimiLinearKVCache declares — instead of {0,0},{0,0,0} and an abort.
+TEST_CASE("LoadHfConfig synthesizes layer_types + GDN geometry from linear_attn_config") {
+  TempJson f(R"({
+    "model_type": "kimi_linear",
+    "architectures": ["KimiLinearForCausalLM"],
+    "hidden_size": 2304,
+    "num_hidden_layers": 8,
+    "vocab_size": 163840,
+    "num_attention_heads": 32,
+    "intermediate_size": 9216,
+    "rms_norm_eps": 1e-05,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "mla_use_nope": true,
+    "linear_attn_config": {
+      "kda_layers": [1, 2, 3, 5, 6, 7],
+      "full_attn_layers": [4, 8],
+      "num_heads": 32,
+      "head_dim": 128,
+      "short_conv_kernel_size": 4
+    },
+    "max_position_embeddings": 1048576
+  })");
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+
+  // GDN-group geometry sourced from linear_attn_config (num_k == num_v == the
+  // KDA num_heads; Dk == Dv == head_dim; conv kernel == short_conv_kernel_size),
+  // so the runner derives conv_dim = 2*Hk*Dk + Hv*Dv = 3*32*128 = 12288 and the
+  // ssm shape {32,128,128} — exactly MakeKimiLinearKVCache's MambaSpec.
+  CHECK(cfg.linear_num_key_heads == 32);
+  CHECK(cfg.linear_num_value_heads == 32);
+  CHECK(cfg.linear_key_head_dim == 128);
+  CHECK(cfg.linear_value_head_dim == 128);
+  CHECK(cfg.linear_conv_kernel_dim == 4);
+
+  // layer_types synthesized from the 1-indexed kda_layers list.
+  REQUIRE(cfg.layer_types.size() == 8);
+  const std::vector<std::string> expect = {
+      "linear_attention", "linear_attention", "linear_attention",
+      "full_attention",   "linear_attention", "linear_attention",
+      "linear_attention", "full_attention"};
+  for (size_t i = 0; i < expect.size(); ++i) CHECK(cfg.layer_types[i] == expect[i]);
+
+  // The raw doc still carries linear_attn_config for ParseKimiLinearParams.
+  CHECK(cfg.raw.contains("linear_attn_config"));
+}
+
+// The synthesis must be ADDITIVE: a config that carries the explicit qwen3_5
+// fields (kHybridJson has both layer_types AND linear_*) is untouched by it —
+// that path is byte-identical (asserted by the hybrid TEST_CASE above), and a
+// config with NEITHER (plain dense llama) stays all-zero / empty.
+TEST_CASE("LoadHfConfig linear_attn_config synthesis leaves non-Kimi configs untouched") {
+  TempJson f(kLlamaJson);
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  CHECK(cfg.linear_num_key_heads == 0);
+  CHECK(cfg.linear_num_value_heads == 0);
+  CHECK(cfg.linear_conv_kernel_dim == 0);
+  CHECK(cfg.layer_types.empty());
+}
+
+// The PRIORITY conjunct (`cfg.linear_num_key_heads == 0`): a config carrying
+// BOTH the explicit qwen3_5-style keys AND a linear_attn_config keeps the
+// EXPLICIT values — the synthesis never overwrites them. Drop the conjunct and
+// this case REDs (num_value_heads would become 4 == num_heads, key_head_dim 16,
+// conv 4). This makes B1 additive-by-construction, pinned rather than assumed.
+TEST_CASE("LoadHfConfig explicit linear_* fields WIN over linear_attn_config") {
+  TempJson f(R"({
+    "model_type": "qwen3_5_moe",
+    "architectures": ["Qwen3NextForCausalLM"],
+    "hidden_size": 64,
+    "num_hidden_layers": 3,
+    "vocab_size": 128,
+    "num_attention_heads": 4,
+    "layer_types": ["linear_attention", "full_attention", "linear_attention"],
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 8,
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 64,
+    "linear_conv_kernel_dim": 3,
+    "linear_attn_config": {
+      "kda_layers": [1, 2, 3],
+      "full_attn_layers": [],
+      "num_heads": 4,
+      "head_dim": 16,
+      "short_conv_kernel_size": 4
+    }
+  })");
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  // The explicit (qwen3_5-style, asymmetric) geometry survives verbatim ...
+  CHECK(cfg.linear_num_key_heads == 2);
+  CHECK(cfg.linear_num_value_heads == 8);
+  CHECK(cfg.linear_key_head_dim == 32);
+  CHECK(cfg.linear_value_head_dim == 64);
+  CHECK(cfg.linear_conv_kernel_dim == 3);
+  // ... and the explicit layer_types are NOT resynthesized from kda_layers
+  // (which would flip index 1 to linear_attention).
+  REQUIRE(cfg.layer_types.size() == 3);
+  CHECK(cfg.layer_types[1] == "full_attention");
+}
+
 TEST_CASE("LoadHfConfig throws when required fields are missing") {
   SUBCASE("missing model_type") {
     TempJson f(R"({"hidden_size": 64, "num_hidden_layers": 2})");
@@ -674,5 +808,61 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
     const auto& rp = cfg.raw.at("rope_parameters");
     CHECK(rp.at("full_attention").at("rope_theta").get<double>() == 1000000.0);
     CHECK(rp.at("sliding_attention").at("rope_theta").get<double>() == 10000.0);
+  }
+}
+
+// ─── generation_config.json eos ids (vllm/config/model.py try_get_generation_
+// config -> sampling_params.py:645-655) ──────────────────────────────────────
+// Upstream loads generation_config.json alongside config.json whenever
+// --generation-config is "auto" (the default) or "vllm". Its eos_token_id is a
+// DIFFERENT, usually larger set than config.json's: Gemma-4-26B ships
+// config.json [1, 106] and generation_config.json [1, 106, 50].
+TEST_CASE("LoadHfConfig reads sibling generation_config.json eos ids") {
+  constexpr const char* kConfig = R"({
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 8,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "vocab_size": 32,
+    "max_position_embeddings": 128,
+    "eos_token_id": [1, 106]
+  })";
+
+  SUBCASE("array eos is unioned, config.json raw left untouched") {
+    TempModelDir model(kConfig, R"({"eos_token_id": [1, 106, 50]})");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    // Sorted, de-duplicated union.
+    std::vector<int32_t> expected = {1, 50, 106};
+    CHECK(cfg.generation_config_eos_ids == expected);
+    // raw["eos_token_id"] is the checkpoint's own field and must not be
+    // rewritten: the PRIMARY eos id is derived from it downstream.
+    CHECK(cfg.raw["eos_token_id"] == nlohmann::json::array({1, 106}));
+  }
+
+  SUBCASE("scalar eos in generation_config.json") {
+    TempModelDir model(kConfig, R"({"eos_token_id": 50})");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    std::vector<int32_t> expected = {50};
+    CHECK(cfg.generation_config_eos_ids == expected);
+  }
+
+  SUBCASE("absent generation_config.json leaves the list empty") {
+    TempModelDir model(kConfig, "");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    CHECK(cfg.generation_config_eos_ids.empty());
+  }
+
+  SUBCASE("malformed generation_config.json is a silent no-op, not a throw") {
+    TempModelDir model(kConfig, "{ this is not json");
+    vllm::HfConfig cfg;
+    REQUIRE_NOTHROW(cfg = vllm::LoadHfConfig(model.config_path()));
+    CHECK(cfg.generation_config_eos_ids.empty());
+  }
+
+  SUBCASE("generation_config.json without an eos field") {
+    TempModelDir model(kConfig, R"({"temperature": 0.7})");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    CHECK(cfg.generation_config_eos_ids.empty());
   }
 }

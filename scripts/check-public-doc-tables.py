@@ -319,12 +319,31 @@ def features_errors(text: str) -> list[str]:
 # measured on 2026-08-04 and may only go DOWN. New rows and tighter prose pass;
 # growth fails. The same mechanism as the device-leakage DSR ratchet in CI.
 # Lowering these numbers as the page is compacted is the gate closing.
+#
+# THE `chars` KEY WAS REMOVED 2026-08-11 (ENG-RECORD-CONFLICT-SURFACES, #364).
+# It was a byte count of docs/STATUS.md stored in THIS file and permitted to move
+# only downward, so a PR owing the page one lifecycle line had to delete
+# unrelated prose from some other row to pay for it AND edit this file — two
+# shared surfaces per PR, both of which every other PR was also editing. It made
+# `scripts/check-public-doc-tables.py` a merge hotspot in 4 of the 16 conflicting
+# open PRs and docs/STATUS.md one in another 4, measured at origin/main d928e2c3.
+# The comment that used to sit here already recorded the failure — "a ratchet
+# pinned to the byte turns every concurrently merged row's one-line status edit
+# into a spurious failure" — and answered it by adding slack to the constant,
+# which only postponed it to the next cadence of parallel work.
+#
+# The three keys below are DELIBERATELY KEPT. Each counts a QUALITY defect
+# (sections, paragraphs over MAX_PARAGRAPH_CHARS, cells over MAX_CELL_CHARS)
+# rather than a length, so an ordinary lifecycle line moves none of them and two
+# concurrent PRs do not collide on them. They carry the whole anti-bloat
+# obligation the `chars` key was claimed to serve: a page cannot decay into
+# wall-of-prose without tripping one, and BENCHMARKS.md's 11,127-line decay would
+# have been caught by `long_paragraphs` and `oversized_cells` alone.
 STATUS = ROOT / "docs/STATUS.md"
 STATUS_RATCHET = {
-    "chars": 287_838,
     "h2_sections": 11,
-    "long_paragraphs": 89,
-    "oversized_cells": 47,
+    "long_paragraphs": 82,
+    "oversized_cells": 44,
 }
 STATUS_REQUIRED = (
     ("Parity pin", ("parity pin",)),
@@ -365,7 +384,7 @@ def status_errors(text: str) -> list[str]:
                 f"docs/STATUS.md {key.replace('_', ' ')} is {measured[key]}, over "
                 f"the {cap} ratchet: this page may only shrink. Collapse the "
                 "superseded narrative into the binding result and move the "
-                f"detail to {RECORD_LINK} or .agents/state.md, then lower the "
+                f"detail to {RECORD_LINK} or structured state evidence, then lower the "
                 "ratchet in the same change"
             )
 

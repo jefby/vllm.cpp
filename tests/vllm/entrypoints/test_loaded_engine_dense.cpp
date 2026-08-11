@@ -27,8 +27,11 @@
 #include <string>
 #include <vector>
 
+#include "vllm/config/device.h"
 #include "vllm/config/scheduler.h"
+#include "vllm/platforms/interface.h"
 #include "vllm/v1/core/sched/async_scheduler.h"
+#include "vllm/v1/engine/input_processor.h"  // InputValidationError
 
 #include <nlohmann/json.hpp>
 
@@ -446,4 +449,200 @@ TEST_CASE("loaded_engine: prefix caching mirrors model-capability defaults") {
   CHECK(LoadedEngine::ResolveEnablePrefixCaching(params, hybrid));
   params.enable_prefix_caching = false;
   CHECK_FALSE(LoadedEngine::ResolveEnablePrefixCaching(params, decoder));
+}
+
+// ─── ARCH-ONE-SURFACE ROW 8: explicit device selection ───────────────────────
+// The policy matrix behind SelectQueue's explicit arms, gated PURE over the
+// "is the CUDA platform registered" probe answer so the CPU tier pins the
+// whole contract — including the CUDA-build half ("explicit cpu beats a
+// registered accelerator") that a CPU-only process could otherwise never
+// exercise. SelectQueue routes its explicit arms through THIS function
+// (model_loader.cpp), so these pins bind the production policy, not a copy.
+TEST_CASE("loaded_engine: ResolveExplicitDeviceType uses the named platform without fallback") {
+  using vllm::Device;
+
+  // Explicit CPU resolves CPU regardless of what the name lookup found. The
+  // non-CPU value is the accelerator-build pin: a registered accelerator must
+  // NOT win over an
+  // explicit cpu ask (the fold-ROW-8 defect was that an embedder could not ASK
+  // for CPU at all).
+  CHECK(LoadedEngine::ResolveExplicitDeviceType(
+            Device::kCPU, std::optional{vt::DeviceType::kXPU}) ==
+        vt::DeviceType::kCPU);
+  CHECK(LoadedEngine::ResolveExplicitDeviceType(Device::kCPU, std::nullopt) ==
+        vt::DeviceType::kCPU);
+
+  // The explicit named-platform arm returns what the registry found. kXPU is
+  // deliberate mutation sensitivity: a hidden CUDA constant cannot satisfy it.
+  CHECK(LoadedEngine::ResolveExplicitDeviceType(
+            Device::kNamedPlatform, std::optional{vt::DeviceType::kXPU}) ==
+        vt::DeviceType::kXPU);
+
+  // Explicit CUDA WITHOUT the platform throws the pinned message — never a
+  // silent CPU fallback (mirror of vLLM assigning an explicit device verbatim,
+  // vllm/config/device.py:61-66).
+  CHECK_THROWS_WITH_AS(
+      LoadedEngine::ResolveExplicitDeviceType(Device::kNamedPlatform,
+                                              std::nullopt),
+      doctest::Contains("device 'cuda' was requested but no CUDA platform"),
+      std::runtime_error);
+
+  // kAuto is not an explicit selection: it resolves through the probe inside
+  // SelectQueue, and this seam refuses it rather than guessing.
+  CHECK_THROWS_AS(
+      LoadedEngine::ResolveExplicitDeviceType(Device::kAuto, std::nullopt),
+                  std::invalid_argument);
+}
+
+TEST_CASE("loaded_engine: DeviceFromString mirrors the vLLM Device names") {
+  using vllm::Device;
+  // The supported subset of upstream's Device Literal (vllm/config/device.py:13)
+  // — the strings the server's --device flag consumes.
+  CHECK(vllm::DeviceFromString("auto") == Device::kAuto);
+  CHECK(vllm::DeviceFromString("cpu") == Device::kCPU);
+  CHECK(vllm::DeviceFromString("cuda") == Device::kNamedPlatform);
+  CHECK_THROWS_WITH_AS(vllm::DeviceFromString("tpu"),
+                       doctest::Contains("Unknown device: tpu"),
+                       std::invalid_argument);
+  CHECK_THROWS_AS(vllm::DeviceFromString(""), std::invalid_argument);
+
+  // The wire contract (vllm_model_params.device, ABI v14): 0 MUST stay auto so
+  // a zero-initialized struct preserves pre-v14 behaviour; cpu/cuda follow the
+  // v12 vllm_video_model_params.device precedent (0 cpu, 1 cuda) shifted by
+  // the auto slot.
+  CHECK(static_cast<int32_t>(Device::kAuto) == 0);
+  CHECK(static_cast<int32_t>(Device::kCPU) == 1);
+  CHECK(static_cast<int32_t>(Device::kNamedPlatform) == 2);
+  CHECK(std::string(vllm::DeviceName(Device::kAuto)) == "auto");
+  CHECK(std::string(vllm::DeviceName(Device::kCPU)) == "cpu");
+  CHECK(std::string(vllm::DeviceName(Device::kNamedPlatform)) == "cuda");
+}
+
+TEST_CASE("loaded_engine: FromModelDir resolves an explicit absent device BEFORE any path I/O") {
+  // The device error must win over the path error (the mirror of vLLM building
+  // DeviceConfig at config-creation time, before the model load —
+  // arg_utils.py:1878, device.py __post_init__). This is also what makes the
+  // EngineParams->FromModelDir plumb pinnable on the CPU tier with no loadable
+  // checkpoint: a bogus path + device=cuda must report the DEVICE, not the path.
+  if (vllm::platforms::FindPlatformByName("cuda") != nullptr) {
+    return;  // CUDA build/box: the explicit-cuda arm resolves; nothing to pin.
+  }
+  EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  CHECK_THROWS_WITH_AS(
+      LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/model/dir", params),
+      doctest::Contains("device 'cuda' was requested but no CUDA platform"),
+      std::runtime_error);
+
+  // An explicit CPU ask is legal and proceeds to the path (the path error, not
+  // a device error, surfaces) — the plumb forwards the field, not a constant.
+  params.device = vllm::Device::kCPU;
+  CHECK_THROWS_WITH_AS(
+      LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/model/dir", params),
+      doctest::Contains("not a directory"), std::runtime_error);
+}
+
+// ─── KV sizing at startup (issue #83 M4; external PR #227) ───────────────────
+// vllm/v1/core/kv_cache_utils.py:2160-2174 @ 555967922 runs both halves at
+// engine init. Without them a prompt the pool can never hold is admitted, never
+// allocates, and the engine spins at model_executed=0 with an idle GPU.
+
+TEST_CASE(
+    "loaded_engine: refuses a pinned --max-model-len the KV pool cannot hold") {
+  // _check_enough_kv_cache_memory (kv_cache_utils.py:751-788): the caller asked
+  // for 4096 tokens of context out of a 1 x 32-token pool.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.num_blocks = 1;  // 1 x 32 = 32 tokens of KV
+  params.max_model_len = 4096;
+
+  CHECK_THROWS_WITH_AS(
+      LoadedEngine(c, MakeDenseWeights(c), FreshFixture(), params),
+      doctest::Contains("larger than the available KV cache memory"),
+      std::invalid_argument);
+
+  // The message carries upstream's remediation and ours, so the user is left
+  // with an action rather than a number.
+  try {
+    LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+    FAIL("expected the KV sizing check to refuse this configuration");
+  } catch (const std::invalid_argument& e) {
+    const std::string msg = e.what();
+    CHECK(msg.find("max seq len (4096)") != std::string::npos);
+    CHECK(msg.find("estimated maximum model length is 32") != std::string::npos);
+    CHECK(msg.find("--num-blocks") != std::string::npos);
+  }
+}
+
+TEST_CASE(
+    "ResolveMaxModelLen: a model with no paged KV is never refused by the "
+    "sizing check") {
+  // kv_cache_utils.py:872-878 guards the check with `if kv_cache_spec:`. A
+  // model whose KV state does not scale with the block count (attention-free,
+  // or pure Mamba/GDN — KVBytesPerBlock is 0 for both) has nothing to run out
+  // of, so a pinned length must pass however small the pool is, and an unpinned
+  // one must not be fitted down to nothing.
+  const HfConfig c = MakeDenseConfig();
+  vllm::v1::KVCacheConfig no_paged_kv{};
+  no_paged_kv.num_blocks = 1;  // no groups -> KVBytesPerBlock == 0
+
+  EngineParams pinned;
+  pinned.max_model_len = 4096;
+  CHECK(LoadedEngine::ResolveMaxModelLen(pinned, c, no_paged_kv,
+                                         /*block_size=*/32) == 4096);
+
+  EngineParams unpinned;
+  CHECK(LoadedEngine::ResolveMaxModelLen(unpinned, c, no_paged_kv,
+                                         /*block_size=*/32) == kMaxModelLen);
+}
+
+TEST_CASE(
+    "loaded_engine: a pinned --max-model-len the pool CAN hold is served "
+    "unchanged") {
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.num_blocks = 1;                // 32 tokens of KV
+  params.max_model_len = kMaxModelLen;  // exactly one pool
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_model_len() == kMaxModelLen);
+}
+
+TEST_CASE(
+    "loaded_engine: an unpinned max_model_len auto-fits down to the KV pool") {
+  // _auto_fit_max_model_len (kv_cache_utils.py:1967-2027): the checkpoint claims
+  // 4096 tokens of context and the pool holds 32, so 32 is what gets served —
+  // and the admission check then rejects anything longer instead of the
+  // scheduler wedging on it.
+  HfConfig c = MakeDenseConfig();
+  c.max_position_embeddings = 4096;
+  EngineParams params;
+  params.num_blocks = 1;  // 32 tokens
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_model_len() == kMaxModelLen);
+}
+
+TEST_CASE(
+    "loaded_engine: an unpinned max_model_len the pool holds is NOT reduced") {
+  // The default path must be untouched: 256 x 32 = 8192 tokens of KV against a
+  // 32-token checkpoint context leaves the context alone.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;  // defaults: num_blocks 256, block_size 32
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_model_len() == kMaxModelLen);
+}
+
+TEST_CASE("loaded_engine: an over-long prompt is REFUSED, not left waiting") {
+  // The end-to-end point of both guards. Before them this prompt was admitted,
+  // could never allocate, and the engine produced no tokens forever.
+  HfConfig c = MakeDenseConfig();
+  c.max_position_embeddings = 4096;
+  EngineParams params;
+  params.num_blocks = 1;  // 32 tokens of KV -> max_model_len auto-fits to 32
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  REQUIRE(eng.max_model_len() == kMaxModelLen);
+
+  const std::vector<int32_t> long_prompt(kMaxModelLen + 8, 3);
+  CHECK_THROWS_AS(eng.engine().generate(long_prompt, Greedy(1), "toolong"),
+                  vllm::v1::InputValidationError);
+  CHECK_FALSE(eng.engine().has_unfinished_requests());
 }

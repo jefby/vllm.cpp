@@ -17,7 +17,29 @@ MATRICES = {
     # 358 since 2026-08-05: +31 architectures vLLM's registry defines that we had
     # NEVER inventoried (found by scripts/upstream-inventory.py). All INVENTORIED;
     # inventorying is not committing.
-    "MODEL": (AGENTS / "model-matrix.md", 358),
+    # 360 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-ENCODER`, the first row of the
+    # new `MODEL-AUDIO` section (Parakeet / FastConformer encoder + CTC head,
+    # spike parakeet-conformer-encoder.md work item P4). It is NOT one of the 328
+    # registry architectures: vLLM ships it as the audio COMPONENT of
+    # `nano_nemotron_vl.py` and delegates the encoder itself to transformers, so
+    # there is no `registry.py` entry to inventory. A genuinely new row, never a
+    # count relaxed to make a transition pass.
+    # 361 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-TRANSDUCER` (the Parakeet RNN-T
+    # and TDT heads over that same encoder: `ParakeetForRNNT` / `ParakeetForTDT`,
+    # spike work item P6). A SEPARATE row rather than an advance of the encoder
+    # row, because it is a different upstream model class with its own state dict,
+    # its own decode and its own checkpoints. Like the encoder row it is not one
+    # of the 328 registry architectures: vLLM has no transducer call site at all
+    #: so there is nothing in `registry.py` to inventory. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    # 362 since 2026-08-10: +`MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation`
+    # (Meta's Muse Glimmer 30B, released 2026-08-08). A THIRD beyond-pin row: it is
+    # not one of the 326 registry architectures at `555967922`, and unlike the two
+    # Parakeet rows it is absent because it did not exist yet, not because vLLM
+    # delegates it. Its only upstream implementation is the still-OPEN
+    # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 362),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -130,9 +152,29 @@ MATRICES = {
     # the DGX GB10: 2/2 cases · 92401 assertions vs the CPU oracle + f64 dequant,
     # memcheck 0, RED-first proven. `ACTIVE`, `CLAIM-CUDA-KEEPQUANT-GEMM`, spec
     # specs/deepseek-v4-flash.md §W8.)
+    # 46 since 2026-08-06: +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
+    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
+    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
+    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
+    # the broad CPU-backend row.
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 45),
+    # 47 since 2026-08-06: +`KERNEL-GEMM-CPU-ELEM-X86WIDE` (the AVX2/AVX-512
+    # elementwise tiers; our x86 tier is SSE2 while the box has avx512f, a
+    # measured 3.5x) and +`KERNEL-GEMM-CPU-TILED` (the tinyBLAS-style tiled
+    # sgemm; controls proved our NEON kernel is at ggml-stock parity and the
+    # whole 16-bit deficit is llamafile, ~1.9x Arm / ~2.4x x86).
+    # 50 since 2026-08-06: +`KERNEL-CPU-CONV2D-SUBSAMPLE`, +`KERNEL-DEPTHWISE-CONV1D`
+    # and +`KERNEL-ATTN-RELPOS` — the three conformer/FastConformer audio-encoder
+    # primitives the tree had no device op for at all (Conv2d existed only as a host
+    # std::vector loop; the only depthwise conv1d was the CAUSAL Mamba/GDN one; every
+    # attention path was RoPE + paged/flash KV). Spike specs/parakeet-conformer-encoder.md.
+    # 51 since 2026-08-06 (PR #79): +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
+    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
+    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
+    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
+    # the broad CPU-backend row.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -158,7 +200,10 @@ MATRICES = {
     # 79 since 2026-08-05: +11 BACKEND-GGML-* rows, the llama.cpp ggml
     # backends folded into scope (user-directed). All INVENTORIED and
     # spike-gated; inventorying is not committing.
-    "BACKEND": (AGENTS / "backend-matrix.md", 79),
+    # 80 since 2026-08-09: +`BACKEND-TENSTORRENT`, an extension platform
+    # proposal (Tenstorrent Blackhole, ttnn C++ adapter) in the same class as
+    # Metal/Vulkan. INVENTORIED; spec-only, not yet reviewed or accepted.
+    "BACKEND": (AGENTS / "backend-matrix.md", 80),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -252,7 +297,75 @@ ENGINE_PREFIXES = (
 # the same change — the heads/`SequencePooler`/`DispatchPooler` composite — not a
 # new row.) Bumped for a real new row, never to make a failing state transition
 # pass.
-ENGINE_ROWS = 131
+# 141 since 2026-08-06: +`SERVE-VIDEOS-OAI` (the `/v1/videos` request surface in
+# OpenAI's Sora shape plus `GET /v1/videos/{id}/content`) — a real new serving
+# capability, not a restatement of the MiniMax-H3 model row: an OpenAI video
+# client works unmodified, the MP4 is fetchable over HTTP at all, and the
+# fl2va/ref2va exclusivity is enforced at the request boundary. CPU-landed +
+# gated, `PARTIAL`, `CLAIM-SERVE-VIDEOS-OAI`, spec `specs/minimax-h3.md` §9.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 142 since 2026-08-06: +`SERVE-VIDEOS-REFS` (reference CONDITIONING over
+# `/v1/videos`: `input_reference` -> fl2va, plus the two `metadata` ref2va
+# modalities) — a real new capability stacked on `SERVE-VIDEOS-OAI`, not a
+# restatement of it: that row made an OpenAI body PARSE, this one makes its
+# references reach the pipeline. Before it no reference modality was reachable
+# over HTTP at all. CPU-landed + gated, `CLAIM-SERVE-VIDEOS-REFS`, spec
+# `specs/minimax-h3.md` §10.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 143 since 2026-08-07: +`ENG-RELEASE-BINARIES` (downloadable, backend-specific
+# server bundles and their static/runtime dependency contract) — a real
+# distribution capability requested in issue #117, not a restatement of the
+# server implementation. Inventoried while its release-matrix spike is written;
+# no packaging support is claimed by the count bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 144 since 2026-08-08: +`ENG-RELEASE-CONTAINERS` (published GHCR container
+# images built by GitHub Actions — a distribution channel distinct from the
+# downloadable archives in `ENG-RELEASE-BINARIES`: different artifact format,
+# registry, tag contract, multi-arch manifest and publish flow, sharing only the
+# staged bundle. User-directed, issue #170; inventoried while its spike is
+# written, and no image, workflow or registry package is claimed by the bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 145 since 2026-08-09: +`ENG-DOCS-SITE` (publish `docs/` as a GitHub Pages site
+# that mounts the existing markdown read-only rather than copying it — a real
+# distribution surface for the documentation, distinct from the binary and
+# container channels above and from the docs themselves, which it does not
+# modify). User-directed, issue #224; `READY` on its committed spec, and no
+# site, workflow or published page is claimed by the bump.
+# 147 since 2026-08-10: +`KV-MOONCAKE-STORE` (`MooncakeStoreConnector`, Mooncake's
+# distributed KV object store as an external cache pool). Split out of
+# `KV-CONNECTORS`, whose blanket "Mooncake NOT SCHEDULED" verdict conflated the
+# P2P `MooncakeConnector` with the store connector; the P2P half keeps that
+# verdict. User-directed, issue #287; `SPIKE` on its committed spec. No client,
+# no connector, no build flag and no gate result is claimed by the bump.
+# 148 since 2026-08-11: +`ENG-RECORD-CONFLICT-SURFACES` (retire the shared record
+# surfaces that make concurrent PRs conflict by construction — the `STATUS_RATCHET`
+# global, the `NOW.md` byte budget, and the insert-at-one-anchor claims table).
+# MEASURED at `origin/main` `d928e2c3`: 16 of 29 open PRs conflict and 13 of those
+# 16 conflict in bookkeeping only. User-directed, issue #364; `READY` on its
+# committed spec. No checker semantic, no doc content and no gate result is
+# changed by the bump — this row is the record of the work, not the work.
+# 149 since 2026-08-11: +`ENG-NOW-DERIVED` (the live position is DERIVED and the
+# freshness obligation moves to the row's own spec, so `.agents/NOW.md` stops
+# being a surface every row-advancing PR must write). Follow-up to #364, which
+# removed the file's byte budget but not the doc-checkpoint requirement that
+# marched every PR into it. User-directed, issue #374; `ACTIVE` on its committed
+# spec. No checker semantic beyond the row's own scope and no product source is
+# changed by the bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 149
+
+ENGINE_SUMMARY_SECTIONS = (
+    ("Engine and scheduling", "Engine core and scheduling"),
+    ("KV cache and memory", "KV cache and memory"),
+    ("Parallelism", "Parallelism and scale-out"),
+    ("Sampling and generation", "Sampling and generation controls"),
+    ("Structured output and tools", "Structured outputs and tool calling"),
+    ("Speculative decoding", "Speculative decoding"),
+    ("Serving, API, CLI, library", "Serving surface, CLI, and library"),
+    ("LoRA and adapters", "LoRA and adapters"),
+    ("Long context and attention", "Long context and attention breadth"),
+    ("Loading, tokenizer, config", "Loading, tokenizer, and config"),
+)
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
@@ -323,7 +436,6 @@ TEST_ANCHOR_PREFIXES = (
 CODE_ANCHOR_FILES = {"CMakeLists.txt"}
 EVIDENCE_ANCHOR_FILES = {
     ".agents/parity-ledger.md",
-    ".agents/state.md",
 }
 
 SPEC_REQUIREMENTS = {
@@ -458,15 +570,26 @@ def parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]:
     return rows
 
 
+def link_base(source: Path, text: str) -> Path:
+    """Resolve migrated legacy links from their original .agents/ location."""
+    if (
+        source.is_relative_to(AGENTS / "completed/state-events")
+        and "<!-- legacy-payload:begin -->" in text
+    ):
+        return AGENTS
+    return source.parent
+
+
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
         text = source.read_text(encoding="utf-8")
+        base = link_base(source, text)
         for raw_target in LINK_RE.findall(text):
             target = raw_target.strip().strip("<>")
             if not target or target.startswith(("http://", "https://", "mailto:")):
                 continue
             target_path, _, fragment = target.partition("#")
-            resolved = (source.parent / target_path).resolve()
+            resolved = (base / target_path).resolve()
             if not resolved.exists():
                 errors.append(f"{source.relative_to(ROOT)}: dangling link {raw_target}")
                 continue
@@ -528,33 +651,66 @@ def check_engine_summary(rows: list[ClaimRow], errors: list[str]) -> None:
     lines = ENGINE_MATRIX.read_text(encoding="utf-8").splitlines()
     header: list[str] | None = None
     total: list[str] | None = None
-    for line in lines:
+    summaries: dict[str, list[str]] = {}
+    section_lines: dict[str, int] = {}
+    for line_no, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            section_lines[line.removeprefix("## ").strip()] = line_no
         if line.startswith("| Area | Rows |"):
             header = [normalize_header(cell) for cell in split_cells(line)]
-        elif header is not None and line.startswith("| **Total** |"):
-            total = [cell.replace("*", "").strip() for cell in split_cells(line)]
-            break
+        elif header is not None and total is None and line.startswith("|"):
+            cells = [cell.replace("*", "").strip() for cell in split_cells(line)]
+            if is_separator(cells):
+                continue
+            if cells[0] == "Total":
+                total = cells
+            else:
+                summaries[cells[0]] = cells
     if header is None or total is None or len(header) != len(total):
         errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: missing or malformed lifecycle summary")
         return
 
     actual_rows = [row for row in rows if row.path == ENGINE_MATRIX]
-    expected = {"rows": len(actual_rows)}
-    expected.update(
-        {normalize_header(state): sum(row.state == state for row in actual_rows) for state in STATES}
-    )
-    for index, name in enumerate(header[1:], 1):
-        if name not in expected:
+
+    def check_counts(label: str, recorded_cells: list[str], scoped_rows: list[ClaimRow]) -> None:
+        if len(recorded_cells) != len(header):
+            errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: malformed {label} lifecycle summary")
+            return
+        expected = {"rows": len(scoped_rows)}
+        expected.update(
+            {normalize_header(state): sum(row.state == state for row in scoped_rows) for state in STATES}
+        )
+        for index, name in enumerate(header[1:], 1):
+            if name not in expected:
+                continue
+            try:
+                recorded = int(recorded_cells[index])
+            except ValueError:
+                errors.append(
+                    f"{ENGINE_MATRIX.relative_to(ROOT)}: non-numeric {label} summary for {name}"
+                )
+                continue
+            if recorded != expected[name]:
+                errors.append(
+                    f"{ENGINE_MATRIX.relative_to(ROOT)}: {label} summary {name}={recorded}; "
+                    f"actual {expected[name]}"
+                )
+
+    check_counts("total", total, actual_rows)
+    for area, section in ENGINE_SUMMARY_SECTIONS:
+        recorded_cells = summaries.get(area)
+        section_line = section_lines.get(section)
+        if recorded_cells is None or section_line is None:
+            errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: missing {area} lifecycle summary")
             continue
-        try:
-            recorded = int(total[index])
-        except ValueError:
-            errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: non-numeric total for {name}")
-            continue
-        if recorded != expected[name]:
-            errors.append(
-                f"{ENGINE_MATRIX.relative_to(ROOT)}: summary {name}={recorded}; actual {expected[name]}"
-            )
+        next_section_line = min(
+            (line_no for line_no in section_lines.values() if line_no > section_line),
+            default=len(lines) + 1,
+        )
+        scoped_rows = [
+            row for row in actual_rows if section_line < row.line_no < next_section_line
+        ]
+        check_counts(area, recorded_cells, scoped_rows)
 
 
 def is_placeholder(value: str) -> bool:
@@ -748,21 +904,47 @@ def check_spec(row: ClaimRow, errors: list[str]) -> None:
         )
 
 
+def claim_sources() -> list[Path]:
+    """Every file that may carry an active claim row.
+
+    One file per claim in .agents/claims/ (ENG-RECORD-CONFLICT-SURFACES, #364),
+    plus the legacy table in coordination.md. Both are read, so a claim is
+    equally valid in either and no existing row had to be migrated -- the table
+    empties as its claims close.
+
+    The per-claim file exists because the table is insert-at-one-anchor: every
+    concurrent claim appended at the same line, which made coordination.md the
+    largest single conflict source in the repository (8 of the 16 conflicting
+    open PRs at origin/main d928e2c3, six of them one author's sequential ROCm
+    stack whose only conflict was this). A file with one writer cannot collide.
+    """
+    sources = [AGENTS / "coordination.md"]
+    claims_dir = AGENTS / "claims"
+    if claims_dir.is_dir():
+        sources.extend(sorted(claims_dir.glob("CLAIM-*.md")))
+    return sources
+
+
 def parse_active_claims(errors: list[str]) -> dict[str, set[str]]:
-    path = AGENTS / "coordination.md"
     claims: dict[str, set[str]] = {}
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.startswith("| `CLAIM-"):
-            continue
-        cells = split_cells(line)
-        claim_match = CLAIM_RE.search(cells[0])
-        if claim_match is None:
-            continue
-        claim = claim_match.group(0)
-        if claim in claims:
-            errors.append(f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim {claim}")
-            continue
-        claims[claim] = set(ID_RE.findall(cells[1])) if len(cells) > 1 else set()
+    origin: dict[str, str] = {}
+    for path in claim_sources():
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.startswith("| `CLAIM-"):
+                continue
+            cells = split_cells(line)
+            claim_match = CLAIM_RE.search(cells[0])
+            if claim_match is None:
+                continue
+            claim = claim_match.group(0)
+            if claim in claims:
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim "
+                    f"{claim} (already declared in {origin[claim]})"
+                )
+                continue
+            origin[claim] = str(path.relative_to(ROOT))
+            claims[claim] = set(ID_RE.findall(cells[1])) if len(cells) > 1 else set()
     return claims
 
 
@@ -800,7 +982,7 @@ def check_row_contracts(
                 claim = claim_match.group(0)
                 if row.item_id not in active_claims.get(claim, set()):
                     errors.append(
-                        f"{location}: owner {claim} does not claim active row {row.item_id} in coordination.md"
+                        f"{location}: owner {claim} does not claim active row {row.item_id} in any claim source"
                     )
 
         if row.state == "DONE":
@@ -818,14 +1000,14 @@ def check_row_contracts(
 
     for claim, item_ids in active_claims.items():
         if not item_ids:
-            errors.append(f".agents/coordination.md: active claim {claim} has no stable row IDs")
+            errors.append(f"active claim {claim} has no stable row IDs")
         for item_id in item_ids:
             row = by_id.get(item_id)
             if row is None:
-                errors.append(f".agents/coordination.md: {claim} references unknown row {item_id}")
+                errors.append(f"active claim {claim} references unknown row {item_id}")
             elif row.state not in {"SPIKE", "ACTIVE"}:
                 errors.append(
-                    f".agents/coordination.md: {claim} references {item_id} in state {row.state}, not SPIKE/ACTIVE"
+                    f"active claim {claim} references {item_id} in state {row.state}, not SPIKE/ACTIVE"
                 )
 
 
@@ -885,6 +1067,53 @@ def check_spec_location(errors: list[str]) -> None:
             errors.append(f"{path.relative_to(ROOT)}: feature spec/scoping file belongs in .agents/specs/")
 
 
+ISSUE_ROW = re.compile(
+    r"^\|\s*\[#(\d+)\]\((https://github\.com/[^)]+/issues/(\d+))\)\s*\|"
+    r"\s*(?:`([A-Z0-9][A-Za-z0-9_.-]*)`|—)\s*\|"
+)
+
+
+def check_issue_table(errors: list[str]) -> None:
+    """Every tracked issue is well-formed and its row link is consistent.
+
+    Deliberately NETWORK-FREE. Querying GitHub would make this gate fail on
+    connectivity, which is exactly the class of flake this protocol exists to
+    remove. It checks the FORM and the internal consistency; whether the issue
+    is still open is the agent's job at intake, not a CI blocker.
+    """
+
+    path = AGENTS / "roadmap_v1.md"
+    text = path.read_text(encoding="utf-8")
+    if "## Open issues" not in text:
+        errors.append(f"{path.relative_to(ROOT)}: missing the '## Open issues' intake table")
+        return
+
+    section = text.split("## Open issues", 1)[1].split("\n## ", 1)[0]
+    seen: set[str] = set()
+    rows = 0
+    for line in section.splitlines():
+        if not line.startswith("|") or line.startswith("| Issue") or set(line) <= set("|-: "):
+            continue
+        match = ISSUE_ROW.match(line)
+        if not match:
+            errors.append(
+                f"{path.relative_to(ROOT)}: malformed issue row {line[:60]!r}; "
+                "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
+            )
+            continue
+        rows += 1
+        number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
+        if number != url_number:
+            errors.append(
+                f"{path.relative_to(ROOT)}: issue #{number} links to {url}, a different issue"
+            )
+        if number in seen:
+            errors.append(f"{path.relative_to(ROOT)}: issue #{number} listed twice")
+        seen.add(number)
+    if rows == 0:
+        errors.append(f"{path.relative_to(ROOT)}: the open-issue table has no rows")
+
+
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
     path = AGENTS / "roadmap_v1.md"
     expected_blocks = [
@@ -941,6 +1170,7 @@ def main() -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
+        check_issue_table(errors)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)

@@ -1,328 +1,353 @@
-# AGENTS.md — vllm.cpp canonical index
+# AGENTS.md — the rules
 
-This file is the **index** to the project's canonical record. Every session,
-read this first and follow the links that matter for the task. Commits are
-allowed for completed in-scope changes and must follow the commit protocol
-below.
+This file is the complete policy for `vllm.cpp`. It is the only file every agent
+loads automatically, so every rule lives here. Files under `.agents/` are task
+guides — how to do a specific job — and they can never add or weaken a rule
+here.
 
-**Developer preferences.** After this file, read
-`.agents/developer-preferences.md` when it
-exists. It is intentionally untracked and records the current developer's Git
-integration choices, usable hosts, local paths, GPU contention policy,
-download/service permissions, and collaboration preferences. Start from the
-tracked
-[developer-preferences example](.agents/developer-preferences.example.md).
-Preferences control operations, not project truth: they cannot weaken the
-correctness, testing, evidence, attribution, lifecycle, or documentation rules
-in this file. Do not infer preferences from a developer name, filesystem path,
-Git author, or machine identity.
+The project mirrors vLLM in C++ with no PyTorch and no ggml dependency. vLLM is
+the reference for behavior and the bar for speed.
 
-If the preference file is absent or silent, use the safe defaults: local edits,
-tests, and commits are allowed; do not push, merge, force-update refs, use
-external hosts, install/download large assets, manage services, or start
-parallel agents. Ask before those actions. In the protocol, `${VLLM_SOURCE}`,
-`${VLLM_ORACLE}`, `${DEPENDENCY_SOURCE}`, `${GPU_LOCK}` and the other
-placeholders mean the values in the untracked `.env` at the repository root:
-copy the tracked [`.env.example`](.env.example) and fill in what your setup
-has. An empty value means unavailable — the gates that need it stay `PENDING`;
-never substitute another developer's paths. **When `.env` is missing, set it
-up interactively — like the role claim, it is asked, never inferred.** Walk
-the developer through what their setup has (reference checkouts, oracle, gate
-hardware and its SSH target, GPU lock, device arch/toolchain, plus the policy
-choices in the preferences template), generate `.env` and
-`.agents/developer-preferences.md` from the tracked examples with their
-answers, and offer to register their box as a profile in
-[.agents/environment.md](.agents/environment.md). Exact Ettore infrastructure
-paths retained in the environment registry or historical evidence are not
-commands for other developers.
+## Start here
 
-**Read [`.agents/NOW.md`](.agents/NOW.md) FIRST — it is the one-Read resume
-surface.** The canonical record is large by design (evidence is never deleted),
-which made orientation expensive: the files a cold session was told to read are
-the largest in the repo. NOW.md is the fix — a ≤100-line SNAPSHOT, rewritten in
-place, of the live claims, the gate being chased, and the next actions. It is
-never a log; the detail it summarises stays in the append-only record.
-**Refresh it in the SAME change as any `.agents/state.md` append**, because a
-state append is exactly the event that moves what is live.
-`scripts/check-now-current.py` (CI-gated, with its mutation test
-`tests/scripts/test_check_now_current.py`) enforces both its budget and that
-freshness coupling; do not weaken the checker to bypass the obligation.
+1. Run `scripts/agent-start.py`. Pass `--intent operator|helper|read-only` and
+   `--row <ID>` when you already know them; otherwise relay its welcome and ask
+   what work is intended. Follow its printed action, then rerun it.
+2. Declare a role: `scripts/agent-role.py claim operator` for a multi-step
+   integration campaign, `claim helper --row <ID>` for one scoped task, or
+   `claim read-only` for inspection. The operator claim records this worktree
+   as a coordinator; it is never refused because someone else is coordinating.
+   Add `--headless` only when the developer explicitly says the run is
+   unattended. Never infer it.
+3. Run `scripts/now.py` for the live position, and read `.agents/NOW.md`
+   for the operator's current gate and next actions. The first is derived;
+   the second is authored and fits on one screen.
+4. Read only the claimed row, its spec, its evidence, and the task guide for
+   what you are about to do.
+5. Run `scripts/agent-preflight.sh` before you edit anything.
 
-## T0 — the non-negotiables
+Never infer a role, host, permission, or developer preference. Resolve `.env`
+and `.agents/developer-preferences.md` from the shared checkout, asking only for
+the single value the current gate needs. An unavailable value leaves its gate
+`PENDING`; it never becomes an assumption. Preferences control operations only —
+they can never reduce a correctness, evidence, attribution, or testing
+obligation.
 
-These survive any context pressure. Each links to its full statement in
-[.agents/directives.md](.agents/directives.md); the linked text is the binding
-version, this list is the reminder.
+## History is git
 
-- **Mirror vLLM.** Feature parity across all features; when vLLM has an answer,
-  mirror it including all its modes. Never ask the user how a feature should
-  behave, only genuine product/scope calls.
-  ([full](.agents/directives.md#standing-directive--mirror-vllm-across-all-features-dont-ask-mirror))
-- **Ground every check in the whole execution chain**, not just the vLLM repo:
-  flashinfer, cutlass, cuBLASLt, DeepGEMM, torch/Inductor. Cite `file:line` on
-  both sides. Never declare a lever unreachable without dumping the generated
-  kernel.
-- **Trace the execution, not just the code.** `nsys` BOTH vLLM and ours on the
-  same workload before any perf comparison; graphed local engines need
-  `--cuda-graph-trace=node`. Source finds dispatch logic, not what ran. **cuBLAS/
-  kernel INVOCATION parity:** any GEMM/GEMV parity claim MUST verify vLLM's ACTUAL
-  call on FOUR axes — (1) output/C dtype (it SELECTS the gemvx template: an
-  API-name match can still be a slower `<bf16,FLOAT>` template than vLLM's
-  `<bf16,bf16>`), (2) compute+scale type, (3) entry point + algo policy
-  (`cublasGemmEx` default-algo vs `cublasLtMatmul` requestedAlgoCount/heuristic),
-  (4) the resolved kernel TEMPLATE dtypes read off the SAME tool's trace. HARD
-  RULE: a CROSS-TOOL comparison (our nsys vs vLLM's torch-profiler) can NEVER
-  establish invocation parity — a same-tool trace where entry point AND resolved
-  template match is required. Op-contract gate:
-  `scripts/check-gemv-invocation-consistency.py`; full lane in
-  [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § The
-  STRUCTURAL lens.
-- **Three MUST-route seams (CI-gated).** A model routes through the fusion
-  catalog (`vt::FusedChain`), the merged-GEMM family
-  (`layers::MlpGateUpMethodBase`, `vt::MergedGemmGroup`), and the shared decode
-  runner (`ModelRegistry::Forward`, `dense_attn::AttnBlock`, on-GPU sampling).
-  Hand-rolling any of them is drift: fold, or take a conscious allowlist entry.
-- **Compare against the oracle, same workload.** Correctness vs the pinned
-  pip-vLLM oracle; performance vs `vllm bench throughput` on the identical
-  workload. Both numbers and the ratio go in the ledger.
-- **Match or beat vLLM on EVERY axis**, never below, on both gate models, with
-  16/16 token-exact correctness as a precondition you may never trade. Below on
-  any axis is an open gap, not a done change. Reproduction is part of the gate.
-- **Never accept a "ceiling".** Same architecture, same GPU: if vLLM hits a
-  number we can. An apparent ceiling means specific differences not yet found.
-- **Port the tests with the code.** Upstream `tests/` is the executable spec;
-  every port carries its upstream test module in the same change.
-- **Spike before implementing.** No row enters `READY`/`ACTIVE` without a
-  committed `.agents/specs/<slug>.md` covering the full spike contract.
-- **Never weaken a checker** to make a transition pass. Repair the record.
-- **Evidence is moved, never deleted.** Compaction relocates detail into the
-  append-only record; it never drops it.
-- **Every commit carries `FOLLOWING_AGENTS_PROTOCOL`** plus `Assisted-by:`, and
-  never `Signed-off-by` or `Co-Authored-By` from an AI.
-- **Run `scripts/agent-preflight.sh`** at session start and before committing,
-  and chain the push to it (`gate && git push`) so a red gate cannot be followed
-  by a green push.
-- **Know your ROLE before you work.** Operator or helper
-  ([protocol](.agents/specs/operator-helper-protocol.md)). It cannot be derived
-  at session start — several sessions launch from one checkout — so DECLARE it
-  (`scripts/agent-role.py claim operator|helper --row <ROW-ID>`), which
-  materializes it into an exclusive lock or a worktree+PR, after which it is
-  re-derived rather than remembered. A helper works in an isolated worktree on
-  `row/<ROW-ID>` and opens a DRAFT PR at the START: that PR **is** the claim.
-  The operator merges PRs first thing, owns `main` and the GPU, and drives
-  feature work through sub-agents rather than writing it.
-- **Never three-way merge a keyed record.** `docs/STATUS.md`,
-  `docs/BENCHMARKS.md`, `docs/FEATURES.md`, `.agents/NOW.md`, the matrices and
-  `coordination.md` are merged by taking `main`'s version wholesale, re-applying
-  your edit, and verifying the other side is byte-identical. A three-way merge
-  silently produced a VARIANT of another session's binding numbers on
-  2026-08-04 — no conflict, no marker. Union-append only the append-only logs.
+There is no state log. Git is the history, and it cannot disagree with the tree.
 
-**Session handoff.** Deeper cold-resume context for unfinished work lives in the
-newest [`.agents/state.md`](.agents/state.md) entries plus the live claim row
-in [`.agents/coordination.md`](.agents/coordination.md): active claim, exact
-source/evidence roots, prohibitions, and the first resume/verification
-commands. **The state tail is only trustworthy below the
-`<!-- state-order:enforced-below -->` marker**, where every entry carries a
-sortable `<!-- state: YYYY-MM-DD -->` anchor on the line after its heading and
-`scripts/check-state-order.py` proves the order runs oldest-to-newest. That gate
-exists because union-merging appends from parallel worktrees had silently
-interleaved the tail, so "newest last" was false and cold resume returned a
-jumble; repair an interleaved merge with
-`python3 scripts/sort-state-tail.py --apply`, never by hand.
-Append to the state log for a feature/lifecycle checkpoint, a
-material implementation decision, or unfinished work that needs a handoff.
-Routine review, Git housekeeping, and protocol discussion do not require a
-state entry. Before ending a session with work in flight, record the handoff in
-the same checkpoint change. (User-directed 2026-07-14: the separate
-`HANDSOFF.md` replace-in-place surface is retired; do not recreate it.)
-
-**Public document obligations (full text:
-[.agents/directives.md](.agents/directives.md#public-document-obligations)).**
-`README.md` is the user-facing landing page and changes ONLY when a
-user-visible headline shifts. `docs/STATUS.md` is the per-capability status
-surface updated at EVERY checkpoint. `docs/BENCHMARKS.md` and `docs/FEATURES.md`
-are KEYED TABLES: update the row in place, never append a section. Forensic
-detail goes to the append-only `.agents/` record. Each is CI-gated
-(`check-readme-structure.py`, `check-public-doc-tables.py`,
-`check-doc-checkpoint.py`); do not weaken a checker to bypass the obligation.
-
-**The obligated public surfaces, declared once.** This block is the single
-statement of what `scripts/check-doc-checkpoint.py` enforces.
-`scripts/check-protocol-consistency.py` (CI-gated, with its mutation test
-`tests/scripts/test_check_protocol_consistency.py`) asserts it equals the
-checker's constants AND appears verbatim in
-[`.agents/workflow.md`](.agents/workflow.md), the session operating manual.
-That gate exists because the obligation was migrated off `README.md` here and in
-the checker but NOT in the manual, which went on instructing agents to do the
-exact thing the migration removed — prose and gate must move together, and prose
-is what agents actually read. `README.md` is deliberately absent from the block.
-
-<!-- doc-obligation-contract:begin -->
-| Public surface | Owed by |
+| Question | Command |
 |---|---|
-| `docs/STATUS.md` | every feature/iteration checkpoint |
-| `docs/BENCHMARKS.md` | every feature/iteration checkpoint |
-| `docs/FEATURES.md` | any change to a feature/model/backend/quantization surface |
-<!-- doc-obligation-contract:end -->
+| Did this row already land? | `git log --oneline --grep '<ROW-ID>'` |
+| When did this symbol change? | `git log -S'<symbol>' --oneline -- <path>` |
+| What happened to this file? | `git log --follow --oneline -- <path>` |
+| What is on main that I lack? | `git log --oneline HEAD..origin/main` |
+| Why is this line like this? | `git log -L '<start>,<end>:<path>'` |
+| What did that commit change? | `git show --stat <sha>` |
 
-**Record obligations (full text:
-[.agents/directives.md](.agents/directives.md#record-obligations)).** The
-roadmap portfolio row and its owning area matrix row move in the SAME change as
-the state they describe, and `DONE` means merged and gated with real anchors.
-Adding a CUDA architecture requires vendoring that arch's full Triton-AOT cubin
-set in the same change, or recording the GDN gap honestly. `.agents/` holds live
-context only: era-closed documents move to `.agents/completed/`, specs live in
-`.agents/specs/`, and live narratives are compacted to the binding result at
-every checkpoint.
+The roadmap row states where a row is *now*; git and the row's spec state how it
+got there. Before concluding anything about past work, check the spec and
+`git log -S` — do not re-derive it.
 
-**Tabular inventory, spike first, then parallel claims (full text:
-[.agents/directives.md](.agents/directives.md#standing-directive--tabular-inventory-spike-first-then-parallel-claims)).**
-The record is table-first: every row carries a stable ID, upstream source, our
-anchor, tests/evidence, spike, lifecycle state and owner, across the engine,
-feature, model, quantization, kernel and backend matrices. Every item is spiked
-before implementation. Parallel work claims row IDs in
-[.agents/coordination.md](.agents/coordination.md) and uses isolated worktrees.
-`scripts/check-agent-record.py` and its mutation suite gate all of it.
+## Every change starts from an issue
 
-**Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
-message. This asserts the contributor (human or AI-assisted) has read this
-AGENTS.md and follows the protocol. **CI rejects any commit lacking it**
-(see `.github/workflows/ci.yml` → `commit-protocol-tag`). It is a one-line
-trailer, e.g.:
+**No work without an open GitHub issue.** Before claiming a row or writing code,
+confirm an issue tracks the work; if none exists, open one. Link it in three
+places that must agree: the issue table in
+[`.agents/roadmap_v1.md`](.agents/roadmap_v1.md), the row's spec, and the PR
+body.
 
+A bug you find while doing something else still gets an issue — but filing it
+does not mean deferring it. File it, fix it in the same flow, reference it in
+the commit, and close it. The traceability is what matters, not the round trip:
+the person who just found the bug has the context to fix it, and making them
+hand it off loses that.
+
+This covers the small and obvious. A fix that needs its own spec, changes a
+checker's semantics, or would surprise a reviewer still takes the normal
+row / spec / fresh-review path — "fix it in-flow" is not a bypass for those.
+
+## Spec before code
+
+No row becomes `READY` or `ACTIVE` without a committed
+`.agents/specs/<slug>.md`. The spec is committed *before* implementation, never
+written up afterwards. It carries scope, upstream anchors, design, risks, tests,
+gates, evidence, and stop conditions.
+
+Before claiming, re-verify the gap against current code, tests, issues, PRs,
+`NOW.md`, and the owning row. If it already landed, is already claimed, or no
+longer matches its record, reconcile the record first and do not implement.
+
+When a row reaches `DONE`, its spec carries an `## Outcome` section: what was
+measured, what was rejected and why, and why any default is set the way it is.
+That is the one thing neither the code nor git records.
+
+## How work gets done
+
+Work is delegated, reviewed by someone else, and verified by the operator. This
+sequence is the method, not a suggestion:
+
+1. A **fresh implementer** works from the committed spec. It ports or writes the
+   smallest test that fails for the intended reason, captures the red result,
+   makes the minimum complete change, gets focused green, then runs the full
+   gate.
+2. A **fresh reviewer** — never the agent that wrote the code — reviews the
+   immutable head. It inspects statically *and* mutates the claimed guarantees
+   in a scratch copy to prove the tests catch their defect. Mutate, don't just
+   read. Restore the tree byte-for-byte afterwards.
+3. **Findings return to a fresh implementer.** Never repair a finding in the
+   coordinating session. Repeat focused gate, full gate, and fresh scoped review
+   until PASS. Attempt budgets are scheduling controls and never terminate a
+   correctable finding; only explicit developer direction or a precise external
+   blocker stops the loop.
+4. The **operator reruns the row's gate itself**. An implementer or reviewer
+   report is an input, never a gate result.
+
+Every delegated task states goal, context, exact scope and exclusions,
+constraints, done-when, required evidence, authority, output contract, and stop
+conditions. Missing binding context returns `NEEDS_CONTEXT` rather than a guess;
+a material disagreement returns `NEEDS_DECISION` rather than silent scope
+change. Use the versioned contracts in [`.agents/prompts/`](.agents/prompts/).
+
+The operator is a **coordinator**. It holds the plan and the GPU, merges
+reviewed PRs, dispatches sub-agents into separate worktrees, and does not write
+implementations that should be independently reviewed. **Several operators may
+run at once** — `scripts/agent-role.py claim operator` records who is
+coordinating where and never refuses; `show` lists the others.
+
+**`main` is never force-pushed.** No `--force`, no `--force-with-lease`, by
+anyone, ever. That is what makes concurrent coordinators safe: a plain
+`git push` refuses any non-fast-forward, so git itself is the interlock. A
+rejected push means fetch, re-merge, re-run the gate, and push again — never
+force.
+
+## vLLM is the reference
+
+**Mirror it.** When vLLM defines behavior, mirror every applicable mode,
+default, error, and edge case. Escalate only a genuine product decision; never
+ask how a mirrored feature should behave.
+
+**Pin it.** Comparisons run against the pinned oracle recorded in
+[`.agents/upstream-sync.md`](.agents/upstream-sync.md). Advance the pin only
+after every affected row and gate is reconciled. An oracle is only gateable once
+it demonstrably *builds and runs* the model — constructing a config proves
+nothing.
+
+**Verify against both the running oracle and its source.** Every change is
+checked two ways: execute the pinned vLLM on the identical workload, and read
+the upstream path it corresponds to. Ground conclusions in the whole executing
+chain — FlashInfer, CUTLASS, cuBLASLt, DeepGEMM, torch/Inductor, generated
+code, and local dispatch — and cite the `file:line` you ported from. Dump the
+generated kernel before calling a lever unreachable. Anything written from
+scratch is recorded as such in the porting inventory.
+
+**Port its tests in the same change**, preserving parameters, modes, fixtures,
+tolerances, failure cases, and the upstream revision anchor. Document only
+unavoidable harness adaptation.
+
+**Trace both sides with the same tool** on the identical workload before any
+throughput comparison. Source inspection establishes candidates; matching traces
+establish what actually ran. A GEMM/GEMV invocation-parity claim proves output
+dtype, compute and scale type, entry point, algorithm policy, and resolved
+template dtypes *in the same tool*.
+
+## Gates
+
+Correctness first, always. Establish the declared token-exact gate — or an
+explicitly ratified distributional gate where the oracle's own greedy decode is
+non-deterministic — before accepting any performance result. Never trade
+correctness for throughput.
+
+Both sides use the pinned oracle with identical model artifacts, prompts, token
+counts, batching, concurrency, and sampling. The honest denominator is vLLM's
+production configuration, never `--enforce-eager`.
+
+Record values and ratios for every required throughput, latency, and memory
+axis; any axis below floor is an open gap. Record the exact build and run
+recipe, revisions, model hashes, environment, and contention state, and
+reproduce the result on an idle box with same-binary A/B before accepting it.
+
+**Never declare a ceiling.** An apparent same-architecture performance limit is
+an unresolved implementation difference. Keep the gap open and name the next
+traceable hypothesis.
+
+Report exactly one result per applicable rule: satisfied, narrowly waived,
+pending a named external authority or resource, or failing. Permanent
+report-only is not a result.
+
+## Shared seams
+
+A capability that is not reachable through the shared surface is not done.
+
+- Route model fusion through `vt::FusedChain`.
+- Route mergeable MLP projections through `layers::MlpGateUpMethodBase` and
+  `vt::MergedGemmGroup`.
+- Route decode through `ModelRegistry::Forward`, `dense_attn::AttnBlock`, and
+  on-device sampling.
+- Expose every shipped capability through `include/vllm.h`. Examples and servers
+  are thin clients of that ABI and never include internal headers.
+
+If a shared seam cannot represent the upstream behavior, extend it or record one
+exact tracked exception. Never hand-roll a parallel path.
+
+New hardware, architectures, and models are **additive** files that mirror
+vLLM's structure.
+
+A model port covers the **quantized arms, not just bf16**. GGUF k-quants in
+particular are a standing requirement, not a per-model choice: they are what most
+users can actually run, and they are what a quant-matched llama.cpp comparison
+needs. An arm that is not implemented is refused with a message naming the
+missing piece and recorded as owed — never left to be discovered later.
+[`.agents/porting-a-model.md`](.agents/porting-a-model.md) is the checklist.
+
+## Records
+
+Every inventory item has a stable ID and records upstream source, local anchor,
+tests and evidence, its spec, lifecycle state, owner, and issue in the correct
+matrix. When lifecycle state changes, update the roadmap row and its owning
+matrix row in the same change.
+
+Resolve concurrent edits to a keyed record by taking the target branch version
+wholesale and reapplying your scoped edit; verify unrelated keys byte-for-byte.
+Union-append only genuinely append-only logs. Never accept an automatic
+three-way merge of a keyed record.
+
+**No surface that every PR must write.** If N concurrent PRs all edit file F,
+then F is a lock. A record surface is admissible in one of three shapes only:
+**one file per row**, globbed for reading; **genuinely append-only**, so it
+union-merges; or **derived at read time**, so nobody writes it. Rewrite anything
+else into one of the three.
+
+Two corollaries. **Cap the entry, never the file** — a budget on a shared file
+turns every addition into evicting someone else's content, and merging two such
+edits cleanly is worse than conflicting, because it applies both evictions.
+**Never store a measurement of one file inside another** — a number that moves on
+every edit couples every PR to lines it does not own.
+
+A gate is what usually creates the lock: if a checker *requires* every change to
+touch a shared file, that is the defect, not the discipline of the people
+touching it. Relocate the obligation to a per-row surface rather than deleting
+it.
+
+Compact by *moving* superseded detail into `.agents/completed/` with links and
+provenance intact. Never delete evidence to save context.
+
+## Public documents
+
+Each has one purpose and one trigger. They are projections, not narratives —
+each fact lives in exactly one of them.
+
+| Surface | Changes when |
+|---|---|
+| `docs/STATUS.md` | a row changes lifecycle state |
+| `docs/BENCHMARKS.md` | a row gains an accepted or explicitly pending/failed/void measurement |
+| `docs/FEATURES.md` | a feature, model, backend, or quantization surface changes |
+| `docs/USAGE.md` | a command, C API, config key, install step, or workflow changes |
+| `README.md` | a user-visible headline, positioning, or quick start changes |
+| the moved row spec's `## Now` | a row changes lifecycle state |
+
+Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
+lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
+`.agents/NOW.md` is authored only at operator cadence and is never a per-row
+lifecycle write.
+
+## Work happens in a worktree
+
+**Every unit of work — feature, fix, policy, docs, records, a one-line gate
+repair — happens in its own linked worktree on its own task branch.** A claimed
+row uses `row/<ID>`. Pin the base SHA when you create the worktree.
+
+The shared checkout stays on `main`, clean, and is **never a work surface**. It
+is what everything else branches from, so it has to be current and safe at all
+times. Never edit, commit, or stash in it.
+
+Remove the worktree and delete its branch once the work merges, closes, or is
+abandoned. A worktree is a full checkout; leaving them behind fills the disk
+until gates start failing for want of a temp file.
+
+## Landing work
+
+Work reaches `main` from its task branch, never from the shared checkout: a
+helper opens a reviewed `row/<ID>` PR, and an operator holding recorded merge
+authority may instead merge that branch locally with a commit naming it. That
+keeps the repair-without-a-round-trip case one step, while still leaving every
+change on a branch that git can show, revert, and attribute.
+
+Run the applicable gate before every push and chain that success directly to the
+exact-SHA push. Never force-push, and never add a force variant to a script; a
+rejected push is git protecting someone else's merge, so fetch, re-merge,
+re-gate and push again. Hooks are bypassable convenience, never proof. If the
+remote cannot be queried, report `REMOTE_UNVERIFIED` — unknown is neither
+absence nor success, and it authorizes no cleanup.
+
+Verified PRs are merged in-session; obsolete ones are closed with the reason
+recorded. Never end a session with a verified, unmerged PR.
+
+Every commit carries a bare `FOLLOWING_AGENTS_PROTOCOL` line and these trailers:
+
+```text
+Following-Agents-Protocol: true
+AI-Assisted: true
+Assisted-by: AGENT:MODEL [TOOL]
 ```
-<your commit subject>
 
-<body…>
+AI tools never add `Signed-off-by` or `Co-Authored-By`. The human submitter owns
+and reviews the change.
 
-FOLLOWING_AGENTS_PROTOCOL
-Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]
+Classify policy, checker, doc, script, test, CI, generated, and product paths
+explicitly, and never hide mutable files behind a blanket directory exemption.
+There is no line budget: the per-class limits were retired 2026-08-10 because
+9 of the last 22 merged PRs exceeded the product one and tests were a third to
+a half of every large diff, so the gate fired on ordinary work and charged
+RED-first mutation tests against the same allowance as kernel code. Size is a
+review judgement. Split a change when a reviewer would be better served by
+parts, not when a counter says so.
+
+## Changing the rules or a checker
+
+A checker's own message is the authority on what it enforces; this file states
+the rule in prose. Nothing verifies that the two agree, deliberately — keeping
+two descriptions in sync is the failure mode this protocol was built to remove.
+
+Changing a checker's semantics requires a spec, a red-before test or mutation,
+and green-after evidence. You may never turn a red gate green by deleting an
+assertion or widening a scope.
+
+There is no waiver registry. A registry of exceptions is a state log, and this
+protocol has none — a change that needs an exception argues for it in its own
+commit message, where the reason is attached to the diff it excuses, carries an
+author and a date, and cannot drift from the tree because it *is* the tree.
+`git log --grep` is the record. An exception is visible debt, not success, and a
+reviewer who does not accept the argument does not merge it.
+
+## Task guides
+
+Read the one for the job in front of you.
+
+| Doing this | Read |
+|---|---|
+| Porting a MODEL (the coverage checklist) | [`.agents/porting-a-model.md`](.agents/porting-a-model.md) |
+| Porting a model, kernel, or feature from vLLM | [`.agents/porting.md`](.agents/porting.md) |
+| Running gates, proving correctness, reviewing | [`.agents/verification.md`](.agents/verification.md) |
+| Measuring performance | [`.agents/benchmarking.md`](.agents/benchmarking.md) |
+| Fixing a bug | [`.agents/bugfixing.md`](.agents/bugfixing.md) |
+| Working on a specific host or GPU | [`.agents/environment.md`](.agents/environment.md) |
+| Coordinating parallel work | [`.agents/workflow.md`](.agents/workflow.md) |
+| Chasing a parity lever | [`.agents/parity-lever-protocol.md`](.agents/parity-lever-protocol.md) |
+| Syncing the vLLM pin | [`.agents/upstream-sync.md`](.agents/upstream-sync.md) |
+
+## Commands
+
+```sh
+scripts/agent-start.py                          # always first
+python3 scripts/agent-role.py show
+scripts/agent-preflight.sh                      # before edits
+scripts/agent-preflight.sh --staged             # before commit
+python3 scripts/agent-ready.py                  # before remote handoff
+python3 scripts/agent-integration.py --base origin/main
 ```
 
-**TL;DR:** 1:1 port of vLLM to pure C++ (no Python/PyTorch; ggml as example,
-not dependency), structured so every future upstream vLLM PR can be ported
-mechanically. MVP gate: Qwen3.6-35B-A3B + 27B (NVFP4) at vLLM throughput
-parity on the project GB10/sm_121 release target, loading from safetensors **and GGUF**, shipped
-llama.cpp-style as a library + example CLI/OpenAI server, with tool calling,
-grammars, streaming/non-streaming, and e2e test suites.
-
-**The performance and parity directives (full text:
-[.agents/directives.md](.agents/directives.md#standing-directive--mirror-vllm-across-all-features-dont-ask-mirror)):**
-mirror vLLM across all features; ground every check in the whole execution chain
-and vendor generated kernels rather than declaring them out of reach; fold onto
-the shared fusion, merged-GEMM and decode-runner frameworks; trace the execution
-with `nsys` on both sides; port the upstream tests; compare against the oracle on
-every axis; and never accept a ceiling. These are summarised in T0 above and
-stated in full in the linked document.
-
-## Policy for AI-Assisted Contributions
-
-This project follows the Linux kernel project's [guidelines for AI coding
-assistants](https://docs.kernel.org/process/coding-assistants.html). Before
-submitting AI-assisted code, read
-[.agents/ai-coding-assistants.md](.agents/ai-coding-assistants.md). Key rules:
-
-- **No `Signed-off-by` from AI.** Only the human submitter may sign off on the
-  Developer Certificate of Origin.
-- **No `Co-Authored-By: <AI>` trailers.** The human contributor owns the change.
-- **Use an `Assisted-by:` trailer** to attribute AI involvement. Format:
-  `Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]`.
-- **The human submitter is responsible** for reviewing, testing, and
-  understanding every line of generated code.
-
-## Index
-
-- `.agents/developer-preferences.md` — the
-  ignored, developer-owned execution profile for this workspace (copy the
-  tracked example below; absence uses the safe defaults above).
-- [.agents/developer-preferences.example.md](.agents/developer-preferences.example.md)
-  — tracked template for Git integration, hosts, compute, and collaboration
-  preferences.
-- [`.env.example`](.env.example) — tracked template for the untracked `.env`:
-  the machine-readable values (`${VLLM_SOURCE}`, `${VLLM_ORACLE}`, gate host,
-  device arch/toolchain) the protocol placeholders resolve from.
-- [.agents/directives.md](.agents/directives.md) — **the full text of every
-  standing directive** summarised in T0 above. Binding; AGENTS.md is the index.
-- [.agents/mission.md](.agents/mission.md) — what this project is and is not.
-- [.agents/gates.md](.agents/gates.md) — the 5 MVP gates (success definition).
-- [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) — the
-  **scan → re-adapt → find levers** loop: never accept a "ceiling"; when stuck,
-  dynamic-workflow-scan vLLM's hot path vs ours to find the specific diffs.
-- [.agents/benchmark-protocol.md](.agents/benchmark-protocol.md) — **match or
-  beat vLLM on EVERY axis (never below)**; how to benchmark vs vLLM on all axes,
-  both models; **reproduction is a gate** (record recipe, re-run to confirm,
-  idle box, same-binary A/B).
-- [.agents/discipline.md](.agents/discipline.md) — **non-negotiable** porting
-  rules: mirrored structure, port-don't-reinvent, upstream-commit file
-  headers, recorded deviations, parity-first testing.
-- [.agents/upstream-sync.md](.agents/upstream-sync.md) — **sync protocol**:
-  the PARITY PIN (the vLLM commit we are parity-comparable against) and the
-  repeatable sync cycle (enumerate → classify → report → port → re-verify →
-  advance pin) that keeps porting upstream PRs a routine task.
-- [.agents/environment.md](.agents/environment.md) — factual environment
-  profile registry, benchmark models, gate-model architecture, prior-art patch
-  series, and environment TODOs; availability is selected by developer
-  preferences.
-- [.agents/vllm-v1-v2.md](.agents/vllm-v1-v2.md) — V1 engine vs "Model Runner
-  V2" terminology; we port MRV2.
-- [.agents/backends.md](.agents/backends.md) — backend portability strategy
-  (CUDA/CPU now; ROCm, Metal, Vulkan, Intel XPU and ANE later) via vLLM's own Platform +
-  attention-backend seams; MLX/ANE explorations; binding vt:: interface
-  requirements for M0.2.
-- [.agents/workflow.md](.agents/workflow.md) — **agent operating manual**:
-  session protocol, Definition of Done, practicalities.
-- [.agents/coordination.md](.agents/coordination.md) — **parallel-work control
-  plane**: stable IDs, spike gate, claims/worktrees, dependency and GPU-lock
-  rules, handoff, and completed-block archival.
-- [.agents/porting-inventory.md](.agents/porting-inventory.md) — **living
-  parity record**: full vLLM feature/architecture inventory, T0 (gate) / T1 /
-  T2 / T3 tiers, upstream paths, inline status markers. Kept up to date with
-  every change.
-- [.agents/parity-ledger.md](.agents/parity-ledger.md) — **append-only
-  ledger**: one row per change we introduce — what it does vs vLLM, upstream
-  PR/commit references, how parity was verified.
-- [.agents/roadmap_v1.md](.agents/roadmap_v1.md) — **THE ROADMAP** (post-MVP,
-  live): one ordered portfolio table over the area matrices and current gates.
-- [.agents/completed/roadmap_mvp_v0.md](.agents/completed/roadmap_mvp_v0.md) —
-  ARCHIVED M0–M3 record of the completed MVP (both throughput gates passed
-  2026-07-10).
-- [.agents/engine-matrix.md](.agents/engine-matrix.md) — canonical stable-ID
-  execution rows for cross-cutting engine/KV/sampling/serving/loading work,
-  with exact code, tests, spike and owner fields.
-- [.agents/feature-matrix.md](.agents/feature-matrix.md) — broad one-by-one
-  cross-cutting vLLM parity coverage view; execution claims use engine-matrix.
-- [.agents/model-matrix.md](.agents/model-matrix.md) — comprehensive pinned-vLLM
-  model architecture/family inventory and port status.
-- [.agents/quantization-matrix.md](.agents/quantization-matrix.md) — canonical
-  per-scheme quantization inventory, with loader/compute/backend/e2e evidence.
-- [.agents/kernel-matrix.md](.agents/kernel-matrix.md) — kernel-family and
-  dispatch parity inventory across vLLM and its runtime dependency chain.
-- [.agents/backend-matrix.md](.agents/backend-matrix.md) — backend/platform and
-  CUDA target matrix, including native-competitor performance gates.
-- [.agents/sglang-matrix.md](.agents/sglang-matrix.md) — the SGLang parity
-  PROGRAM's whole-surface inventory: every SGLang runtime capability classified
-  FUSED / SGLANG-DISTINCT / INVENTORIED / OUT-OF-SCOPE vs our vLLM-derived
-  engine, with the SGLang-as-oracle gate methodology in
-  [.agents/specs/sglang-parity-oracle.md](.agents/specs/sglang-parity-oracle.md).
-  SGLang is a full parity target (competitor perf floor + correctness
-  cross-check), not the mirror source — vLLM remains the behavior truth.
-- [.agents/specs/](.agents/specs/) — live feature implementation specs,
-  scoping reports, semantics notes, feasibility studies, and design references.
-- [.agents/state.md](.agents/state.md) — **append-only state log**: progress,
-  decisions, next steps. Update this every working session.
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — user-facing accepted benchmark
-  scoreboard plus the current pending/failed/void checkpoint and repro status.
-  KEYED TABLE: update the row, never append a section.
-- [docs/FEATURES.md](docs/FEATURES.md) — user-facing feature matrix against
-  vLLM, SGLang and llama.cpp. KEYED TABLE, same rules.
-- [.agents/benchmark-record.md](.agents/benchmark-record.md) — **append-only
-  benchmark record**: every attempt, refuted hypothesis, profiler table and
-  superseded number. Read it before re-running a lever; most entries are dead
-  ends already measured and closed.
-
-## Canonical documents (outside .agents/)
-
-- [docs/superpowers/specs/2026-07-02-vllm-cpp-core-design.md](docs/superpowers/specs/2026-07-02-vllm-cpp-core-design.md)
-  — core architecture design (vt:: tensor runtime, engine mirroring,
-  performance plan for the parity gate, milestones M0–M3).
+Never push, merge, manage services, use external compute, or download large
+assets without authority recorded in developer preferences or given for the
+task.

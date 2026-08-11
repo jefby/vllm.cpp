@@ -19,6 +19,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -32,13 +33,16 @@
 #include <vector>
 
 #include "vt/cuda/conv_update_fast.h"
+#include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/cuda_gdn_internal.h"
+#include "vt/cuda/gdn_decode_fused.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_prefill_conv.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
 #include "vt/cuda/rmsnorm_gated_fast.h"
 #include "vt/cuda/tile/cp_async.cuh"
 #include "vt/cuda/tile/tma_pipeline.cuh"
+#include "vt/cuda/triton_aot_arch_dispatch.h"
 #include "vt/ops.h"
 
 #ifdef VLLM_CPP_TRITON
@@ -50,35 +54,96 @@
 // runtime. One spec per gate-model GDN shape: h48 (Qwen3.6-27B), h32 (35B).
 // gdn_deltah_hNN_default(stream, k, v, w, v_new, g, gk, h, h0, ht, cu_seqlens,
 //   chunk_offsets, T, NH) launches the FLA chunk_gated_delta_rule_fwd_kernel.
-extern "C" {
-#include "gdn_deltah_h48.h"
-#include "gdn_deltah_h32.h"
-// GDN chunk_o (the output kernel): gdn_chunko_hNN_default, and optionally
-// gdn_chunko_bf16_hNN_default when the vendored artifacts are present.
-// See triton_kernels/chunk_o.py. o(=out) is f32 for the default GDN out dtype;
-// bf16 mirrors the vLLM-faithful recurrence-output dtype once regenerated.
-#include "gdn_chunko_h48.h"
-#include "gdn_chunko_h32.h"
-#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
-#include "gdn_chunko_bf16_h48.h"
-#include "gdn_chunko_bf16_h32.h"
-#endif
-// GDN WU pipeline (kkt -> solve_tril -> recompute_w_u), 3 stable dispatchers each.
-// See triton_kernels/{chunk_scaled_dot_kkt,solve_tril,wy_fast}.py.
-#include "gdn_kkt_h48.h"
-#include "gdn_kkt_h32.h"
-#include "gdn_tril_h48.h"
-#include "gdn_tril_h32.h"
-#include "gdn_wu_h48.h"
-#include "gdn_wu_h32.h"
-// GDN packed pure-decode recurrence (fused_recurrent_gated_delta_rule packed
-// decode): gdn_decode_h48_default / gdn_decode_h32_default. See
-// triton_kernels/fused_recurrent_packed_decode.py. The MEASURED codegen-bound
-// lever (dgx phase1 2026-07-16): REG:205/0-spill under Triton vs REG:255+STACK:48
-// (spills) as hand-CUDA at BK=128.
-#include "gdn_decode_h48.h"
-#include "gdn_decode_h32.h"
-}
+#include "triton_aot_multiarch.h"
+
+#define VT_AOT_SYMBOL_IMPL(ARCH, NAME) vt_aot_##ARCH##_##NAME##_default
+#define VT_AOT_SYMBOL(ARCH, NAME) VT_AOT_SYMBOL_IMPL(ARCH, NAME)
+#define VT_AOT_LOAD_SYMBOL_IMPL(ARCH, NAME) vt_aot_##ARCH##_load_##NAME
+#define VT_AOT_LOAD_SYMBOL(ARCH, NAME) VT_AOT_LOAD_SYMBOL_IMPL(ARCH, NAME)
+#define VT_TRITON_AOT_CALL(NAME, ...)                                      \
+  vt::cuda::DispatchTritonAot(                                             \
+      vt::cuda::GetDeviceCaps().sm_major,                                  \
+      vt::cuda::GetDeviceCaps().sm_minor, CUDA_ERROR_NOT_SUPPORTED,        \
+      std::array{&VT_AOT_SYMBOL(sm_80, NAME),                               \
+                 &VT_AOT_SYMBOL(sm_86, NAME),                              \
+                 &VT_AOT_SYMBOL(sm_89, NAME),                              \
+                 &VT_AOT_SYMBOL(sm_90a, NAME),                             \
+                 &VT_AOT_SYMBOL(sm_100a, NAME),                            \
+                 &VT_AOT_SYMBOL(sm_121a, NAME)},                           \
+      __VA_ARGS__)
+#define VT_TRITON_AOT_LOAD(NAME)                                          \
+  vt::cuda::DispatchTritonAotVoid(                                        \
+      vt::cuda::GetDeviceCaps().sm_major,                                 \
+      vt::cuda::GetDeviceCaps().sm_minor,                                 \
+      std::array{&VT_AOT_LOAD_SYMBOL(sm_80, NAME),                         \
+                 &VT_AOT_LOAD_SYMBOL(sm_86, NAME),                        \
+                 &VT_AOT_LOAD_SYMBOL(sm_89, NAME),                        \
+                 &VT_AOT_LOAD_SYMBOL(sm_90a, NAME),                       \
+                 &VT_AOT_LOAD_SYMBOL(sm_100a, NAME),                      \
+                 &VT_AOT_LOAD_SYMBOL(sm_121a, NAME)})
+
+#define gdn_deltah_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_deltah_h48, __VA_ARGS__)
+#define gdn_deltah_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_deltah_h32, __VA_ARGS__)
+#define gdn_chunko_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_h48, __VA_ARGS__)
+#define gdn_chunko_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_h32, __VA_ARGS__)
+#define gdn_chunko_bf16_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_bf16_h48, __VA_ARGS__)
+#define gdn_chunko_bf16_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_bf16_h32, __VA_ARGS__)
+#define gdn_kkt_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_kkt_h48, __VA_ARGS__)
+#define gdn_kkt_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_kkt_h32, __VA_ARGS__)
+#define gdn_tril_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_tril_h48, __VA_ARGS__)
+#define gdn_tril_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_tril_h32, __VA_ARGS__)
+#define gdn_wu_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_wu_h48, __VA_ARGS__)
+#define gdn_wu_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_wu_h32, __VA_ARGS__)
+#define gdn_decode_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_decode_h48, __VA_ARGS__)
+#define gdn_decode_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_decode_h32, __VA_ARGS__)
+#define kda_gate_cumsum_default(...) \
+  VT_TRITON_AOT_CALL(kda_gate_cumsum, __VA_ARGS__)
+#define kda_kkt_inter_default(...) \
+  VT_TRITON_AOT_CALL(kda_kkt_inter, __VA_ARGS__)
+#define kda_kkt_intra_default(...) \
+  VT_TRITON_AOT_CALL(kda_kkt_intra, __VA_ARGS__)
+#define kda_wu_default(...) VT_TRITON_AOT_CALL(kda_wu, __VA_ARGS__)
+#define kda_deltah_h32_default(...) \
+  VT_TRITON_AOT_CALL(kda_deltah_h32, __VA_ARGS__)
+#define kda_gla_o_default(...) VT_TRITON_AOT_CALL(kda_gla_o, __VA_ARGS__)
+
+#define VT_DEFINE_TRITON_AOT_LOADER(NAME) \
+  static void load_##NAME() { (void)VT_TRITON_AOT_LOAD(NAME); }
+VT_DEFINE_TRITON_AOT_LOADER(gdn_deltah_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_deltah_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_bf16_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_bf16_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_kkt_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_kkt_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_tril_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_tril_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_wu_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_wu_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_decode_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_decode_h32)
+VT_DEFINE_TRITON_AOT_LOADER(kda_gate_cumsum)
+VT_DEFINE_TRITON_AOT_LOADER(kda_kkt_inter)
+VT_DEFINE_TRITON_AOT_LOADER(kda_kkt_intra)
+VT_DEFINE_TRITON_AOT_LOADER(kda_wu)
+VT_DEFINE_TRITON_AOT_LOADER(kda_deltah_h32)
+VT_DEFINE_TRITON_AOT_LOADER(kda_gla_o)
+#undef VT_DEFINE_TRITON_AOT_LOADER
 #endif
 
 namespace vt::cuda {
@@ -689,6 +754,7 @@ void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tens
 // directly — never a value the window mutated). See gdn_prefill_conv.h.
 constexpr int kConvRegN = 128;    // channels per block (blockDim.x; coalesced x/out)
 constexpr int kConvRegM = 32;     // token chunk per block (grid.z parallelism)
+constexpr int kConvExactM = 8;    // upstream compute_causal_conv1d_metadata BLOCK_M
 constexpr int kConvRegMaxW = 8;   // max supported width (k-1); Qwen GDN k=4 -> 3
 constexpr int64_t kConvRegChunkMaxSeqs = 4;  // chunk the token axis only for few seqs
 
@@ -697,21 +763,28 @@ __global__ void CausalConv1dFwdRegKernel(Tout* out, const Tin* x, const Tin* w,
                                          const Tin* bias, float* conv_state,
                                          const int32_t* qsl, const THas* his, int64_t c_dim,
                                          int64_t x_row_stride, int64_t k, bool silu,
-                                         int chunked) {
+                                         int chunked, const int32_t* batch_ptr,
+                                         const int32_t* token_chunk_offset_ptr, int exact) {
   const int64_t width = k - 1;
-  const int64_t s = blockIdx.y;                                                   // sequence
+  const int64_t program = blockIdx.y;
+  const int64_t s = exact ? batch_ptr[program] : program;                         // sequence
   const int64_t c = static_cast<int64_t>(blockIdx.x) * kConvRegN + threadIdx.x;   // channel
   const bool active = c < c_dim;
   const int64_t begin = qsl[s];
   const int64_t t_len = qsl[s + 1] - begin;
 
   // Token range this block owns. chunked: [chunk*M, chunk*M+M); else whole sequence.
-  const int64_t token_offset = chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM : 0;
+  const int64_t chunk_m = exact ? kConvExactM : kConvRegM;
+  const int64_t token_offset = exact
+                                   ? static_cast<int64_t>(token_chunk_offset_ptr[program]) *
+                                         kConvExactM
+                                   : (chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM
+                                              : 0);
   // Skip chunks past the sequence end — except chunk 0, which still runs the state
   // write-back (also the only path when t_len == 0).
   if (token_offset > 0 && token_offset >= t_len) return;
   const int64_t token_end =
-      (chunked && token_offset + kConvRegM < t_len) ? token_offset + kConvRegM : t_len;
+      ((chunked || exact) && token_offset + chunk_m < t_len) ? token_offset + chunk_m : t_len;
 
   const bool init = his[s] != 0;
   float* srow = active ? conv_state + (s * c_dim + c) * width : nullptr;
@@ -770,6 +843,114 @@ __global__ void CausalConv1dFwdRegKernel(Tout* out, const Tin* x, const Tin* w,
   }
 }
 
+// Width-four experiment used by Qwen3.5. Unlike the sealed runtime-width kernel
+// above, K and the number of channels owned by each lane are compile-time
+// constants. ChannelsPerThread=1 isolates width specialization at the same
+// 128-channel tile; ChannelsPerThread=2 covers two coalesced 128-channel stripes
+// and therefore matches upstream's 256-channel feature tile.
+template <int ChannelsPerThread, typename Tin, typename Tout, typename THas>
+__global__ void CausalConv1dFwdRegK4Kernel(
+    Tout* out, const Tin* x, const Tin* w, const Tin* bias, float* conv_state,
+    const int32_t* qsl, const THas* his, int64_t c_dim, int64_t x_row_stride,
+    bool silu, int chunked, const int32_t* batch_ptr,
+    const int32_t* token_chunk_offset_ptr, int exact) {
+  static_assert(ChannelsPerThread == 1 || ChannelsPerThread == 2);
+  constexpr int64_t k = 4;
+  constexpr int64_t width = k - 1;
+  constexpr int64_t channels_per_block = kConvRegN * ChannelsPerThread;
+
+  const int64_t program = blockIdx.y;
+  const int64_t s = exact ? batch_ptr[program] : program;
+  const int64_t begin = qsl[s];
+  const int64_t t_len = qsl[s + 1] - begin;
+  const int64_t chunk_m = exact ? kConvExactM : kConvRegM;
+  const int64_t token_offset = exact
+                                   ? static_cast<int64_t>(token_chunk_offset_ptr[program]) *
+                                         kConvExactM
+                                   : (chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM
+                                              : 0);
+  if (token_offset > 0 && token_offset >= t_len) return;
+  const int64_t token_end =
+      ((chunked || exact) && token_offset + chunk_m < t_len) ? token_offset + chunk_m : t_len;
+  const bool init = his[s] != 0;
+
+  int64_t channels[ChannelsPerThread];
+  bool active[ChannelsPerThread];
+  float* state_rows[ChannelsPerThread];
+  float biases[ChannelsPerThread];
+  float weights[ChannelsPerThread][k];
+  float windows[ChannelsPerThread][k];
+
+  // Load both stripes' initial history before processing either stripe. This
+  // matches the intended duplicated-register experiment without extending the
+  // baseline state-read/write exposure across an entire first-stripe token loop.
+#pragma unroll
+  for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+    const int64_t c = static_cast<int64_t>(blockIdx.x) * channels_per_block +
+                      threadIdx.x + static_cast<int64_t>(lane_channel) * kConvRegN;
+    channels[lane_channel] = c;
+    active[lane_channel] = c < c_dim;
+    if (!active[lane_channel]) continue;
+    float* srow = conv_state + (s * c_dim + c) * width;
+    state_rows[lane_channel] = srow;
+    biases[lane_channel] = bias != nullptr ? Load(bias, c) : 0.0f;
+#pragma unroll
+    for (int j = 0; j < k; ++j) weights[lane_channel][j] = Load(w, c * k + j);
+#pragma unroll
+    for (int j = 0; j < width; ++j) {
+      const int64_t ti = token_offset - width + j;
+      float v = 0.0f;
+      if (ti >= 0) {
+        v = Load(x, (begin + ti) * x_row_stride + c);
+      } else if (init) {
+        v = srow[width + ti];
+      }
+      windows[lane_channel][j] = v;
+    }
+    windows[lane_channel][width] =
+        token_offset < t_len ? Load(x, (begin + token_offset) * x_row_stride + c) : 0.0f;
+  }
+
+  for (int64_t t = token_offset; t < token_end; ++t) {
+#pragma unroll
+    for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+      if (!active[lane_channel]) continue;
+      const int64_t c = channels[lane_channel];
+      float acc = biases[lane_channel];
+#pragma unroll
+      for (int j = 0; j < k; ++j)
+        acc += weights[lane_channel][j] * windows[lane_channel][j];
+      Store(out, (begin + t) * c_dim + c, silu ? Silu(acc) : acc);
+#pragma unroll
+      for (int j = 0; j < width; ++j)
+        windows[lane_channel][j] = windows[lane_channel][j + 1];
+      const int64_t nt = t + 1;
+      windows[lane_channel][width] =
+          nt < t_len ? Load(x, (begin + nt) * x_row_stride + c) : 0.0f;
+    }
+  }
+
+  if (token_end == t_len) {
+#pragma unroll
+    for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+      if (!active[lane_channel]) continue;
+      const int64_t c = channels[lane_channel];
+      float* srow = state_rows[lane_channel];
+#pragma unroll
+      for (int j = 0; j < width; ++j) {
+        const int64_t tj = t_len - width + j;
+        float v = 0.0f;
+        if (tj >= 0) {
+          v = Load(x, (begin + tj) * x_row_stride + c);
+        } else if (init) {
+          v = srow[width + tj];
+        }
+        srow[j] = v;
+      }
+    }
+  }
+}
+
 // Toggle: DEFAULT ON (VT_CONV_REG=0 restores the tiled/scalar path). Read per call
 // (prefill dispatch is coarse — one launch/step — so the getenv is negligible and
 // in-process CUDA tests can flip the selection). Predicate factored to
@@ -778,46 +959,133 @@ bool ConvRegEnabled() {
   return ConvRegFlagIsOn(std::getenv("VT_CONV_REG"));
 }
 
-// Register-window launcher (VT_CONV_REG=1). grid = (channel-tiles, sequences, chunks).
-// grid.z chunks the token axis only for few (kConvRegChunkMaxSeqs) sequences, where
-// one block per (channel-tile, seq) would under-occupy on a long prefill; gridZ must
-// cover the LONGEST sequence — without a host-side max we bound it by
-// cdiv(total_tokens, M) (exact for n==1, over-provisions by <= n for n>1, and the
-// early-return blocks are ~free). For many sequences grid.z==1 and each block streams
-// its whole sequence (the channel-tile x seq grid already occupies).
+bool ConvExactChunksEnabled() {
+  return ConvExactChunksFlagIsOn(std::getenv("VT_CONV_EXACT_CHUNKS"));
+}
+
+template <int ChannelsPerThread, typename Tin, typename Tout>
+void LaunchConvFwdRegK4(cudaStream_t s, Tensor& out, const Tensor& x,
+                        const Tensor& w, const Tensor* bias, Tensor& conv_state,
+                        const Tensor& qsl, const Tensor& his,
+                        const CausalConv1dArgs& args, int64_t chan_tiles) {
+  static_assert(ChannelsPerThread == 1 || ChannelsPerThread == 2);
+  const int64_t n = conv_state.shape[0], c = x.shape[1];
+  const int64_t total_tokens = x.shape[0];
+  const int64_t x_rs = x.stride[0];
+  int64_t grid_z = 1;
+  int chunked = 0;
+  const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
+  int64_t grid_y = n;
+  if (exact) {
+    grid_y = args.batch_ptr->shape[0];
+    VT_CHECK(grid_y <= kMaxGridY,
+             "cuda causal_conv1d_fwd(reg-k4): too many exact chunk programs");
+  } else if (n <= kConvRegChunkMaxSeqs) {
+    const int64_t z = (total_tokens + kConvRegM - 1) / kConvRegM;
+    if (z >= 1 && z <= kMaxGridY) {
+      grid_z = z;
+      chunked = 1;
+    }
+  }
+  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(grid_y),
+                  static_cast<unsigned>(grid_z));
+  const dim3 block(kConvRegN);
+  const int32_t* batch_ptr = exact ? args.batch_ptr->Ptr<int32_t>() : nullptr;
+  const int32_t* token_chunk_offset_ptr =
+      exact ? args.token_chunk_offset_ptr->Ptr<int32_t>() : nullptr;
+  if (his.dtype == DType::kI8) {
+    CausalConv1dFwdRegK4Kernel<ChannelsPerThread, Tin, Tout, int8_t>
+        <<<grid, block, 0, s>>>(
+            out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+            bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+            qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs,
+            args.silu_activation, chunked, batch_ptr, token_chunk_offset_ptr,
+            exact ? 1 : 0);
+  } else {
+    CausalConv1dFwdRegK4Kernel<ChannelsPerThread, Tin, Tout, int32_t>
+        <<<grid, block, 0, s>>>(
+            out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+            bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+            qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs,
+            args.silu_activation, chunked, batch_ptr, token_chunk_offset_ptr,
+            exact ? 1 : 0);
+  }
+  Check(cudaGetLastError(), "causal_conv1d_fwd(reg-k4) launch");
+}
+
+// Register-window launcher (VT_CONV_REG=1). The default exact descriptor maps
+// grid.y to a flattened list of (sequence, 8-token chunk) programs, mirroring
+// upstream and launching neither rectangular padding nor sequence-serial work.
+// VT_CONV_EXACT_CHUNKS=0 restores the legacy grid=(channel tiles, sequences,
+// chunks): it chunks grid.z only for <=4 sequences, and serially streams each
+// whole sequence for larger batches.
 template <typename Tin, typename Tout>
-void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                      const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
-                      const Tensor& his, const CausalConv1dArgs& args) {
+void LaunchConvFwdRegRuntime(cudaStream_t s, Tensor& out, const Tensor& x,
+                             const Tensor& w, const Tensor* bias,
+                             Tensor& conv_state, const Tensor& qsl,
+                             const Tensor& his, const CausalConv1dArgs& args,
+                             int64_t chan_tiles) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
   const int64_t total_tokens = x.shape[0];
   const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   VT_CHECK(k - 1 <= kConvRegMaxW, "cuda causal_conv1d_fwd(reg): conv width exceeds kConvRegMaxW");
-  const int64_t chan_tiles = (c + kConvRegN - 1) / kConvRegN;
   int64_t gridZ = 1;
   int chunked = 0;
-  if (n <= kConvRegChunkMaxSeqs) {
+  const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
+  int64_t gridY = n;
+  if (exact) {
+    gridY = args.batch_ptr->shape[0];
+    VT_CHECK(gridY <= kMaxGridY,
+             "cuda causal_conv1d_fwd(reg): too many exact chunk programs");
+  } else if (n <= kConvRegChunkMaxSeqs) {
     const int64_t z = (total_tokens + kConvRegM - 1) / kConvRegM;
     if (z >= 1 && z <= kMaxGridY) {
       gridZ = z;
       chunked = 1;
     }
   }
-  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(n),
+  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(gridY),
                   static_cast<unsigned>(gridZ));
   const dim3 block(kConvRegN);
+  const int32_t* batch_ptr = exact ? args.batch_ptr->Ptr<int32_t>() : nullptr;
+  const int32_t* token_chunk_offset_ptr =
+      exact ? args.token_chunk_offset_ptr->Ptr<int32_t>() : nullptr;
   if (his.dtype == DType::kI8) {
     CausalConv1dFwdRegKernel<Tin, Tout, int8_t><<<grid, block, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation, chunked);
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation, chunked,
+        batch_ptr, token_chunk_offset_ptr, exact ? 1 : 0);
   } else {
     CausalConv1dFwdRegKernel<Tin, Tout, int32_t><<<grid, block, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation, chunked);
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation, chunked,
+        batch_ptr, token_chunk_offset_ptr, exact ? 1 : 0);
   }
   Check(cudaGetLastError(), "causal_conv1d_fwd(reg) launch");
+}
+
+template <typename Tin, typename Tout>
+void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x,
+                      const Tensor& w, const Tensor* bias, Tensor& conv_state,
+                      const Tensor& qsl, const Tensor& his,
+                      const CausalConv1dArgs& args) {
+  const int64_t c = x.shape[1], k = w.shape[1];
+  DispatchConvChannelTileLaunch(
+      std::getenv("VT_CONV_CHANNEL_TILE"), c, k,
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegRuntime<Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                           his, args, contract.feature_blocks);
+      },
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegK4<1, Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                        his, args, contract.feature_blocks);
+      },
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegK4<2, Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                        his, args, contract.feature_blocks);
+      });
 }
 
 // Dispatch on the toggles. reg (VT_CONV_REG, default ON) wins; else tiled
@@ -1298,7 +1566,101 @@ __global__ void GdnPostConvFastKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, flo
   }
 }
 
-// Split post-conv (VT_GDN_POSTCONV_SPLIT, default ON) — grid (T, Hk+Hv), mirroring
+// Experimental 1:1 CUDA spelling of vLLM/FLA's post-conv launch schedule:
+// grid=(ceil(T,16), Hk+Hv), BLOCK_T=16, four warps. Each warp owns four tokens
+// in the tile. For Q/K, each lane keeps four feature values in registers across
+// the float32 norm reduction and normalized store, eliminating the fast kernel's
+// second conv read and all shared-memory barriers. For V, the same mapping gives
+// four coalesced 32-element copy waves per token and lane zero computes gating.
+// Arithmetic and strides otherwise retain the local GdnPostConv contract.
+template <typename Tqkv, typename Tconv, typename Tgate>
+__global__ void GdnPostConvTokenTileKernel(
+    Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out, float* beta_out,
+    const Tconv* conv, const Tgate* araw, const Tgate* braw, const float* a_log,
+    const float* dt_bias, int64_t t, int64_t hk, int64_t dk, int64_t hv, int64_t dv,
+    int64_t a_row_stride, int64_t b_row_stride, float eps) {
+  constexpr int kWarps = 4;
+  constexpr int kFeaturesPerLane = 4;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int64_t tile_start = static_cast<int64_t>(blockIdx.x) * kGdnPostConvTokenTileTokens;
+  const int64_t head = blockIdx.y;
+  const int64_t key_dim = hk * dk;
+  const int64_t value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+
+  if (head < hk) {
+#pragma unroll
+    for (int tile_token = warp; tile_token < kGdnPostConvTokenTileTokens;
+         tile_token += kWarps) {
+      const int64_t tok = tile_start + tile_token;
+      if (tok >= t) continue;
+      const int64_t row = tok * conv_dim;
+      const Tconv* qin = conv + row + head * dk;
+      const Tconv* kin = conv + row + key_dim + head * dk;
+      Tqkv* qo = q_out + (tok * hk + head) * dk;
+      Tqkv* ko = k_out + (tok * hk + head) * dk;
+
+      float qv[kFeaturesPerLane];
+      float kv[kFeaturesPerLane];
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        qv[item] = Load(qin, feature);
+        kv[item] = Load(kin, feature);
+      }
+      // Reproduce the fast kernel's 128-lane shared reduction exactly. Its first
+      // two levels are (i+i+64), then (i+i+32); those four terms are resident in
+      // this lane. The remaining 32-lane tree is the same 16,8,4,2,1 order.
+      float qsum = (qv[0] * qv[0] + qv[2] * qv[2]) +
+                   (qv[1] * qv[1] + qv[3] * qv[3]);
+      float ksum = (kv[0] * kv[0] + kv[2] * kv[2]) +
+                   (kv[1] * kv[1] + kv[3] * kv[3]);
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        qsum += __shfl_down_sync(0xffffffffu, qsum, offset);
+        ksum += __shfl_down_sync(0xffffffffu, ksum, offset);
+      }
+      qsum = __shfl_sync(0xffffffffu, qsum, 0);
+      ksum = __shfl_sync(0xffffffffu, ksum, 0);
+      const float qinv = 1.0f / sqrtf(qsum + eps);
+      const float kinv = 1.0f / sqrtf(ksum + eps);
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        Store(qo, feature, qv[item] * qinv);
+        Store(ko, feature, kv[item] * kinv);
+      }
+    }
+  } else {
+    const int64_t value_head = head - hk;
+#pragma unroll
+    for (int tile_token = warp; tile_token < kGdnPostConvTokenTileTokens;
+         tile_token += kWarps) {
+      const int64_t tok = tile_start + tile_token;
+      if (tok >= t) continue;
+      const int64_t row = tok * conv_dim;
+      const Tconv* vin = conv + row + 2 * key_dim + value_head * dv;
+      Tqkv* vo = v_out + tok * value_dim + value_head * dv;
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        Store(vo, feature, Load(vin, feature));
+      }
+      if (lane == 0) {
+        const int64_t idx = tok * hv + value_head;
+        const float av = Load(araw, tok * a_row_stride + value_head);
+        const float bv = Load(braw, tok * b_row_stride + value_head);
+        const float x = av + dt_bias[value_head];
+        const float sp = x > 20.0f ? x : log1pf(expf(x));
+        g_out[idx] = -expf(a_log[value_head]) * sp;
+        beta_out[idx] = 1.0f / (1.0f + expf(-bv));
+      }
+    }
+  }
+}
+
+// Split post-conv (VT_GDN_POSTCONV_SPLIT, opt-in) — grid (T, Hk+Hv), mirroring
 // vLLM's grid (ceil(L,BLOCK_T), H+HV) in _fused_post_conv_kernel:57-149 where each V
 // head is its own program. The shipped GdnPostConvKernel packs the ENTIRE
 // value_dim = Hv*Dv copy + all Hv gating scalars into ONE grid.y block per token
@@ -1371,7 +1733,7 @@ __global__ void GdnPostConvSplitKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, fl
   }
 }
 
-// Toggle: DEFAULT ON (VT_GDN_POSTCONV_SPLIT=0 restores the single-megablock kernel).
+// Toggle: DEFAULT OFF; a present non-'0'-leading value selects the split kernel.
 // Read per call (post-conv dispatch is coarse — one launch/step).
 bool GdnPostConvSplitEnabled() {
   return GdnPostConvSplitFlagIsOn(std::getenv("VT_GDN_POSTCONV_SPLIT"));
@@ -1394,12 +1756,20 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
   // VT_GDN_POSTCONV_SPLIT (opt-in): grid (T, Hk+Hv) — each V head its own block
   // (mirrors vLLM). =0 (default) uses the single-megablock grid (T, Hk+1).
   const bool split = GdnPostConvSplitEnabled();
+  // VT_GDN_POSTCONV_TOKEN_TILE (opt-in): the full upstream 16-token,
+  // per-head/four-warp schedule. The explicit split control keeps priority when
+  // both experimental flags are set. Only the production 128-wide heads route.
+  const bool token_tile = GdnPostConvTokenTileEligible(
+      split, std::getenv("VT_GDN_POSTCONV_TOKEN_TILE"), dk, dv);
   // VT_GDN_POSTCONV_FAST: byte-identical megablock at 128 threads + 128-bit V copy.
   // Only for the Dk==Dv==128 gate dims (16B alignment + value_dim%8==0); mutually
   // exclusive with the split (both target the same megablock). See predicate.
-  const bool fast = !split && GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) &&
-                    dk == 128 && dv == 128;
-  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(split ? hk + hv : hk + 1));
+  const bool fast = !split && !token_tile &&
+                    GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) && dk == 128 &&
+                    dv == 128;
+  const unsigned grid_x = static_cast<unsigned>(token_tile ? GdnPostConvTokenTileGridX(t) : t);
+  const unsigned grid_y = static_cast<unsigned>((split || token_tile) ? hk + hv : hk + 1);
+  dim3 grid(grid_x, grid_y);
   cudaStream_t s = AsStream(q);
   // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
   // input-side bf16 GDN path (VT_GDN_IN_BF16); the conv read upcasts to f32.
@@ -1407,7 +1777,13 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
-    if (fast) {
+    if (token_tile) {
+      GdnPostConvTokenTileKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+          beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),
+          a_log.Ptr<float>(), dt_bias.Ptr<float>(), t, hk, dk, hv, dv, araw.stride[0],
+          braw.stride[0], args.eps);
+    } else if (fast) {
       GdnPostConvFastKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
           q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
           beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),
@@ -2401,11 +2777,14 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
 // NW consecutive lanes [floor(lane/NW)*NW, +NW), aligned inside one warp (NW is
 // a power of two dividing 32 and the launcher only uses NW>1 when BV==32, so a
 // block is always a whole number of warps) — the xor butterfly stays in-warp.
-template <typename Tin, typename Tout, typename TState, int NW>
+template <typename Tin, typename Tout, typename TState, int NW, bool SWIZZLED,
+          bool REGSTATE>
 __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
                                      const float* g, const float* beta, TState* state,
                                      const int32_t* state_idx, int64_t hk_n, int64_t dk,
                                      int64_t hv_n, int64_t dv, int64_t bv, float scale) {
+  static_assert(!REGSTATE || (SWIZZLED && NW == 8),
+                "register state requires the production swizzled NW8 layout");
   const int64_t i_v = blockIdx.x;         // value-dim tile
   const int64_t i_nh = blockIdx.y;        // fused (sequence, v-head)
   const int64_t i_n = i_nh / hv_n;        // sequence == decode token index
@@ -2430,7 +2809,7 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
     row = si;
   }
 
-  const int64_t sdk = dk + 1;  // padded shared row stride (kills the 32-way conflict)
+  const int64_t sdk = SWIZZLED ? dk + NW : dk + 1;
   extern __shared__ float smem[];
   float* bq = smem;       // [dk]  q' = q*scale
   float* bk = bq + dk;    // [dk]  k
@@ -2441,17 +2820,29 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   // q'(=q*scale) and k for this (token, head) — broadcast to every lane.
   const int64_t qkbase = (i_n * hk_n + hk) * dk;
   for (int64_t i = tid; i < dk; i += blockDim.x) {
-    bq[i] = Load(q, qkbase + i) * scale;
-    bk[i] = Load(k, qkbase + i);
+    const int64_t si = SWIZZLED ? (i % 16) * 8 + i / 16 : i;
+    bq[si] = Load(q, qkbase + i) * scale;
+    bk[si] = Load(k, qkbase + i);
   }
   // Coalesced load of the [BV,Dk] state slice into padded shared. The persistent
   // cache TState is bf16 (mirrors vLLM's default mamba_cache_dtype=auto→model
   // dtype; fla fused_recurrent reads bf16→f32 registers→writes bf16) or f32
   // (unit test). Load() upcasts to f32; the recurrence below runs in f32.
   TState* s_head = state + (row * hv_n + hv) * dv * dk + vbase * dk;  // [<=bv, dk]
-  for (int64_t e = tid; e < bv * dk; e += blockDim.x)
-    sbh[(e / dk) * sdk + e % dk] = e < tile ? Load(s_head, e) : 0.0f;
+  for (int64_t e = tid; e < bv * dk; e += blockDim.x) {
+    const int64_t c = e % dk;
+    const int64_t sc = SWIZZLED ? (c % 16) * 8 + c / 16 : c;
+    sbh[(e / dk) * sdk + sc] = e < tile ? Load(s_head, e) : 0.0f;
+  }
   __syncthreads();
+
+  float* r = sbh + static_cast<int64_t>(vi) * sdk;
+  float rr[16];
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      rr[j] = r[GdnDecodeRegisterSharedColumn(wk, j)];
+    }
+  }
 
   // This thread's Dk column slice [c0, c1) of value-row vi (partition of [0,dk)).
   const int64_t ck = (dk + NW - 1) / NW;
@@ -2462,11 +2853,24 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   // slice); only the global v-load and o-store are guarded by vrow < dv.
   const float decay = expf(g[i_n * hv_n + hv]);
   const float beta_t = beta[i_n * hv_n + hv];
-  float* r = sbh + static_cast<int64_t>(vi) * sdk;
   float pdot = 0.0f;  // partial (S * exp(g)) @ k over this slice, fused w/ decay
-  for (int64_t c = c0; c < c1; ++c) {
-    r[c] *= decay;
-    pdot += r[c] * bk[c];
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = GdnDecodeRegisterSharedColumn(wk, j);
+      rr[j] *= decay;
+      pdot += rr[j] * bk[sc];
+    }
+  } else if constexpr (SWIZZLED) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = j * 8 + wk;
+      r[sc] *= decay;
+      pdot += r[sc] * bk[sc];
+    }
+  } else {
+    for (int64_t c = c0; c < c1; ++c) {
+      r[c] *= decay;
+      pdot += r[c] * bk[c];
+    }
   }
   float dot = pdot;  // reduce the partials across the NW lanes of the row-group
 #pragma unroll
@@ -2474,64 +2878,116 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   const float vv = vrow < dv ? Load(v, (i_n * hv_n + hv) * dv + vrow) : 0.0f;
   const float vp = (vv - dot) * beta_t;
   float po = 0.0f;  // partial (S + outer(v',k)) @ q' over this slice, fused w/ update
-  for (int64_t c = c0; c < c1; ++c) {
-    r[c] += vp * bk[c];
-    po += r[c] * bq[c];
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = GdnDecodeRegisterSharedColumn(wk, j);
+      rr[j] += vp * bk[sc];
+      po += rr[j] * bq[sc];
+    }
+  } else if constexpr (SWIZZLED) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = j * 8 + wk;
+      r[sc] += vp * bk[sc];
+      po += r[sc] * bq[sc];
+    }
+  } else {
+    for (int64_t c = c0; c < c1; ++c) {
+      r[c] += vp * bk[c];
+      po += r[c] * bq[c];
+    }
   }
   float o = po;
 #pragma unroll
   for (int off = 1; off < NW; off <<= 1) o += __shfl_xor_sync(0xffffffffu, o, off);
   if (vrow < dv && wk == 0) Store(out, (i_n * hv_n + hv) * dv + vrow, o);
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      r[GdnDecodeRegisterSharedColumn(wk, j)] = rr[j];
+    }
+  }
   __syncthreads();
 
   // Coalesced write-back of the updated slice from f32 registers to the
   // configured fp16/bf16/fp32 temporal cache.
-  for (int64_t e = tid; e < tile; e += blockDim.x)
-    Store(s_head, e, sbh[(e / dk) * sdk + e % dk]);
+  for (int64_t e = tid; e < tile; e += blockDim.x) {
+    const int64_t c = e % dk;
+    const int64_t sc = SWIZZLED ? (c % 16) * 8 + c / 16 : c;
+    Store(s_head, e, sbh[(e / dk) * sdk + sc]);
+  }
 }
 
 template <typename Tin, typename Tout, typename TState, int NW>
 void LaunchGdnDecodeFusedNW(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                            const int32_t* state_idx, int64_t n, const GdnArgs& args) {
+                            const int32_t* state_idx, int64_t n, const GdnArgs& args,
+                            const GdnDecodeLaunchContract& contract) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
-  const int64_t bv = dv < 32 ? dv : 32;   // fla BV cap of 32; any dv via tail guard
-  const int64_t nv = (dv + bv - 1) / bv;  // value-dim tiles (fla NV)
-  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(n * hv_n));
-  const size_t shmem =
-      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
-  GdnDecodeFusedKernel<Tin, Tout, TState, NW><<<grid, static_cast<unsigned>(bv * NW), shmem, s>>>(
-      out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
-      beta.Ptr<float>(), state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv, args.scale);
+  const int64_t bv = contract.value_tile;
+  const dim3 grid(static_cast<unsigned>(contract.value_tiles),
+                  static_cast<unsigned>(n * hv_n));
+  if constexpr (NW == 8) {
+    if (contract.swizzled) {
+      DispatchGdnDecodeStateStorage(
+          contract,
+          [&](const GdnDecodeLaunchContract&) {
+            GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, false>
+                <<<grid, static_cast<unsigned>(contract.block_threads),
+                   contract.shared_bytes, s>>>(
+                    out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                    v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                    state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+                    args.scale);
+          },
+          [&](const GdnDecodeLaunchContract&) {
+            GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true>
+                <<<grid, static_cast<unsigned>(contract.block_threads),
+                   contract.shared_bytes, s>>>(
+                    out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                    v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                    state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+                    args.scale);
+          });
+    } else {
+      GdnDecodeFusedKernel<Tin, Tout, TState, NW, false, false>
+          <<<grid, static_cast<unsigned>(contract.block_threads), contract.shared_bytes, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+          beta.Ptr<float>(), state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+          args.scale);
+    }
+  } else {
+    GdnDecodeFusedKernel<Tin, Tout, TState, NW, false, false>
+        <<<grid, static_cast<unsigned>(contract.block_threads), contract.shared_bytes, s>>>(
+        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+        beta.Ptr<float>(), state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv, args.scale);
+  }
   Check(cudaGetLastError(), "gdn decode(fused) launch");
 }
 
-// nw: warps-per-block for the Dk-split (occupancy lever). >1 only when BV==32
-// (dv>=32, the real gate dim) so a block is always a whole number of warps and
-// the row-group shuffles stay in-warp; smaller dv (test corners) forces nw=1.
+// lanes_per_row: cooperative lanes for each value row's Dk split. The launch
+// contract keeps each row's NW consecutive lanes together for every value tile;
+// smaller dv test corners preserve the shipped NW=1 rule.
 template <typename Tin, typename Tout, typename TState>
 void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                          const int32_t* state_idx, int64_t n, const GdnArgs& args, int nw) {
-  const int64_t dv = v.shape[2];
-  const int nw_eff = dv >= 32 ? nw : 1;
-  switch (nw_eff) {
+                          const int32_t* state_idx, int64_t n, const GdnArgs& args,
+                          const GdnDecodeLaunchContract& contract) {
+  switch (contract.lanes_per_row) {
     case 2:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 2>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
     case 4:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 4>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
     case 8:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 8>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
     default:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 1>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
   }
 }
@@ -2541,16 +2997,17 @@ void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const
 template <typename Tin, typename Tout>
 void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                            const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                           const int32_t* state_idx, int64_t n, const GdnArgs& args, int nw) {
+                           const int32_t* state_idx, int64_t n, const GdnArgs& args,
+                           const GdnDecodeLaunchContract& contract) {
   if (state.dtype == DType::kBF16)
     LaunchGdnDecodeFused<Tin, Tout, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, nw);
+                                                   n, args, contract);
   else if (state.dtype == DType::kF16)
     LaunchGdnDecodeFused<Tin, Tout, __half>(s, out, q_in, k, v, g, beta,
-                                           state, state_idx, n, args, nw);
+                                           state, state_idx, n, args, contract);
   else
     LaunchGdnDecodeFused<Tin, Tout, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args,
-                                           nw);
+                                           contract);
 }
 
 // Decode dispatch. state_idx == nullptr: compact [n,Hv,Dv,Dk] state (row==i_n).
@@ -2567,14 +3024,6 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
   const int64_t n = q_in.shape[0], hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
   if (n == 0 || hv_n == 0 || dv == 0) return;
   VT_CHECK(n * hv_n <= kMaxGridY, "cuda gdn_decode: too many (seq×head) blocks (grid.y limit)");
-  const int64_t bv = dv < 32 ? dv : 32;
-  const size_t shmem =
-      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
-  if (shmem > 48 * 1024) {  // corner-dim fallback (no decode test hits this; real dims are 128)
-    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, state_idx,
-                args, "gdn_decode");
-    return;
-  }
   // Warps-per-block for the Dk-split occupancy lever (default 8 — measured best
   // on GB10 sm_121: raises GdnDecodeFused theoretical occupancy 10.4%→66.7% and
   // cuts per-call time ~2.2× at conc-64; A/B via env, read once per call —
@@ -2586,21 +3035,33 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
     if (v_nw == 1 || v_nw == 2 || v_nw == 4 || v_nw == 8) nw = v_nw;
   }
   cudaStream_t s = AsStream(q);
-  if (q_in.dtype == DType::kF32) {
-    if (out.dtype == DType::kF32)
-      LaunchGdnDecodeFusedS<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args,
-                                          nw);
-    else
-      LaunchGdnDecodeFusedS<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx, n,
-                                                  args, nw);
-  } else {
-    if (out.dtype == DType::kF32)
-      LaunchGdnDecodeFusedS<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,
-                                                  args, nw);
-    else
-      LaunchGdnDecodeFusedS<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state,
-                                                          state_idx, n, args, nw);
-  }
+  auto launch = [&](const GdnDecodeLaunchContract& contract) {
+    if (contract.shared_bytes > 48 * 1024) {
+      // Corner-dim fallback (no decode test hits this; real dims are 128).
+      GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, state_idx,
+                  args, "gdn_decode");
+      return;
+    }
+    if (q_in.dtype == DType::kF32) {
+      if (out.dtype == DType::kF32)
+        LaunchGdnDecodeFusedS<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,
+                                            args, contract);
+      else
+        LaunchGdnDecodeFusedS<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
+                                                    n, args, contract);
+    } else {
+      if (out.dtype == DType::kF32)
+        LaunchGdnDecodeFusedS<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, state_idx,
+                                                    n, args, contract);
+      else
+        LaunchGdnDecodeFusedS<__nv_bfloat16, __nv_bfloat16>(
+            s, out, q_in, k, v, g, beta, state, state_idx, n, args, contract);
+    }
+  };
+  DispatchGdnDecodeValueTile(std::getenv("VT_GDN_DECODE_BV"),
+                             std::getenv("VT_GDN_DECODE_SWIZZLE"),
+                             std::getenv("VT_GDN_DECODE_REGSTATE"), dv, dk,
+                             nw, launch, launch);
 }
 
 // Shared wrapper body: qsl_ptr == nullptr → decode (n = batch = state rows;
@@ -2638,6 +3099,115 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
       LaunchGdnScanState<__nv_bfloat16, __nv_bfloat16>(
           s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx, n, args);
     }
+  }
+}
+
+// ===========================================================================
+// KDA per-K-channel-decay sequential scan (kKdaGatedDeltaRule).
+//
+// Byte-for-byte GdnScanKernel EXCEPT the state decay is per-K-channel: GDN uses
+// one scalar `decay = expf(g[t*hv_n+hv])` for the whole [Dv,Dk] state; KDA stages
+// a per-K vector `decay[ki] = expf(g[(t*hv_n+hv)*dk + ki])` in shared memory and
+// applies `s_row[ki] *= decay[ki]`. Ported 1:1 from FLA
+// fused_recurrent_gated_delta_rule_fwd_kernel IS_KDA=True
+// (`b_h *= exp(b_gk[None, :])`, third_party/flash_linear_attention/ops/
+// fused_recurrent.py:136-137 @ pin 555967922). All state math f32; q/k must be
+// l2-normalized by the caller (as GdnScan). The shared GDN kernels are untouched.
+template <typename Tin, typename Tout, typename TState>
+__global__ void KdaScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
+                              const float* g, const float* beta, TState* state,
+                              const int32_t* qsl, const int32_t* state_idx,
+                              int64_t state_slots, int64_t hk_n, int64_t dk,
+                              int64_t hv_n, int64_t dv, float scale) {
+  const int64_t s = blockIdx.y;   // sequence
+  const int64_t hv = blockIdx.x;  // v-head
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t state_slot = state_idx != nullptr ? state_idx[s] : s;
+  if (state_slot < 0 || state_slot >= state_slots) {
+    const int64_t begin = qsl != nullptr ? qsl[s] : s;
+    const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+    for (int64_t t = begin; t < end; ++t)
+      for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x)
+        Store(out, (t * hv_n + hv) * dv + vi, 0.0f);
+    return;
+  }
+  extern __shared__ float smem[];  // [dk] q'  then [dk] k  then [dk] per-K decay
+  float* q_sh = smem;
+  float* k_sh = smem + dk;
+  float* d_sh = smem + 2 * dk;
+  TState* s_head = state + (state_slot * hv_n + hv) * dv * dk;  // [Dv, Dk]
+  const int64_t begin = qsl != nullptr ? qsl[s] : s;
+  const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+  for (int64_t t = begin; t < end; ++t) {
+    for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
+      q_sh[i] = Load(q, (t * hk_n + hk) * dk + i) * scale;
+      k_sh[i] = Load(k, (t * hk_n + hk) * dk + i);
+      d_sh[i] = expf(g[(t * hv_n + hv) * dk + i]);  // per-K-channel decay
+    }
+    __syncthreads();
+    const float beta_t = beta[t * hv_n + hv];
+    for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x) {
+      TState* s_row = s_head + vi * dk;
+      float dot = 0.0f;  // (S * exp(g_channel)) @ k, fused with the per-channel decay
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        const float decayed = Load(s_row, ki) * d_sh[ki];
+        dot += decayed * k_sh[ki];
+      }
+      const float vp = (Load(v, (t * hv_n + hv) * dv + vi) - dot) * beta_t;
+      float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        const float updated = Load(s_row, ki) * d_sh[ki] + vp * k_sh[ki];
+        Store(s_row, ki, updated);
+        o += updated * q_sh[ki];
+      }
+      Store(out, (t * hv_n + hv) * dv + vi, o);
+    }
+    __syncthreads();  // all reads of the staged rows done before next token's load
+  }
+}
+
+template <typename Tin, typename Tout>
+void LaunchKdaScan(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                   const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                   const int32_t* qsl, int64_t n, const GdnArgs& args) {
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v.shape[1], dv = v.shape[2];
+  const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n));
+  const size_t shmem = 3 * static_cast<size_t>(dk) * sizeof(float);  // q' + k + decay
+  KdaScanKernel<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
+      out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+      beta.Ptr<float>(), state.Ptr<float>(), qsl, nullptr, state.shape[0], hk_n, dk, hv_n, dv,
+      args.scale);
+  Check(cudaGetLastError(), "kda scan launch");
+}
+
+void KdaGatedDeltaRuleKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                                 const Tensor& v, const Tensor& g, const Tensor& beta,
+                                 Tensor& state, const Tensor& qsl, const GdnArgs& args) {
+  constexpr const char* name = "kda_gated_delta_rule";
+  VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
+           std::string("cuda ") + name + ": unsupported q dtype (f32/bf16 only)");
+  VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+           std::string("cuda ") + name + ": q/k/v dtypes must match");
+  const int64_t n = state.shape[0];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  if (n == 0 || hv_n == 0 || dv == 0) return;
+  VT_CHECK(n <= kMaxGridY, std::string("cuda ") + name + ": too many sequences (grid.y limit)");
+  VT_CHECK(3 * static_cast<size_t>(dk) * sizeof(float) <= 48 * 1024,
+           std::string("cuda ") + name + ": Dk too large for the shared q'/k/decay staging");
+  cudaStream_t s = AsStream(q);
+  const int32_t* qsl_ptr = qsl.Ptr<int32_t>();
+  if (q_in.dtype == DType::kF32) {
+    if (out.dtype == DType::kF32)
+      LaunchKdaScan<float, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+    else
+      LaunchKdaScan<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+  } else {
+    if (out.dtype == DType::kF32)
+      LaunchKdaScan<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+    else
+      LaunchKdaScan<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n,
+                                                  args);
   }
 }
 
@@ -2878,6 +3448,15 @@ template <typename TD>
 struct WmmaCfg;
 template <>
 struct WmmaCfg<__nv_bfloat16> {
+// bf16 WMMA fragments are complete types only for __CUDA_ARCH__ >= 800 (bf16
+// tensor cores are Ampere+). The MEMBERS are guarded rather than the struct so
+// the specialization still exists for every arch; every consumer is a device
+// body that is itself guarded, so nothing references these on <sm_80. WK is
+// inside the guard too: with the bodies compiled out it would otherwise trip
+// #177-D (declared but never referenced), which this build promotes to an error
+// under -Werror=all-warnings. sm_80+ is a preprocessor identity ->
+// byte-identical. See .agents/specs/cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   static constexpr int WK = 16;
   using Acc = wmma::fragment<wmma::accumulator, kWM, kWM, WK, float>;
   using Arow = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, __nv_bfloat16, wmma::row_major>;
@@ -2888,9 +3467,17 @@ struct WmmaCfg<__nv_bfloat16> {
   __device__ static void load(F& f, const __nv_bfloat16* p, int ld) {
     wmma::load_matrix_sync(f, p, ld);
   }
+#endif
 };
 template <>
 struct WmmaCfg<float> {
+// TF32 is a SECOND Ampere-gated tensor-core type, and it fails harder than bf16:
+// `wmma::precision::tf32` is not declared at all below sm_80, so an UNGUARDED
+// alias here is a namespace-lookup error at the DEFINITION of this explicit
+// specialization (not an incomplete type at a use site), which is why guarding
+// only the kernel bodies is insufficient for this struct. Same shape as the bf16
+// specialization above; sm_80+ is a preprocessor identity -> byte-identical.
+#if __CUDA_ARCH__ >= 800
   static constexpr int WK = 8;
   using Acc = wmma::fragment<wmma::accumulator, kWM, kWM, WK, float>;
   using Arow = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, wmma::precision::tf32, wmma::row_major>;
@@ -2902,6 +3489,7 @@ struct WmmaCfg<float> {
     wmma::load_matrix_sync(f, p, ld);
     for (int i = 0; i < f.num_elements; ++i) f.x[i] = wmma::__float_to_tf32(f.x[i]);
   }
+#endif
 };
 
 // 128-bit (int4/float4) staging: one coalesced 16-byte transfer moves N=16/
@@ -2915,6 +3503,10 @@ template <typename TD>
 struct V128;
 template <>
 struct V128<__nv_bfloat16> {
+// 128-bit staging is used ONLY by the WMMA bodies guarded above, so on <sm_80
+// every member here is unreferenced and trips #177-D under -Werror=all-warnings.
+// Guarded on the same condition; sm_80+ is a preprocessor identity.
+#if __CUDA_ARCH__ >= 800
   static constexpr int N = 8;
   __device__ static void Uf(const __nv_bfloat16* p, float* f) {
     const int4 v = *reinterpret_cast<const int4*>(p);
@@ -2933,9 +3525,12 @@ struct V128<__nv_bfloat16> {
   __device__ static void Cpy(__nv_bfloat16* d, const __nv_bfloat16* s) {
     *reinterpret_cast<int4*>(d) = *reinterpret_cast<const int4*>(s);
   }
+#endif
 };
 template <>
 struct V128<float> {
+// Same rationale as the bf16 specialization above.
+#if __CUDA_ARCH__ >= 800
   static constexpr int N = 4;
   __device__ static void Uf(const float* p, float* f) {
     const float4 v = *reinterpret_cast<const float4*>(p);
@@ -2951,6 +3546,7 @@ struct V128<float> {
   __device__ static void Cpy(float* d, const float* s) {
     *reinterpret_cast<float4*>(d) = *reinterpret_cast<const float4*>(s);
   }
+#endif
 };
 
 // DeltaH (WMMA). One block per (sequence, v-head), SEQUENTIAL over chunks.
@@ -2964,6 +3560,12 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
                                          const TD* u, const TD* w, const float* gcum,
                                          const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                          int64_t dk, int64_t hv_n, int64_t dv, bool vec) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   using V = V128<TD>;
   constexpr int WK = Cfg::WK;
@@ -3110,6 +3712,9 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
       V128<float>::Cpy(s_head + g * 4, Hf + g * 4);
   else
     for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
+#else
+  __trap();
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -3147,6 +3752,12 @@ __global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, con
                                         const TD* u, const TD* w, const float* gcum,
                                         const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                         int64_t dk, int64_t hv_n, int64_t dv) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   constexpr int BT = kChunk;         // 64
@@ -3298,6 +3909,9 @@ __global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, con
     wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
     wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
   }
+#else
+  __trap();
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -3320,6 +3934,12 @@ __global__ void GdnChunkDeltaHRegRingKernel(float* state, TD* hstate, TD* v_new,
                                             const TD* u, const TD* w, const float* gcum,
                                             const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                             int64_t dk, int64_t hv_n, int64_t dv) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   constexpr int BT = kChunk;
@@ -3483,6 +4103,9 @@ __global__ void GdnChunkDeltaHRegRingKernel(float* state, TD* hstate, TD* v_new,
     wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
     wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
   }
+#else
+  __trap();
+#endif
 }
 
 // DeltaH (REGISTER-tiled + N-stage TMA+mbarrier ring, vt::tile Rung-2). Identical
@@ -3508,6 +4131,12 @@ __global__ void GdnChunkDeltaHTmaKernel(float* state, TD* hstate, TD* v_new, con
                                         int64_t dk, int64_t hv_n, int64_t dv,
                                         const __grid_constant__ CUtensorMap descW,
                                         const __grid_constant__ CUtensorMap descK) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   namespace tp = vt::cuda::tile;
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
@@ -3672,6 +4301,9 @@ __global__ void GdnChunkDeltaHTmaKernel(float* state, TD* hstate, TD* v_new, con
     wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
     wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
   }
+#else
+  __trap();
+#endif
 }
 
 // ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
@@ -3682,6 +4314,12 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
                                     const TD* hstate, const float* gcum, const int32_t* tok0a,
                                     const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
                                     int64_t dv, float scale, bool vec) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   using V = V128<TD>;
   constexpr int WK = Cfg::WK;
@@ -3798,6 +4436,9 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
     const int64_t i = e / dv, vi = e % dv;
     if (i < len) Store(out, (tok0 + i) * hv_n * dv + hv * dv + vi, scale * outc[e]);
   }
+#else
+  __trap();
+#endif
 }
 
 // Step B (WMMA) — chunk_scaled_dot_kkt Gram on tensor cores. The scalar
@@ -3817,6 +4458,12 @@ template <typename TD>
 __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, const float* beta,
                                      const float* gcum, const int32_t* tok0a, const int32_t* lena,
                                      int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
@@ -3893,6 +4540,9 @@ __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, con
     for (int64_t i = 0; i < len; ++i)
       Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
   }
+#else
+  __trap();
+#endif
 }
 
 // Step B (WMMA, VEC path — VT_GDN_CHUNK_VEC, default). FLA-faithful WY: the
@@ -3929,6 +4579,14 @@ constexpr int kOBlk = 64;  // WMMA apply output column block (multiple of kWM)
 // BOTH kernel dtypes (Am/Tf/Pw are f32; the apply rounds Tf→Tb(TD) afterwards), so
 // the merges use the f32/TF32 WMMA config unconditionally — the same precision the
 // f32 apply already runs at (solve_tril output_dtype=k.dtype).
+// bf16/TF32 WMMA tensor-core code is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Unlike the
+// __global__ kernels below, the WHOLE function is guarded rather than just its
+// body: every caller is itself guarded out on <sm_80, so a body-only guard would
+// leave an emitted-but-uncalled definition that trips #177-D (declared but never
+// referenced) under -Werror=all-warnings. sm_80+ is a preprocessor identity ->
+// byte-identical. See .agents/specs/cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
 __device__ inline void WyMerge(float* Tf, const float* Am, float* Pw, int64_t BT, int bi,
                                int bj) {
   using Cfg = WmmaCfg<float>;
@@ -3960,12 +4618,19 @@ __device__ inline void WyMerge(float* Tf, const float* Am, float* Pw, int64_t BT
   for (int i = 0; i < accT.num_elements; ++i) accT.x[i] = -accT.x[i];
   wmma::store_matrix_sync(Tf + (bi * kWM) * BT + (bj * kWM), accT, BT, wmma::mem_row_major);
 }
+#endif
 
 template <typename TD>
 __global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
                                         const float* beta, const float* gcum,
                                         const int32_t* tok0a, const int32_t* lena, int64_t hk_n,
                                         int64_t dk, int64_t hv_n, int64_t dv, bool blocked) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
@@ -4129,6 +4794,9 @@ __global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
       __syncthreads();
     }
   }
+#else
+  __trap();
+#endif
 }
 
 // Builds the per-chunk layout (tok0/len) + per-seq base-offset (boh) arrays
@@ -4233,6 +4901,16 @@ __global__ void GdnChunkVNewSlackZeroKernel(TD* v_new, const int32_t* qsl, int64
 static bool GdnTritonEnvOn(const char* n) {
   const char* e = std::getenv(n);
   return e == nullptr || e[0] != '0';
+}
+
+int CurrentTritonAotTreeIndex() {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid) return -1;
+  return TritonAotTreeIndex(caps.sm_major, caps.sm_minor);
+}
+
+bool TritonAotAvailableOnCurrentDevice() {
+  return CurrentTritonAotTreeIndex() >= 0;
 }
 
 // Persistent per-stream scratch for the Triton-AOT GDN build. This mirrors the
@@ -4379,22 +5057,29 @@ T* EnsureGdnScratch(GdnScratchBuf& buf, size_t count, cudaStream_t s, const char
 // so concurrent first use from separate queues cannot double-load or race those
 // globals. CUDA primary-context modules are process-wide for the active device.
 struct GdnAotModuleOnce {
-  std::once_flag deltah_h48;
-  std::once_flag deltah_h32;
-  std::once_flag chunko_h48;
-  std::once_flag chunko_h32;
+  std::array<std::once_flag, 6> deltah_h48;
+  std::array<std::once_flag, 6> deltah_h32;
+  std::array<std::once_flag, 6> chunko_h48;
+  std::array<std::once_flag, 6> chunko_h32;
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
-  std::once_flag chunko_bf16_h48;
-  std::once_flag chunko_bf16_h32;
+  std::array<std::once_flag, 6> chunko_bf16_h48;
+  std::array<std::once_flag, 6> chunko_bf16_h32;
 #endif
-  std::once_flag kkt_h48;
-  std::once_flag tril_h48;
-  std::once_flag wu_h48;
-  std::once_flag kkt_h32;
-  std::once_flag tril_h32;
-  std::once_flag wu_h32;
-  std::once_flag decode_h48;
-  std::once_flag decode_h32;
+  std::array<std::once_flag, 6> kkt_h48;
+  std::array<std::once_flag, 6> tril_h48;
+  std::array<std::once_flag, 6> wu_h48;
+  std::array<std::once_flag, 6> kkt_h32;
+  std::array<std::once_flag, 6> tril_h32;
+  std::array<std::once_flag, 6> wu_h32;
+  std::array<std::once_flag, 6> decode_h48;
+  std::array<std::once_flag, 6> decode_h32;
+  // KDA chunk-prefill family (Kimi-Linear; H=32).
+  std::array<std::once_flag, 6> kda_gate_cumsum;
+  std::array<std::once_flag, 6> kda_kkt_inter;
+  std::array<std::once_flag, 6> kda_kkt_intra;
+  std::array<std::once_flag, 6> kda_wu;
+  std::array<std::once_flag, 6> kda_deltah_h32;
+  std::array<std::once_flag, 6> kda_gla_o;
 };
 
 GdnAotModuleOnce& GdnAotModules() {
@@ -4404,43 +5089,47 @@ GdnAotModuleOnce& GdnAotModules() {
 
 void EnsureGdnDeltaHLoaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.deltah_h48, load_gdn_deltah_h48);
+    std::call_once(modules.deltah_h48[tree], load_gdn_deltah_h48);
   } else {
-    std::call_once(modules.deltah_h32, load_gdn_deltah_h32);
+    std::call_once(modules.deltah_h32[tree], load_gdn_deltah_h32);
   }
 }
 
 void EnsureGdnChunkOF32Loaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.chunko_h48, load_gdn_chunko_h48);
+    std::call_once(modules.chunko_h48[tree], load_gdn_chunko_h48);
   } else {
-    std::call_once(modules.chunko_h32, load_gdn_chunko_h32);
+    std::call_once(modules.chunko_h32[tree], load_gdn_chunko_h32);
   }
 }
 
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
 void EnsureGdnChunkOBF16Loaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.chunko_bf16_h48, load_gdn_chunko_bf16_h48);
+    std::call_once(modules.chunko_bf16_h48[tree], load_gdn_chunko_bf16_h48);
   } else {
-    std::call_once(modules.chunko_bf16_h32, load_gdn_chunko_bf16_h32);
+    std::call_once(modules.chunko_bf16_h32[tree], load_gdn_chunko_bf16_h32);
   }
 }
 #endif
 
 void EnsureGdnWULoaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.kkt_h48, load_gdn_kkt_h48);
-    std::call_once(modules.tril_h48, load_gdn_tril_h48);
-    std::call_once(modules.wu_h48, load_gdn_wu_h48);
+    std::call_once(modules.kkt_h48[tree], load_gdn_kkt_h48);
+    std::call_once(modules.tril_h48[tree], load_gdn_tril_h48);
+    std::call_once(modules.wu_h48[tree], load_gdn_wu_h48);
   } else {
-    std::call_once(modules.kkt_h32, load_gdn_kkt_h32);
-    std::call_once(modules.tril_h32, load_gdn_tril_h32);
-    std::call_once(modules.wu_h32, load_gdn_wu_h32);
+    std::call_once(modules.kkt_h32[tree], load_gdn_kkt_h32);
+    std::call_once(modules.tril_h32[tree], load_gdn_tril_h32);
+    std::call_once(modules.wu_h32[tree], load_gdn_wu_h32);
   }
 }
 
@@ -4448,14 +5137,16 @@ void EnsureGdnWULoaded(int64_t hv_n) {
 // select packed decode; Hv=32 serves the dense 4B model.
 void EnsureGdnPackedDecodeLoaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.decode_h48, load_gdn_decode_h48);
+    std::call_once(modules.decode_h48[tree], load_gdn_decode_h48);
   } else {
-    std::call_once(modules.decode_h32, load_gdn_decode_h32);
+    std::call_once(modules.decode_h32[tree], load_gdn_decode_h32);
   }
 }
 
 void EnsureAllGdnAotModulesLoaded() {
+  if (!TritonAotAvailableOnCurrentDevice()) return;
   for (const int64_t hv_n : {48, 32}) {
     EnsureGdnDeltaHLoaded(hv_n);
     EnsureGdnChunkOF32Loaded(hv_n);
@@ -4490,6 +5181,7 @@ bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
                            const Tensor& dt_bias, Tensor& state,
                            const Tensor& state_idx, const GdnArgs& args) {
   // Default ON: fire unless VT_GDN_PACKED_DECODE_TRITON leads with '0' (rollback).
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnPackedDecodeTritonFlagIsOn(
           std::getenv("VT_GDN_PACKED_DECODE_TRITON")))
     return false;
@@ -4555,6 +5247,7 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
                      const __nv_bfloat16* k, const __nv_bfloat16* u, const __nv_bfloat16* w,
                      const float* gcum, const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t n_seq, int64_t t_tot) {
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnTritonEnvOn("VT_GDN_DELTAH_TRITON")) return false;  // default ON (see GdnTritonEnvOn); =0 restores hand path
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -4588,6 +5281,7 @@ bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t nt_tot, int64_t t_tot) {
   static_assert(std::is_same<Tout, float>::value || std::is_same<Tout, __nv_bfloat16>::value,
                 "Triton chunk_o supports f32 or bf16 output");
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnTritonEnvOn("VT_GDN_CHUNKO_TRITON")) return false;
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -4650,6 +5344,7 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
                  const __nv_bfloat16* v, const float* beta, const float* gcum, const int32_t* qsl,
                  const int32_t* cidx, int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv,
                  int64_t nt_tot, int64_t t_tot, GdnWuScratch* scratch) {
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnTritonEnvOn("VT_GDN_WU_TRITON")) return false;
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -4718,6 +5413,227 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
 }
 #endif  // VLLM_CPP_TRITON
 
+// ===========================================================================
+// KDA CHUNK-PREFILL (kKdaChunkPrefill) — the chunked forward of the per-K-channel
+// gated-delta linear attention through the vendored FLA Triton-AOT cubins, vLLM's
+// ACTUAL prefill path (kimi_gdn_linear_attn.py:141 chunk_kda_with_fused_gate).
+// Mirrors LaunchChunkedPrefill's structure but for the KDA per-K-channel kernels;
+// decode (T==1) and any non-pinned shape fall back to the recurrence.
+// ===========================================================================
+#ifdef VLLM_CPP_TRITON
+void EnsureKdaChunkLoaded() {
+  auto& m = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
+  std::call_once(m.kda_gate_cumsum[tree], load_kda_gate_cumsum);
+  std::call_once(m.kda_kkt_inter[tree], load_kda_kkt_inter);
+  std::call_once(m.kda_kkt_intra[tree], load_kda_kkt_intra);
+  std::call_once(m.tril_h32[tree], load_gdn_tril_h32);  // REUSE gdn_tril_h32 (byte-identical sig)
+  std::call_once(m.kda_wu[tree], load_kda_wu);
+  std::call_once(m.kda_deltah_h32[tree], load_kda_deltah_h32);
+  std::call_once(m.kda_gla_o[tree], load_kda_gla_o);
+}
+
+template <typename Tin>
+__global__ void KdaToBf16Kernel(const Tin* in, __nv_bfloat16* out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(Load(in, i));  // Load handles f32/bf16
+}
+__global__ void KdaBf16ToF32Kernel(const __nv_bfloat16* in, float* out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __bfloat162float(in[i]);
+}
+void KdaCastTensorToBf16(cudaStream_t s, const Tensor& t, __nv_bfloat16* out, int64_t n) {
+  const unsigned nb = static_cast<unsigned>((n + 255) / 256);
+  if (t.dtype == DType::kBF16)
+    KdaToBf16Kernel<__nv_bfloat16><<<nb, 256, 0, s>>>(t.Ptr<__nv_bfloat16>(), out, n);
+  else
+    KdaToBf16Kernel<float><<<nb, 256, 0, s>>>(t.Ptr<float>(), out, n);
+  Check(cudaGetLastError(), "kda chunk cast->bf16 launch");
+}
+
+// The pinned Kimi KDA chunk-prefill orchestration (H=32, Dk=Dv=128, BT=64), a
+// single prefill sequence (state [1,H,Dv,Dk]). Exactly _chunk_kda_fwd_with_
+// cumulative_g's launch order. All scratch stream-ordered + freed on the queue.
+void LaunchKdaChunkPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                           const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                           const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                           const Tensor& qsl, const GdnArgs& /*args*/) {
+  constexpr int64_t H = 32, DK = 128, DV = 128, BT = 64;
+  const int64_t T = q_in.shape[0];
+  const int64_t NT = (T + BT - 1) / BT;  // chunks (single sequence)
+  const int32_t Ti = static_cast<int32_t>(T);
+  const int32_t NTi = static_cast<int32_t>(NT);
+  const int32_t NHi = static_cast<int32_t>(H);  // n_seq(1) * H
+  EnsureKdaChunkLoaded();
+  auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
+
+  // ── chunk metadata: chunk_indices [NT,2] and chunk_offsets [1]=0 (single seq).
+  int32_t* d_cidx = nullptr;
+  int32_t* d_boh = nullptr;
+  Check(cudaMallocAsync(&d_cidx, static_cast<size_t>(2 * NT) * sizeof(int32_t), s),
+        "kda chunk cidx alloc");
+  Check(cudaMallocAsync(&d_boh, sizeof(int32_t), s), "kda chunk boh alloc");
+  Check(cudaMemsetAsync(d_boh, 0, sizeof(int32_t), s), "kda chunk boh zero");
+  GdnBuildChunkIndices<<<1, 32, 0, s>>>(d_cidx, qsl.Ptr<int32_t>(), d_boh, 1);
+  Check(cudaGetLastError(), "kda chunk cidx build");
+
+  // ── bf16 casts of the Triton kernel inputs (q/k/v/g_raw/beta).
+  const size_t nqk = static_cast<size_t>(T) * H * DK;
+  const size_t nv = static_cast<size_t>(T) * H * DV;
+  const size_t nbeta = static_cast<size_t>(T) * H;
+  __nv_bfloat16 *qb = nullptr, *kb = nullptr, *vb = nullptr, *grb = nullptr, *betab = nullptr;
+  Check(cudaMallocAsync(&qb, nqk * sizeof(__nv_bfloat16), s), "kda chunk qb alloc");
+  Check(cudaMallocAsync(&kb, nqk * sizeof(__nv_bfloat16), s), "kda chunk kb alloc");
+  Check(cudaMallocAsync(&vb, nv * sizeof(__nv_bfloat16), s), "kda chunk vb alloc");
+  Check(cudaMallocAsync(&grb, nqk * sizeof(__nv_bfloat16), s), "kda chunk grb alloc");
+  Check(cudaMallocAsync(&betab, nbeta * sizeof(__nv_bfloat16), s), "kda chunk betab alloc");
+  KdaCastTensorToBf16(s, q_in, qb, static_cast<int64_t>(nqk));
+  KdaCastTensorToBf16(s, k, kb, static_cast<int64_t>(nqk));
+  KdaCastTensorToBf16(s, v, vb, static_cast<int64_t>(nv));
+  KdaCastTensorToBf16(s, g_raw, grb, static_cast<int64_t>(nqk));
+  KdaCastTensorToBf16(s, beta, betab, static_cast<int64_t>(nbeta));
+
+  // ── scratch (all [0,T)-indexed; the Triton kernels boundary_check the tail).
+  float* g_cum = nullptr;  // [T,H,DK] cumulative gate (exp2-space) f32
+  float* a_raw = nullptr;  // [T,H,BT] strictly-lower A f32
+  float* aqk = nullptr;    // [T,H,BT] causal Aqk f32
+  __nv_bfloat16* a_inv = nullptr;  // [T,H,BT] (I+A)^-1 bf16
+  __nv_bfloat16* w = nullptr;      // [T,H,DK] bf16
+  __nv_bfloat16* u = nullptr;      // [T,H,DV] bf16
+  __nv_bfloat16* kg = nullptr;     // [T,H,DK] bf16
+  __nv_bfloat16* hstate = nullptr; // [NT,H,DV,DK] bf16
+  __nv_bfloat16* v_new = nullptr;  // [T,H,DV] bf16
+  __nv_bfloat16* o_bf = nullptr;   // [T,H,DV] bf16 output
+  const size_t na = static_cast<size_t>(T) * H * BT;
+  const size_t nh = static_cast<size_t>(NT) * H * DV * DK;
+  Check(cudaMallocAsync(&g_cum, nqk * sizeof(float), s), "kda chunk g_cum alloc");
+  Check(cudaMallocAsync(&a_raw, na * sizeof(float), s), "kda chunk a_raw alloc");
+  Check(cudaMallocAsync(&aqk, na * sizeof(float), s), "kda chunk aqk alloc");
+  Check(cudaMallocAsync(&a_inv, na * sizeof(__nv_bfloat16), s), "kda chunk a_inv alloc");
+  Check(cudaMallocAsync(&w, nqk * sizeof(__nv_bfloat16), s), "kda chunk w alloc");
+  Check(cudaMallocAsync(&u, nv * sizeof(__nv_bfloat16), s), "kda chunk u alloc");
+  Check(cudaMallocAsync(&kg, nqk * sizeof(__nv_bfloat16), s), "kda chunk kg alloc");
+  Check(cudaMallocAsync(&hstate, nh * sizeof(__nv_bfloat16), s), "kda chunk hstate alloc");
+  Check(cudaMallocAsync(&v_new, nv * sizeof(__nv_bfloat16), s), "kda chunk v_new alloc");
+  Check(cudaMallocAsync(&o_bf, nv * sizeof(__nv_bfloat16), s), "kda chunk o_bf alloc");
+  // kkt writes only the lower/diagonal blocks of A; solve_tril writes only the 10
+  // lower 16x16 blocks of A_inv, and recompute_w_u reads the FULL [BT,BT] A_inv —
+  // so zero both (cudaMallocAsync returns dirty pool memory in a busy engine).
+  Check(cudaMemsetAsync(a_raw, 0, na * sizeof(float), s), "kda chunk a_raw zero");
+  Check(cudaMemsetAsync(a_inv, 0, na * sizeof(__nv_bfloat16), s), "kda chunk a_inv zero");
+
+  const CUdeviceptr Dqsl = D(qsl.Ptr<int32_t>());
+  const CUdeviceptr Dcidx = D(d_cidx);
+  CUresult r;
+  // (1) fused decay-gate + chunk cumsum: g_raw_bf16 (+a_log,dt_bias) -> g_cum.
+  r = kda_gate_cumsum_default(s, D(grb), D(a_log.data), D(g_cum), D(dt_bias.data), Dqsl, Dcidx,
+                              Ti, NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk gate_cumsum: non-success");
+  // (2)+(3) per-K-channel-gated K.Kᵀ + q.kᵀ -> A(strictly-lower), Aqk(causal).
+  r = kda_kkt_inter_default(s, D(qb), D(kb), D(g_cum), D(betab), D(a_raw), D(aqk), Dqsl, Dcidx, Ti,
+                            NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk kkt_inter: non-success");
+  r = kda_kkt_intra_default(s, D(qb), D(kb), D(g_cum), D(betab), D(a_raw), D(aqk), Dqsl, Dcidx, Ti,
+                            NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk kkt_intra: non-success");
+  // (4) invert the strictly-lower A (WY solve) -> A_inv (REUSE gdn_tril_h32).
+  r = gdn_tril_h32_default(s, D(a_raw), D(a_inv), Dqsl, Dcidx, Ti, NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk solve_tril: non-success");
+  // (5) recompute W, U (+ kg = k*exp2(gn-gk)); q/qg dead (STORE_QG=0).
+  r = kda_wu_default(s, 0, D(kb), 0, D(kg), D(vb), D(betab), D(w), D(u), D(a_inv), D(g_cum), Dqsl,
+                     Dcidx, Ti, NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk recompute_w_u: non-success");
+  // (6) chunked hidden-state scan: k=kg, v=u, gk=g_cum (g dead), h0=ht=state
+  //     -> h(snapshots), v_new, final state. state is fresh zeros (caller).
+  r = kda_deltah_h32_default(s, D(kg), D(u), D(w), D(v_new), 0, D(g_cum), D(hstate),
+                             D(state.data), D(state.data), Dqsl, D(d_boh), Ti, NHi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk delta_h: non-success");
+  // (7) GLA-style output with per-K gk decay -> o_bf.
+  r = kda_gla_o_default(s, D(qb), D(v_new), D(g_cum), D(hstate), D(o_bf), D(aqk), Dqsl, Dcidx, Ti,
+                        NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk gla_o: non-success");
+
+  // ── out <- o_bf (cast to f32 or copy bf16).
+  if (out.dtype == DType::kF32) {
+    const unsigned nbo = static_cast<unsigned>((static_cast<int64_t>(nv) + 255) / 256);
+    KdaBf16ToF32Kernel<<<nbo, 256, 0, s>>>(o_bf, out.Ptr<float>(), static_cast<int64_t>(nv));
+    Check(cudaGetLastError(), "kda chunk out cast launch");
+  } else {
+    Check(cudaMemcpyAsync(out.data, o_bf, nv * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, s),
+          "kda chunk out copy");
+  }
+
+  for (void* p : {static_cast<void*>(o_bf), static_cast<void*>(v_new), static_cast<void*>(hstate),
+                  static_cast<void*>(kg), static_cast<void*>(u), static_cast<void*>(w),
+                  static_cast<void*>(a_inv), static_cast<void*>(aqk), static_cast<void*>(a_raw),
+                  static_cast<void*>(g_cum), static_cast<void*>(betab), static_cast<void*>(grb),
+                  static_cast<void*>(vb), static_cast<void*>(kb), static_cast<void*>(qb),
+                  static_cast<void*>(d_boh), static_cast<void*>(d_cidx)})
+    Check(cudaFreeAsync(p, s), "kda chunk scratch free");
+}
+#endif  // VLLM_CPP_TRITON
+
+// Fused per-K-channel decay gate (kda_gate_cumsum's per-token gate, pre-cumsum):
+// g_dec[t,h,d] = -exp(a_log[h]) * softplus(g_raw[t,h,d] + dt_bias[h,d]) (beta=1).
+// Feeds the recurrence fallback when the chunk cubins are unavailable/mismatched.
+__global__ void KdaGateFromRawKernel(const float* g_raw, const float* a_log, const float* dt_bias,
+                                     bool has_bias, float* g_dec, int64_t T, int64_t H, int64_t Dk) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= T * H * Dk) return;
+  const int64_t d = idx % Dk;
+  const int64_t h = (idx / Dk) % H;
+  float x = g_raw[idx];
+  if (has_bias) x += dt_bias[h * Dk + d];
+  const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus(beta=1)
+  g_dec[idx] = -expf(a_log[h]) * sp;
+}
+
+void KdaChunkPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                               const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                               const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                               const Tensor& qsl, const GdnArgs& args) {
+  const int64_t T = q_in.shape[0];
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  // hk_n's ONLY use is the geom_ok check below, which sits inside
+  // `#ifdef VLLM_CPP_TRITON`. In a NON-Triton build that use is compiled out and
+  // nvcc's #177-D -- an ERROR under -Werror -- fails the whole CUDA build. That
+  // configuration dependence is why this stayed green wherever Triton is on.
+  (void)hk_n;
+  const int64_t hv_n = state.shape[1], dv = state.shape[2];
+  if (T == 0 || hv_n == 0 || dv == 0) return;
+  cudaStream_t s = AsStream(q);
+  const bool has_bias = dt_bias.shape[0] != 0;
+#ifdef VLLM_CPP_TRITON
+  // Fire the vendored chunk cubins only at the exact pinned Kimi KDA geometry, with
+  // the baked scale, a real prompt (T>1), dt_bias present (HAS_BIAS=1 baked), and
+  // the runtime toggle on (VT_KDA_CHUNK_TRITON default ON; =0 restores recurrence).
+  const float baked_scale = 1.0f / std::sqrt(static_cast<float>(dk));
+  const bool geom_ok = (hk_n == 32 && hv_n == 32 && dk == 128 && dv == 128 && has_bias &&
+                        std::fabs(args.scale - baked_scale) <= 1e-6f * baked_scale && T > 1);
+  if (geom_ok && TritonAotAvailableOnCurrentDevice() &&
+      GdnTritonEnvOn("VT_KDA_CHUNK_TRITON")) {
+    LaunchKdaChunkPrefill(s, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, qsl, args);
+    return;
+  }
+#endif
+  // Fallback (non-Triton build, non-pinned shape, decode, or no bias): fuse the gate
+  // on device then run the exact per-K-channel recurrence (byte-for-byte the decode
+  // kernel). Produces the same math as the chunk path up to reduction order.
+  float* g_dec = nullptr;
+  const int64_t ng = T * hv_n * dk;
+  Check(cudaMallocAsync(&g_dec, static_cast<size_t>(ng) * sizeof(float), s),
+        "kda chunk fallback g_dec alloc");
+  const unsigned nb = static_cast<unsigned>((ng + 255) / 256);
+  KdaGateFromRawKernel<<<nb, 256, 0, s>>>(g_raw.Ptr<float>(), a_log.Ptr<float>(),
+                                          has_bias ? dt_bias.Ptr<float>() : nullptr, has_bias,
+                                          g_dec, T, hv_n, dk);
+  Check(cudaGetLastError(), "kda chunk fallback gate launch");
+  Tensor g_t = g_raw;  // same [T,Hv,Dk] f32 contiguous metadata
+  g_t.data = g_dec;
+  KdaGatedDeltaRuleKernelCuda(q, out, q_in, k, v, g_t, beta, state, qsl, args);
+  Check(cudaFreeAsync(g_dec, s), "kda chunk fallback g_dec free");
+}
+
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
@@ -4726,6 +5642,10 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
                           const Tensor& qsl, int64_t n_seq, int64_t nt_tot, bool dev_meta,
                           const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  // hk_n is kept for the shape mapping it documents (q_in is [T, hk_n, dk]), but
+  // nothing below reads it, and nvcc's #177-D is an ERROR under -Werror -- so this
+  // declaration alone was failing every CUDA build.
+  (void)hk_n;
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t t_tot = out.shape[0];
 
@@ -5258,9 +6178,22 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
   // fallback (VT_GDN_CHUNKED=0). The bf16 chunked path is WMMA (tensor-core),
   // which tiles at 16 and 32 — bf16 dims that are not WMMA-friendly fall back
   // to the sequential scan (real gate dims Dk=Dv=128 satisfy both).
+  // ARCH TERM (required, not an optimisation). Every kernel LaunchChunkedPrefill
+  // reaches — the WU, delta_h (wmma/reg/regring/tma) and chunk_o bodies — is
+  // compiled `#if __CUDA_ARCH__ >= 800` with an `#else __trap()`, because bf16
+  // fragments AND wmma::precision::tf32 are Ampere+. That holds for BOTH scratch
+  // dtypes: the TSc=float instantiations use the TF32 WmmaCfg, so f32 is not a
+  // way around it. This routing is the single chokepoint (all 7 launches live in
+  // LaunchChunkedPrefill, itself reached only from here), so gating it sends
+  // <sm_80 to GdnScanCuda, the portable sequential scan that already serves the
+  // arbitrary-dim corners. Fails safe: caps invalid -> scan. On sm_80+ the term
+  // is always true, so the gate models' path is unchanged.
+  // See .agents/specs/cuda-arch-breadth-fp16.md §V0-a / W1c.
+  const DeviceCaps& gdn_caps = GetDeviceCaps();
+  const bool arch_has_mma = gdn_caps.valid && gdn_caps.sm_major >= 8;
   const bool wmma_ok = q_in.dtype != DType::kBF16 || (dk % kWM == 0 && dv % kNB == 0);
   if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f &&
-      wmma_ok) {
+      wmma_ok && arch_has_mma) {
     GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
     return;
   }
@@ -5688,6 +6621,12 @@ struct Registrar {
         OpId::kGdnPackedDecode, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
             &GdnPackedDecodeKernelCuda)));
+    RegisterOp(
+        OpId::kKdaGatedDeltaRule, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(&KdaGatedDeltaRuleKernelCuda)));
+    RegisterOp(
+        OpId::kKdaChunkPrefill, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<KdaChunkPrefillFn>(&KdaChunkPrefillKernelCuda)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCUDA,
         reinterpret_cast<void*>(

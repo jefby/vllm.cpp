@@ -441,6 +441,68 @@ HTTP 请求
 | 服务端 | `examples/server/main.cpp`、`vllm/entrypoints/openai/api_server.h` |
 | CLI | `examples/cli/main.cpp` |
 
+## 13. 模型支持示例：Qwen3.6-35B-A3B
+
+Qwen3.6-35B-A3B 是当前代码的一等公民目标模型之一，MoE + GDN-hybrid 架构，支持 safetensors 与 GGUF 双路径加载。
+
+### 13.1 架构注册
+
+- 注册名：`"Qwen3_5MoeForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_moe.cpp:178`）。
+- 该 TU 仅负责 registry 粘合；核心前向在 `src/vllm/model_executor/models/qwen3_5.cpp`（`Qwen3_5Model::Forward` / `ForwardDevice` / `Qwen3_5DecodeGraph`）。
+- 同步密集版本另有 `"Qwen3_5ForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_dense.cpp:208`）和经典 `"Qwen3ForCausalLM"`（`src/vllm/model_executor/models/qwen3_dense.cpp:155`）。
+
+### 13.2 加载路径
+
+| 格式 | 入口 | 说明 |
+|------|------|------|
+| Safetensors NVFP4 | `LoadQwen3_5Moe` in `qwen3_5_weights.cpp` | nvidia/Qwen3.6-35B-A3B-NVFP4 snapshot `491c2f1e` 是测试基准 |
+| GGUF | `LoadQwen3_5MoeFromGguf` in `qwen3_5_gguf_weights.cpp` | 支持 F32/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0 等混合量化 |
+| C ABI | `vllm_engine_load()` | `model_path` 直接指向模型目录或 `.gguf` 文件 |
+
+### 13.3 已支持的高级特性
+
+- **NVFP4 W4A4/W4A16**：CUDA Blackwell 路径默认 keep-quant，权重以 FP4 驻留显存；Marlin 驻留与 grouped GEMM 可选。
+- **GGUF keep-quant**：CPU / CUDA 直接对压缩块计算，无需整体反量化为 BF16。
+- **MTP 投机解码**：35B 自带 `mtp.*` 草稿头可复用本模型的 embed / lm_head。
+- **DFlash / DSpark spec**：MoE 前向支持 `aux_tap` 多 tap 输出，用于 block-diffusion / dspark verify。
+- **前缀缓存**：dense full-attention 层默认开启；GDN 组默认关闭。
+- **异步设备镜像**：35B 的 dense 变体已默认走 `AsyncLLM` 消除同步 server 的 GPU 空闲。
+
+### 13.4 性能基准
+
+`docs/BENCHMARKS.md` 中 Qwen3.6-35B-A3B NVFP4 `nvidia` vs vLLM 0.25.0（GB10）：
+
+| 并发 | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| vllm.cpp / vLLM 比率 | 0.918x | 0.940x | 0.972x | 0.956x | 0.93x | — |
+| 状态 | near-tie | near-tie | near-tie | near-tie | open gap | 未测量 |
+
+> 注：c16 0.93x 是仍未关闭的 open gap；项目目标是 match or beat vLLM on every axis。
+
+---
+
+## 14. 与 llama.cpp 的速度对比
+
+vllm.cpp 的**主要性能目标是 vLLM parity**，llama.cpp 仅作为 **secondary floor**（当 vLLM 无法加载同一 checkpoint 时使用）。因此对比结果高度依赖后端、模型和比较维度。
+
+### 14.1 已测量数据（来源：`docs/BENCHMARKS.md`、`.agents/benchmark-record.md`）
+
+| 场景 | 后端/量化 | vllm.cpp | llama.cpp | 比率 | 解读 |
+|---|---|---:|---:|---:|---|
+| 20-core ARM i8mm (GB10 aarch64) | CPU GGUF | prefill 223.8 / decode 24.7 tok/s | prefill 177.3 / decode 25.4 | prefill **1.18x** / decode 0.97x（tie） | 服务器级 ARM 上 vllm.cpp prefill 领先，decode 持平，内存持平 |
+| RPi5 A76 4-core | CPU GGUF | prefill 12.81 / decode 2.55 | prefill 27.77 / decode 3.91 | prefill **0.461x** / decode **0.653x** | 低功耗 ARM 上 llama.cpp 仍更快；vllm.cpp RSS 少 24.2% |
+| GB10 Vulkan | Vulkan GGUF 27B | prefill 21.5x | baseline | prefill **21.5x** | Vulkan 路径 prefill 大幅领先，decode 4.36 vs 4.35 持平 |
+| Muse Glimmer 30B | CPU GGUF | prefill 0.997x / decode 0.232x | baseline | prefill tie / decode **0.232x** | 新模型 decode 仍显著落后于 llama.cpp |
+| Laguna-S-2.1 batch-1 | CPU GGUF Q4_K_XL | 7.7 tok/s | 27.8 tok/s | 0.28x | 单流大 MoE GGUF 上 llama.cpp 的 GEMV 仍是 best-in-class；但 vllm.cpp 的 NVFP4 CUDA 路径 vs vLLM 是 near-tie |
+
+### 14.2 关键结论
+
+1. **CUDA 路径**：vllm.cpp 不直接 vs llama.cpp，因为 llama.cpp 通常无法加载 NVFP4/FP8 safetensors；vllm.cpp 与 vLLM 对比（Qwen3.6-27B 1.045x–1.017x c1–c32）是主战场。
+2. **服务器级 ARM CPU**：vllm.cpp 凭借 assembly/SDOT 优化可在 prefill 上击败 llama.cpp，decode 持平。
+3. **低功耗 ARM / 新模型 GGUF decode**：llama.cpp 的 GGUF 手写 GEMV 更成熟，vllm.cpp 仍有 gap。
+4. **Vulkan 后端**：vllm.cpp 在 GB10 上 prefill 大幅领先，decode 持平。
+5. **内存**：vllm.cpp 在 Pi 上 RSS 少 24.2%；在 GB10 aarch64 上几乎持平。
+
 ---
 
 *文档由 Kimi Code 根据当前仓库源码与 AGENTS.md / README.md / docs 生成。*

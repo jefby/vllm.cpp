@@ -1,7 +1,7 @@
 # vllm.cpp 软件架构流程分析
 
-> 生成时间：基于仓库当前 `main` 状态（2026-08-05 会话快照）。
-> 分析范围：C++ 推理引擎核心、vt 张量运行时、调度与执行管线、服务入口与 C ABI。
+> 生成时间：基于合并 `main` 后的最新代码快照（2026-08-11）。
+> 分析范围：C++ 推理引擎核心、vt 张量运行时、调度与执行管线、服务入口、C ABI 与多模态扩展。
 
 ---
 
@@ -13,7 +13,7 @@
 - **行为镜像 vLLM**：同一 workload、同一模型、greedy 解码要求 token-for-token 一致。
 - **llama.cpp 式部署**：核心产物是 `libvllm` + 稳定 C ABI（`include/vllm.h`），上层再包 CLI / OpenAI 服务器。
 - **GGUF 一等公民**：与 safetensors 并列支持，CPU 可直接在量化块上计算。
-- **多后端同构**：CPU、CUDA、Metal、Vulkan、XPU 等通过统一 `vt::` 运行时接入，引擎代码不感知具体硬件。
+- **多后端同构**：CPU、CUDA、Metal、ROCm、Vulkan、Tenstorrent 已通过统一 `vt::` 运行时接入，XPU / ANE 后续跟进，引擎代码不感知具体硬件。
 
 ---
 
@@ -59,17 +59,23 @@
 
 ### 3.1 C ABI（库入口）
 
-`include/vllm.h` 是稳定的 C 接口，当前 ABI 版本 `VLLM_ABI_VERSION 10`：
+`include/vllm.h` 是稳定的 C 接口，当前 ABI 版本 `VLLM_ABI_VERSION 17`：
 
 - `vllm_engine_load()`：从模型目录或 **GGUF 文件**构建完整引擎（`model_path` 直接接受 `.gguf`）。
 - `vllm_complete()` / `vllm_complete_stream()`：阻塞式或流式完成。
+- `vllm_complete_tokens()`（ABI v13）：预 tokenized 的阻塞式完成。
 - `vllm_request_submit()` / `vllm_request_wait()`：非阻塞异步请求。
 - `vllm_chat()` / `vllm_chat_stream()`：OpenAI 风格 chat，引擎侧做 chat template、tool/reasoning 解析。
+- `vllm_transcribe()` / `vllm_transcription_params`（ABI v11）：Parakeet 语音转文字。
+- `vllm_embed()` / `vllm_embedding_result`（ABI v15）：Llama 等 pooling 模型获取文本嵌入。
+- `vllm_video_engine_load()` / `vllm_video_generate()` / `vllm_video_mux_argv()`（ABI v12）：MiniMax-H3 视频+音频生成与 mux。
+- `vllm_server_main()`：以库形式直接启动 OpenAI 兼容 HTTP 服务器（`examples/server` 是其薄封装）。
+- `vllm_abi_version()`：返回编译时 ABI 版本。
 - 结构化输出、投机解码、前缀缓存、调度策略、外部 KV 传输均通过 `vllm_model_params` 字段配置。
 
 ### 3.2 CLI
 
-`examples/cli/main.cpp` 完全走 C ABI：
+`examples/cli/main.cpp` 完全走 C ABI，并暴露 `--max-num-seqs` 等关键调度参数：
 
 ```text
 解析参数 → vllm_model_params_default() → vllm_engine_load()
@@ -99,6 +105,12 @@
 | GET  | `/metrics` | Prometheus 指标（vLLM 同名） |
 | POST | `/tokenize`、`/detokenize` | 分词/反分词 |
 | POST | `/reset_prefix_cache` | 重置前缀缓存 |
+| POST | `/v1/embeddings` | 文本嵌入（pooling 模型） |
+| POST | `/v1/audio/transcriptions` | 语音转文字（Parakeet） |
+| POST | `/v1/videos` | 视频生成任务入队（MiniMax-H3） |
+| POST | `/v1/videos/sync` | 同步视频生成，返回 MP4 |
+| GET  | `/v1/videos/{id}` | 查询异步视频任务状态 |
+| GET  | `/v1/videos/{id}/content` | 获取已完成 MP4 字节 |
 | GET  | `/server_info` | 服务信息 |
 
 启动示例：
@@ -155,6 +167,8 @@ EngineCoreProc 线程
     → 拉取 EngineCoreOutputs
     → OutputProcessor 生成每个请求的 delta
     → 唤醒对应 RequestOutputCollector
+
+> 注：经典 Dense 模型（如 Qwen3 系列）的异步服务路径已默认使用设备镜像（Async Dense Mirror），将 `Qwen3ForCausalLM` 的同步 `LLMEngine` 执行迁移到 `AsyncLLM`，消除同步 server 的 GPU 空闲。
 ```
 
 ---
@@ -215,7 +229,7 @@ execute_model(scheduler_output)
     4. 根据模型类型调用 Forward：
        - Qwen3_5Model::Forward (MoE hybrid GDN + full-attn)
        - Qwen3_5DenseModel::Forward
-       - Llama / Mistral / Gemma / DeepSeek-V4 / ... 等注册模型
+       - Llama / Mistral / Gemma-4 / DeepSeek-V4 / Kimi-Linear-48B / Muse-Glimmer / MiniMax-H3 / Parakeet / ... 等注册模型
     5. stash logits + step inputs
 
 sample_tokens(grammar_output)
@@ -267,10 +281,12 @@ GDN 元数据负责把 batch 分割成 `num_decodes / num_prefills / num_spec_de
 ### 7.3 后端实现
 
 ```text
-src/vt/cuda/     → cuBLASLt / CUTLASS / Triton-AOT cubins / 手写 CUDA kernels
-src/vt/cpu/      → C++ 参考内核，用于 CI、op parity、无 GPU 机器
-src/vt/metal/    → Apple Silicon Metal / 可选 MLX GEMM provider
-src/vt/vulkan/   → 可移植 GPU 骨架（当前 8 个 op + fusion catalog 校验）
+src/vt/cuda/         → cuBLASLt / CUTLASS / Triton-AOT cubins / 手写 CUDA kernels
+src/vt/cpu/          → C++ 参考内核，用于 CI、op parity、无 GPU 机器
+src/vt/metal/        → Apple Silicon Metal / 可选 MLX GEMM provider
+src/vt/rocm/         → AMD ROCm HIP 后端（HIPBLASLt、自定义 kernel）
+src/vt/vulkan/       → 可移植 GPU 后端（compute shaders + SPIR-V）
+src/vt/tenstorrent/  → Tenstorrent 设备后端（TTNN / mesh-trace）
 ```
 
 CUDA 侧把 Triton-AOT cubin（GDN、NVFP4 等）vendor 进仓库，编译运行不需要 Python/Triton。
@@ -352,7 +368,10 @@ GGUF 是 vllm.cpp 的一等公民输入格式，与 safetensors 并列：
 
 - image / video / audio 路径通过 `multimodal::MultiModalInputs` 进入引擎。
 - vision tower 在主机侧（或 encoder runner）预处理，生成 merged embeddings 与 MRoPE positions。
-- 已支持 Qwen3-VL、Qwen3.6-27B vision、Voxtral audio。
+- 视频生成：MiniMax-H3 提供 `vllm_video_*` C API 与 `/v1/videos` 端点，生成帧 + WAV 后由调用者 exec ffmpeg 得到 MP4。
+- 语音转写：Parakeet CTC/RNN-T/TDT 家族通过 `vllm_transcribe` 与 `/v1/audio/transcriptions` 提供服务。
+- 文本嵌入：Llama 等 pooling 模型通过 `vllm_embed` 与 `/v1/embeddings` 提供服务。
+- 已支持 Qwen3-VL、Qwen3.6-27B vision、Voxtral audio、Muse-Glimmer、MiniMax-H3、Parakeet。
 
 ### 9.5 外部 KV 卸载
 

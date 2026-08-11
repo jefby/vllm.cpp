@@ -1,6 +1,6 @@
 # vllm.cpp OpenAI Server 流程详解
 
-> 对应代码：`examples/server/main.cpp`、`vllm/entrypoints/openai/*`、`vllm/entrypoints/model_loader.*`、`vllm/v1/engine/async_llm.*`。
+> 对应代码：`examples/server/main.cpp`、`src/vllm/entrypoints/openai/*`（含 `api_server`、`server_main`、`video_api`、`serving_*`）、`vllm/entrypoints/model_loader.*`、`vllm/v1/engine/async_llm.*`。基于合并 `main` 后的最新代码（2026-08-11）。
 
 ---
 
@@ -36,8 +36,8 @@
    - `OpenAIServingCompletion`：使用 `engine->async_engine()`。
    - `OpenAIServingChat`：使用 `async_engine()` + `MakeChatTemplatePromptFn(...)` + tool/reasoning parser。
    - `OpenAIServingModels`：模型名检查。
-4. **构造 `ApiServer`**：绑定 completion / chat / models handler，配置最大并发流。
-5. **注册可选端点**：`/metrics`、`/tokenize`、`/detokenize`、`/reset_prefix_cache`、`/abort_requests`、`/tokenizer_info`。
+4. **构造 `ApiServer`**：绑定 completion / chat / models / embeddings / audio / videos handler，配置最大并发流。
+5. **注册可选端点**：`/metrics`、`/tokenize`、`/detokenize`、`/reset_prefix_cache`、`/abort_requests`、`/tokenizer_info`；加载 pooling 模型时注册 `/v1/embeddings`，加载 Parakeet 时注册 `/v1/audio/transcriptions`，挂载 MiniMax-H3 video engine 时注册 `/v1/videos*`。
 6. **listen(host, port)**：阻塞运行 HTTP 服务。
 
 ### 2.2 `LoadedEngine::FromModelDir`
@@ -88,6 +88,12 @@ static constexpr size_t kControlWorkerHeadroom = 4;
 | POST | `/tokenize`、`/detokenize` | `handle_tokenize` / `handle_detokenize`（需 tokenizer） |
 | POST | `/reset_prefix_cache` | `handle_reset_prefix_cache`（需回调） |
 | POST | `/abort_requests` | `handle_abort_requests`（需回调，dev mode） |
+| POST | `/v1/embeddings` | `handle_embeddings`（需 `embedder_` 回调） |
+| POST | `/v1/audio/transcriptions` | `handle_audio_transcriptions`（multipart WAV，需 `transcriber_` 回调） |
+| POST | `/v1/videos` | 异步任务入队（需 MiniMax-H3 video engine） |
+| POST | `/v1/videos/sync` | 同步视频生成，返回 MP4 |
+| GET  | `/v1/videos/{id}` | 查询异步视频任务状态 |
+| GET  | `/v1/videos/{id}/content` | 获取已完成的 MP4 字节 |
 | GET  | `/tokenizer_info` | `handle_tokenizer_info`（需 enable flag） |
 
 ---
@@ -234,6 +240,23 @@ ChatSseStream::next()
 
 Dev mode 端点，解析 `{request_ids: [...]}`，调用 `AsyncLLM::abort()`。空列表表示 abort 所有 in-flight 请求。
 
+### 6.6 `/v1/embeddings`
+
+在 **embedding-capable** 引擎（pooling 模型，如 Llama embedding）上运行，输入为单条字符串或字符串数组，输出 OpenAI 兼容的 `embedding` 数组。HTTP 端点与 `vllm_embed` C API 共享同一条 `LLMEngine::embed -> PoolingRunner` 路径，避免 HTTP 与 FFI 行为漂移。
+
+### 6.7 `/v1/audio/transcriptions`
+
+镜像 vLLM `speech_to_text/transcription`，接收 `multipart/form-data` 上传的 16-bit PCM mono WAV（16 kHz），由 Parakeet CTC/RNN-T/TDT 模型转写为文本。返回纯文本或 token id 取决于 checkpoint 是否携带 tokenizer。
+
+### 6.8 `/v1/videos*`（MiniMax-H3）
+
+- `POST /v1/videos`：入队异步视频生成任务，立即返回 `{id, status}`。
+- `POST /v1/videos/sync`：同步执行生成，直接返回 MP4 文件。
+- `GET /v1/videos/{id}`：查询任务状态。
+- `GET /v1/videos/{id}/content`：下载已完成 MP4 字节。
+
+实现位于 `video_api.*`；视频 DiT、文本编码器、音频 VAE 与 mux argv 构造由 `vllm_video_*` C API 提供。
+
 ---
 
 ## 7. Streaming / SSE 实现
@@ -261,7 +284,7 @@ struct SseStream {
 | 模式 | 使用场景 | 特点 |
 |------|---------|------|
 | `LLMEngine`（同步） | `examples/cli`、legacy server 路径、单元测试 | 单请求 `generate()` 阻塞 |
-| `AsyncLLM`（异步） | `examples/server` 生产路径 | 多请求并发，输出处理线程，batch-queue depth=2 重叠前向与采样输出 copy |
+| `AsyncLLM`（异步） | `examples/server` 生产路径 | 多请求并发，输出处理线程，batch-queue depth=2 重叠前向与采样输出 copy；经典 Dense Qwen3 已默认迁移到异步设备镜像 |
 
 `OpenAIServingCompletion/Chat` 同时支持两种构造：
 
@@ -301,6 +324,9 @@ OpenAIServingChat(v1::AsyncLLM& engine, ...);    // 异步
 | Tool / Reasoning Parser | `src/vllm/entrypoints/openai/tool_parsers/*`、`src/vllm/entrypoints/openai/reasoning_parsers/*` |
 | 异步引擎 | `src/vllm/v1/engine/async_llm.cpp`、`include/vllm/v1/engine/async_llm.h` |
 | SSE 接口 | `include/vllm/entrypoints/openai/serving_completion.h`（`SseStream`） |
+| 视频生成端点 | `src/vllm/entrypoints/openai/video_api.cpp`、`include/vllm/entrypoints/openai/video_api.h` |
+| Server 主入口 | `src/vllm/entrypoints/openai/server_main.cpp`、`include/vllm/entrypoints/openai/server_main.h` |
+| Run batch | `src/vllm/entrypoints/openai/run_batch.cpp`、`include/vllm/entrypoints/openai/run_batch.h` |
 
 ---
 

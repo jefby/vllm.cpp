@@ -505,4 +505,48 @@ vllm.cpp 的**主要性能目标是 vLLM parity**，llama.cpp 仅作为 **second
 
 ---
 
+## 15. Qwen3.6-27B 支持速查
+
+Qwen3.6-27B 是 vllm.cpp 的 MVP gate 模型之一，走 **dense / GDN-hybrid** 路径，与 35B-A3B 共享同一个 `Qwen3_5Model` 前向骨架，但**无 MoE**。
+
+### 15.1 架构注册
+
+- 注册名：`"Qwen3_5ForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_dense.cpp:208`）。
+- 文件注释明确写 “DENSE Qwen3.6-27B text gate”。
+- 核心前向同样在 `src/vllm/model_executor/models/qwen3_5.cpp`（`Qwen3_5Model::Forward` / `ForwardDevice` / `Qwen3_5DenseDecodeGraph`）。
+- 经典 Dense 版本另有 `"Qwen3ForCausalLM"`（`src/vllm/model_executor/models/qwen3_dense.cpp:155`）。
+
+### 15.2 加载路径
+
+| 格式 | 入口 | 说明 |
+|------|------|------|
+| Safetensors NVFP4 | `LoadQwen3_5Dense` in `qwen3_5_dense_weights.cpp` | 同时覆盖 `unsloth/Qwen3.6-27B-NVFP4` 与 `nvidia/Qwen3.6-27B-NVFP4` 两个发布源 |
+| GGUF | `LoadQwen3_5DenseFromGguf` in `qwen3_5_gguf_weights.cpp` | 支持 Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / F32 等混合量化，CPU/CUDA keep-quant 直接算 |
+| C ABI | `vllm_engine_load()` | `model_path` 直接指向模型目录或 `.gguf` 文件 |
+
+### 15.3 已支持的高级特性
+
+- **NVFP4 W4A4 / W4A16**：CUDA Blackwell 路径默认 keep-quant；`lm_head` FP4 打包、`GDN FP8 QKVZ` 合并优化已落地。
+- **GGUF keep-quant**：CPU / CUDA 直接对压缩块计算，无需整体反量化为 BF16。
+- **CUDA decode graph**：`Qwen3_5DenseDecodeGraph`（`qwen3_5_dense.cpp` 中启用）。
+- **MTP 投机解码**：`qwen3_5_mtp.h` 提供 27B / 35B 共享的 MTP 草稿层。
+- **DFlash / DSpark spec**：`qwen3_dflash.h` / `qwen3_dspark.h` 针对 27B 提供 speculative verify 路径。
+- **前缀缓存**：dense full-attention 层默认开启；GDN 组默认关闭。
+- **异步设备镜像**：dense Qwen3 路径已默认迁移到 `AsyncLLM`。
+
+### 15.4 测试与性能基准
+
+- Parity golden：`tests/parity/goldens/qwen36_*_27b/` 包含 logits、GDN layer、full-attention layer、norm、embed、MTP head 等测试基准。
+- 功能测试：`tests/vllm/models/test_qwen27_paged_forward.cpp`、`tests/parity/test_qwen27_gguf_nvfp4_compute.cpp` 等。
+- `docs/BENCHMARKS.md` 中 Qwen3.6-27B 的绑定对比（GB10）：
+
+| Checkpoint | vs vLLM 0.25.0 | 结果 |
+|---|---|---|
+| `unsloth/Qwen3.6-27B-NVFP4` @`890bdef7` | c1 1.045x，c2–c32 1.011–1.017x | **ahead / tie** |
+| `nvidia/Qwen3.6-27B-NVFP4` @`0893e160` (ModelOpt `modelopt_mixed`) | c1 0.838x，c2–c8 0.964–0.967x | **behind / near-tie** |
+
+> 两个 27B 同名 checkpoint 因量化分布不同（unsloth vs nvidia ModelOpt）被当作不同行对比。
+
+---
+
 *文档由 Kimi Code 根据当前仓库源码与 AGENTS.md / README.md / docs 生成。*

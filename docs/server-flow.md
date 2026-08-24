@@ -1,6 +1,6 @@
 # vllm.cpp OpenAI Server 流程详解
 
-> 对应代码：`examples/server/main.cpp`、`src/vllm/entrypoints/openai/*`（含 `api_server`、`server_main`、`video_api`、`serving_*`）、`vllm/entrypoints/model_loader.*`、`vllm/v1/engine/async_llm.*`。基于合并 `main` 后的最新代码（2026-08-11）。
+> 对应代码：`examples/server/main.cpp`、`src/vllm/entrypoints/openai/*`（含 `api_server`、`server_main`、`video_api`、`speech_api*`、`serving_*`）、`vllm/entrypoints/model_loader.*`、`vllm/v1/engine/async_llm.*`。基于合并 `main` 后的最新代码（2026-08-24，ABI v23）。
 
 ---
 
@@ -26,7 +26,7 @@
 
 ### 2.1 `examples/server/main.cpp`
 
-1. **解析命令行**：`--model`、`--host`、`--port`、`--max-num-seqs`、`--max-num-batched-tokens`、`--enable-prefix-caching`、`--scheduling-policy`、`--tool-call-parser`、`--reasoning-parser`、`--kv-transfer-config`、`--speculative-config` 等。
+1. **解析命令行**：`--model`、`--host`、`--port`、`--max-num-seqs`、`--max-num-batched-tokens`、`--enable-prefix-caching`、`--scheduling-policy`、`--tool-call-parser`、`--reasoning-parser`、`--kv-transfer-config`、`--speculative-config` 等；语音/视频生成另有 `--speech-model` / `--speech-family` / `--speech-device` 与 `--video-*` 系列，多模态 GGUF 走 `--mmproj`。`--speech-model` 可单独使用（不带 `--model` 时服务只挂 `/v1/audio/speech`）。
 2. **加载模型**：
    ```text
    EngineParams params = {...};
@@ -90,11 +90,13 @@ static constexpr size_t kControlWorkerHeadroom = 4;
 | POST | `/abort_requests` | `handle_abort_requests`（需回调，dev mode） |
 | POST | `/v1/embeddings` | `handle_embeddings`（需 `embedder_` 回调） |
 | POST | `/v1/audio/transcriptions` | `handle_audio_transcriptions`（multipart WAV，需 `transcriber_` 回调） |
+| POST | `/v1/audio/speech` | `handle_audio_speech`（JSON 请求、返回 audio/wav 字节；OpenAI createSpeech 形态，仅当 `synthesizer_` 回调存在时注册） |
 | POST | `/v1/videos` | 异步任务入队（需 MiniMax-H3 video engine） |
 | POST | `/v1/videos/sync` | 同步视频生成，返回 MP4 |
 | GET  | `/v1/videos/{id}` | 查询异步视频任务状态 |
 | GET  | `/v1/videos/{id}/content` | 获取已完成的 MP4 字节 |
-| GET  | `/tokenizer_info` | `handle_tokenizer_info`（需 enable flag） |
+| GET  | `/tokenizer_info` | `handle_tokenizer_info`（需 tokenizer + enable flag） |
+| GET  | `/server_info` | `handle_server_info`（只读三键 server_info 形态，始终注册） |
 
 ---
 
@@ -248,7 +250,13 @@ Dev mode 端点，解析 `{request_ids: [...]}`，调用 `AsyncLLM::abort()`。�
 
 镜像 vLLM `speech_to_text/transcription`，接收 `multipart/form-data` 上传的 16-bit PCM mono WAV（16 kHz），由 Parakeet CTC/RNN-T/TDT 模型转写为文本。返回纯文本或 token id 取决于 checkpoint 是否携带 tokenizer。
 
-### 6.8 `/v1/videos*`（MiniMax-H3）
+### 6.8 `/v1/audio/speech`
+
+OpenAI `createSpeech` 形态：请求体是 JSON（`model` 必填、`input` 文本、可选 `language` / `lyrics` / `description` / 参考音频等），响应直接是 `audio/wav` 字节。仅在启动时附带 `--speech-model`（MiniMax-Music3 等语音/音乐家族）时注册，纯文本服务器保持 404。
+
+实现位于 `speech_api.*`（路由契约）与 `speech_api_synthesize.cpp`（到 `SpeechEngine` 的唯一映射）；引擎侧通过 C ABI 的 `vllm_speech_engine_load` / `vllm_synthesize`（ABI v20）暴露，波形与 RIFF/WAVE 字节一次生成。
+
+### 6.9 `/v1/videos*`（MiniMax-H3 / LTX-2.5）
 
 - `POST /v1/videos`：入队异步视频生成任务，立即返回 `{id, status}`。
 - `POST /v1/videos/sync`：同步执行生成，直接返回 MP4 文件。
@@ -319,8 +327,10 @@ OpenAIServingChat(v1::AsyncLLM& engine, ...);    // 异步
 | `/v1/chat/completions` 逻辑 | `src/vllm/entrypoints/openai/serving_chat.cpp`、`include/vllm/entrypoints/openai/serving_chat.h` |
 | OpenAI 协议类型 | `include/vllm/entrypoints/openai/protocol.h`、`src/vllm/entrypoints/openai/protocol.cpp` |
 | 模型加载与引擎栈 | `src/vllm/entrypoints/model_loader.cpp`、`include/vllm/entrypoints/model_loader.h` |
-| Chat Template | `src/vllm/entrypoints/chat_template.*` |
-| 多模态 chat 预处理 | `src/vllm/entrypoints/openai/chat_mm.*` |
+| Chat Template | `include/vllm/entrypoints/chat_template.h`、`src/vllm/entrypoints/chat_template.cpp` |
+| 多模态 chat 预处理 | `include/vllm/entrypoints/openai/chat_mm.h`、`src/vllm/entrypoints/openai/chat_mm.cpp` |
+| 语音转写端点 | `src/vllm/entrypoints/openai/api_server.cpp`（`handle_audio_transcriptions`） |
+| 语音合成端点 | `include/vllm/entrypoints/openai/speech_api.h`、`src/vllm/entrypoints/openai/speech_api.cpp`、`speech_api_synthesize.cpp` |
 | Tool / Reasoning Parser | `src/vllm/entrypoints/openai/tool_parsers/*`、`src/vllm/entrypoints/openai/reasoning_parsers/*` |
 | 异步引擎 | `src/vllm/v1/engine/async_llm.cpp`、`include/vllm/v1/engine/async_llm.h` |
 | SSE 接口 | `include/vllm/entrypoints/openai/serving_completion.h`（`SseStream`） |

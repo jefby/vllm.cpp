@@ -1,6 +1,6 @@
 # vllm.cpp 软件架构流程分析
 
-> 生成时间：基于合并 `main` 后的最新代码快照（2026-08-11）。
+> 生成时间：基于合并 `main` 后的最新代码快照（2026-08-24，ABI v23）。
 > 分析范围：C++ 推理引擎核心、vt 张量运行时、调度与执行管线、服务入口、C ABI 与多模态扩展。
 
 ---
@@ -13,7 +13,7 @@
 - **行为镜像 vLLM**：同一 workload、同一模型、greedy 解码要求 token-for-token 一致。
 - **llama.cpp 式部署**：核心产物是 `libvllm` + 稳定 C ABI（`include/vllm.h`），上层再包 CLI / OpenAI 服务器。
 - **GGUF 一等公民**：与 safetensors 并列支持，CPU 可直接在量化块上计算。
-- **多后端同构**：CPU、CUDA、Metal、ROCm、Vulkan、Tenstorrent 已通过统一 `vt::` 运行时接入，XPU / ANE 后续跟进，引擎代码不感知具体硬件。
+- **多后端同构**：CPU、CUDA、Metal、ROCm、Vulkan、Tenstorrent 已通过统一 `vt::` 运行时接入；`DeviceType` 已预留 `kXPU`（实现仍在路线图上），引擎代码不感知具体硬件。
 
 ---
 
@@ -59,7 +59,7 @@
 
 ### 3.1 C ABI（库入口）
 
-`include/vllm.h` 是稳定的 C 接口，当前 ABI 版本 `VLLM_ABI_VERSION 17`：
+`include/vllm.h` 是稳定的 C 接口，当前 ABI 版本 `VLLM_ABI_VERSION 23`：
 
 - `vllm_engine_load()`：从模型目录或 **GGUF 文件**构建完整引擎（`model_path` 直接接受 `.gguf`）。
 - `vllm_complete()` / `vllm_complete_stream()`：阻塞式或流式完成。
@@ -67,6 +67,8 @@
 - `vllm_request_submit()` / `vllm_request_wait()`：非阻塞异步请求。
 - `vllm_chat()` / `vllm_chat_stream()`：OpenAI 风格 chat，引擎侧做 chat template、tool/reasoning 解析。
 - `vllm_transcribe()` / `vllm_transcription_params`（ABI v11）：Parakeet 语音转文字。
+- `vllm_speech_engine_load()` / `vllm_synthesize()` / `vllm_speech_result_free()` 及家族/采样率/参考音频查询（ABI v20，v21 加设备选择）：MiniMax-Music3 等语音/音乐合成。
+- 多模态 GGUF 的 `clip` mmproj 文件随主模型一起加载（ABI v22 的 `--mmproj` / `mmproj_path`）。
 - `vllm_embed()` / `vllm_embedding_result`（ABI v15）：Llama 等 pooling 模型获取文本嵌入。
 - `vllm_video_engine_load()` / `vllm_video_generate()` / `vllm_video_mux_argv()`（ABI v12）：MiniMax-H3 视频+音频生成与 mux。
 - `vllm_server_main()`：以库形式直接启动 OpenAI 兼容 HTTP 服务器（`examples/server` 是其薄封装）。
@@ -107,6 +109,7 @@
 | POST | `/reset_prefix_cache` | 重置前缀缓存 |
 | POST | `/v1/embeddings` | 文本嵌入（pooling 模型） |
 | POST | `/v1/audio/transcriptions` | 语音转文字（Parakeet） |
+| POST | `/v1/audio/speech` | 语音/音乐合成（OpenAI createSpeech 形态，需 `--speech-model`） |
 | POST | `/v1/videos` | 视频生成任务入队（MiniMax-H3） |
 | POST | `/v1/videos/sync` | 同步视频生成，返回 MP4 |
 | GET  | `/v1/videos/{id}` | 查询异步视频任务状态 |
@@ -327,8 +330,8 @@ FromModelDir(path)
 
 GGUF 是 vllm.cpp 的一等公民输入格式，与 safetensors 并列：
 
-- **C ABI**：`vllm_model_params.model_path` 可直接指向 `.gguf` 文件（`include/vllm.h:127`）。
-- **加载器**：`ModelSource::FromGguf(...)` 与 `FromSafetensors` 并列注册到 `ModelRegistry`（`include/vllm/model_executor/models/model_registry.h:75`）。
+- **C ABI**：`vllm_model_params.model_path` 可直接指向 `.gguf` 文件（`include/vllm.h:371`）；多模态模型可另附 `clip` 架构的 `mmproj-*.gguf`（ABI v22 的 `--mmproj`，`include/vllm.h:655`）。
+- **加载器**：`ModelSource::FromGguf(...)` 与 `FromSafetensors` 并列注册到 `ModelRegistry`（`include/vllm/model_executor/models/model_registry.h:93`）。
 - **tokenizer**：GGUF 内置的 `tokenizer.chat_template` 元数据会被用于 chat 入口；也可用 `--tokenizer-config` 覆盖。
 - **量化计算**：
   - CPU 路径直接对压缩块做 GEMM/GEMV，无需反量化为 BF16，内存占用与 llama.cpp 同级。
@@ -360,7 +363,7 @@ GGUF 是 vllm.cpp 的一等公民输入格式，与 safetensors 并列：
 
 ### 9.3 Tool Calling 与 Reasoning
 
-- 36 个 tool-parser 家族、9 个 reasoning parser。
+- 43 个 tool-parser 家族、13 个 reasoning parser。
 - chat template 引擎使用 vendored `google/minja`（与 llama.cpp 相同）。
 - 引擎侧流式解析 tool_calls / reasoning content。
 
@@ -368,10 +371,11 @@ GGUF 是 vllm.cpp 的一等公民输入格式，与 safetensors 并列：
 
 - image / video / audio 路径通过 `multimodal::MultiModalInputs` 进入引擎。
 - vision tower 在主机侧（或 encoder runner）预处理，生成 merged embeddings 与 MRoPE positions。
-- 视频生成：MiniMax-H3 提供 `vllm_video_*` C API 与 `/v1/videos` 端点，生成帧 + WAV 后由调用者 exec ffmpeg 得到 MP4。
+- 视频生成：MiniMax-H3 提供 `vllm_video_*` C API（v18 家族注册、v23 渲染阶段表）与 `/v1/videos` 端点，生成帧 + WAV 后由调用者 exec ffmpeg 得到 MP4；LTX-2.5 走同一 family registry。
+- 语音/音乐合成：MiniMax-Music3 通过 `vllm_speech_*`（v20/v21）与 `/v1/audio/speech` 提供服务；IndexTTS-2.5 是 vLLM-Omni lane 的参考接缝。
 - 语音转写：Parakeet CTC/RNN-T/TDT 家族通过 `vllm_transcribe` 与 `/v1/audio/transcriptions` 提供服务。
 - 文本嵌入：Llama 等 pooling 模型通过 `vllm_embed` 与 `/v1/embeddings` 提供服务。
-- 已支持 Qwen3-VL、Qwen3.6-27B vision、Voxtral audio、Muse-Glimmer、MiniMax-H3、Parakeet。
+- 已支持 Qwen3-VL、Qwen3.6-27B vision、Voxtral audio、Muse-Glimmer、MiniMax-H3、MiniMax-Music3、Parakeet 等。
 
 ### 9.5 外部 KV 卸载
 
@@ -447,9 +451,9 @@ Qwen3.6-35B-A3B 是当前代码的一等公民目标模型之一，MoE + GDN-hyb
 
 ### 13.1 架构注册
 
-- 注册名：`"Qwen3_5MoeForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_moe.cpp:178`）。
+- 注册名：`"Qwen3_5MoeForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_moe.cpp:91`）。
 - 该 TU 仅负责 registry 粘合；核心前向在 `src/vllm/model_executor/models/qwen3_5.cpp`（`Qwen3_5Model::Forward` / `ForwardDevice` / `Qwen3_5DecodeGraph`）。
-- 同步密集版本另有 `"Qwen3_5ForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_dense.cpp:208`）和经典 `"Qwen3ForCausalLM"`（`src/vllm/model_executor/models/qwen3_dense.cpp:155`）。
+- 同步密集版本另有 `"Qwen3_5ForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_dense.cpp:117`）和经典 `"Qwen3ForCausalLM"`（`src/vllm/model_executor/models/qwen3_dense.cpp:87`）。
 
 ### 13.2 加载路径
 
@@ -511,10 +515,10 @@ Qwen3.6-27B 是 vllm.cpp 的 MVP gate 模型之一，走 **dense / GDN-hybrid** 
 
 ### 15.1 架构注册
 
-- 注册名：`"Qwen3_5ForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_dense.cpp:208`）。
+- 注册名：`"Qwen3_5ForConditionalGeneration"`（`src/vllm/model_executor/models/qwen3_5_dense.cpp:117`）。
 - 文件注释明确写 “DENSE Qwen3.6-27B text gate”。
 - 核心前向同样在 `src/vllm/model_executor/models/qwen3_5.cpp`（`Qwen3_5Model::Forward` / `ForwardDevice` / `Qwen3_5DenseDecodeGraph`）。
-- 经典 Dense 版本另有 `"Qwen3ForCausalLM"`（`src/vllm/model_executor/models/qwen3_dense.cpp:155`）。
+- 经典 Dense 版本另有 `"Qwen3ForCausalLM"`（`src/vllm/model_executor/models/qwen3_dense.cpp:87`）。
 
 ### 15.2 加载路径
 

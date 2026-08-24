@@ -18,10 +18,18 @@
 | 标准 attention 内核 | portable FA-style prefill + paged decode |
 | 引擎调度主循环 | add_request → schedule → forward → sample |
 
-**hang 被隔离到 35B-A3B 独有的两条路径：**
+**hang 被隔离到 35B-A3B 独有的路径（2026-08-25 根据 upstream #1880 记录修正后）：**
 
 1. **MoE 分组专家 GEMM**：`vt::MatmulBTQuantGrouped`（`src/vt/cuda/cuda_quant_dot.cu`，2211 行，无 `__CUDA_ARCH__` 守卫 = portable 内核）
-2. **GDN hybrid 层内核**：`src/vt/cuda/cuda_gdn.cu` 的 chunked-scan prefill + packed decode
+2. **GDN hybrid 层 prefill 内核**：`src/vt/cuda/cuda_gdn.cu` 的 chunked-scan prefill（eager 执行）
+3. **decode graph capture 期间的驱动交互**（#1732 同类）：MoE 有 decode graph
+   （`qwen3_5_moe.cpp:176` 创建），capture 内的 cuBLASLt heuristic/驱动调用在 QNX 上可能表现为 hang 而非 throw
+
+> **修正记录（#1880 分析结论）**：初版曾把「GDN packed decode 回退」列为嫌疑 #2。
+> 已排除：upstream #1793 确认 **GGUF MoE loader 仍保持 `in_proj_b`/`in_proj_a`
+> split**（`qwen3_5_gguf_weights.cpp:1082-1085`），`has_packed_ba` 为 false，
+> packed GDN decode 在 GGUF MoE checkpoint 上**根本不会到达**——Triton cubin
+> 回退路径不是本 hang 的源。
 
 ## 2. 为什么这两条路径可疑
 
@@ -37,13 +45,14 @@
 
 ## 3. 嫌疑点排序
 
-| # | 嫌疑点 | 锚点 |
-|---|---|---|
-| 1 | GDN prefill chunked-scan 的 portable 回退内核挂死/死循环 | `src/vt/cuda/cuda_gdn.cu` |
-| 2 | GDN packed decode 手写内核（Triton cubin 不匹配后的回退） | `cuda_gdn.cu:2680` 起 |
-| 3 | MoE grouped quant-dot 内核 | `src/vt/cuda/cuda_quant_dot.cu` |
-| 4 | 加载期 device_fit 决策异常（QNX 上 cudaMemGetInfo 上报差异 → keep-quant/offload 误判） | `src/vllm/model_executor/model_loader/gguf_device_fit.cpp` |
-| 5 | cuBLASLt heuristic 在 graph capture 外的行为（上游 #1741 刚修过 capture 相关问题） | commit `3e4cd6d11` |
+| # | 嫌疑点 | 锚点 | 状态 |
+|---|---|---|---|
+| 1 | GDN prefill chunked-scan 的 portable 内核挂死/死循环 | `src/vt/cuda/cuda_gdn.cu`（含 `:4721` 串行前向替换） | 待验证 |
+| 2 | ~~GDN packed decode 手写内核~~ | — | **已排除**（GGUF MoE 不走 packed leg，#1793） |
+| 3 | MoE grouped quant-dot 内核 | `src/vt/cuda/cuda_quant_dot.cu` | 待验证 |
+| 4 | 加载期 device_fit 决策异常（QNX 上 cudaMemGetInfo 上报差异 → keep-quant/offload 误判） | `src/vllm/model_executor/model_loader/gguf_device_fit.cpp` | 待验证 |
+| 5 | **graph capture 期间的 cuBLASLt/驱动交互**（#1732 同类；GB10 上是 throw，QNX 可能是 hang） | `qwen3_5_moe.cpp:176`；upstream #1741 + `VT_FP8_PLAN_CACHE=1` 才双修复 | 待验证（新增） |
+| 6 | 引擎级可复现性问题（#1877：GB10 NVFP4 35B 同臂重复运行即分歧行） | upstream issue #1877 | 背景风险 |
 
 ## 4. 明天的调试计划（按序执行）
 
@@ -64,9 +73,14 @@ VT_ASYNC_RUNNER=0 VT_GDN_VALIDATE=1 ...        # 打开形状校验
 # ④ 若加载即 hang，显式给设备拟合预算：
 VT_DEVICE_WEIGHT_BUDGET_BYTES=<bytes> ...
 
-# ⑤ 对照实验：同一模型在 GB10 (sm_121a) 上跑同版本二进制确认无回归；
-#    再试 35B-A3B 的 NVFP4 safetensors 版本（走 Marlin，已 kernel-verified）
-#    以区分 "GGUF-MoE 特有" vs "MoE+GDN 共有"。
+# ⑤ graph capture 二分（#1880/#1732 分析新增的高优先级开关）：
+VLLM_CPP_CUDAGRAPH=0 VT_ASYNC_RUNNER=0 ...
+#    - hang 消失 → 问题在 capture 期间的 cuBLASLt/驱动调用（嫌疑 5，#1732 同类）
+
+# ⑥ 对照实验：同一模型在 GB10 (sm_121a) 上跑同版本二进制确认无回归；
+#    再试 35B-A3B 的 NVFP4 safetensors 版本（走 Marlin + 可达 packed leg）
+#    以区分：NVFP4 不 hang 而 GGUF hang → 指向 quant-dot/device_fit（嫌疑 3/4）；
+#            两者都 hang → 指向 GDN prefill 或 capture（嫌疑 1/5）。
 ```
 
 ### 有用的环境开关速查（grep 自 `getenv("VT_*")`）
@@ -86,7 +100,17 @@ VT_DEVICE_WEIGHT_BUDGET_BYTES=<bytes> ...
 - 本仓库此前对 Thor sm_110 的验证全部基于 JetPack R38（Linux + driver 580），
   **QNX 是全新宿主 OS，零验证零适配代码**。
 
-## 6. 后续动作
+## 6. 参考提交与 issue（2026-08-24 upstream 同步合入）
+
+- `1724be38e` record(GDN-MOE-PACKED-BA) #1880：packed GDN decode 在 35B 上首次到达并测量
+  （spec：`.agents/specs/gdn-moe-packed-ba.md`）；packed 快 ~0.8%（bf16）/ ~3.5%（NVFP4）；
+  遗留 #1877 / #1878 / #1793 三个 owed。
+- `732e9ddf8` fix(FIX-FP8-PLAN-CAPTURE-1843)：fp8 plan cache 默认 ON（CUDA 13.3 下
+  capture 时未缓存 lane 有错）——重新构建时用最新 HEAD 保证行为一致。
+- 关键推论链：GGUF MoE split loader（#1793）→ packed leg 不可达 → 本 hang 与 Triton
+  cubin/packed-decode 无关；MoE decode graph 存在 → capture 期驱动交互成为新嫌疑。
+
+## 7. 后续动作
 
 - [ ] 按 §4 抓取 hang 阶段证据（step log + 二分开关结果）
 - [ ] 结果回填本文档 §3 排序表（确认/排除）

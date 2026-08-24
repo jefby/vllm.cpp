@@ -90,17 +90,17 @@ class PermissionMutationTests(unittest.TestCase):
 class TagGateMutationTests(unittest.TestCase):
     def test_an_ungated_publish_job_is_rejected(self):
         text = SHIPPED.replace(
-            "  publish:\n    needs: [plan, verify]\n    if: needs.plan.outputs.is_release == 'true'\n",
+            "  publish:\n    needs: [plan, verify]\n    if: needs.plan.outputs.publishes == 'true'\n",
             "  publish:\n    needs: [plan, verify]\n",
         )
-        assert_flags(self, text, "nothing publishes between tags")
+        assert_flags(self, text, "a pull request must not reach it")
 
     def test_an_ungated_promote_job_is_rejected(self):
         text = SHIPPED.replace(
             "  promote:\n    needs: [plan, attest]\n    if: needs.plan.outputs.is_release == 'true'\n",
             "  promote:\n    needs: [plan, attest]\n",
         )
-        assert_flags(self, text, "nothing publishes between tags")
+        assert_flags(self, text, ":latest follows a RELEASE")
 
     def test_dropping_the_tag_version_check_is_rejected(self):
         text = SHIPPED.replace('test "${GITHUB_REF_NAME}" = "v${version}"', "true")
@@ -190,6 +190,47 @@ class PlanAndPromoteTests(unittest.TestCase):
         assert_flags(self, text, "missing the 'attest' job")
 
 
+class MainPublishTests(unittest.TestCase):
+    """Main ships moving :main-<lane> images. What must stay impossible is a
+    main run writing a version tag or moving :latest, and a pull request
+    reaching a registry at all."""
+
+    def test_promote_stays_release_only(self):
+        promote = guard.job_block(SHIPPED, "promote")
+        text = SHIPPED.replace(
+            promote,
+            promote.replace(
+                "if: needs.plan.outputs.is_release == 'true'",
+                "if: needs.plan.outputs.publishes == 'true'",
+            ),
+        )
+        assert_flags(self, text, ":latest follows a RELEASE")
+
+    def test_publish_must_be_gated_on_publishes(self):
+        publish = guard.job_block(SHIPPED, "publish")
+        text = SHIPPED.replace(
+            publish,
+            publish.replace("if: needs.plan.outputs.publishes == 'true'\n", "", 1),
+        )
+        assert_flags(self, text, "a pull request must not reach it")
+
+    def test_a_pull_request_cannot_be_classified_as_a_main_publish(self):
+        text = SHIPPED.replace('GITHUB_EVENT_NAME}" != "pull_request"', 'true')
+        assert_flags(self, text, "must never be classified as a publish")
+
+    def test_main_publish_must_not_write_a_version_tag(self):
+        manifest = guard.job_block(SHIPPED, "manifest")
+        text = SHIPPED.replace(manifest, manifest.replace("main-${lane}", "${version}-${lane}"))
+        assert_flags(self, text, "never a version")
+
+    def test_promote_must_not_move_main_tags(self):
+        promote = guard.job_block(SHIPPED, "promote")
+        text = SHIPPED.replace(
+            promote, promote.replace("--moving", "--moving # main-cpu")
+        )
+        assert_flags(self, text, "moves :latest* only")
+
+
 class BuildMatrixTests(unittest.TestCase):
     """The reduced PR matrix is a cost decision; it must not become a publish gap."""
 
@@ -271,6 +312,66 @@ class TagResolutionTests(unittest.TestCase):
                 pairs[f"ghcr.io/mudler/vllm.cpp:latest-{lane}"],
                 f"ghcr.io/mudler/vllm.cpp:9.9.9-{lane}",
             )
+
+
+class BuildParallelismMutationTests(unittest.TestCase):
+    """Issue #1548. The ten-SM fat cuda lane may not take the whole runner.
+
+    Each .cu file in that lane is compiled for ten device architectures, so one
+    compiler process holds many times the resident set of a cpu or vulkan
+    translation unit. Run 32447481128 died at object 512 of 787 with exit 143.
+    The two building jobs build the identical image, so a cap that holds in one
+    and not the other lets publish die on the build verify proved.
+    """
+
+    def test_an_uncapped_nproc_reaching_every_lane_is_rejected(self):
+        for job in ("verify", "publish"):
+            marker = (
+                "vllm-cpp-verify" if job == "verify" else "vllm-cpp-publish"
+            )
+            text = SHIPPED.replace(
+                '            --build-arg "JOBS=${jobs}" \\\n'
+                f'            --tag "{marker}:',
+                '            --build-arg "JOBS=$(nproc)" \\\n'
+                f'            --tag "{marker}:',
+            )
+            self.assertNotEqual(text, SHIPPED, f"{job} mutation did not apply")
+            assert_flags(self, text, f"job {job!r} hands JOBS=$(nproc)")
+
+    def test_dropping_the_cuda_cap_from_either_building_job_is_rejected(self):
+        for job, marker in (
+            ("verify", "vllm-cpp-verify"),
+            ("publish", "vllm-cpp-publish"),
+        ):
+            block = guard.job_block(SHIPPED, job)
+            self.assertIn(marker, block)
+            text = SHIPPED.replace(
+                block,
+                block.replace(
+                    '          if [ "${{ matrix.lane }}" = "cuda" ]; then jobs=2; fi\n',
+                    "",
+                ),
+            )
+            self.assertNotEqual(text, SHIPPED, f"{job} mutation did not apply")
+            assert_flags(self, text, f"job {job!r} must lower build parallelism")
+
+    def test_capping_a_lane_that_is_not_failing_is_still_accepted(self):
+        # The gate is on the SHAPE, not on the number. Tuning the cuda value is
+        # a measurement decision and must not need a checker edit.
+        text = SHIPPED.replace(
+            'then jobs=2; fi', 'then jobs=3; fi'
+        )
+        self.assertNotEqual(text, SHIPPED)
+        self.assertEqual(errors_for(text), [])
+
+    def test_removing_the_timeout_from_either_building_job_is_rejected(self):
+        for job in ("verify", "publish"):
+            block = guard.job_block(SHIPPED, job)
+            text = SHIPPED.replace(
+                block, block.replace("    timeout-minutes: 300\n", "", 1)
+            )
+            self.assertNotEqual(text, SHIPPED, f"{job} mutation did not apply")
+            assert_flags(self, text, f"job {job!r} must declare timeout-minutes")
 
 
 if __name__ == "__main__":

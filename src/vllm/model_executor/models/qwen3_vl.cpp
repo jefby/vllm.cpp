@@ -19,6 +19,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_attn_block.h"    // Dev/DBuf/ResidentWeight/KvSlice
 #include "vllm/model_executor/models/dense_weight_loaders.h"  // dense_loaders::*
+#include "vllm/model_executor/models/interfaces.h"          // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/model_registry.h"      // MM-ENGINE-FORWARD: ModelForwardInput/MultiModalForwardInput/ModelRegistry
 #include "vllm/model_executor/models/qwen3_5.h"             // GdnStateCache (ModelForwardInput field)
 #include "vllm/model_executor/models/qwen3_vl_text.h"       // Qwen3VL{GetRopeIndex,MergeMultimodal,ComputeDeepstack}
@@ -26,6 +27,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/unaligned.h"  // LoadUnaligned — mmap'd payloads have no alignment guarantee
 
 namespace vllm {
 namespace {
@@ -69,13 +71,20 @@ void RoundToBf16(std::vector<float>& v) {
 }
 
 // ---- vision weight loader: model.visual.* bf16 -> host f32 (matches M2a dump) ----
+// `t.data` points into the safetensors mmap, whose payload offset carries NO
+// alignment guarantee (issue #772), so the bytes are read through
+// vt::LoadUnaligned rather than handed to Bf16BitsToF32 as a `const uint16_t*`.
+// Bf16BitsToF32 keeps that signature for its OTHER callers, which pass
+// std::vector<uint16_t>::data() and are suitably aligned by construction.
 std::vector<float> LoadVisionF32(const TensorResolver& get,
                                  const std::string& name) {
   const StTensor& t = get(name);
   VT_CHECK(t.dtype == "BF16", "qwen3-vl vision: expected BF16 for " + name);
-  const int64_t n = static_cast<int64_t>(t.nbytes / sizeof(uint16_t));
-  std::vector<float> out =
-      Bf16BitsToF32(reinterpret_cast<const uint16_t*>(t.data), n);
+  const auto n = static_cast<size_t>(t.nbytes / sizeof(uint16_t));
+  const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
+  std::vector<float> out(n);
+  for (size_t i = 0; i < n; ++i)
+    out[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return out;
 }
@@ -257,10 +266,7 @@ ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
   fl.rows = rows;
   fl.vocab = vocab;
   fl.device_tensor = dlogits.t();
-  const size_t alloc = dlogits.alloc_bytes();
-  void* p = dlogits.Release();
-  fl.device_storage =
-      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  fl.device_storage = dlogits.ReleaseShared();
   return fl;
 }
 
@@ -395,7 +401,8 @@ int32_t VLArgMaxFromForward(Dev d, const ForwardLogits& fl) {
 }  // namespace
 
 Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
-                                  const HfConfig& config) {
+                                  const HfConfig& config,
+                                  const MultiModalConfig* mm_config) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
@@ -410,7 +417,20 @@ Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
   w.text = LoadTextBackbone(get, config);
   // Vision tower (model.visual.*), bf16 -> f32; w.vision_cfg holds the Qwen3-VL-4B
   // defaults. Shared with the 27B path via LoadQwen3VLVisionWeights.
-  w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg);
+  //
+  // #607 L3, the TOWER SKIP. `w.vision_cfg` above is the constructed-but-
+  // uninitialised half: the geometry is resolved either way, only the storage is
+  // conditional, which is what `no_init_weights` over `torch.device("meta")`
+  // does upstream (interfaces.py:288-293, utils.py:762). The modality set is
+  // `{"image", "video"}` because that is exactly how upstream marks this tower
+  // (qwen3_vl.py:1747, and qwen3_5.py:422,634 for the 27B/35B wrappers that
+  // compose the SAME Qwen3_VisionTransformer), so `image: 0` alone keeps it.
+  if (SkipTowerForModalities(mm_config, {"image", "video"})) {
+    w.vision_skipped = true;
+  } else {
+    w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg);
+    w.vision_loaded = true;
+  }
   return w;
 }
 

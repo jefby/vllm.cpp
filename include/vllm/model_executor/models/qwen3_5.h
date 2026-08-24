@@ -23,6 +23,7 @@
 // f32. Weights are the owned host bf16 tensors from qwen3_5_weights.h.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -35,6 +36,7 @@
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vt/device.h"
+#include "vt/fp8_kv.h"  // KV-FP8 W3: the PagedKvCache fp8 interpretation
 #include "vt/tensor.h"
 
 namespace vllm {
@@ -64,6 +66,19 @@ struct PagedKvCache {
   int64_t block_size = 0;
   int64_t num_kv_heads = 0;
   int64_t head_size = 0;
+  // KV-FP8 W3 — carried straight from the layer's `AttentionSpec` by the runner
+  // and consumed by `dense_attn::WriteKvCache` / `dense_attn::ApplyKvCacheQuant`.
+  // ADDITIVE and default-inert: `kAuto` means `dtype` is a float cache and the
+  // store/read take the byte-identical float path they always did.
+  //
+  // `dtype` and `fp8_kind` travel TOGETHER on purpose. `dtype == kI8` sizes the
+  // page at one byte per element; `fp8_kind` says what that byte means. A view
+  // that carried only the first would read fp8 bytes as int8 and only the second
+  // would index a half-sized page at full width — both are wrong tokens rather
+  // than a crash, which is why they are one struct and not two.
+  vt::Fp8KVCacheDataType fp8_kind = vt::Fp8KVCacheDataType::kAuto;
+  float k_scale = 1.0F;
+  float v_scale = 1.0F;
 };
 
 // Per-GDN-layer PERSISTENT mamba state (device buffers, updated in place). Rows
@@ -295,7 +310,14 @@ class Qwen3_5DecodeGraph {
                      const v1::CommonAttentionMetadata& attn_meta,
                      const v1::GDNAttentionMetadata& gdn_meta,
                      const std::vector<PagedKvCache>& attn_kv,
-                     const std::vector<GdnStateCache>& gdn_state);
+                     const std::vector<GdnStateCache>& gdn_state,
+                     // SPEC-DSPARK W8 (#442): non-null captures the DFlash/DSpark
+                     // aux hidden taps into this slot's PERSISTENT [S, H*taps]
+                     // buffer and points `aux_out->tensor` at it. The view is
+                     // valid until this slot's next replay, the same contract the
+                     // returned logits already carry. Null keeps the pure-decode
+                     // behavior byte-identical.
+                     Qwen3_5AuxTaps* aux_out = nullptr);
 
   // Diagnostics (A/B + tests): is a graph currently captured, and how many
   // replays have run since the last (re)capture.
@@ -318,5 +340,52 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
                                       const std::vector<float>& hidden_in,
                                       const std::vector<int32_t>& positions,
                                       int64_t seqlen, vt::Queue& queue);
+
+// ── The MoE arm's VL forward (issue #891, .agents/specs/moe-vision-tower.md) ──
+//
+// Single-image / single-video, single-sequence GREEDY generation on the
+// Qwen3.6-35B-A3B GDN-hybrid MoE backbone (`Qwen3_5MoeForConditionalGeneration`).
+// The MoE sibling of `Qwen3_5VLGenerateGreedy` / `...Video` (qwen3_5_dense.h),
+// sharing ONE implementation with them: upstream composes the SAME
+// `Qwen3_VisionTransformer` on both conditional-generation classes over two text
+// backbones, so the tower (`LoadQwen3_5MoeVision` -> `Qwen3VLVisionForward`), the
+// processor, the MRoPE index math and the greedy driver are shared and only the
+// backbone consuming the merger output differs.
+//
+// The forward is FORKED and GATED ON MM INPUT: these entry points are reached
+// only for a request that carries an image or a video. A text-only request goes
+// through the registered `ForwardQwen3_5Moe`, which is untouched.
+//
+// Two mm-only points are active, exactly as on the dense arm: (1) inputs_embeds
+// — embed(prompt_ids) then scatter the tower merger output [N,H] into the
+// image/video-token rows; (2) MRoPE — the full-attention layers' cos|sin cache is
+// built from the `Qwen3VLGetRopeIndex[Video]` positions [3,T] +
+// `config.mrope_section` ([11,11,10] interleaved) instead of the 1-D RoPE cache.
+// NO DeepStack (`deepstack_visual_indexes: []` on this family). GDN
+// (linear_attention) layers carry no rope. Allocates its own paged KV (full-attn)
+// + GDN recurrent state and greedy-decodes up to max_new_tokens (stops on
+// eos_token_id).
+//
+// prompt_ids : placeholder-expanded model input ids.
+// mm_main    : the tower merger output [N, H] (== out_hidden_size == hidden_size,
+//              2048 on the 35B), host f32; scattered (bf16-rounded) into the
+//              visual rows. N MUST equal the visual-token count.
+// grid_thw   : the LLM-grid source (t,h,w) for get_rope_index.
+std::vector<int32_t> Qwen3_5MoeVLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens);
+
+// Video sibling. The two video differences (as on the dense arm) are (a) the
+// merge mask is on video_token_id across all frames and (b) the MRoPE prefill
+// positions come from `Qwen3VLGetRopeIndexVideo`, the per-frame,
+// timestamp-interleaved scan.
+std::vector<int32_t> Qwen3_5MoeVLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens);
 
 }  // namespace vllm

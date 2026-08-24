@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include "vllm/config/multimodal.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
@@ -99,6 +100,25 @@ struct ModelSource {
   // Non-owning queue selected by the entrypoint. Dense plain-BF16 loaders may
   // stage completed layers here and the runner then reuses the same queue.
   vt::Queue* load_queue = nullptr;
+  // ENG-MM-INPUT-PIPELINE wave L3 (#607): the engine's multimodal input limits,
+  // BORROWED for the duration of one load. A loader that owns a tower asks
+  // `SkipTowerForModalities` (models/interfaces.h, the mirror of
+  // interfaces.py:293) whether to read that tower's tensors at all.
+  //
+  // Upstream reaches the same value through `vllm_config.model_config
+  // .multimodal_config` inside the model's own `__init__`. Our loader seam
+  // (ModelWeightLoader below) carries no vllm_config, and ModelSource is
+  // already the per-load CONTEXT rather than only the checkpoint — `load_queue`
+  // beside it is an engine-selected execution resource, not a property of the
+  // file — so this is where the borrow belongs. The two alternatives are
+  // recorded in specs/multimodal-track.md §1.5 L3 with the reason each was
+  // rejected: a third ModelWeightLoader parameter rewrites every architecture's
+  // signature to thread a value nearly all of them ignore, and a process-global
+  // (WeightOffloader's shape) has no upstream analogue for this config.
+  //
+  // NULL means "no limits configured for this load": load everything, which is
+  // byte-identical to pre-L3 and is what every non-engine caller gets.
+  const MultiModalConfig* multimodal = nullptr;
 };
 
 struct ModelFactory;
@@ -119,6 +139,20 @@ class LoadedModel {
   // Runtime capability rather than architecture metadata: GGUF/synthetic
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
+
+  // ENG-MM-INPUT-PIPELINE wave L3 (#607): the mirror of
+  // `SupportsMultiModal._tower_model_names` (interfaces.py:141,298) together
+  // with the `stage_name` each skipped stage carries (`:279-282`). The stage
+  // names of the towers this model CONSTRUCTED WITHOUT LOADING because every
+  // modality they serve had limit 0 — upstream's
+  // `isinstance(model.visual, StageMissingLayer)`, expressed on a type-erased
+  // base.
+  //
+  // EMPTY on every text model, and on every multimodal model loaded with a
+  // non-zero limit. It exists so the skip is observable from a PRODUCTION entry
+  // point (LoadedEngine::skipped_towers) rather than only by downcasting to a
+  // concrete model class inside a test.
+  virtual std::vector<std::string> skipped_towers() const { return {}; }
 
   // ARCH-ONE-SURFACE ROW 6: the model-owned Pooler of a POOLING model — the
   // mirror of upstream `VllmModelForPooling.pooler` (as_embedding_model wires
@@ -184,6 +218,46 @@ class LoadedModel {
   const TensorParallel* tensor_parallel_ = nullptr;
 };
 
+// ── The type-erasure seam's OTHER half (#775) ───────────────────────────────
+// Every registered `prepare`/`forward` is handed a type-erased `LoadedModel&`
+// and has to open it as its own concrete model. Doing that with a bare
+// `static_cast` down the hierarchy is a PROMISE, not a check: on an object
+// whose dynamic type is not that model, every member call through the resulting
+// reference is undefined behaviour, and the compiler is entitled to act on the
+// promise. UBSan reports it as "member call on address ... which does not point
+// to an object of type 'X'". It is invisible without a sanitizer whenever the
+// entry point was going to refuse anyway, which is precisely the state a model
+// still missing its weight loader is in.
+//
+// `ModelAs` is the checked form: it establishes the dynamic type first and
+// refuses BY NAME when the caller paired one architecture's registration with
+// another architecture's model. The cost is one `dynamic_cast` per forward
+// step (the seam is entered once per `ModelRegistry::Forward`, not per layer),
+// against a step that is milliseconds of GEMMs.
+//
+// `architecture` is the caller's OWN architecture name, so the refusal says
+// which entry point refused rather than only that something did.
+[[noreturn]] void RaiseModelTypeMismatch(std::string_view architecture,
+                                         const LoadedModel& model);
+
+template <typename Model>
+Model& ModelAs(LoadedModel& model, std::string_view architecture) {
+  Model* typed = dynamic_cast<Model*>(&model);
+  if (typed == nullptr) {
+    RaiseModelTypeMismatch(architecture, model);
+  }
+  return *typed;
+}
+
+template <typename Model>
+const Model& ModelAs(const LoadedModel& model, std::string_view architecture) {
+  const Model* typed = dynamic_cast<const Model*>(&model);
+  if (typed == nullptr) {
+    RaiseModelTypeMismatch(architecture, model);
+  }
+  return *typed;
+}
+
 // MM-ENGINE-FORWARD: one multimodal (vision/audio-language) forward step's
 // vision-conditioned inputs, carried as an OPTIONAL sub-field of ModelForwardInput
 // (below). Set (non-nullopt) ONLY by the runner mm-path when the request carries
@@ -239,6 +313,32 @@ struct ModelForwardInput {
   int num_reqs = 0;
   int64_t gdn_state_slots = 0;
   bool pure_decode = false;
+  // SPEC-DSPARK W8 (#442): the configured speculation width, so the decode-graph
+  // gate can mirror vLLM's UNIFORM-decode predicate instead of "query_len == 1".
+  // Upstream's captured decode length is `1 + num_speculative_tokens`
+  // (cudagraph_dispatcher.py:37), which is why its T=1+k speculative VERIFY is
+  // graph-captured and ours was not. DEFAULT 0 => the predicate reduces exactly
+  // to today's pure-decode shape, so every non-spec caller is byte-identical.
+  int64_t num_speculative_tokens = 0;
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, moved off
+  // `pure_decode` and onto the step's ACTUAL uniform query length.
+  //
+  // The runner computes it once per step through
+  // `v1::ActualUniformDecodeQueryLen` (`v1/worker/gpu/cudagraph_dispatch.h`) and
+  // every model reads the answer. 0 means "no captured decode graph in this tree
+  // can serve this step" -- prefill, mixed, ragged, or uniform at a length above
+  // the configured `1 + num_speculative_tokens`. 1 is exactly `pure_decode`.
+  // A value ABOVE 1 is a speculative VERIFY step at its actual draft depth,
+  // which is the population [#1020] named and which the two Qwen3.5 drivers
+  // serve.
+  //
+  // WHY `pure_decode` SURVIVES BESIDE IT. Seven of the nine decode drivers
+  // capture a query_len == 1 shape and nothing else, and widening them here
+  // would admit steps no driver can serve -- the exact failure the spec's
+  // `## Work breakdown` W6 says to avoid by ordering this stage last. They keep
+  // reading `pure_decode`, which is provably NARROWER than this field, so the
+  // widening is opt-in per driver rather than imposed on all nine at once.
+  int64_t uniform_query_len = 0;
   bool gather_logits = true;
   // SPEC-MTP I5d-pre hidden-state tap. When non-null (only the spec verify
   // forward sets it, I5d), the Qwen3.5 dense/MoE forward routes to
@@ -305,6 +405,50 @@ struct ModelFactory {
   // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
   // Default false: every existing arch's engine load path is byte-identical.
   bool stage_on_load = false;
+  // ENG-WEIGHT-OFFLOAD: whether THIS model's loader asks
+  // `WeightOffloader::ConsiderWeight` for each weight and honours the answer.
+  //
+  // THE DEFAULT IS FALSE, AND THAT IS THE MECHANISM. There is no single upload
+  // helper in this tree: each model allocates its own device buffers, and
+  // `load_stats::AddDeviceUpload` reaches only 9 call sites in 6 files, so
+  // neither is a chokepoint that could enforce this. A model whose loader was
+  // never wired would therefore accept a `cpu_offload_gb` and silently keep
+  // every weight on the device, which is a memory bug with no error anywhere.
+  //
+  // Declaring the capability makes that case LOUD instead: the engine refuses a
+  // configured offload against a model that does not claim support, naming the
+  // architecture. A new model inherits false and is refused until someone wires
+  // it, which is the same polarity as the `-Werror=switch` totality proof in
+  // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
+  // switch over.
+  bool supports_weight_offload = false;
+  // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124): whether THIS model's forward
+  // reads its routed-expert weights through the expert-stream slot seam
+  // (`KqExpertSlice`), so the stacked `*_exps.weight` towers are served a slice
+  // at a time out of the host slot store instead of being staged.
+  //
+  // THE DEFAULT IS FALSE FOR THE SAME REASON `supports_weight_offload`'s is, and
+  // this one is load-bearing in the UNSAFE direction. The load-time fit bound
+  // (`gguf_device_fit.h`) can drop a tensor set from what it charges the device,
+  // and the loader identifies that set by NAME — `_exps.weight`, which is what a
+  // llama.cpp MoE export writes for every MoE family it converts, not only the
+  // ones this tree streams. `deepseek_v4_weights.cpp` and `laguna_weights.cpp`
+  // both write that exact suffix, and neither model composes `RunMoeBlock`
+  // (`deepseek_v2.cpp` says so at its head), so neither ever reaches
+  // `KqExpertSlice`. Dropping their towers from the bound would remove a REFUSAL
+  // THAT WAS CORRECT and put back the failure #1123 exists to prevent: a
+  // 26-minute load and then `cudaMalloc: out of memory` on the first forward.
+  //
+  // WHY THE CAPABILITY AND NOT AN ARCHITECTURE LIST. The fact is a property of
+  // the model's forward, and it lives beside the forward: `qwen3_5_moe.cpp` and
+  // `qwen3_moe_registry.cpp` are the two translation units that route into
+  // `RunMoeBlock`, and they are the two that set this. A list in the loader would
+  // be a second description of the same fact, in a file that cannot see when the
+  // first one changes — and a model whose forward stopped streaming would leave
+  // the list saying it still does. Inheriting false is the safe answer: a new
+  // architecture gets the whole bound and the #1123 refusal until somebody wires
+  // the seam and says so here.
+  bool streams_routed_experts = false;
 };
 
 struct ModelRegistration {

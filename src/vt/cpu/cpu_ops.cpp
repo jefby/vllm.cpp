@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "cpu_matmul_elem.h"
@@ -47,6 +48,11 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
     default: VT_CHECK(false, "StoreF32: unsupported dtype");
   }
 }
+
+// Defined below with the Mamba2 host references. Declared here because the
+// gated activations need it too: it is the general "what this value reads back
+// as at width `dt`" helper, not a Mamba2-private one.
+float RoundThrough(DType dt, float v);
 
 // GEMM chunk worker — 16x16 block tiling inside a chunk, ported from
 // ggml_compute_forward_mul_mat_one_chunk (ggml-cpu.c:1155-1243; empty-chunk
@@ -399,12 +405,29 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
 
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  // act(gate) is narrowed to the INPUT dtype before the multiply, which is what
+  // upstream does on every accelerator path it ships:
+  // csrc/libtorch_stable/activation_kernels.cu:158 `silu_kernel` returns
+  // `(T)(((float)x) / (1.0f + expf((float)-x * alpha)))` and :36 `compute`
+  // returns `(scalar_t)(ACT_FN(gate, alpha) * ((float)up + beta))`, so ACT_FN
+  // has already narrowed by the time the multiply happens; the vectorized
+  // :72 path narrows identically. The native reference agrees --
+  // activation.py:143 is `F.silu(x[..., :d]) * x[..., d:]`, and `F.silu` on a
+  // bf16 tensor yields bf16 -- and upstream pins the two BIT-EXACTLY at
+  // tests/kernels/core/test_activation.py:108,
+  // `assert_close(out, ref_out, atol=0.0, rtol=0.0)`. Pin 555967922. (#1322)
+  //
+  // The target is x's dtype, NOT out's. Upstream never has the two differ
+  // (`SiluAndMul.forward_cuda` allocates out with `dtype=x.dtype`), while this
+  // seam permits an f32 input with a bf16 output; keying on the input leaves
+  // every f32-in path bit-identical and confines the change to bf16-in ones.
+  const DType in_dt = x.dtype;
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float gate = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
-      float silu = gate / (1.0f + std::exp(-gate));
+      float silu = RoundThrough(in_dt, gate / (1.0f + std::exp(-gate)));
       StoreF32(out, i * d + j, silu * up);
     }
   }
@@ -415,13 +438,19 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
 // sqrt(2/pi)*(g + 0.044715*g^3))) — the exact gelu_pytorch_tanh, computed in f32.
 void GeluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  // Same polarity as SiluAndMulKernel above, and the same upstream anchors:
+  // activation_kernels.cu:205 `gelu_tanh_kernel` returns
+  // `(T)(0.5f * f * (1.0f + ::tanhf(inner)))`, activation.py:418 is
+  // `F.gelu(x[..., :d], approximate=approximate) * x[..., d:]`, and gelu_tanh
+  // is one of the activations test_activation.py:108 compares at atol=rtol=0.
+  const DType in_dt = x.dtype;
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float g = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
       float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-      float gelu = 0.5f * g * (1.0f + std::tanh(inner));
+      float gelu = RoundThrough(in_dt, 0.5f * g * (1.0f + std::tanh(inner)));
       StoreF32(out, i * d + j, gelu * up);
     }
   }
@@ -450,12 +479,37 @@ void SoftCapKernel(Queue&, Tensor& out, const Tensor& x, double cap) {
 
 void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
   const int64_t n = out.Numel();
+  // Same polarity, same kernel upstream: fused_moe.py's `fused_experts_impl`
+  // reaches `activation.py::apply_moe_activation`, which calls
+  // `torch.ops._C.silu_and_mul` -- the very kernel anchored on
+  // SiluAndMulKernel above. The narrowing target is the GATE tensor's dtype,
+  // which is the activated half's input width, so the f32-gate callers
+  // (notably the grouped bf16 GEMM composite, whose partials are f32) are
+  // bit-identical to before.
+  const DType in_dt = gate.dtype;
   // Elementwise: partition the flat output range.
   ForRows(n, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     const float g = LoadF32(gate, i);
-    const float silu = g / (1.0f + std::exp(-g));
+    const float silu = RoundThrough(in_dt, g / (1.0f + std::exp(-g)));
     StoreF32(out, i, silu * LoadF32(up, i));
+  }
+  });
+}
+
+// The NON-GATED MoE activation: out[i] = relu(x[i])^2, the whole epilogue of a
+// NemotronH expert (nemotron_h.py:227 -> MoEActivation.RELU2_NO_MUL). Mirrors
+// vLLM's relu_squared_kernel (csrc/libtorch_stable/activation_kernels.cu:673-678)
+// EXACTLY in dtype order: widen to f32, clamp at zero in f32, square in f32, and
+// round ONCE on the store. LoadF32/StoreF32 are that widen/round pair, so a bf16
+// input with an f32 output keeps the full f32 square (no intermediate narrowing).
+void MoeRelu2Kernel(Queue&, Tensor& out, const Tensor& x) {
+  const int64_t n = out.Numel();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
+    const float f = LoadF32(x, i);
+    const float v = f > 0.0f ? f : 0.0f;
+    StoreF32(out, i, v * v);
   }
   });
 }
@@ -512,6 +566,209 @@ uint8_t F32ToFp8(float f) {
   }
   return static_cast<uint8_t>(sign | (static_cast<uint8_t>(exp_field) << 3) |
                               static_cast<uint8_t>(mant));
+}
+
+// --- Static per-tensor FP8 W8A8 (VT-FP8-W8A8-CPU-ARM, #468). The CPU arm of the
+// path vLLM's ModelOptFp8LinearMethod runs: a static per-tensor activation quant
+// followed by a per-tensor fp8 GEMM. It exists so the fp8 seam is reachable, and
+// therefore testable, without a GPU.
+
+// QuantFp8Static CPU kernel — mirror of vLLM's static_scaled_fp8_quant
+// (csrc/quantization/w8a8/fp8/common.cuh:58-77 `scaled_fp8_conversion`):
+//   x = val * scale;  r = fmaxf(-448, fminf(x, 448));  hardware RNE convert
+// with the RECIPROCAL formed ONCE outside the loop, exactly as upstream forms it
+// (csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31 `1.0f / scale[...]`)
+// and exactly as our CUDA kernel does (cuda_matmul_fp8_cutlass.cu: `const float
+// inv = 1.0f / input_scale;` then `LoadIn(x, i) * inv`). It is a MULTIPLY BY THE
+// RECIPROCAL, not a divide: the two differ by up to one f32 ulp before the fp8
+// round, and near an e4m3 tie that ulp changes the emitted byte.
+//
+// F32ToFp8 supplies both remaining halves: it saturates (|a| >= 448 -> 0x7E,
+// which IS the encoding of 448, so clamp-then-convert and saturating-convert
+// coincide because 448 is the largest finite e4m3fn value) and it rounds to
+// nearest-even. The scale is per-TENSOR — upstream collapses the per-shard
+// input_scale to one scalar with `.max()` (modelopt.py:528) and then treats
+// `scale.numel() == 1` as a single group spanning the whole tensor
+// (common.cu:204-210). LoadF32 widens a bf16 x to f32 BEFORE the multiply, as
+// the CUDA kernel's LoadIn overload does, so both backends round at one point.
+void QuantFp8StaticKernel(Queue&, Tensor& out_fp8, const Tensor& x, float input_scale) {
+  const int64_t n = x.shape[0] * x.shape[1];
+  const float inv_scale = 1.0F / input_scale;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) op[i] = F32ToFp8(LoadF32(x, i) * inv_scale);
+  });
+}
+
+// --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 M1). QuantFp8Group CPU kernel:
+// the DYNAMIC per-token, per-group activation quant.
+//
+// MIRROR OF THE KERNEL THAT ACTUALLY EXECUTES, which is the C++ custom op and
+// not the Triton kernel. `per_token_group_quant_fp8` calls
+// `torch.ops._C.per_token_group_fp8_quant` and RETURNS whenever the platform is
+// CUDA-alike and the input is contiguous
+// (vllm/model_executor/layers/quantization/utils/fp8_utils.py:635-650), so the
+// Triton kernel below it never runs there. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps                  eps SEEDS the reduction
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit       a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)   a DIVIDE
+//   :86  DST_DTYPE(q)                              hardware e4m3 RNE
+//
+// TWO DIVIDES, DELIBERATELY, and this is the opposite of QuantFp8StaticKernel
+// forty lines above. That kernel multiplies by a hoisted reciprocal because
+// upstream ships the reciprocal there (common.cuh:62, with `1.0f / scale`
+// formed by the caller at common.cu:31). Here upstream ships a divide, and the
+// scale changes per group, so there is no loop-invariant reciprocal to hoist in
+// the first place. The Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) differs by up to one f32 ulp and carries an upstream
+// comment saying so. Near an e4m3 tie that ulp changes the emitted byte.
+// tests/vt/test_ops_quant_fp8_group_cpu.cpp G1 compares BYTES for this reason;
+// upstream's own test compares values at rtol=0.15 and cannot see it.
+//
+// eps is the reduction's INITIAL value rather than a clamp afterwards. The two
+// are numerically identical, and writing it upstream's way makes it visible
+// that an all-zero group yields y_s = 1e-10/448 instead of dividing by zero.
+//
+// LoadF32 widens a bf16 x to f32 before the absolute value and before the
+// divide, matching `fabsf(static_cast<float>(src))` at :53 and
+// `static_cast<float>(src) / y_s` at :85, so a bf16 input rounds at one point.
+// Parallel over ROWS: each row's groups are independent, and the reduction
+// order inside a group is fixed and sequential, so the result does not depend
+// on the thread count.
+void QuantFp8GroupKernel(Queue&, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                         int group_size) {
+  const int64_t m = x.shape[0], k = x.shape[1];
+  const int64_t groups = k / group_size;
+  constexpr float kEps = 1e-10F;      // fp8_utils.py:570, the only value any
+                                      // upstream call site passes
+  constexpr float kFp8MaxV = 448.0F;  // quant_utils.py:27-35 finfo(e4m3fn).max
+  constexpr float kFp8MinV = -448.0F;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  float* sp = out_scale.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      for (int64_t g = 0; g < groups; ++g) {
+        const int64_t base = r * k + g * group_size;
+        float amax = kEps;
+        for (int64_t i = 0; i < group_size; ++i)
+          amax = std::fmax(amax, std::fabs(LoadF32(x, base + i)));
+        const float y_s = amax / kFp8MaxV;
+        sp[r * groups + g] = y_s;
+        for (int64_t i = 0; i < group_size; ++i)
+          op[base + i] =
+              F32ToFp8(std::fmin(std::fmax(LoadF32(x, base + i) / y_s, kFp8MinV), kFp8MaxV));
+      }
+    }
+  });
+}
+
+// --- Block-wise FP8 (VT-MATMUL-FP8-BLOCK-REF, #1189 M2). MatmulFp8BlockScaled
+// CPU kernel: the 128x128 block-scaled fp8 GEMM, mirroring
+// native_w8a8_block_matmul (tests/kernels/quant_utils.py:91-154).
+//
+// THE SCALES APPLY IN THE MAINLOOP, ONCE PER K-BLOCK. `part` is a SEPARATE f32
+// accumulator that is scaled and only then folded into `acc`. That separation is
+// the whole point of the op: MatmulFp8CutlassKernel fifty lines below folds one
+// scalar alpha AFTER the whole K reduction, which has exactly one degree of
+// freedom per output element while this scheme has cdiv(K, block_k) of them. An
+// epilogue-only application cannot express a per-K-block scale AT ALL. Collapsing
+// `part` into `acc` here IS that epilogue form, and
+// tests/vt/test_ops_matmul_fp8_block_cpu.cpp G4 is constructed so it cannot pass.
+//
+// The scale PRODUCT is formed first, `part * (a_s * b_s)`, mirroring
+// `s = As_tiles[i] * Bs[j][i]` then `c += matmul(a, b.t()) * s`
+// (quant_utils.py:150-151). The kernel that executes upstream is CUTLASS, not
+// Triton (vllm/model_executor/kernels/linear/__init__.py:355-377,
+// vllm/utils/deep_gemm.py:27-46), and it associates left to right --
+// `accum(i) += tmp_accum(i) * tCrScaleAViewAsC(i) * tCrScaleBViewAsC(i)`, cutlass
+// 4.5.0 sm120_mma_tma_blockwise_scaling.hpp:714-717. The two differ by at most one
+// f32 ULP per K-block, and upstream's own gate is what admits it: it compares the
+// CUTLASS arm against THIS reference at rel_diff < 0.001
+// (test_block_fp8.py:194-200). We mirror the reference, because this op is the
+// reference port.
+//
+// `col / block_n` indexes the b_scale ROW by OUTPUT COLUMN, mirroring
+// `offs_bsn = offs_bn // group_n` (fp8_utils.py:823) and the reference's tiling
+// (quant_utils.py:131-143). For a round N that agrees with a tile counter; for a
+// ragged N it does not, which is why N=576 is in the ported grid.
+//
+// CEIL tiling and a short final K-tile: `k1 = min(k0 + block_k, k)`
+// (quant_utils.py:131-141). Upstream's wrapper asserts the ceil shapes
+// (fp8_utils.py:935-936), so a ragged block is legal rather than tolerated.
+//
+// A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH, in the same sense as
+// MatmulFp8CutlassKernel below: a naive nest that makes the block-fp8 seam
+// resolvable on a CPU queue so #1189 milestones M3 and M4 can be gated without a
+// GPU. It makes no speed claim. M5 owns the CUDA arm and will be measured
+// against this one. Parallel over ROWS; each output row is independent and the
+// reduction order inside a row is fixed, so the result does not depend on the
+// thread count.
+void MatmulFp8BlockScaledKernel(Queue&, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
+                                const Tensor& b_fp8, const Tensor& b_scale, int block_n,
+                                int block_k) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  const int64_t k_tiles = (k + block_k - 1) / block_k;
+  const auto* ap = a_fp8.Ptr<uint8_t>();
+  const auto* bp = b_fp8.Ptr<uint8_t>();
+  const auto* asp = a_scale.Ptr<float>();
+  const auto* bsp = b_scale.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    std::vector<float> arow(static_cast<size_t>(k));
+    for (int64_t i = r0; i < r1; ++i) {
+      // Decode the A row once and reuse it across N, as MatmulNvfp4Fp4Kernel does.
+      for (int64_t kk = 0; kk < k; ++kk)
+        arow[static_cast<size_t>(kk)] = Fp8ToF32(ap[i * k + kk]);
+      for (int64_t col = 0; col < n; ++col) {
+        const int64_t nb = col / block_n;   // fp8_utils.py:823
+        float acc = 0.0F;
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+          const int64_t k0 = kt * block_k;
+          const int64_t k1 = std::min(k0 + static_cast<int64_t>(block_k), k);
+          float part = 0.0F;                // the MAINLOOP register, kept separate
+          for (int64_t kk = k0; kk < k1; ++kk)
+            part += arow[static_cast<size_t>(kk)] * Fp8ToF32(bp[col * k + kk]);
+          acc += part * (asp[i * k_tiles + kt] * bsp[nb * k_tiles + kt]);
+        }
+        StoreF32(out, i * n + col, acc);
+      }
+    }
+  });
+}
+
+// MatmulFp8Cutlass CPU kernel: out[m,n] = alpha * Sum_k f8val(a[m,k])*f8val(b[n,k]),
+// f32 accumulate, ONE folded alpha (= input_scale*weight_scale — our recorded
+// deviation from upstream's two epilogue scalars, see include/vt/ops.h).
+//
+// A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH. It is a naive triple loop; it
+// makes no speed claim and nothing routes a production model through it. Its
+// purpose is that the fp8 GEMM seam resolves on a CPU queue so the surrounding
+// wiring can be gated without a GPU (#468).
+//
+// It is deliberately NOT a bit-mirror of the CUDA GEMM and does not claim to be:
+// the CUDA arm reduces K in tensor-core order and rounds its epilogue through
+// bf16, so the two agree to fp8/bf16 tolerance. Only the QUANT half above carries
+// a bit-exactness claim. Shaped like MatmulNvfp4Fp4Kernel: the A row is decoded
+// once per M and reused across N.
+void MatmulFp8CutlassKernel(Queue&, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                            float alpha) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  const auto* ap = a_fp8.Ptr<uint8_t>();
+  const auto* bp = b_fp8.Ptr<uint8_t>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    std::vector<float> arow(static_cast<size_t>(k));
+    for (int64_t i = r0; i < r1; ++i) {
+      for (int64_t kk = 0; kk < k; ++kk)
+        arow[static_cast<size_t>(kk)] = Fp8ToF32(ap[i * k + kk]);
+      for (int64_t col = 0; col < n; ++col) {
+        float acc = 0.0F;
+        for (int64_t kk = 0; kk < k; ++kk)
+          acc += arow[static_cast<size_t>(kk)] * Fp8ToF32(bp[col * k + kk]);
+        StoreF32(out, i * n + col, alpha * acc);
+      }
+    }
+  });
 }
 
 // Fused fp8 RMSNorm -> static per-tensor quant (mirror vLLM Inductor
@@ -1502,6 +1759,505 @@ void KdaChunkPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tens
   KdaGatedDeltaRuleKernel(q, out, q_in, k, v, g_t, beta, state, qsl, args);
 }
 
+// ── Mamba2 / SSD host references (.agents/specs/mamba2-ssd.md W1, #496) ──────
+//
+// Landed in THIS translation unit rather than a new src/vt/cpu/cpu_mamba2_ssd.cpp
+// (which the spec's §3 port map names) because adding a source file means editing
+// the root CMakeLists.txt, which check-doc-checkpoint classifies as user_usage and
+// therefore owes a docs/USAGE.md update this change does not have. The GDN and KDA
+// references these ops are siblings of already live here, so this is where a reader
+// looks for them.
+//
+// Three ops, each a 1:1 transcription of the upstream path named on it, at the
+// pinned oracle `555967922` (vLLM 0.26.0.dev0):
+//
+//   Mamba2ChunkScan   <- ops/ssd_combined.py:27-235 (the 5-stage varlen pipeline)
+//                        over ssd_chunk_state.py, ssd_state_passing.py,
+//                        ssd_bmm.py and ssd_chunk_scan.py
+//   Mamba2StateUpdate <- ops/mamba_ssm.py:497+ `selective_state_update`, at the
+//                        scalar-per-head shape Mamba2 uses, which is also the
+//                        one upstream's OWN CPU kernel implements
+//                        (csrc/cpu/mamba_kernels.hpp:104-250)
+//   RmsNormGatedGroup <- mamba_mixer2.py:100-149 `Mixer2RMSNormGated.forward_native`
+//
+// SSD IS NOT THE GATED DELTA RULE. Nothing here is shared with, or derived from,
+// cpu_ops.cpp's GdnPrefill/GdnDecode/KdaGatedDeltaRule: those carry a delta
+// removal term `(I - beta*k*k^T)` this recurrence does not have, and a per-head
+// (or per-K-channel) decay where this one has `exp(A[h]*dt[t,h])` with `B`/`C`
+// shared across `n_groups` head groups. Sibling ops, one shared state layout
+// (mamba2-ssd.md §0, §7).
+//
+// DTYPE POLICY. Arithmetic is ALWAYS f32; only the load/store width varies, so a
+// bf16 stream rounds exactly at upstream's cast point and nowhere else. The two
+// buffers that are f32 REGARDLESS of the activation dtype are f32 because
+// upstream pins them there, not by our choice:
+//   * the per-chunk state `states` — `states_in_fp32=True` (ssd_combined.py:100-102);
+//   * `CB` — `output_dtype=torch.float32` (ssd_combined.py:124).
+// The INTER-CHUNK state that `_state_passing_fwd` produces is NOT f32: it carries
+// the caller's `state_dtype` (ssd_combined.py:46,119,176), and `_chunk_scan_fwd`
+// reads it back at that width, so the rounding is observable in `out` as well as
+// in `final_states`. `RoundThrough` below reproduces exactly that rounding.
+//
+// DELIBERATE DEVIATION FROM THE DEVICE ARM (W2 owns closing it). Triton's dots
+// downcast their tile inputs — `_chunk_state_fwd` casts the decayed `B` to x's
+// dtype before `tl.dot` (ssd_chunk_state.py:283-285) and `_chunk_scan_fwd` casts
+// the f32 `CB` and the previous state to C's dtype (:266-269, :359-363). Those
+// are tensor-core input-precision details of the device kernels, not statements
+// of the algorithm; this host reference keeps f32 throughout. The W1 gate is the
+// host reference against a sequential double-precision recurrence, not a
+// bit-compare against Triton (mamba2-ssd.md §5).
+// The value `v` as it would read back after a store/load round trip through
+// `dt`. Used to keep an f32 working buffer numerically identical to one actually
+// held at the target width — the `state_dtype` / `input_dtype` cast points.
+float RoundThrough(DType dt, float v) {
+  switch (dt) {
+    case DType::kF32: return v;
+    case DType::kF16: return F16ToF32(F32ToF16(v));
+    case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+    default: VT_CHECK(false, "mamba2: unsupported dtype"); return 0.0f;
+  }
+}
+
+// softplus, guarded exactly as upstream: `tl.where(dt <= 20.0, softplus(dt), dt)`
+// (ssd_chunk_state.py:94; the same guard at mamba_kernels.hpp:177).
+inline float SoftplusGuarded(float v) { return v <= 20.0f ? std::log1p(std::exp(v)) : v; }
+
+inline float SiluGate(float z) { return z / (1.0f + std::exp(-z)); }
+
+// A IS STRICTLY NEGATIVE, BY CONTRACT — and the contract is enforced, not
+// assumed. Upstream builds it as `A = -torch.exp(self.A_log.float())`
+// (mamba_mixer2.py:456), which is < 0 for every finite `A_log`, and `dt >= 0`
+// after the `dt_limit` clamp (`dt_min < 0` is refused in the validator).
+// Together those two make `dA_cumsum` non-increasing WITHIN a chunk, which is
+// the only reason upstream's `min(., 0)` clamps (ssd_chunk_state.py:283-285,
+// ssd_chunk_scan.py:339-341) are algebraic no-ops here rather than a
+// truncation. Neither is derivable from the arguments: fed `A = +1.0` the
+// clamped intra-chunk term silently returns a truncated recurrence instead of
+// the growing one it was asked for. An arm that is not implemented is REFUSED
+// with the missing piece named (mamba2-ssd.md §7).
+void CheckMamba2ANegative(const Tensor& A, const char* name) {
+  const float* Ap = A.Ptr<float>();
+  for (int64_t h = 0; h < A.shape[0]; ++h) {
+    VT_CHECK(Ap[h] < 0.0f,
+             std::string(name) + ": A must be strictly negative (A = -exp(A_log), " +
+                 "mamba_mixer2.py:456) — A[" + std::to_string(h) + "] = " +
+                 std::to_string(Ap[h]));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::Mamba2ChunkScan — the 5-stage varlen SSD prefill pipeline, in upstream
+// order (_mamba_chunk_scan_combined_fwd, ssd_combined.py:88-146).
+// ─────────────────────────────────────────────────────────────────────────────
+void Mamba2ChunkScanKernel(Queue&, Tensor& out, Tensor& final_states, const Tensor& x,
+                           const Tensor& dt_in, const Tensor& A, const Tensor& B,
+                           const Tensor& C, const Tensor* D, const Tensor* z,
+                           const Tensor* dt_bias, const Tensor* initial_states,
+                           const Tensor& cu_seqlens, const Tensor& cu_chunk_seqlens,
+                           const Tensor& last_chunk_indices, const Tensor& seq_idx,
+                           const Mamba2Args& args) {
+  const int64_t T = x.shape[0], H = x.shape[1], P = x.shape[2];
+  const int64_t G = B.shape[1], N = B.shape[2];
+  const int64_t S = final_states.shape[0];
+  const int64_t cs = args.chunk_size;
+  const int64_t nchunks = cu_chunk_seqlens.shape[0] - 1;
+  const int64_t hpg = H / G;  // nheads_ngroups_ratio (ssd_chunk_state.py:238)
+
+  const int32_t* ccs = cu_chunk_seqlens.Ptr<int32_t>();
+  const int32_t* lci = last_chunk_indices.Ptr<int32_t>();
+  const int32_t* sidx = seq_idx.Ptr<int32_t>();
+  const int32_t* cus = cu_seqlens.Ptr<int32_t>();
+  const float* Ap = A.Ptr<float>();
+  const float* dbp = dt_bias != nullptr ? dt_bias->Ptr<float>() : nullptr;
+  const float* Dp = D != nullptr ? D->Ptr<float>() : nullptr;
+  const bool d_has_hdim = D != nullptr && D->rank == 2;
+
+  // The metadata contract `compute_varlen_chunk_metadata` guarantees
+  // (mamba2_attn.py:56-74): chunks tile [0,T) in order, none crosses a physical
+  // chunk boundary, and none is empty.
+  VT_CHECK(ccs[0] == 0 && ccs[nchunks] == static_cast<int32_t>(T),
+           "mamba2_chunk_scan: cu_chunk_seqlens must tile [0, T)");
+  VT_CHECK(cus[0] == 0 && cus[S] == static_cast<int32_t>(T),
+           "mamba2_chunk_scan: cu_seqlens must tile [0, T)");
+  for (int64_t c = 0; c < nchunks; ++c) {
+    const int64_t len = ccs[c + 1] - ccs[c];
+    VT_CHECK(len > 0 && len <= cs,
+             "mamba2_chunk_scan: each logical chunk must be non-empty and at most chunk_size");
+    VT_CHECK(sidx[c] >= 0 && sidx[c] < S,
+             "mamba2_chunk_scan: seq_idx entries must index a sequence");
+  }
+  CheckMamba2ANegative(A, "mamba2_chunk_scan");
+  for (int64_t b = 0; b < S; ++b) {
+    // `last_chunk_indices[b] == -1` is what `compute_varlen_chunk_metadata`
+    // leaves for a sequence with NO tokens (mamba2_attn.py:56-74 pushes no chunk
+    // for it). Upstream's `varlen_states = states[last_chunk_indices]`
+    // (ssd_combined.py:154) is then a torch NEGATIVE index: it silently returns
+    // the last chunk of the whole batch — some OTHER sequence's state. vLLM
+    // never schedules an empty sequence, so that is an indexing quirk rather
+    // than behaviour to mirror; refuse instead of deviating quietly.
+    VT_CHECK(lci[b] >= 0,
+             "mamba2_chunk_scan: last_chunk_indices[" + std::to_string(b) +
+                 "] < 0 — empty sequences are NOT supported (upstream's "
+                 "states[last_chunk_indices] would negative-index another sequence's "
+                 "chunk, ssd_combined.py:154)");
+    VT_CHECK(lci[b] < nchunks, "mamba2_chunk_scan: last_chunk_indices out of range");
+  }
+
+  // ── stage 1: `_chunk_cumsum_fwd` (ssd_chunk_state.py:300-346) ──────────────
+  // dt_out and dA_cumsum are [H, nchunks, chunk_size] f32 (:314-319). Positions
+  // past a partial chunk hold dt = 0 (:104-107), so dA_cumsum[..., cs-1] is the
+  // chunk's TOTAL decay whatever its length — which is what stages 2 and 3 read.
+  std::vector<float> dtv(static_cast<size_t>(H * nchunks * cs), 0.0f);
+  std::vector<float> dac(static_cast<size_t>(H * nchunks * cs), 0.0f);
+  ForRows(H, [&](int64_t h0, int64_t h1) {
+    for (int64_t h = h0; h < h1; ++h) {
+      const float a = Ap[h];
+      for (int64_t c = 0; c < nchunks; ++c) {
+        const int64_t start = ccs[c], len = ccs[c + 1] - start;
+        const size_t base = static_cast<size_t>((h * nchunks + c) * cs);
+        float acc = 0.0f;
+        for (int64_t i = 0; i < cs; ++i) {
+          float d = 0.0f;
+          if (i < len) {
+            d = LoadF32(dt_in, (start + i) * H + h);
+            if (dbp != nullptr) d += dbp[h];
+            if (args.dt_softplus) d = SoftplusGuarded(d);
+            d = std::min(std::max(d, args.dt_min), args.dt_max);
+          }
+          dtv[base + static_cast<size_t>(i)] = d;
+          acc += d * a;
+          dac[base + static_cast<size_t>(i)] = acc;
+        }
+      }
+    }
+  });
+
+  // ── stage 2: `_chunk_state_fwd` (ssd_chunk_state.py:349-407) ───────────────
+  // states[c,h,p,n] = sum_i x[i,h,p] * B[i,g,n] * exp(min(dA_last - dA_i, 0)) * dt_i
+  // f32 by upstream's own `states_in_fp32=True` (ssd_combined.py:100-102).
+  std::vector<float> states(static_cast<size_t>(nchunks * H * P * N), 0.0f);
+  ForRows(nchunks * H, [&](int64_t r0, int64_t r1) {
+    std::vector<float> xrow(static_cast<size_t>(P)), brow(static_cast<size_t>(N));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t c = r / H, h = r % H, g = h / hpg;
+      const int64_t start = ccs[c], len = ccs[c + 1] - start;
+      const size_t dbase = static_cast<size_t>((h * nchunks + c) * cs);
+      const float da_last = dac[dbase + static_cast<size_t>(cs - 1)];
+      float* st = states.data() + static_cast<size_t>((c * H + h) * P * N);
+      for (int64_t i = 0; i < len; ++i) {
+        // The `min(., 0)` is upstream's, and INSIDE THE ENFORCED CONTRACT it is
+        // an algebraic no-op: `A < 0` (CheckMamba2ANegative) and `dt >= 0`
+        // (dt_min >= 0, checked in the validator) make `dac` non-increasing over
+        // i, so `da_last - dac[i] <= 0` for every i in the chunk. It is kept
+        // because upstream keeps it — it guards the floating-point edge where
+        // the running cumsum ticks up by an ulp — and it is NOT what stands
+        // between the op and an `A > 0` caller; that arm is refused outright.
+        const float scale = std::exp(std::min(da_last - dac[dbase + static_cast<size_t>(i)],
+                                              0.0f)) *
+                            dtv[dbase + static_cast<size_t>(i)];
+        if (scale == 0.0f) continue;
+        for (int64_t p = 0; p < P; ++p)
+          xrow[static_cast<size_t>(p)] = LoadF32(x, ((start + i) * H + h) * P + p);
+        for (int64_t n = 0; n < N; ++n)
+          brow[static_cast<size_t>(n)] =
+              LoadF32(B, ((start + i) * G + g) * N + n) * scale;
+        for (int64_t p = 0; p < P; ++p) {
+          const float xv = xrow[static_cast<size_t>(p)];
+          float* srow = st + p * N;
+          for (int64_t n = 0; n < N; ++n) srow[n] += xv * brow[static_cast<size_t>(n)];
+        }
+      }
+    }
+  });
+
+  // ── stage 3: `_state_passing_fwd` (ssd_state_passing.py:99-146) ────────────
+  // Per SEQUENCE, over the chunk range last_chunk_indices derives (:56-60):
+  //   S_c = exp(dA_last[c]) * S_{c-1} + states[c],  S_{-1} = initial_states[b]
+  // and out[c] is the state AFTER chunk c (:90-97).
+  //
+  // THE RUNNING STATE STAYS F32 AND THE STORE ROUNDS. Upstream carries `states`
+  // in f32 registers across the chunk loop and stores a `state_dtype` copy per
+  // chunk (:88-97) — it never reads its own rounded store back into the
+  // recurrence. `_chunk_scan_fwd` DOES read that stored copy, so `state_dtype`
+  // shows up in `out` as well as in `final_states`, but it must not compound
+  // inside the state passing itself.
+  // `passed` is f32 while upstream's `out` buffer is `state_dtype` (2x narrower
+  // at bf16). It holds only `state_dtype`-ROUNDED values (RoundThrough below),
+  // so the extra width is not numerically observable — it is a HOST-REFERENCE
+  // working buffer that keeps stage 5 on one load path, never a model-path
+  // allocation. W2 (the CUDA arm) must allocate this at `state_dtype`, as
+  // upstream does, and must NOT inherit this width (.agents/porting.md: a
+  // token gate cannot catch a dtype that is too WIDE).
+  std::vector<float> passed(static_cast<size_t>(nchunks * H * P * N), 0.0f);
+  const DType state_dt = final_states.dtype;
+  ForRows(S * H, [&](int64_t r0, int64_t r1) {
+    std::vector<float> s(static_cast<size_t>(P * N));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t b = r / H, h = r % H;
+      const int64_t chunk_end = lci[b] + 1;
+      const int64_t chunk_start = b > 0 ? lci[b - 1] + 1 : 0;
+      if (initial_states != nullptr) {
+        for (int64_t i = 0; i < P * N; ++i)
+          s[static_cast<size_t>(i)] = LoadF32(*initial_states, (b * H + h) * P * N + i);
+      } else {
+        std::fill(s.begin(), s.end(), 0.0f);
+      }
+      for (int64_t c = chunk_start; c < chunk_end; ++c) {
+        const float decay =
+            std::exp(dac[static_cast<size_t>((h * nchunks + c) * cs + cs - 1)]);
+        const float* in = states.data() + static_cast<size_t>((c * H + h) * P * N);
+        float* outp = passed.data() + static_cast<size_t>((c * H + h) * P * N);
+        for (int64_t i = 0; i < P * N; ++i) {
+          s[static_cast<size_t>(i)] = s[static_cast<size_t>(i)] * decay + in[i];
+          outp[i] = RoundThrough(state_dt, s[static_cast<size_t>(i)]);
+        }
+      }
+      // `varlen_states = states[last_chunk_indices]` (ssd_combined.py:154).
+      // A sequence with no chunk keeps its incoming state, which for a fresh
+      // sequence is zeros.
+      for (int64_t i = 0; i < P * N; ++i)
+        StoreF32(final_states, (b * H + h) * P * N + i, s[static_cast<size_t>(i)]);
+    }
+  });
+
+  // ── stage 4: `_bmm_chunk_fwd` (ssd_bmm.py:148-209) ─────────────────────────
+  // CB[c,g,i,j] = sum_n C[i,g,n] * B[j,g,n], f32 REGARDLESS of the activation
+  // dtype (`output_dtype=torch.float32`, ssd_combined.py:124).
+  std::vector<float> cb(static_cast<size_t>(nchunks * G * cs * cs), 0.0f);
+  ForRows(nchunks * G, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t c = r / G, g = r % G;
+      const int64_t start = ccs[c], len = ccs[c + 1] - start;
+      float* dst = cb.data() + static_cast<size_t>((c * G + g) * cs * cs);
+      std::vector<float> crow(static_cast<size_t>(N));
+      for (int64_t i = 0; i < len; ++i) {
+        for (int64_t n = 0; n < N; ++n)
+          crow[static_cast<size_t>(n)] = LoadF32(C, ((start + i) * G + g) * N + n);
+        for (int64_t j = 0; j <= i; ++j) {  // only j <= i is ever read (IS_CAUSAL)
+          float acc = 0.0f;
+          for (int64_t n = 0; n < N; ++n)
+            acc += crow[static_cast<size_t>(n)] * LoadF32(B, ((start + j) * G + g) * N + n);
+          dst[i * cs + j] = acc;
+        }
+      }
+    }
+  });
+
+  // ── stage 5: `_chunk_scan_fwd` (ssd_chunk_scan.py:216-525) ────────────────
+  //   out_i = exp(dA_i) * (C_i . S_{c-1})                                  inter
+  //         + sum_{j<=i} CB[i,j] * exp(min(dA_i - dA_j, 0)) * dt_j * x_j    intra
+  //         + D * x_i                                                      skip
+  //   then `out *= z * sigmoid(z)` when z is given (:394-406).
+  ForRows(nchunks * H, [&](int64_t r0, int64_t r1) {
+    std::vector<float> prev(static_cast<size_t>(P * N));
+    std::vector<float> crow(static_cast<size_t>(N));
+    std::vector<float> w(static_cast<size_t>(cs));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t c = r / H, h = r % H, g = h / hpg;
+      const int64_t start = ccs[c], len = ccs[c + 1] - start;
+      const size_t dbase = static_cast<size_t>((h * nchunks + c) * cs);
+
+      // Previous state: initial_states[seq_idx[c]] when this chunk opens a new
+      // sequence AND initial states were supplied, ZEROS when they were not
+      // (ssd_chunk_scan.py:236-250, :271-274), else the passed state of c-1.
+      const int32_t si = sidx[c];
+      const int32_t si_prev = c >= 1 ? sidx[c - 1] : -1;
+      bool prev_zero = false;
+      if (si != si_prev) {
+        if (initial_states != nullptr) {
+          for (int64_t i = 0; i < P * N; ++i)
+            prev[static_cast<size_t>(i)] =
+                LoadF32(*initial_states, (static_cast<int64_t>(si) * H + h) * P * N + i);
+        } else {
+          prev_zero = true;
+        }
+      } else {
+        const float* src = passed.data() + static_cast<size_t>(((c - 1) * H + h) * P * N);
+        std::copy(src, src + P * N, prev.begin());
+      }
+
+      const float* cbc = cb.data() + static_cast<size_t>((c * G + g) * cs * cs);
+      for (int64_t i = 0; i < len; ++i) {
+        const float da_i = dac[dbase + static_cast<size_t>(i)];
+        const float scale_m = std::exp(da_i);
+        for (int64_t n = 0; n < N; ++n)
+          crow[static_cast<size_t>(n)] = LoadF32(C, ((start + i) * G + g) * N + n);
+        // The intra-chunk weight is independent of p; hoist it out of the p loop.
+        // As in stage 2, `min(., 0)` is an algebraic no-op inside the enforced
+        // contract (`A < 0`, `dt >= 0` => `dac` non-increasing => `da_i <= da_j`
+        // for j <= i) and is kept only because upstream keeps it.
+        for (int64_t j = 0; j <= i; ++j) {
+          w[static_cast<size_t>(j)] =
+              cbc[i * cs + j] *
+              std::exp(std::min(da_i - dac[dbase + static_cast<size_t>(j)], 0.0f)) *
+              dtv[dbase + static_cast<size_t>(j)];
+        }
+        for (int64_t p = 0; p < P; ++p) {
+          float acc = 0.0f;
+          if (!prev_zero) {
+            const float* prow = prev.data() + p * N;
+            for (int64_t n = 0; n < N; ++n) acc += crow[static_cast<size_t>(n)] * prow[n];
+          }
+          acc *= scale_m;
+          for (int64_t j = 0; j <= i; ++j)
+            acc += w[static_cast<size_t>(j)] * LoadF32(x, ((start + j) * H + h) * P + p);
+          const float xi = LoadF32(x, ((start + i) * H + h) * P + p);
+          if (Dp != nullptr) acc += (d_has_hdim ? Dp[h * P + p] : Dp[h]) * xi;
+          if (z != nullptr) acc *= SiluGate(LoadF32(*z, ((start + i) * H + h) * P + p));
+          StoreF32(out, ((start + i) * H + h) * P + p, acc);
+        }
+      }
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::Mamba2StateUpdate — `selective_state_update` (ops/mamba_ssm.py:497+) at the
+// scalar-per-head shape, transcribed from upstream's own CPU kernel
+// (csrc/cpu/mamba_kernels.hpp:104-250 `selective_state_update_kernel`).
+// ─────────────────────────────────────────────────────────────────────────────
+void Mamba2StateUpdateKernel(Queue&, Tensor& out, Tensor& state, const Tensor& x,
+                             const Tensor& dt_in, const Tensor& A, const Tensor& B,
+                             const Tensor& C, const Tensor* D, const Tensor* z,
+                             const Tensor* dt_bias, const Tensor* state_indices,
+                             const Mamba2Args& args) {
+  const int64_t Nb = x.shape[0], H = x.shape[1], P = x.shape[2];
+  const int64_t G = B.shape[1], N = B.shape[2];
+  const int64_t S = state.shape[0];
+  const int64_t hpg = H / G;
+  const int32_t* sidx = state_indices != nullptr ? state_indices->Ptr<int32_t>() : nullptr;
+  const float* Ap = A.Ptr<float>();
+  const float* Dp = D != nullptr ? D->Ptr<float>() : nullptr;
+  const float* dbp = dt_bias != nullptr ? dt_bias->Ptr<float>() : nullptr;
+
+  CheckMamba2ANegative(A, "mamba2_state_update");
+
+  // Row-chunked over the BATCH: each row owns one cache slot and one output row,
+  // as GdnDecodeKernel does. `ForRows` is a PARALLEL for, so two rows naming the
+  // same slot race on the same read-modify-write and the answer depends on the
+  // thread schedule; upstream's own CPU kernel is sequential and stays
+  // deterministic under duplicates, so distinctness is a LOCAL precondition and
+  // is enforced here rather than only documented. NULL rows (index < 0) touch no
+  // slot at all and may repeat.
+  if (sidx != nullptr) {
+    std::vector<int32_t> slots;
+    slots.reserve(static_cast<size_t>(Nb));
+    for (int64_t b = 0; b < Nb; ++b)
+      if (sidx[b] >= 0) slots.push_back(sidx[b]);
+    std::sort(slots.begin(), slots.end());
+    VT_CHECK(std::adjacent_find(slots.begin(), slots.end()) == slots.end(),
+             "mamba2_state_update: state_indices entries must be DISTINCT (each row owns "
+             "one cache slot; the row dispatch is parallel)");
+  }
+
+  ForRows(Nb, [&](int64_t r0, int64_t r1) {
+    for (int64_t b = r0; b < r1; ++b) {
+      int64_t slot = b;
+      if (sidx != nullptr) {
+        // LOCAL ABI: index < 0 is the NULL row (upstream's `NULL_BLOCK_ID`
+        // padding, v1/attention/backends/utils.py:46, remapped by the caller).
+        // Its cache slot is untouched — `continue` at mamba_kernels.hpp:147 —
+        // and its output row is zeroed, as GdnDecodeKernel does.
+        if (sidx[b] < 0) {
+          for (int64_t i = 0; i < H * P; ++i) StoreF32(out, b * H * P + i, 0.0f);
+          continue;
+        }
+        slot = sidx[b];
+        VT_CHECK(slot < S, "mamba2_state_update: state_indices entry out of range");
+      }
+      for (int64_t h = 0; h < H; ++h) {
+        const int64_t g = h / hpg;
+        float d = LoadF32(dt_in, b * H + h);
+        if (dbp != nullptr) d += dbp[h];
+        if (args.dt_softplus) d = SoftplusGuarded(d);
+        const float dA = std::exp(Ap[h] * d);
+        for (int64_t p = 0; p < P; ++p) {
+          const float xv = LoadF32(x, (b * H + h) * P + p);
+          const int64_t sbase = ((slot * H + h) * P + p) * N;
+          float y = 0.0f;
+          for (int64_t n = 0; n < N; ++n) {
+            const float bv = LoadF32(B, (b * G + g) * N + n);
+            const float cv = LoadF32(C, (b * G + g) * N + n);
+            // The readout uses the F32 value, not the value re-read from the
+            // cache: the Triton kernel holds `state` in registers and computes
+            // `out = sum(state * C)` from it, storing the cache-width copy
+            // separately (mamba_ssm.py:433,451); upstream's CPU kernel does the
+            // same with `s_new` (mamba_kernels.hpp:225-228).
+            const float sn = LoadF32(state, sbase + n) * dA + bv * xv * d;
+            StoreF32(state, sbase + n, sn);
+            y += sn * cv;
+          }
+          if (Dp != nullptr) y += Dp[h] * xv;
+          if (z != nullptr) y *= SiluGate(LoadF32(*z, (b * H + h) * P + p));
+          StoreF32(out, (b * H + h) * P + p, y);
+        }
+      }
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::RmsNormGatedGroup — `Mixer2RMSNormGated.forward_native`
+// (mamba_mixer2.py:100-149).
+// ─────────────────────────────────────────────────────────────────────────────
+void RmsNormGatedGroupKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
+                             const Tensor* weight, const RmsNormGatedGroupArgs& args) {
+  const int64_t hidden = x.shape[x.rank - 1];
+  int64_t rows = 1;
+  for (int r = 0; r < x.rank - 1; ++r) rows *= x.shape[r];
+  const int64_t group_size = hidden / args.n_groups;
+  // THE WEIGHT IS READ AT ITS OWN DTYPE. `Mixer2RMSNormGated.weight` is
+  // `nn.Parameter(torch.ones(per_rank_hidden_size))` (mamba_mixer2.py:91),
+  // created at the MODEL dtype — bf16 for every checkpoint that ships this
+  // layer — and the validator accepts any float (`CheckMamba2Operand(...,
+  // is_output=false)`, src/vt/ops.cpp). `Tensor::Ptr<float>()` is an unchecked
+  // `static_cast` (include/vt/tensor.h), so taking one here would read
+  // `hidden * 4` bytes out of a `hidden * 2` byte allocation. `LoadF32` is the
+  // dtype-aware read the sibling `RmsNormGatedKernel` already uses.
+  // `input_dtype = x.dtype` (:113) is the width the normalized value is cast back
+  // to before the weight multiply (`self.weight * x.to(input_dtype)`, :149).
+  const DType input_dt = x.dtype;
+
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    std::vector<float> v(static_cast<size_t>(hidden));
+    for (int64_t r = r0; r < r1; ++r) {
+      // `x = x * nn.functional.silu(gate.to(torch.float32))` (:114) — the gate is
+      // promoted to f32 BEFORE the silu, which is why this is f32 throughout.
+      for (int64_t j = 0; j < hidden; ++j)
+        v[static_cast<size_t>(j)] =
+            LoadF32(x, r * hidden + j) * SiluGate(LoadF32(gate, r * hidden + j));
+      if (weight == nullptr) {
+        // use_rms_norm == False: no parameter, no norm (:94-96, :115-116).
+        for (int64_t j = 0; j < hidden; ++j)
+          StoreF32(out, r * hidden + j,
+                    RoundThrough(input_dt, v[static_cast<size_t>(j)]));
+        continue;
+      }
+      for (int64_t g = 0; g < args.n_groups; ++g) {
+        // variance = x_grouped.pow(2).mean(-1) over group_size (:139-140); the
+        // n_groups == 1 branch (:127-131) is the same expression with
+        // group_size == hidden.
+        // f32 accumulation, NOT double: upstream reduces `x.pow(2).mean(-1)`
+        // in f32 (x is f32 from the :114 gate promotion) and the sibling
+        // `RmsNormGatedKernel` above does the same. W2 must not inherit a wider
+        // host-reference reduction.
+        float ss = 0.0f;
+        for (int64_t j = 0; j < group_size; ++j) {
+          const float t = v[static_cast<size_t>(g * group_size + j)];
+          ss += t * t;
+        }
+        // `rsqrt(variance + eps)` (:130, :141) — eps is INSIDE the square root.
+        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(group_size) + args.eps);
+        for (int64_t j = 0; j < group_size; ++j) {
+          const int64_t idx = g * group_size + j;
+          const float normed = RoundThrough(input_dt, v[static_cast<size_t>(idx)] * inv);
+          StoreF32(out, r * hidden + idx, LoadF32(*weight, idx) * normed);
+        }
+      }
+    }
+  });
+}
+
 // SPECULATIVE (multi-token, slot-snapshotting) gated-delta-rule step.
 // Ported from vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @
 // e24d1b24 — fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN
@@ -1975,8 +2731,23 @@ void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor&
 
 // §4/§6 weighted scatter-combine: out[t,:] = sum_j w[t,j]*expert_out[t,j,:]
 // (f32 accumulation) + shared[t,:] (optional). Stored at out's dtype.
+// `routed_scale` multiplies the ROUTED sum only, BEFORE the shared term is added
+// — upstream's apply_routed_scale_to_output arm (moe_runner.py:390-407, :402-406 scales
+// `fused_output`, leaves `shared_output` alone, then :722-725 adds them). The
+// default 1.0f is the fold-into-router-weights polarity every landed caller uses.
+// It scales the ASSEMBLED sum, not each router weight: upstream's
+// `fused_output *= factor` (:404) is one multiply on the finished tensor, so the
+// scale rounds ONCE after the K-term reduction. Folding it into `weights[j]` is
+// equal in exact arithmetic and a different f32 value (it rounds K times inside
+// the sum); Laguna is entitled to that fold (`laguna_ops.h:48`, no `shared`),
+// this path is not. Pinned bitwise in test_ops_moe_nongated_relu2.cpp.
+// NOT MIRRORED, UNREACHABLE: upstream's fp16 arm (:403-406) instead divides
+// `shared_output` by the factor to dodge an fp16 overflow. That branch is keyed
+// on `fused_output.dtype == torch.float16`; the analogue here is `out`, whose
+// dtype `MoeCombine` gates through `IsOutFloat` (ops.cpp:22 — f32/bf16 only, no
+// kF16), so no caller can reach it. Pinned by the f16-out refusal test.
 void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                      const Tensor* shared) {
+                      const Tensor* shared, float routed_scale) {
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t row = r0; row < r1; ++row) {
@@ -1985,6 +2756,7 @@ void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tenso
       for (int64_t j = 0; j < k; ++j)
         acc += weights.Ptr<float>()[row * k + j] *
                LoadF32(expert_out, (row * k + j) * h + col);
+      if (routed_scale != 1.0f) acc *= routed_scale;
       if (shared != nullptr) acc += LoadF32(*shared, row * h + col);
       StoreF32(out, row * h + col, acc);
     }
@@ -2042,6 +2814,63 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
       }
       for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
     }
+  }
+  });
+}
+
+// Dense non-causal CROSS attention (LTX-2.5 L2) — the CPU REFERENCE. Same three
+// pass structure as AttentionKernel, with the key extent taken from KEY's own
+// token count (not query's) and an optional additive score bias. Semantics
+// ported from torch's `scaled_dot_product_attention(q,k,v,attn_mask=...,
+// is_causal=False)` as LTX's PytorchAttention calls it
+// (ltx_core/model/transformer/attention.py:97-102).
+void AttentionCrossKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key,
+                          const Tensor& value, const Tensor* bias,
+                          const AttentionCrossArgs& args) {
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t s = key.shape[0], hk = key.shape[1];
+  const int64_t qpk = hq / hk;  // q-heads per kv-head (GQA ratio)
+  const float scale = args.scale;
+  const float* bias_data = bias != nullptr ? bias->Ptr<float>() : nullptr;
+  const int64_t bias_rows = bias != nullptr ? bias->shape[0] : 0;
+  ForRows(hq * tq, [&](int64_t r0, int64_t r1) {
+  std::vector<float> probs(static_cast<size_t>(s));
+  std::vector<float> acc(static_cast<size_t>(d));
+  for (int64_t r = r0; r < r1; ++r) {
+    const int64_t h = r / tq;
+    const int64_t g = h / qpk;
+    const int64_t i = r % tq;
+    const int64_t qoff = (i * hq + h) * d;
+    // The bias row this query reads: its own, or the single broadcast row.
+    const float* brow = bias_data == nullptr ? nullptr
+                                             : bias_data + (bias_rows == 1 ? 0 : i) * s;
+    // Pass 1: scores + running max.
+    float m = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < s; ++j) {
+      const int64_t koff = (j * hk + g) * d;
+      float dot = 0.0f;
+      for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(key, koff + e);
+      dot *= scale;
+      if (brow != nullptr) dot += brow[j];
+      probs[static_cast<size_t>(j)] = dot;
+      if (dot > m) m = dot;
+    }
+    // Pass 2: exp + normalization denominator.
+    float denom = 0.0f;
+    for (int64_t j = 0; j < s; ++j) {
+      const float e = std::exp(probs[static_cast<size_t>(j)] - m);
+      probs[static_cast<size_t>(j)] = e;
+      denom += e;
+    }
+    const float inv = 1.0f / denom;  // denom >= 1 (the argmax term is exp(0)=1)
+    // Pass 3: weighted sum of v (f32 accumulation), stored at out's dtype.
+    for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+    for (int64_t j = 0; j < s; ++j) {
+      const float p = probs[static_cast<size_t>(j)] * inv;
+      const int64_t voff = (j * hk + g) * d;
+      for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += p * LoadF32(value, voff + e);
+    }
+    for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
   }
   });
 }
@@ -2218,6 +3047,289 @@ void DFlashPagedBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query,
   });
 }
 
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314) — the
+// CPU REFERENCE, and the authoritative implementation the CUDA kernel mirrors.
+//
+// BEYOND-PIN. Ported from `_grouped_conv`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`):
+//
+//     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+//     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+//     output = coefficients[:, 0] * blocks
+//     position = torch.arange(hidden_states.shape[0], device=...)
+//     if block_size & (block_size - 1) == 0:
+//         position = position & (block_size - 1)
+//     else:
+//         position = position % block_size
+//     for tap in range(1, taps):
+//         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+//         output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+//     return output.flatten(-2)
+//
+// Three things are load-bearing and each is invisible to a token gate if wrong,
+// because a DFlash2 draft with a broken conv still emits the TARGET's tokens
+// (the verify is lossless) and loses only acceptance:
+//
+//  1. THE BLOCK MASK. `position` is the GLOBAL row index reduced modulo the
+//     block, so tap `t` contributes only where the source row `i-t` lies in the
+//     same (1+k) query block. Upstream's `F.pad(blocks[:-tap], ...)` supplies a
+//     zero for the first `tap` rows of the WHOLE batch and the mask supplies it
+//     at every later block boundary; this loop simply stops at `t > pos`, which
+//     is the same set because the mask is monotone in `t`.
+//  2. THE GROUP MAP. `delta` is indexed per GROUP and `base` per CHANNEL, so the
+//     same delta applies to every channel of a group. `g = c / group_size`.
+//  3. THE SIDE. `base` is `[sides, taps, H]` and dim 0 is prepare/finish, NOT a
+//     tap. On the published 27B draft both axes are 2, so a swap is undetectable
+//     by shape alone.
+//
+// ROUNDING. Upstream's chain materializes a tensor of the model dtype after each
+// step (`base + delta`, `coefficients * blocks`, `output += ...`), so each step
+// rounds here too. Every step is elementwise with no reduction-order freedom, so
+// this and the CUDA kernel agree BIT-FOR-BIT rather than within an envelope.
+void DFlashGroupedConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                             const Tensor& base, const DFlashGroupedConvArgs& args) {
+  const int64_t rows = x.shape[0];
+  const int64_t taps = args.taps;
+  const int64_t groups = args.num_groups;
+  const int64_t gsize = args.group_size;
+  const int64_t h = groups * gsize;
+  const int64_t sides = coefficients.shape[1];
+  const int64_t side = args.side;
+  const int64_t block = args.block_size;
+  // Upstream's own power-of-two special case, mirrored including the `&` arm:
+  // both published DFlash2 checkpoints resolve to a power-of-two query block
+  // (8 and 16), and upstream's reference test parametrises 5 for the other arm.
+  const bool pot = (block & (block - 1)) == 0;
+  const DType dt = out.dtype;
+  const auto round = [dt](float v) -> float {
+    switch (dt) {
+      case DType::kF32: return v;
+      case DType::kF16: return F16ToF32(F32ToF16(v));
+      case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+      default: VT_CHECK(false, "dflash2-grouped-conv: unsupported dtype"); return 0.0f;
+    }
+  };
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      const int64_t pos = pot ? (i & (block - 1)) : (i % block);
+      for (int64_t g = 0; g < groups; ++g) {
+        for (int64_t j = 0; j < gsize; ++j) {
+          const int64_t c = g * gsize + j;
+          float acc = 0.0f;
+          for (int64_t t = 0; t < taps && t <= pos; ++t) {
+            const float b = LoadF32(base, (side * taps + t) * h + c);
+            const float d = LoadF32(coefficients, ((i * sides + side) * taps + t) * groups + g);
+            const float k = round(b + d);
+            const float term = round(k * LoadF32(x, (i - t) * h + c));
+            acc = (t == 0) ? term : round(acc + term);
+          }
+          StoreF32(out, i * h + c, acc);
+        }
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314) — the
+// AUTHORITATIVE reference. `Dflash2SelectorEdgesArgs` (include/vt/ops.h) carries
+// the contract, the upstream anchor and the rounding placement; this is the
+// implementation of it.
+//
+// Ported from `_score_edges` (vllm/model_executor/models/qwen3_dflash2.py:208-228
+// @ vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`).
+// Upstream's einsum is `blpr,blcr->blpc` over `predecessors * hidden[:, :, None]`
+// and `successors`; the loop below is that contraction written out, with the two
+// bf16 materializations upstream makes reproduced at the same two points.
+void Dflash2SelectorEdgesKernel(Queue&, Tensor& scores, const Tensor& pred_codebook,
+                                const Tensor& succ_codebook, const Tensor& candidate_ids,
+                                const Tensor& unary, const Tensor& hidden,
+                                const Tensor& anchors,
+                                const Dflash2SelectorEdgesArgs& args) {
+  const int64_t B = candidate_ids.shape[0];
+  const int64_t L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  const int64_t R = pred_codebook.shape[1];
+  const int64_t V = pred_codebook.shape[0];
+  const DType dt = pred_codebook.dtype;
+  const auto round = [dt](float v) -> float {
+    switch (dt) {
+      case DType::kF32: return v;
+      case DType::kF16: return F16ToF32(F32ToF16(v));
+      case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+      default: VT_CHECK(false, "dflash2-selector-edges: unsupported dtype"); return 0.0f;
+    }
+  };
+  const int64_t* cand = candidate_ids.Ptr<int64_t>();
+  const int64_t* anchor = anchors.Ptr<int64_t>();
+  const float* un = unary.Ptr<float>();
+  float* out = scores.Ptr<float>();
+  // A candidate or anchor id outside the codebook is an id-space error (the
+  // org-vocab rebase, or a draft vocabulary that does not match the selector's).
+  // Upstream would index out of bounds; this names it.
+  for (int64_t b = 0; b < B; ++b)
+    VT_CHECK(anchor[b] >= 0 && anchor[b] < V,
+             "dflash2-selector-edges: anchor token id outside the codebook vocabulary");
+  for (int64_t i = 0; i < B * L * K; ++i)
+    VT_CHECK(cand[i] >= 0 && cand[i] < V,
+             "dflash2-selector-edges: candidate token id outside the codebook vocabulary");
+  ForRows(B * L, [&](int64_t r0, int64_t r1) {
+    // `gated[p][r]` is upstream's `predecessors * hidden[:, :, None]`, which is a
+    // MATERIALIZED bf16 tensor there and is rounded here for the same reason.
+    std::vector<float> gated(static_cast<size_t>(K * R));
+    for (int64_t idx = r0; idx < r1; ++idx) {
+      const int64_t b = idx / L, l = idx - b * L;
+      for (int64_t p = 0; p < K; ++p) {
+        // The PREDECESSOR of slot p: the verified anchor at step 0 (the same
+        // token for every p), else the previous step's candidate p.
+        const int64_t pid = (l == 0) ? anchor[b] : cand[(b * L + (l - 1)) * K + p];
+        for (int64_t r = 0; r < R; ++r)
+          gated[static_cast<size_t>(p * R + r)] =
+              round(LoadF32(pred_codebook, pid * R + r) * LoadF32(hidden, idx * R + r));
+      }
+      for (int64_t p = 0; p < K; ++p) {
+        for (int64_t c = 0; c < K; ++c) {
+          const int64_t cid = cand[idx * K + c];
+          float acc = 0.0f;
+          for (int64_t r = 0; r < R; ++r)
+            acc += gated[static_cast<size_t>(p * R + r)] * LoadF32(succ_codebook, cid * R + r);
+          // The einsum's OWN output is a bf16 tensor upstream; `unary + <bf16>`
+          // then promotes to f32 by torch's type-promotion rule, so the add is
+          // f32 and only the contraction rounds.
+          out[idx * K * K + p * K + c] = un[idx * K + c] + round(acc);
+        }
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector PATH WALK (SPEC-DFLASH2 W4, #1314) — the
+// AUTHORITATIVE reference. `Dflash2PathWalkArgs` (include/vt/ops.h) carries the
+// contract, the tie-break, the -inf rule and the upstream anchor.
+//
+// Ported from `_selector_walk_kernel`
+// (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:16-79 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`) at
+// `SAMPLE_PROBABILISTIC=False`, where `gumbel_noised_argmax` reduces to
+// `tl.max(logits, axis=0, return_indices=True)`.
+//
+// THE THREE THINGS THIS LOOP HAS TO GET RIGHT, none of which raises when wrong:
+//   * `previous` carries. Step l reads block row `previous`, the slot step l-1
+//     chose. Step 0 reads row 0 because the lattice puts the verified ANCHOR in
+//     every predecessor slot of step 0, so a walk that never carried would agree
+//     with this one at L == 1 and diverge at every longer block.
+//   * the tie-break is the LOWEST slot, which is `tl.max`'s own. It picks the
+//     next step's predecessor row too, so it moves the rest of the path.
+//   * an all -inf row answers slot 0. Upstream reaches that value by loading
+//     masked lanes with `other=-inf`; the seed below (`best = -inf`, `index =
+//     K`, strict `>`, then collapse `K` to 0) is the same answer in a form the
+//     CUDA arm can reduce in parallel and reach bit-identically. Strictness is
+//     also what keeps a NaN from ever winning on either arm.
+//
+// A `>=` REDUCTION BREAKS ALL THREE OF THE ABOVE, not just the NaN row (#1518
+// corrects an earlier note here that said the tie rows and the -inf row do not
+// measure strictness). This scan ascends, so `>=` keeps the LAST maximum
+// instead of the first: the tie row then answers slot K-1 rather than slot 0,
+// and the all -inf row claims K-1 rather than leaving `index == K` for the
+// collapse. Measured by turning `>` into `>=` in this function
+// (tests/vt/test_ops_dflash2_path_walk.cpp): `a tie resolves to the LOWEST
+// slot` fails 2 assertions (got 13 for 11, 22 for 20), `an all -inf row
+// resolves to slot 0` fails 1 (33 for 31) and `a NaN never wins a slot` fails
+// 2 (83 for 81, and 83 != 83) -- 3 cases / 5 assertions, `Status: FAILURE!`.
+// What the NaN case adds that the other two do not is the NaN CLASS itself,
+// and it is the row on which the two backends actually diverged before W4's
+// review reconciled the CUDA lane comparator.
+//
+// Requests are independent, so the OUTER loop parallelizes and the inner step
+// loop stays serial -- which is exactly the shape upstream's one-program-per-
+// request grid has.
+void Dflash2PathWalkKernel(Queue&, Tensor& tokens, const Tensor& scores,
+                           const Tensor& candidate_ids,
+                           const Dflash2PathWalkArgs& args) {
+  const int64_t B = candidate_ids.shape[0];
+  const int64_t L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  const float* sc = scores.Ptr<float>();
+  const int64_t* cand = candidate_ids.Ptr<int64_t>();
+  int64_t* out = tokens.Ptr<int64_t>();
+  ForRows(B, [&](int64_t b0, int64_t b1) {
+    for (int64_t b = b0; b < b1; ++b) {
+      int64_t previous = 0;
+      for (int64_t l = 0; l < L; ++l) {
+        const int64_t flat = b * L + l;
+        const float* row = sc + (flat * K + previous) * K;
+        float best = -std::numeric_limits<float>::infinity();
+        int64_t index = K;
+        for (int64_t j = 0; j < K; ++j) {
+          if (row[j] > best) {
+            best = row[j];
+            index = j;
+          }
+        }
+        if (index == K) index = 0;  // an all -inf (fully masked) row
+        out[flat] = cand[flat * K + index];
+        previous = index;
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314)
+// — the AUTHORITATIVE reference. `TopKValuesIndicesArgs` (include/vt/ops.h)
+// carries the contract, the tie-break and the upstream anchor.
+//
+// Ported from `_topk` (vllm/model_executor/models/qwen3_dflash2.py:60-64 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`),
+// whose off-CUDA arm is `torch.topk(scores, k, dim=-1)`.
+//
+// `std::partial_sort` with the explicit (value DESC, index ASC) comparator IS the
+// tie-break contract, not an incidental property of the sort: `partial_sort` is
+// not stable, so leaving ties to the comparator's `false` branch would let the
+// order depend on the algorithm's internal swaps.
+void TopKValuesIndicesKernel(Queue&, Tensor& values, Tensor& indices, const Tensor& logits,
+                             const TopKValuesIndicesArgs& args) {
+  const int64_t rows = logits.shape[0], V = logits.shape[1];
+  const int64_t k = args.k, pad = args.num_org_vocab_padding;
+  const int64_t usable = V - pad;  // the padded tail can never be a candidate
+  const float* lg = logits.Ptr<float>();
+  float* val = values.Ptr<float>();
+  int64_t* idx = indices.Ptr<int64_t>();
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    std::vector<int64_t> order(static_cast<size_t>(usable));
+    for (int64_t row = r0; row < r1; ++row) {
+      const float* src = lg + row * V;
+      for (int64_t j = 0; j < usable; ++j) order[static_cast<size_t>(j)] = j;
+      // DESCENDING value, ties by ASCENDING index -- `torch.topk`'s CPU order,
+      // which `## Owed` O10 records as the contract this op's CUDA arm has to
+      // reproduce. NaN is handled EXPLICITLY and first, for two reasons. It is
+      // upstream's order (`torch.topk(largest=True)` treats NaN as the largest
+      // value), and without it this is not a strict weak ordering at all:
+      // `src[a] != src[b]` is TRUE for a NaN against anything, both `>` are
+      // FALSE, so NaN compares EQUIVALENT to every value while those values are
+      // not equivalent to each other -- and an intransitive equivalence is
+      // undefined behaviour in `std::partial_sort`, not merely a surprising
+      // answer. No shipped path feeds this op a NaN logit today; the ordering is
+      // defined here so that the day one arrives it is a defined answer rather
+      // than whichever comparison the sort happened to make.
+      std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k),
+                        order.end(), [src](int64_t a, int64_t b) {
+                          const float x = src[a], y = src[b];
+                          const bool nx = std::isnan(x), ny = std::isnan(y);
+                          if (nx != ny) return nx;
+                          if (!nx && x != y) return x > y;
+                          return a < b;
+                        });
+      for (int64_t j = 0; j < k; ++j) {
+        idx[row * k + j] = order[static_cast<size_t>(j)];
+        val[row * k + j] = src[order[static_cast<size_t>(j)]];
+      }
+    }
+  });
+}
+
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
 // small host-side loops between the big decode ops; all math f32, dims inferred
 // from the tensor shapes.
@@ -2242,15 +3354,35 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
-// x[m,n] *= col[n]; x f32 [M,N] (inner-contiguous rows, row stride x.stride[0]),
-// col f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel.
+// x[m,n] *= col[n]; x f32 OR bf16 [M,N] (inner-contiguous rows, row stride
+// x.stride[0]), col always f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel,
+// and the portable reference every other backend ports FROM — so it carries the
+// same bf16 store width the CUDA kernel gained for PERF-FP8-ALPHA-FOLD / #417,
+// not a CUDA-only capability.
+//
+// Both arms do the SAME single IEEE f32 multiply; only the store differs. The
+// f32 arm keeps the direct `*=` loop byte-for-byte (it is the shipped path and
+// the hot one), and the bf16 arm goes through LoadF32/StoreF32, whose F32ToBF16
+// is round-to-nearest-even — the same rounding __float2bfloat16 applies on CUDA,
+// which is what keeps the two tiers comparable element for element.
 void MulColVecF32Kernel(Queue&, Tensor& x, const Tensor& col) {
   const int64_t m = x.shape[0], n = x.shape[1], rs = x.stride[0];
   const float* c = col.Ptr<float>();
+  if (x.dtype == DType::kF32) {
+    ForRows(m, [&](int64_t r0, int64_t r1) {
+      for (int64_t i = r0; i < r1; ++i) {
+        float* row = x.Ptr<float>() + i * rs;
+        for (int64_t j = 0; j < n; ++j) row[j] *= c[j];
+      }
+    });
+    return;
+  }
+  VT_CHECK(x.dtype == DType::kBF16, "cpu mul_col_vec_f32: x must be f32 or bf16");
   ForRows(m, [&](int64_t r0, int64_t r1) {
     for (int64_t i = r0; i < r1; ++i) {
-      float* row = x.Ptr<float>() + i * rs;
-      for (int64_t j = 0; j < n; ++j) row[j] *= c[j];
+      const int64_t base = i * rs;
+      for (int64_t j = 0; j < n; ++j)
+        StoreF32(x, base + j, LoadF32(x, base + j) * c[j]);
     }
   });
 }
@@ -2510,6 +3642,15 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
+    RegisterOp(OpId::kQuantFp8Static, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernel)));
+    RegisterOp(OpId::kQuantFp8Group, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QuantFp8GroupFn>(&QuantFp8GroupKernel)));
+    RegisterOp(OpId::kMatmulFp8Cutlass, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFp8CutlassFn>(&MatmulFp8CutlassKernel)));
+    RegisterOp(OpId::kMatmulFp8BlockScaled, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulFp8BlockScaledFn>(&MatmulFp8BlockScaledKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
     RegisterOp(OpId::kGeluAndMul, DeviceType::kCPU,
@@ -2520,6 +3661,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernel)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
+    RegisterOp(OpId::kMoeRelu2, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MoeRelu2Fn>(&MoeRelu2Kernel)));
     RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernel)));
     RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCPU,
@@ -2578,6 +3721,15 @@ struct Registrar {
         OpId::kKdaChunkPrefill, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<KdaChunkPrefillFn>(&KdaChunkPrefillKernel)));
     RegisterOp(
+        OpId::kMamba2ChunkScan, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<Mamba2ChunkScanFn>(&Mamba2ChunkScanKernel)));
+    RegisterOp(
+        OpId::kMamba2StateUpdate, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<Mamba2StateUpdateFn>(&Mamba2StateUpdateKernel)));
+    RegisterOp(
+        OpId::kRmsNormGatedGroup, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<RmsNormGatedGroupFn>(&RmsNormGatedGroupKernel)));
+    RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCPU,
         reinterpret_cast<void*>(
             static_cast<GdnStateGatherFn>(&GdnStateGatherKernel)));
@@ -2597,6 +3749,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernel)));
     RegisterOp(OpId::kAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    RegisterOp(OpId::kAttentionCross, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionCrossFn>(&AttentionCrossKernel)));
     // Dense-fast shares the CPU reference (the warp variant is a CUDA-only
     // optimization); byte-identical to kAttention on CPU.
     RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCPU,
@@ -2605,12 +3759,28 @@ struct Registrar {
     // to kAttention on CPU.
     RegisterOp(OpId::kAttentionDenseFlash, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    // The FA-2 dense variant is a CUDA tensor-core optimization; byte-identical to
+    // kAttention on CPU.
+    RegisterOp(OpId::kAttentionDenseFa2, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernel)));
     RegisterOp(OpId::kDFlashPagedBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernel)));
+    RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernel)));
+    RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernel)));
+    RegisterOp(OpId::kDflash2PathWalk, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2PathWalkFn>(&Dflash2PathWalkKernel)));
+    RegisterOp(OpId::kTopKValuesIndices, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<TopKValuesIndicesFn>(&TopKValuesIndicesKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,

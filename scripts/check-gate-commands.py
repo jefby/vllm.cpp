@@ -87,9 +87,10 @@ _TOOL = re.compile(
 )
 # `flock <lock> -c '<gate>'` is this repo's MANDATED shape for any gate touching
 # the GPU, and the wrapper QUOTES the real command, putting it out of reach of
-# every other rule here. It needs a lockfile AND something to run: the bare
-# `flock` and `flock /tmp/gpu` that appear in three specs name the idiom, not a
-# gate, and a plain vocabulary entry credits all three with a command.
+# every other rule here. It needs a lockfile AND something to run: a bare
+# `flock`, and a `flock` plus a lockfile with nothing after it, appear in three
+# specs naming the idiom rather than a gate, and a plain vocabulary entry would
+# credit all three with a command.
 _WRAPPER = re.compile(r"(?:^|\s)flock\s+\S+\s+\S")
 # `./anything` is an explicit invocation, arguments or not -- a built test binary
 # (`./build-cuda-121a/tests/test_dropin_abi`) is run, not referred to. A bare
@@ -149,6 +150,61 @@ def runnable_commands(section: str) -> list[str]:
             continue
         good.append(candidate)
     return good
+
+
+# A `Gates` section is a numbered list, and each item opens with a BOLD LEAD that
+# titles it. These three functions exist so a test can key on that structure
+# instead of on a sentence -- see .agents/specs/fix-gate-commands-prose-pin.md.
+#
+# They are DELIBERATELY not wired into `ratchet_errors`. A rule saying every gate
+# item without a runnable command must declare a disposition is red on arrival for
+# items this repo writes in prose rather than quoting (`Red first.`,
+# `CUDA compile.`), and this file's own header records that a gate which has to be
+# relaxed to pass is worse than no gate. That sweep is owed with its own survey.
+_GATE_ITEM = re.compile(r"(?m)^\d+\.\s")
+# The lead is a single-line title. A lead that does not close on its own line
+# returns None, which reads downstream as "declares no disposition" and takes a
+# gate RED rather than green. That is the safe direction for an unparsed record.
+_ITEM_LEAD = re.compile(r"^\d+\.\s+\*\*(.+?)\*\*")
+# A CLOSED, small vocabulary, matched in the LEAD ONLY. A status word in the lead
+# is a declaration ABOUT the gate. The same word in the body is ordinary prose
+# describing what the gate does, and crediting it would make this stop detecting
+# silence. Scope is MEASURED, not assumed: surveyed over every `Gates` section in
+# .agents/specs/ on 2026-08-18, 32 of 323 gate items GAIN a disposition when the
+# search widens from the lead to the whole item -- `**No regression:**` in
+# cpu-elementwise-gemm.md and `**Correctness gate:**` in dropin-kernel-abi.md both
+# pick up `pass` out of body prose. The row that motivated this file is NOT one of
+# the 32; that was the first hypothesis and the survey refuted it.
+_DISPOSITION = re.compile(
+    r"(?i)\b(owed|waived|blocked|deferred|superseded|not gated|ran|pass|passed|failed)\b"
+)
+
+
+def gate_items(section: str) -> list[str]:
+    """The numbered items of a `Gates` section, in order."""
+    starts = [m.start() for m in _GATE_ITEM.finditer(section)]
+    ends = starts[1:] + [len(section)]
+    return [section[a:b].rstrip() for a, b in zip(starts, ends)]
+
+
+def item_lead(item: str) -> str | None:
+    """The bold lead that titles one gate item, or None if it has no closed lead."""
+    match = _ITEM_LEAD.match(item)
+    return match.group(1) if match else None
+
+
+def gate_disposition(item: str) -> str | None:
+    """The status this gate item DECLARES in its lead, or None if it declares none.
+
+    `None` is the finding this exists to report: a gate item that names no
+    disposition and yields no runnable command is a leg the record is silent
+    about, and a reader of a credited row infers coverage nobody claimed.
+    """
+    lead = item_lead(item)
+    if lead is None:
+        return None
+    match = _DISPOSITION.search(lead)
+    return match.group(1) if match else None
 
 
 def classify_row(row) -> tuple[str, str]:
@@ -275,8 +331,113 @@ def audit() -> list[dict]:
 # baseline member. All three departures are the same lifecycle-policy closure,
 # not downgraded verdicts or hidden work. Re-adding DONE to GATED_STATES is the
 # load-bearing mutation pinned in the paired suite.
+# 2026-08-11: +ENG-TRAILER-MERGE-ARTIFACTS on arrival at ACTIVE, then REMOVED
+# the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
+# the gated population, so its verdict is None rather than a downgraded one.
+# A shrink for a real record edit, named as the message demands.
+# 2026-08-21: -SPEC-BPE-QUADRATIC-MERGE. It entered on 2026-08-19 as GROWTH,
+# when its `## Gates` section gained the `g++` build and the two run lines for
+# `tools/bench/bpe_encode_cost.cpp`, and it leaves now because the row was
+# promoted `GATING` -> `DONE` by its closing commit (fix `67823aee2`, PR #1539,
+# issue #1365). Same shape and same reason as ENG-TRAILER-MERGE-ARTIFACTS above:
+# `DONE` is not in GATED_STATES, so the row leaves the AUDITED population and its
+# verdict becomes None rather than a downgraded one. It did NOT lose its command
+# -- the recipe is still in the spec and still runnable by hand -- which is
+# exactly the distinction `ratchet_errors` draws, and why this is a shrink for a
+# real record edit rather than a gate erasing its own finding. A shrink, named as
+# the message demands, and re-pinned in the SAME change as the promotion.
+# 2026-08-11: +ENG-FORGE-COAUTHOR. Reaches ACTIVE on its committed spec (issue
+# #418), whose Gates section names the preflight, tests/scripts and
+# agent-integration invocations plus the per-commit re-verification of
+# f64f2b71, and records that no CUDA/GPU/SACRED gate is implicated because no
+# product source is touched. Growth, so the set is re-pinned in the same change.
+# 2026-08-13: +SERVE-RECIPE-ARGS. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #606), which puts it in GATED_STATES for the first time;
+# its spec's Gates section names `scripts/agent-preflight.sh --staged` plus the
+# focused test file, and records that no CUDA/GPU/SACRED/oracle gate is
+# implicated because the change is argument parsing and reaches no forward pass.
+# Growth from a lifecycle move, so the set is re-pinned in the same change.
+# 2026-08-14: +ENG-RECORD-ANCHOR-RATCHET. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #632), which puts it in GATED_STATES for the first time.
+# Its spec's Gates section names five invocations, and this is a STRONG credit
+# rather than one of the weak ones described above: the row's gate IS
+# `scripts/check-agent-record.py`, so the credited command is the thing under
+# test, and it fails on either direction of the ratchet. The suite
+# (`tests/scripts/test_agent_record.py`) is proven red against the BASE checker
+# by `scripts/check-pr-size.py`, which is itself one of the five. Growth from a
+# lifecycle move, so the set is re-pinned in the same change.
+# 2026-08-16: +SPEC-MTP-K-GT-1. A NEW row arriving at ACTIVE (issue #81), so it
+# enters GATED_STATES for the first time. Its spec's Gates section names
+# `scripts/agent-preflight.sh` plus the built CPU suite (493 passed / 0 failed /
+# 2 skipped of 495, the two skips checkpoint-gated and unrelated) and the three
+# focused doctest binaries, and records what is NOT implicated and why: the
+# change reaches a GPU forward only through paths the CPU tier already runs, so
+# no CUDA or SACRED gate is claimed here, and the DGX three-way at k=2..4 is
+# recorded as OWED rather than skipped. Growth, so the set is re-pinned in the
+# same change.
+# 2026-08-17: +ENG-RESIDENCY-CONFIG. A NEW row arriving at ACTIVE (issue #1110),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names the
+# documented CPU configure/build recipe, `ctest -j 6`, the three focused doctest
+# binaries by name, `scripts/agent-preflight.sh --staged`, and the reachability
+# mutation (delete the install call site in `LoadedEngine::FromModelDir`, require
+# the server-level suite red). It also records what is NOT implicated and why: the
+# row moves where a value comes from and changes no kernel, dtype, allocation or
+# token, so it claims no CUDA, SACRED or throughput gate, and the 370 GiB
+# reproduction through the JSON form is recorded as OWED rather than skipped
+# because dgx.casa was unreachable at the SSH layer. Growth, so the set is
+# re-pinned in the same change.
+# 2026-08-18: +ENG-CUDAGRAPH-DEDUP. A NEW row arriving at ACTIVE (issue #1162),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `ctest -R test_graph_dedup` and `scripts/agent-preflight.sh`, both of which
+# genuinely fail when the row regresses -- the focused suite detected 9 of 9
+# negative mutations of the registry it gates. It also records what is NOT
+# claimed and why: the device byte-identity A/B needs a leased CUDA box this
+# session did not have, so it is carried under the spec's `## Owed` rather than
+# reported as run, and the CUDA leg's compile rests on the `cuda-fat-build` CI
+# job. Growth, so the set is re-pinned in the same change.
+# 2026-08-18: +ENG-HF-MODEL-DOWNLOAD. A NEW row arriving at READY (issue #1280),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `scripts/validate-container-image.py`, which boots the image and asserts the
+# failure for an unknown repository is an HTTP 404 from the hub rather than the
+# message that names the build options. That distinction is the point: a symbol
+# check passes on a build where `VLLM_CPP_HF_DOWNLOAD` resolved OFF, so the
+# container gate is the only instrument that separates a working TLS build from
+# a silently disabled one. The section also records what the runnable gates do
+# NOT cover: the hermetic suite speaks plain hypertext transfer protocol, so it
+# proves nothing about transport layer security, and the second instrument is an
+# opt-in online test that does not run in the default lane. Growth, so the set
+# is re-pinned in the same change.
+# 2026-08-19: +ENG-CUDAGRAPH-BREAK, and this entry is a REPAIR rather than a
+# landing. W5 of that row (#1361, commit 601b576c6) filled its spec's Gates
+# section with runnable evidence, including a named test binary with its case
+# and assertion counts and an exit status, which is what moves a row into the
+# runnable population. The re-pin this ratchet's own error text demands was not
+# made in that change, so `main` itself has been red on
+# tests/scripts/test_check_gate_commands.py since it landed: 8 failures of 44,
+# every one a comparison between the computed runnable set and this pin,
+# measured in a detached worktree of origin/main. The continuous integration
+# lane that would have caught it independently has not executed for this
+# repository since roughly 07:43Z that day, so the change landed with no remote
+# verdict. Found while merging origin/main into row/ENG-HF-MODEL-DOWNLOAD and
+# fixed in that flow under #1376, because the fix is small and clear and a red
+# main blocks every other row's gate. Growth, so the set is re-pinned.
+# 2026-08-22: +SERVE-REQUEST-LENGTH-GUARD enters the runnable population with the
+# row itself (#1541). GROWTH, so the set is re-pinned in the same change, per the
+# note above. Its spec `## Gates` names a configure, a ninja target list and three
+# suite invocations that genuinely fail on a broken guard -- the same three the
+# implementing branch's red-then-green evidence was taken from -- so the credit is
+# the row's own and not inherited.
 RUNNABLE_BASELINE = frozenset({
+    "SERVE-REQUEST-LENGTH-GUARD",
+    "ENG-CUDAGRAPH-BREAK",
+    "ENG-HF-MODEL-DOWNLOAD",
+    "ENG-RESIDENCY-CONFIG",
+    "ENG-CUDAGRAPH-DEDUP",
+    "SPEC-MTP-K-GT-1",
     "ATTN-CHUNKED-LOCAL",
+    "ENG-RECORD-ANCHOR-RATCHET",
+    "SERVE-RECIPE-ARGS",
+    "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
@@ -290,6 +451,12 @@ RUNNABLE_BASELINE = frozenset({
     "ENG-PRIORITY-SCHED",
     "ENG-RELEASE-CONTAINERS",
     "KERNEL-GEMM-CPU-ELEM",
+    # KV-EVENTS W3 (2026-08-11, issue #352): GROWTH, re-pinned in the same
+    # change. The row's Gates section previously described only in-process
+    # assertion counts; W3 names the CPU test binaries and the ctest sweep that
+    # gate the scheduler envelope and the report_mode=="full" reuse path, so the
+    # row now carries a command that can fail and joins the runnable population.
+    "KV-EVENTS",
     "LORA-RUNTIME",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
@@ -311,6 +478,14 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-ASYNC-LLM",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
+    # 2026-08-22: +BACKEND-TENSTORRENT-GDN enters the runnable population when
+    # its spec lands (#1715). The credit is the PRE-EXISTING suites its
+    # `## Gates` binds -- the full TT suite, the CPU gate, and
+    # `scripts/agent-preflight.sh` -- which run today and genuinely fail on a
+    # broken tree. The row's own doctest cases are still OWED (spec-first,
+    # W1/W2 not implemented), so this is an inherited credit in the exact
+    # shape the #1541 note describes, not a certificate.
+    "BACKEND-TENSTORRENT-GDN",
 })
 
 

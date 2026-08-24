@@ -84,12 +84,25 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
   /* Video+audio generation (ABI v12): the separate vllm_video_engine handle
    * plus the engine-free mux-argv composer. */
   {
+    /* v18: the family selector + the parallel extras arrays must be spellable
+     * from pure C, const-qualification and all. */
+    static const char* const extra_keys[] = {"partition"};
+    static const char* const extra_values[] = {"fl2va"};
     vllm_video_model_params vmp = vllm_video_model_params_default();
     vllm_video_params vp = vllm_video_params_default();
     vllm_video_engine* veng = NULL;
+    vmp.family = "minimax-h3";
+    vmp.extra_keys = extra_keys;
+    vmp.extra_values = extra_values;
+    vmp.n_extras = 1;
+    vp.extra_keys = NULL;
+    vp.extra_values = NULL;
+    vp.n_extras = 0;
     st = vllm_video_engine_load(&vmp, &veng);
     if (st == VLLM_OK) {
       vllm_video_result vres;
+      const char* fam = vllm_video_engine_family(veng);
+      (void)fam;
       st = vllm_video_generate(veng, &vp, &vres);
       vllm_video_result_free(&vres);
       vllm_video_engine_free(veng);
@@ -101,6 +114,17 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
       st = vllm_video_mux_argv(&mux, &mux_argv, &mux_argc);
       vllm_video_mux_argv_free(mux_argv, mux_argc);
     }
+  }
+
+  {
+    /* v21: the speech lane's device selector must be spellable from PURE C —
+     * an int32_t field and an int32_t query, no C++ type leaking through the
+     * header. Nothing is loaded here; this compiles and links the surface. */
+    vllm_speech_model_params smp = vllm_speech_model_params_default();
+    smp.path = "/nonexistent";
+    smp.device = 0; /* CPU, the zero value */
+    (void)smp.device;
+    (void)vllm_speech_engine_device(NULL);
   }
 
   (void)vllm_last_error();

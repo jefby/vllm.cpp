@@ -10,6 +10,8 @@
 #include <variant>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/read_only_file_mapping.h"
+
 namespace vllm {
 
 // The read-only mapping of ONE .gguf file, refcounted. `GgufFile` holds one
@@ -20,9 +22,6 @@ namespace vllm {
 // safe to outlive the `GgufFile` value it came from — the entrypoint's
 // `GgufFile` local is destroyed as soon as the model is built.
 struct GgufMapping {
-  int fd = -1;
-  void* addr = nullptr;
-  size_t size = 0;
   // Extra shard mappings kept alive by THIS (primary) mapping, for a multi-file
   // split GGUF (llama.cpp `gguf-split`, "...-00001-of-00003.gguf"). A merged
   // GgufFile exposes ONE mapping (this one) via Mapping(); a borrowed span in
@@ -30,11 +29,16 @@ struct GgufMapping {
   // the whole file. Empty for a normal single-file open. Destroyed after this
   // mapping's own munmap (member-destruction order), releasing each shard.
   std::vector<std::shared_ptr<const GgufMapping>> siblings;
+  // The one platform mapping owned by this logical shard. Declared after
+  // siblings so it is destroyed first, preserving the existing primary-then-
+  // sibling cleanup order. Bytes are immutable and native handles close at the
+  // last borrow.
+  std::shared_ptr<const detail::ReadOnlyFileMapping> file;
 
   GgufMapping() = default;
   GgufMapping(const GgufMapping&) = delete;
   GgufMapping& operator=(const GgufMapping&) = delete;
-  ~GgufMapping();
+  ~GgufMapping() = default;
 };
 
 // GGUF metadata value type ids (wire format).
@@ -138,6 +142,19 @@ class GgufFile {
   // True when [data, data+nbytes) lies wholly inside this file's mapping — the
   // precondition for borrowing those bytes in place.
   bool OwnsSpan(const uint8_t* data, size_t nbytes) const;
+
+  // Where a borrowed span physically LIVES: the descriptor of the shard that
+  // owns it and its byte offset within that shard. `fd` is -1 when the span is
+  // not inside any mapping this file owns, which a caller must treat as "read
+  // it through the mapping instead" rather than as an error.
+  //
+  // A split GGUF is why this is not just `ptr - base`: the span may sit in any
+  // sibling shard, each with its own descriptor and its own zero.
+  struct SpanSource {
+    int fd = -1;
+    size_t offset = 0;
+  };
+  SpanSource SourceOfSpan(const uint8_t* data, size_t nbytes) const;
 
   // Drop the resident pages of a span that has been read for the LAST time —
   // i.e. a tensor the loader EXPANDED, whose file bytes nothing will look at

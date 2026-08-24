@@ -2,18 +2,27 @@
 
 Status: accepted contract with required W1-W11/W13 implementation complete for
 `ENG-RELEASE-BINARIES` in the single delivery PR #196. The release row remains
-`ACTIVE`: local gates are green, while the hosted eight-tuple dry run,
-matching-hardware evidence, and tagged publication are still pending. W12 is
+`ACTIVE`: v0.0.2 published all eight primary tuples, while matching-hardware
+evidence and the native Windows v0.0.3-pre.1 extension remain pending. W12 is
 optional/non-primary.
 
 Pins: vLLM parity source `555967922`; vllm.cpp spike baseline `f13c49ee`;
-request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
+request [#117](https://github.com/mudler/vllm.cpp/issues/117); hosted CI repair
+[#447](https://github.com/mudler/vllm.cpp/issues/447); claim
 `CLAIM-ENG-RELEASE-BINARIES-SPIKE` in draft PR
 [#129](https://github.com/mudler/vllm.cpp/pull/129); W5 implementation claim
 `CLAIM-ENG-RELEASE-BINARIES-W5` in draft PR
 [#141](https://github.com/mudler/vllm.cpp/pull/141); W6 implementation claim
 `CLAIM-ENG-RELEASE-BINARIES-W6` in draft PR
-[#196](https://github.com/mudler/vllm.cpp/pull/196).
+[#196](https://github.com/mudler/vllm.cpp/pull/196). The Windows extension's
+per-commit documentation checkpoint repair is tracked by
+[#448](https://github.com/mudler/vllm.cpp/issues/448); its archive-target
+checkpoint repair is tracked by
+[#450](https://github.com/mudler/vllm.cpp/issues/450). The merged-SHA dry-run
+repairs for exact prerelease identity and the native MSVC test translation unit
+are tracked by [#499](https://github.com/mudler/vllm.cpp/issues/499) and
+[#500](https://github.com/mudler/vllm.cpp/issues/500), specified together in
+[release-dry-run-gate-repairs.md](release-dry-run-gate-repairs.md).
 
 ## Delivery topology
 
@@ -36,7 +45,11 @@ per_sm_cuda=optional-non-primary
 primary_cpu_artifact=one-adaptive-binary-per-os-host-abi
 x86_64_baseline=portable-sse2-without-avx2
 work_W12_policy=optional-non-blocking
-archive_claims=pending
+archive_claims=published-v0.0.2
+published_tag=v0.0.2
+published_sha=7020de93652ca920424a10ac5255b34810dd2f24
+published_run=31466516224
+published_asset_count=26
 runtime_claims=pending
 metal_channel=stable-after-runtime-gate
 mlx_channel=preview
@@ -45,7 +58,7 @@ musl_channel=experimental-preview
 musl_scope=cpu-only-no-gpu
 rocm_channel=blocked
 gpu_driver_boundary=external-host-never-bundled
-required_anchor_paths=.agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,.agents/coordination.md,.agents/completed/state-events/2026-08/STATE-20260809T160000-001.md,docs/STATUS.md,docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,scripts/release_manifest.py,tests/scripts/test_release_manifest.py,examples/CMakeLists.txt,scripts/package-server.py,tests/scripts/test_server_package.py
+required_anchor_paths=.agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,.agents/coordination.md,.agents/completed/state-events/2026-08/STATE-20260809T160000-001.md,release/manifest-v1.schema.json,scripts/release_manifest.py,tests/scripts/test_release_manifest.py,examples/CMakeLists.txt,scripts/package-server.py,tests/scripts/test_server_package.py
 work_W1=
 work_W2=W1
 work_W3=
@@ -190,8 +203,8 @@ hardware the project does not own.
 |---|---|---|
 | `linux-x86_64-glibc-cpu` | stable after baseline and tiered runtime gates | one adaptive binary: SSE2/portable baseline without AVX2, plus only inventoried per-TU F16C/AVX2/AVX-512 and later VNNI/AMX tiers whose kernels and exact probes exist; record glibc/libstdc++ floors and compiled tiers |
 | `linux-aarch64-glibc-cpu` | stable after baseline and tiered runtime gates | one adaptive binary: NEON/portable baseline plus only inventoried HWCAP/HWCAP2-gated DotProd/i8mm and future tiers whose kernels exist; independent arm64 evidence is never inferred from x86_64 |
-| `linux-x86_64-glibc-cuda-fat` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary x86_64 CUDA download; explicit SM set `80,86,87,89,90a,100a,103a,110,120a,121a`; per-source gencode and per-SM runtime/AOT dispatch required |
-| `linux-aarch64-glibc-cuda-fat` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary aarch64 CUDA download with the same ten SM device targets but a distinct host ELF ABI; cannot be the x86_64 archive |
+| `linux-x86_64-glibc-cuda` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary x86_64 CUDA download; explicit SM set `80,86,87,89,90a,100a,103a,110,120a,121a`; per-source gencode and per-SM runtime/AOT dispatch required |
+| `linux-aarch64-glibc-cuda` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary aarch64 CUDA download with the same ten SM device targets but a distinct host ELF ABI; cannot be the x86_64 archive |
 | `macos-arm64-metal` | stable after M-series runtime gate | native Metal, MLX off; record deployment target and required system frameworks |
 | `macos-arm64-metal-mlx` | preview until its exact bundled MLX tuple is runtime/correctness-gated | Metal plus opt-in MLX provider and redistribution/license audit; record MLX dylib and metallib versions |
 | `linux-x86_64-glibc-vulkan` | preview | Vulkan explicitly on; loader/device/driver remain external; only the Vulkan-supported model/quant surface is declared |
@@ -599,14 +612,33 @@ hybrid stable/preview channel. Literal-static scope is limited to the
 experimental musl CPU lane. ROCm is blocked. Primary downloads are adaptive CPU
 or fat CUDA per OS+host ABI; per-SM CUDA archives are optional diagnostics. The
 Required W1-W11/W13 are implemented and the row is `ACTIVE`, not `DONE`. Local
-archive, CPU, Vulkan, workflow, and mutation gates are green. The hosted
-eight-tuple dry run, matching-hardware evidence, and tagged publication remain
-pending, so no published archive or release-channel advancement is claimed.
-W12 remains the optional non-primary diagnostic lane.
+archive, CPU, Vulkan, workflow, and mutation gates are green. The v0.0.2 tag
+workflow published the eight archive/checksum/provenance triplets and two
+generated indexes (26 assets) from
+`7020de93652ca920424a10ac5255b34810dd2f24` in run `31466516224`.
+Matching-hardware evidence and the Windows v0.0.3-pre.1 extension remain
+pending. W12 remains the optional non-primary diagnostic lane.
+
+## Outcome
+
+PR #446's hosted CPU gate exposed two release-version call sites still pinned
+to `0.0.2` after the project advanced to `0.0.3`, plus the
+`vllm-server-archive` CMake target omitting the packager's required explicit
+archive format. Issue #447 updates both executable expectations to `0.0.3` and
+passes `--archive-format tar.gz` at the existing deterministic archive target;
+the archive remains a tarball and no release workflow behavior changes.
+
+That first local #447 repair changed the public CMake archive target without an
+atomic `docs/USAGE.md` projection, so the per-commit documentation checkpoint
+correctly rejected it ([#450](https://github.com/mudler/vllm.cpp/issues/450)).
+The replacement preserves the version and explicit-format fix and documents
+the developer archive separately from prerelease workflow asset naming; no
+checker or workflow behavior is weakened.
 
 ## Now
 
-**ACTIVE; required W1-W11/W13 implemented in #196.** Next: finish the hosted
-ten-SM proof, rebase and push, and run the full eight-tuple dry run. Hosted
-ten-SM completion, matching-hardware gates and tagged publication remain pending;
-no binaries are published.
+**ACTIVE; required W1-W11/W13 implemented and v0.0.2 published.** The eight
+primary archives and their sidecars/indexes are live from SHA
+`7020de93652ca920424a10ac5255b34810dd2f24` (run `31466516224`, 26 assets).
+Matching-hardware evidence and the Windows v0.0.3-pre.1 extension remain
+pending.

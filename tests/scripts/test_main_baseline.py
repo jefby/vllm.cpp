@@ -1,0 +1,1785 @@
+#!/usr/bin/env python3
+"""Offline suite for the `main` baseline reader and its workflow lane (#274).
+
+Two halves, both network-free.
+
+The VERDICT half fixes the trap that made this row necessary. `sanitize-cpu`
+carries `continue-on-error: true`, so the Actions API reports the RUN as
+`success` while the job is `failure`. Run 31448896841 at 5812b8b6 is exactly
+that shape and is the only completed `main` run in the 40-run window this row
+measured: a reader of `run.conclusion` would publish it as the known-good SHA.
+`test_run_level_success_with_red_sanitizers_is_not_green` is that mutation, and
+it is the one test an implementation reading `run.conclusion` fails.
+
+The WORKFLOW half asserts the lane can actually finish: every job-level
+concurrency group must discriminate on the event, or a push to `main` cancels
+the scheduled baseline exactly as it cancels the previous push -- which is the
+measured cause of 26 cancelled runs out of 40. It also asserts the two
+properties a reviewer most needs held constant: `push`/`pull_request` grouping
+is unchanged, and the baseline verdict job can never run on a contributor's PR.
+
+WHY THE WORKFLOW HALF EVALUATES INSTEAD OF GREPPING. Its first version checked
+substrings, and four planted defects walked straight through it:
+
+  a. inverting `cancel-in-progress` to
+     `== 'schedule' || == 'workflow_dispatch'` keeps every substring the old
+     assertion looked for while turning PR cancellation OFF and baseline
+     self-cancellation ON. `CancellationPolicyTests` now resolves the
+     expression to a BOOLEAN per event.
+  b. adding `${{ github.sha }}` to a job group key destroys push/PR dedupe.
+     The old test only blocked `github.run_id`. `GroupKeyTests` pins the
+     resolved key against a literal derived from the base revision's key.
+  c/d. `|| true` on the verdict step, or `continue-on-error: true` on the
+     verdict job, rebuild the exact `sanitize-cpu` defect this row is about one
+     level up. `VerdictJobCannotSwallowFailureTests` refuses both.
+
+And `AgentRecordDiffRangeTests` EXECUTES the two `agent-record` step bodies that
+consume `github.event.before` under a `python3` shim: on a `schedule` payload
+that variable renders empty, and before the guard landed the step died under
+`set -eu` with `--range: range must be exactly BASE..HEAD`, so `agent-record`
+could never be green and the baseline could never publish GREEN at all.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = ROOT / ".github/workflows/ci.yml"
+PREFLIGHT = ROOT / "scripts/agent-preflight.sh"
+
+
+def load_module():
+    path = ROOT / "scripts/main-baseline.py"
+    spec = importlib.util.spec_from_file_location("main_baseline", path)
+    assert spec and spec.loader, path
+    module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE exec: `@dataclass` under `from __future__ import
+    # annotations` resolves its field types through sys.modules[__module__].
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+baseline = load_module()
+
+
+def job(name, conclusion):
+    return {"name": name, "conclusion": conclusion, "status": "completed"}
+
+
+# The real 31448896841 shape: run says success, both sanitizer lanes are red.
+RUN_31448896841 = {
+    "id": 31448896841,
+    "head_sha": "5812b8b667eabcb7fe6f12767176a48c04ff7b26",
+    "created_at": "2026-08-11T01:18:27Z",
+    "conclusion": "success",
+    "event": "push",
+}
+JOBS_31448896841 = [
+    job("agent-record", "success"),
+    job("build-test-cpu", "success"),
+    job("build-test-cpu-arm64", "success"),
+    job("build-test-vulkan", "success"),
+    job("cuda-arch-features", "success"),
+    job("cuda-fat-build", "success"),
+    job("device-leakage", "success"),
+    job("vulkan-spirv-freshness", "success"),
+    job("pr-size", "skipped"),
+    job("sanitize-cpu (address,undefined)", "failure"),
+    job("sanitize-cpu (thread)", "failure"),
+]
+
+ALL_GREEN_JOBS = [
+    job(name, "success")
+    for name in (
+        "agent-record",
+        "build-test-cpu",
+        "build-test-cpu-arm64",
+        "build-test-cpu-arm64-full",
+        "build-test-vulkan",
+        "cuda-arch-features",
+        "cuda-fat-build",
+        "device-leakage",
+        "macos-metal-mlx",
+        "vulkan-spirv-freshness",
+        "windows-msvc-cpu",
+        "windows-msvc-vulkan",
+        "sanitize-cpu (address,undefined)",
+        "sanitize-cpu (thread)",
+    )
+] + [job("pr-size", "skipped")]
+
+
+class VerdictTests(unittest.TestCase):
+    def test_run_level_success_with_red_sanitizers_is_not_green(self) -> None:
+        """The mutation this row exists for: run.conclusion is not the verdict.
+
+        An implementation that reads RUN_31448896841["conclusion"] passes every
+        other test here and fails this one.
+        """
+        verdict = baseline.verdict(RUN_31448896841, JOBS_31448896841)
+        self.assertFalse(verdict.green)
+        self.assertEqual(
+            verdict.failing,
+            ["sanitize-cpu (address,undefined)", "sanitize-cpu (thread)"],
+        )
+        self.assertEqual(verdict.sha, RUN_31448896841["head_sha"])
+
+    def test_all_green_is_green(self) -> None:
+        verdict = baseline.verdict(RUN_31448896841, ALL_GREEN_JOBS)
+        self.assertTrue(verdict.green)
+        self.assertEqual(verdict.failing, [])
+
+    def test_skipped_is_reported_as_not_covered_never_as_a_pass(self) -> None:
+        verdict = baseline.verdict(RUN_31448896841, ALL_GREEN_JOBS)
+        self.assertIn("pr-size", verdict.not_run)
+        self.assertNotIn("pr-size", verdict.covered)
+
+    def test_cancelled_is_not_green(self) -> None:
+        """A cancelled long job is the defect, so it can never read as a pass."""
+        jobs = [job("agent-record", "success"), job("cuda-fat-build", "cancelled")]
+        verdict = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(verdict.green)
+        self.assertIn("cuda-fat-build", verdict.failing)
+
+    def test_missing_and_in_progress_conclusions_are_not_green(self) -> None:
+        for conclusion in (None, "", "timed_out", "action_required", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                jobs = [job("agent-record", "success"), job("build-test-cpu", conclusion)]
+                self.assertFalse(baseline.verdict(RUN_31448896841, jobs).green)
+
+    def test_no_covered_jobs_fails_closed(self) -> None:
+        """An empty or all-skipped job list is unknown, never green."""
+        self.assertFalse(baseline.verdict(RUN_31448896841, []).green)
+        self.assertFalse(
+            baseline.verdict(RUN_31448896841, [job("pr-size", "skipped")]).green
+        )
+
+    def test_summary_job_is_excluded_from_its_own_verdict(self) -> None:
+        """It queries while it is still running; counting itself is never green."""
+        jobs = ALL_GREEN_JOBS + [
+            {"name": baseline.SUMMARY_JOB, "conclusion": None, "status": "in_progress"}
+        ]
+        verdict = baseline.verdict(RUN_31448896841, jobs)
+        self.assertTrue(verdict.green)
+        self.assertNotIn(baseline.SUMMARY_JOB, verdict.covered)
+
+    def test_an_expected_job_the_payload_never_mentions_is_red(self) -> None:
+        """The narrowing mutation: eight of nine covered jobs simply absent.
+
+        Without an expected-job set the verdict is purely subtractive and this
+        prints GREEN with `jobs covered: 1` -- a job renamed or deleted by an
+        unrelated PR silently shrinks the baseline while it keeps publishing
+        green.
+        """
+        verdict = baseline.verdict(RUN_31448896841, [job("agent-record", "success")])
+        self.assertFalse(verdict.green)
+        self.assertEqual(verdict.covered, ["agent-record"])
+        self.assertEqual(
+            sorted(verdict.missing),
+            sorted(n for n in baseline.EXPECTED_JOBS if n != "agent-record"),
+        )
+        self.assertEqual(verdict.failing, [], "absent is not the same as failed")
+
+    def test_a_matrix_job_discharges_its_expectation_under_the_bare_id(self) -> None:
+        """The API reports `sanitize-cpu (thread)`; the expectation is the id."""
+        verdict = baseline.verdict(RUN_31448896841, ALL_GREEN_JOBS)
+        self.assertEqual(verdict.missing, [])
+        self.assertTrue(verdict.green)
+
+    def test_an_expected_job_that_was_skipped_counts_as_never_ran(self) -> None:
+        jobs = [j for j in ALL_GREEN_JOBS if j["name"] != "device-leakage"]
+        jobs.append(job("device-leakage", "skipped"))
+        verdict = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(verdict.green)
+        self.assertIn("device-leakage", verdict.missing)
+
+    def test_expected_jobs_is_pinned_against_the_workflow_needs_list(self) -> None:
+        """The workflow is the authority; the constant is the pin.
+
+        A PR that renames a covered job reds THIS assertion instead of quietly
+        narrowing every future baseline.
+        """
+        self.assertEqual(
+            tuple(sorted(baseline.EXPECTED_JOBS)),
+            baseline.expected_jobs_from_workflow(),
+        )
+        # 9 until 2026-08-17, then 11: `windows-msvc-cpu` and
+        # `windows-msvc-vulkan` joined the lane (#503). 12 from 2026-08-23:
+        # `macos-metal-mlx` joined it (#1765), the only lane that compiles the
+        # four Metal translation units at all. 13 the same day:
+        # `build-test-cpu-arm64-full` joined it (#1385), the only lane that
+        # executes the suite on the architecture the fleet and the release
+        # bundles ship. The literal is here so
+        # that DROPPING a job cannot be spelled as an edit to one list -- the
+        # equality above is satisfied by narrowing both sides together, and this
+        # is not.
+        self.assertEqual(len(baseline.EXPECTED_JOBS), 13)
+
+    def test_an_unfinished_job_is_pending_not_failed(self) -> None:
+        """Fail-closed is right; calling it a FAILURE is a wrong label."""
+        jobs = [dict(entry) for entry in ALL_GREEN_JOBS]
+        for entry in jobs:
+            if entry["name"] == "build-test-cpu":
+                entry["conclusion"] = None
+                entry["status"] = "in_progress"
+        verdict = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(verdict.green)
+        self.assertIn("build-test-cpu", verdict.pending)
+        self.assertNotIn("build-test-cpu", verdict.failing)
+        self.assertNotIn("build-test-cpu", verdict.covered)
+        self.assertNotIn("build-test-cpu", verdict.missing)
+
+
+class LastGreenTests(unittest.TestCase):
+    def verdicts(self):
+        newest = baseline.verdict(
+            {**RUN_31448896841, "id": 3, "head_sha": "c" * 40,
+             "created_at": "2026-08-11T12:00:00Z"},
+            JOBS_31448896841,
+        )
+        middle = baseline.verdict(
+            {**RUN_31448896841, "id": 2, "head_sha": "b" * 40,
+             "created_at": "2026-08-11T08:00:00Z"},
+            ALL_GREEN_JOBS,
+        )
+        oldest = baseline.verdict(
+            {**RUN_31448896841, "id": 1, "head_sha": "a" * 40,
+             "created_at": "2026-08-11T04:00:00Z"},
+            ALL_GREEN_JOBS,
+        )
+        return [newest, middle, oldest]
+
+    def test_last_green_is_the_newest_green_not_the_newest_run(self) -> None:
+        self.assertEqual(baseline.last_green(self.verdicts()).sha, "b" * 40)
+
+    def test_absence_of_any_green_is_explicit(self) -> None:
+        reds = [v for v in self.verdicts() if not v.green]
+        self.assertIsNone(baseline.last_green(reds))
+        text = baseline.render(reds, degraded=None)
+        self.assertIn("no fully green baseline", text.lower())
+        self.assertNotIn("None", text.splitlines()[-1])
+
+    def test_render_names_the_last_green_sha_and_the_newest_failures(self) -> None:
+        text = baseline.render(self.verdicts(), degraded=None)
+        self.assertIn("b" * 40, text)
+        self.assertIn("sanitize-cpu (address,undefined)", text)
+
+    def test_degraded_remote_is_reported_not_rendered_as_green(self) -> None:
+        text = baseline.render([], degraded="REMOTE_UNVERIFIED: no network")
+        self.assertIn("REMOTE_UNVERIFIED", text)
+        self.assertNotIn("no fully green baseline", text.lower())
+
+
+class EmitSummaryTests(unittest.TestCase):
+    def test_exit_code_is_nonzero_for_the_red_shape(self) -> None:
+        stream = io.StringIO()
+        code = baseline.emit_summary(
+            baseline.verdict(RUN_31448896841, JOBS_31448896841), stream
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("sanitize-cpu (thread)", stream.getvalue())
+
+    def test_exit_code_is_zero_when_every_covered_job_is_green(self) -> None:
+        stream = io.StringIO()
+        code = baseline.emit_summary(
+            baseline.verdict(RUN_31448896841, ALL_GREEN_JOBS), stream
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("5812b8b6", stream.getvalue())
+
+    def test_json_output_carries_sha_green_and_failures(self) -> None:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            baseline.print_json(
+                [baseline.verdict(RUN_31448896841, JOBS_31448896841)], degraded=None
+            )
+        payload = json.loads(buffer.getvalue())
+        self.assertFalse(payload["runs"][0]["green"])
+        self.assertIsNone(payload["last_green"])
+        self.assertIn(
+            "sanitize-cpu (thread)", payload["runs"][0]["failing"]
+        )
+
+    def test_a_narrowed_run_reports_red_and_names_what_never_ran(self) -> None:
+        stream = io.StringIO()
+        code = baseline.emit_summary(
+            baseline.verdict(RUN_31448896841, [job("agent-record", "success")]), stream
+        )
+        self.assertNotEqual(code, 0)
+        text = stream.getvalue()
+        self.assertIn("main baseline: RED", text)
+        self.assertIn("never ran", text)
+        self.assertIn("cuda-fat-build", text)
+
+
+class ExitCodeTests(unittest.TestCase):
+    """Absence is not success -- the confusion the module docstring names."""
+
+    def run_main(self, argv, collected):
+        original = baseline.collect
+        baseline.collect = lambda limit: collected
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                code = baseline.main(argv)
+        finally:
+            baseline.collect = original
+        return code, buffer.getvalue()
+
+    def test_no_completed_baseline_run_exits_nonzero(self) -> None:
+        """`main-baseline.py && echo ok` must not print ok when nothing ran."""
+        code, text = self.run_main([], ([], None))
+        self.assertNotEqual(code, 0)
+        self.assertIn("No completed baseline run found on main.", text)
+
+    def test_no_completed_baseline_run_exits_nonzero_in_json_mode_too(self) -> None:
+        code, text = self.run_main(["--json"], ([], None))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(json.loads(text)["runs"], [])
+
+    def test_a_degraded_remote_exits_nonzero(self) -> None:
+        code, text = self.run_main([], ([], "REMOTE_UNVERIFIED: no network"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("REMOTE_UNVERIFIED", text)
+
+    def test_a_real_baseline_history_exits_zero(self) -> None:
+        code, _ = self.run_main(
+            [], ([baseline.verdict(RUN_31448896841, ALL_GREEN_JOBS)], None)
+        )
+        self.assertEqual(code, 0)
+
+
+# ---------------------------------------------------------------------------
+# Workflow lane
+# ---------------------------------------------------------------------------
+
+JOB_HEADER = re.compile(r"(?m)^  ([a-zA-Z0-9_-]+):$")
+GROUP_LINE = re.compile(r"(?m)^      group: (.+)$")
+CANCEL_LINE = re.compile(r"(?m)^      cancel-in-progress: (.+)$")
+
+# Every GitHub event this workflow can be triggered by. The resolved-expression
+# assertions below cover all four, because a polarity mutation is only visible
+# as a DISAGREEMENT between the baseline events and the contributor events.
+EVENTS = ("push", "pull_request", "schedule", "workflow_dispatch")
+BASELINE_EVENTS = ("schedule", "workflow_dispatch")
+
+# Every job that carried a job-level group at 0eb049f7, the base of this row,
+# mapped to THE EXACT KEY IT CARRIED THERE (`git show 0eb049f7:.github/
+# workflows/ci.yml`). The keys below are the whole content of the "grouping is
+# unchanged" claim: this row's key must be the base key with the constant
+# `-<event>` inserted, and nothing else. Inserting a run-varying token such as
+# `${{ github.sha }}` -- which would destroy push and PR dedupe entirely --
+# fails the equality, which a substring check could not see.
+BASE_GROUPS = {
+    "agent-record": "ci-agent-record-${{ github.ref }}-${{ github.repository }}",
+    "cuda-arch-features": "ci-cuda-arch-features-${{ github.ref }}-${{ github.repository }}",
+    "cuda-fat-build": "ci-cuda-fat-build-${{ github.ref }}-${{ github.repository }}",
+    "vulkan-spirv-freshness": "ci-vulkan-spirv-freshness-${{ github.ref }}-${{ github.repository }}",
+    "build-test-vulkan": "ci-build-test-vulkan-${{ github.ref }}-${{ github.repository }}",
+    "device-leakage": "ci-device-leakage-${{ github.ref }}-${{ github.repository }}",
+    "build-test-cpu": "ci-build-test-cpu-${{ github.ref }}-${{ github.repository }}",
+    "build-test-cpu-arm64": "ci-build-test-cpu-arm64-${{ github.ref }}-${{ github.repository }}",
+    "sanitize-cpu": "ci-sanitize-cpu-${{ matrix.lane }}-${{ github.ref }}-${{ github.repository }}",
+}
+GROUPED_JOBS = tuple(BASE_GROUPS)
+# Any of these in a concurrency key means the key varies per RUN, which is the
+# same thing as having no key: every run gets its own group and dedupe stops.
+RUN_VARYING_TOKENS = (
+    "github.run_id",
+    "github.run_number",
+    "github.run_attempt",
+    "github.sha",
+    "github.event.head_commit.id",
+    "github.event.pull_request.head.sha",
+)
+# Diff-scoped per-push gates. They must never regain a group (ci.yml:16-24) and
+# they are not part of the baseline, whose subject is the tree.
+UNGROUPED_JOBS = ("documentation-checkpoint", "commit-protocol-tag")
+
+EXPRESSION_TOKEN = re.compile(
+    r"""\s*(?:
+        (?P<wrap>\$\{\{|\}\})
+      | (?P<op><=|>=|&&|\|\||==|!=|\(|\))
+      | (?P<ctx>github\.event_name)
+      | (?P<text>'[^']*')
+      | (?P<literal>true|false)
+    )\s*""",
+    re.VERBOSE,
+)
+
+
+def resolve_boolean(expression: str, event: str) -> bool:
+    """Evaluate the GitHub-expression subset these keys use, for one event.
+
+    A real evaluation, not a substring check, because the mutation that matters
+    keeps every substring. Inverting a key to
+    `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`
+    still "contains schedule", still "contains workflow_dispatch", still is not
+    the literal `true` -- and it turns PR/push cancellation OFF and baseline
+    self-cancellation ON, which is the precise opposite of the intent.
+
+    Any token outside the recognised subset raises rather than being guessed at:
+    an unreadable key must red the suite, never quietly resolve to something.
+    """
+
+    rendered: list[str] = []
+    position = 0
+    while position < len(expression):
+        match = EXPRESSION_TOKEN.match(expression, position)
+        if match is None:
+            raise AssertionError(
+                f"unrecognised token in {expression!r} at {expression[position:]!r}"
+            )
+        position = match.end()
+        if match.group("wrap"):
+            continue
+        if match.group("ctx"):
+            rendered.append(repr(event))
+        elif match.group("op"):
+            rendered.append(
+                {"&&": " and ", "||": " or "}.get(match.group("op"), match.group("op"))
+            )
+        elif match.group("text"):
+            rendered.append(match.group("text"))
+        else:
+            rendered.append(match.group("literal").capitalize())
+    source = "".join(rendered).strip()
+    if not source:
+        raise AssertionError(f"empty expression: {expression!r}")
+    value = eval(source, {"__builtins__": {}}, {})  # noqa: S307 -- fixed subset above
+    if not isinstance(value, bool):
+        raise AssertionError(f"{expression!r} did not resolve to a boolean for {event}")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Group keys, resolved to a VALUE
+# ---------------------------------------------------------------------------
+#
+# `resolve_boolean` above answers "does this expression mean true for this
+# event". A group key is not a boolean, and since #274's follow-on it is not a
+# constant either: the baseline events carry a conditional that admits the run
+# identity, and every other event must resolve to exactly the key it resolved to
+# before. Half-resolving the string cannot see that, so the resolver below
+# evaluates the same grammar over VALUES, with GitHub's truthiness for `&&` and
+# `||` (`null`, `false`, `0` and `''` are falsy, and both operators return an
+# OPERAND rather than a boolean).
+#
+# Contexts split into two classes, and the split is the whole point. A
+# RUN-VARYING context takes a different value in two different runs of the same
+# workflow on the same ref. A STABLE one does not. Resolving one key twice, once
+# per synthetic run, turns "does this key carry `github.run_id`" into the
+# property that actually matters: does this key put two runs in the same group.
+
+RUN_A = {
+    "github.run_id": "5000000001",
+    "github.run_number": "801",
+    "github.run_attempt": "1",
+    "github.sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "github.event.head_commit.id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "github.event.pull_request.head.sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+}
+RUN_B = {
+    "github.run_id": "5000000002",
+    "github.run_number": "802",
+    "github.run_attempt": "2",
+    "github.sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "github.event.head_commit.id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "github.event.pull_request.head.sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+}
+assert set(RUN_A) == set(RUN_B) == set(RUN_VARYING_TOKENS), (
+    "the run-varying contexts and the by-name blocklist must name the same set"
+)
+assert all(RUN_A[k] != RUN_B[k] for k in RUN_A), "two runs must differ everywhere"
+
+# Stable for a given event: the same in run A and run B. `matrix.lane` is stable
+# because it identifies the lane, not the run, which is exactly why
+# `sanitize-cpu`'s two lanes are allowed to hold separate groups.
+STABLE_CONTEXTS = {
+    "push": {
+        "github.event_name": "push",
+        "github.ref": "refs/heads/main",
+        "github.ref_name": "main",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": None,
+        "matrix.lane": "thread",
+    },
+    "pull_request": {
+        "github.event_name": "pull_request",
+        "github.ref": "refs/pull/1234/merge",
+        "github.ref_name": "1234/merge",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": 1234,
+        "matrix.lane": "thread",
+    },
+    "schedule": {
+        "github.event_name": "schedule",
+        "github.ref": "refs/heads/main",
+        "github.ref_name": "main",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": None,
+        "matrix.lane": "thread",
+    },
+    "workflow_dispatch": {
+        "github.event_name": "workflow_dispatch",
+        "github.ref": "refs/heads/main",
+        "github.ref_name": "main",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": None,
+        "matrix.lane": "thread",
+    },
+}
+assert set(STABLE_CONTEXTS) == set(EVENTS)
+
+VALUE_TOKEN = re.compile(
+    r"""\s*(?:
+        (?P<op>&&|\|\||==|!=|\(|\))
+      | (?P<text>'[^']*')
+      | (?P<literal>true|false|null)
+      | (?P<number>[0-9]+)
+      | (?P<ctx>[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)
+    )\s*""",
+    re.VERBOSE,
+)
+
+
+def _truthy(value) -> bool:
+    """GitHub's truthiness. `null`, `false`, `0` and the empty string are false."""
+    return not (value is None or value is False or value == 0 or value == "")
+
+
+def _render(value) -> str:
+    """How GitHub substitutes a resolved value back into the key text."""
+    if value is None:
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+class _Expression:
+    """Recursive descent over the subset these keys use.
+
+    An unrecognised token or an unknown context RAISES. A key this suite cannot
+    read must red it, never resolve to something plausible -- the failure mode
+    the workflow half of this file exists to refuse.
+    """
+
+    def __init__(self, source: str, contexts: dict) -> None:
+        self.source = source
+        self.contexts = contexts
+        self.tokens: list[tuple[str, str]] = []
+        position = 0
+        while position < len(source):
+            match = VALUE_TOKEN.match(source, position)
+            if match is None:
+                raise AssertionError(
+                    f"unrecognised token in {source!r} at {source[position:]!r}"
+                )
+            position = match.end()
+            kind = match.lastgroup
+            self.tokens.append((kind, match.group(kind)))
+        self.index = 0
+
+    def peek(self):
+        return self.tokens[self.index] if self.index < len(self.tokens) else (None, None)
+
+    def take(self):
+        token = self.peek()
+        self.index += 1
+        return token
+
+    def parse(self):
+        value = self.parse_or()
+        if self.index != len(self.tokens):
+            raise AssertionError(f"trailing tokens in {self.source!r}")
+        return value
+
+    def parse_or(self):
+        value = self.parse_and()
+        while self.peek() == ("op", "||"):
+            self.take()
+            right = self.parse_and()
+            value = value if _truthy(value) else right
+        return value
+
+    def parse_and(self):
+        value = self.parse_compare()
+        while self.peek() == ("op", "&&"):
+            self.take()
+            right = self.parse_compare()
+            value = right if _truthy(value) else value
+        return value
+
+    def parse_compare(self):
+        left = self.parse_primary()
+        kind, text = self.peek()
+        if kind == "op" and text in ("==", "!="):
+            self.take()
+            right = self.parse_primary()
+            return (left == right) if text == "==" else (left != right)
+        return left
+
+    def parse_primary(self):
+        kind, text = self.take()
+        if (kind, text) == ("op", "("):
+            value = self.parse_or()
+            if self.take() != ("op", ")"):
+                raise AssertionError(f"unbalanced parenthesis in {self.source!r}")
+            return value
+        if kind == "text":
+            return text[1:-1]
+        if kind == "number":
+            return int(text)
+        if kind == "literal":
+            return {"true": True, "false": False, "null": None}[text]
+        if kind == "ctx":
+            if text not in self.contexts:
+                raise AssertionError(
+                    f"unknown context {text!r} in {self.source!r}; add it to "
+                    "STABLE_CONTEXTS or to the run-varying set, and say which"
+                )
+            return self.contexts[text]
+        raise AssertionError(f"unexpected token {text!r} in {self.source!r}")
+
+
+def resolve_group(expression: str, event: str, run: dict) -> str:
+    """Render a concurrency group key the way GitHub renders it for one run."""
+
+    contexts = dict(STABLE_CONTEXTS[event])
+    contexts.update(run)
+    out: list[str] = []
+    position = 0
+    while position < len(expression):
+        start = expression.find("${{", position)
+        if start < 0:
+            out.append(expression[position:])
+            break
+        out.append(expression[position:start])
+        end = expression.find("}}", start)
+        if end < 0:
+            raise AssertionError(f"unterminated ${{{{ in {expression!r}")
+        out.append(_render(_Expression(expression[start + 3 : end], contexts).parse()))
+        position = end + 2
+    return "".join(out)
+
+
+def varies_per_run(expression: str, event: str) -> bool:
+    """Do two runs of this workflow, same event and same ref, get SEPARATE groups?
+
+    True means the group can never make one run wait for another, so GitHub can
+    never discard it while it is pending. False means the group is shared, which
+    is what `cancel-in-progress: true` needs to have anything to cancel.
+    """
+
+    return resolve_group(expression, event, RUN_A) != resolve_group(
+        expression, event, RUN_B
+    )
+
+
+def concurrency_blocks(ci: dict) -> list[tuple[str, dict]]:
+    """Every concurrency block in the workflow, workflow level first.
+
+    Enumerated from the parsed file rather than from a fixed list, so a job that
+    joins later is covered by the pull request that adds it.
+    """
+
+    blocks = []
+    if ci.get("concurrency"):
+        blocks.append(("<workflow>", ci["concurrency"]))
+    for name, job in ci["jobs"].items():
+        if job.get("concurrency"):
+            blocks.append((name, job["concurrency"]))
+    return blocks
+
+
+def workflow_text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def job_block(text: str, name: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(name)}:$\n(.*?)(?=^  [a-zA-Z0-9_-]+:$|\Z)", text
+    )
+    assert match, f"job {name} not found in ci.yml"
+    return match.group(1)
+
+
+def code_lines(block: str) -> list[str]:
+    """Drop whole-line YAML comments.
+
+    `baseline-summary`'s own prose explains why `sanitize-cpu` is
+    `continue-on-error`, so a naive substring assertion about that key would
+    trip over the comment that documents it.
+    """
+
+    return [line for line in block.splitlines() if not line.strip().startswith("#")]
+
+
+def steps_of(job: str) -> list[list[str]]:
+    """Split a job block into its `steps:` sequence entries, indentation kept."""
+
+    lines = job.splitlines()
+    try:
+        first = next(i for i, line in enumerate(lines) if line == "    steps:") + 1
+    except StopIteration:
+        return []
+    starts = [i for i in range(first, len(lines)) if lines[i].startswith("      - ")]
+    steps = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        steps.append(lines[start:end])
+    return steps
+
+
+def step_env(step: list[str]) -> dict[str, str]:
+    try:
+        start = next(i for i, line in enumerate(step) if line == "        env:") + 1
+    except StopIteration:
+        return {}
+    mapping: dict[str, str] = {}
+    for line in step[start:]:
+        match = re.fullmatch(r" {10}([A-Za-z_][A-Za-z0-9_]*): (.*)", line)
+        if match is None:
+            break
+        mapping[match.group(1)] = match.group(2)
+    return mapping
+
+
+def step_run_body(step: list[str]) -> str | None:
+    """The literal `run: |` block of a step, dedented to column zero."""
+
+    try:
+        start = next(i for i, line in enumerate(step) if line == "        run: |") + 1
+    except StopIteration:
+        return None
+    body: list[str] = []
+    for line in step[start:]:
+        if not line.strip():
+            body.append("")
+            continue
+        if not line.startswith(" " * 10):
+            break
+        body.append(line[10:])
+    return "\n".join(body) + "\n"
+
+
+def run_shimmed(body: str, environment: dict[str, str]) -> tuple[int, list[list[str]], str]:
+    """Execute a step body with `python3` replaced by an argv recorder.
+
+    No checker actually runs; what is under test is the SHELL logic that decides
+    which checkers get invoked, and with which range.
+
+    ONE exception, and it is deliberate: `scripts/ci-walk-base.py` is executed
+    for real. It is not a checker -- it RESOLVES the base the step then passes to
+    the checkers -- so stubbing it out would make every case below read an empty
+    base and skip the very calls they exist to require (#1809). Running it means
+    these cases test the real composition of the resolver and the step shell
+    rather than a transcription of the resolver's rule.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="vllm-baseline-step-") as temporary:
+        root = Path(temporary)
+        shim = root / "shim"
+        shim.mkdir()
+        trace = root / "argv.log"
+        recorder = shim / "python3"
+        recorder.write_text(
+            "#!/bin/sh\n"
+            "{\n"
+            "  printf 'ARGV'\n"
+            '  for a in "$@"; do printf \'\\t%s\' "$a"; done\n'
+            "  printf '\\n'\n"
+            '} >> "$VLLM_BASELINE_ARGV"\n'
+            "case \"$1\" in\n"
+            "  *ci-walk-base.py) exec \"$VLLM_BASELINE_PYTHON\" \"$@\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        recorder.chmod(0o700)
+        script = root / "step.sh"
+        script.write_text(body, encoding="utf-8")
+        env = dict(os.environ)
+        env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
+        env["VLLM_BASELINE_ARGV"] = str(trace)
+        env["VLLM_BASELINE_PYTHON"] = sys.executable
+        env.update(environment)
+        result = subprocess.run(
+            ["bash", str(script)],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        raw = trace.read_text(encoding="utf-8") if trace.exists() else ""
+    invocations = [
+        line.split("\t")[1:] for line in raw.splitlines() if line.startswith("ARGV")
+    ]
+    return result.returncode, invocations, result.stdout + result.stderr
+
+
+class WorkflowLaneTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.text = workflow_text()
+
+    def test_baseline_triggers_exist(self) -> None:
+        header = self.text.split("\njobs:\n", 1)[0]
+        self.assertIn("schedule:", header)
+        self.assertIn("workflow_dispatch:", header)
+        self.assertRegex(header, r"- cron: ['\"][^'\"]+['\"]")
+
+    def test_every_job_level_group_discriminates_on_the_event(self) -> None:
+        """Without this a push to main cancels the scheduled baseline.
+
+        `github.ref` is `refs/heads/main` for BOTH a push and a scheduled run,
+        so a ref-only key puts them in one group and the baseline dies exactly
+        as the previous push's jobs do -- 26 of 40 runs in the measured window.
+        """
+        for name in GROUPED_JOBS:
+            with self.subTest(job=name):
+                block = job_block(self.text, name)
+                groups = GROUP_LINE.findall(block)
+                self.assertEqual(len(groups), 1, f"{name} must have exactly one group")
+                self.assertIn("github.event_name", groups[0])
+                self.assertIn("github.ref", groups[0])
+
+    def test_each_resolved_group_is_the_base_key_plus_the_event_constant(self) -> None:
+        """The whole "grouping is unchanged" claim, pinned as an equality.
+
+        Substituting the event and comparing against the base revision's key
+        with `-<event>` inserted proves two things at once: the partition of
+        `push` runs (and of PR runs) into groups is bijective with what it was,
+        and NOTHING ELSE was added to the key. Its predecessor compared against
+        no baseline at all and blocked only `github.run_id`, so adding
+        `${{ github.sha }}` -- which gives every run its own group and kills
+        dedupe outright -- walked straight through it.
+        """
+        marker = "-${{ github.ref }}"
+        expected_shape = "-${{ github.event_name }}" + marker
+        for name in GROUPED_JOBS:
+            base = BASE_GROUPS[name]
+            self.assertEqual(base.count(marker), 1, f"{name}: base key shape changed")
+            expected = base.replace(marker, expected_shape)
+            groups = GROUP_LINE.findall(job_block(self.text, name))
+            self.assertEqual(len(groups), 1, f"{name} must have exactly one group")
+            for event in ("push", "pull_request"):
+                with self.subTest(job=name, event=event):
+                    self.assertEqual(
+                        resolve_group(groups[0], event, RUN_A),
+                        resolve_group(expected, event, RUN_A),
+                        f"{name}: the {event} key no longer resolves to the base "
+                        "key plus the event constant, so this lane's runs are "
+                        "partitioned into different groups than they were",
+                    )
+            for event in BASELINE_EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertTrue(
+                        varies_per_run(groups[0], event),
+                        f"{name}: two {event} runs share one group, and a group "
+                        "that never cancels holds ONE pending run -- the third "
+                        "arrival discards the second before it starts a job",
+                    )
+
+    def test_a_baseline_group_is_unique_per_run_and_a_contributor_group_is_not(
+        self,
+    ) -> None:
+        """An independent statement of the same defect, in both directions.
+
+        Its predecessor blocked `github.run_id` by SUBSTRING, for every event.
+        That was right about the push and pull request lanes and wrong about the
+        baseline lane, where a shared key is not dedupe but a one-slot queue
+        that discards its own contents: runs 32140419182 and 32206456661 each
+        returned `startedAt: null` for EVERY job and were cancelled the second
+        their successor was created.
+
+        The assertion is now the resolved property rather than the token.
+        Resolving one key against two synthetic runs asks the question the token
+        was standing in for: do two runs of this workflow, same event and same
+        ref, land in the same group.
+        """
+        for name in GROUPED_JOBS:
+            group = GROUP_LINE.findall(job_block(self.text, name))[0]
+            for event in ("push", "pull_request"):
+                with self.subTest(job=name, event=event):
+                    self.assertFalse(
+                        varies_per_run(group, event),
+                        f"{name}: two {event} runs get separate groups, so "
+                        "cancel-in-progress has nothing to cancel and dedupe "
+                        "is off",
+                    )
+            for event in BASELINE_EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertTrue(
+                        varies_per_run(group, event),
+                        f"{name}: two {event} runs share one group, so the "
+                        "second waits and the third discards it",
+                    )
+
+    def test_cancellation_resolves_to_the_right_boolean_for_every_event(self) -> None:
+        """push/PR still cancel; the baseline lane never cancels itself.
+
+        Resolved, not grepped. The polarity inversion
+        (`== 'schedule' || == 'workflow_dispatch'`) satisfies every substring
+        assertion the previous version made and reverses all nine keys.
+        """
+        for name in GROUPED_JOBS:
+            cancels = CANCEL_LINE.findall(job_block(self.text, name))
+            self.assertEqual(len(cancels), 1, f"{name} must have exactly one key")
+            for event in EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertEqual(
+                        resolve_boolean(cancels[0], event),
+                        event not in BASELINE_EVENTS,
+                        f"{name} cancel-in-progress is wrong for {event}",
+                    )
+
+    def test_the_workflow_level_group_cancels_prs_and_pushes_only(self) -> None:
+        """#822 ratified latest-only for BOTH the pull request and main push
+        lanes. It was previously pull-request-only, because a cancelled push
+        left its diff-scoped range permanently unwalked. That is now safe: the
+        gates base on the last SUCCESSFULLY gated commit, so a cancelled run's
+        commits are covered by the next one (#863).
+
+        `schedule` and `workflow_dispatch` stay non-cancellable. The baseline
+        lane exists to answer "is main green", and a cancelled baseline answers
+        nothing (#274).
+        """
+        header = self.text.split("\njobs:\n", 1)[0]
+        cancel = re.search(r"(?m)^  cancel-in-progress: (.+)$", header)
+        self.assertIsNotNone(cancel)
+        for event in EVENTS:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    resolve_boolean(cancel.group(1), event),
+                    event in ("pull_request", "push"),
+                )
+
+    def test_diff_scoped_jobs_still_carry_no_concurrency_group(self) -> None:
+        for name in UNGROUPED_JOBS:
+            with self.subTest(job=name):
+                self.assertNotIn("concurrency:", job_block(self.text, name))
+
+    def test_diff_scoped_jobs_are_skipped_on_the_baseline_lane(self) -> None:
+        """They range over `github.event.before..github.sha`; a schedule payload
+        has no `before`, so running them there would gate an empty range."""
+        for name in UNGROUPED_JOBS:
+            with self.subTest(job=name):
+                block = job_block(self.text, name)
+                condition = re.search(r"(?m)^    if: (.+)$", block)
+                self.assertIsNotNone(condition, f"{name} needs an event guard")
+                self.assertIn("schedule", condition.group(1))
+                self.assertIn("workflow_dispatch", condition.group(1))
+
+    def test_summary_job_can_never_run_on_a_contributors_pr(self) -> None:
+        block = job_block(self.text, baseline.SUMMARY_JOB)
+        condition = re.search(r"(?m)^    if: (.+)$", block)
+        self.assertIsNotNone(condition)
+        guard = condition.group(1)
+        self.assertIn("always()", guard)
+        self.assertIn("schedule", guard)
+        self.assertIn("workflow_dispatch", guard)
+        self.assertNotIn("pull_request", guard)
+
+    def test_summary_job_waits_on_every_grouped_job(self) -> None:
+        block = job_block(self.text, baseline.SUMMARY_JOB)
+        needs = re.search(r"(?ms)^    needs:.*?$\n(?:      - .+$\n)+", block)
+        self.assertIsNotNone(needs, "baseline-summary must declare needs as a list")
+        for name in GROUPED_JOBS:
+            with self.subTest(job=name):
+                self.assertIn(f"      - {name}\n", needs.group(0))
+
+    def test_summary_job_reads_the_api_and_holds_actions_read(self) -> None:
+        block = job_block(self.text, baseline.SUMMARY_JOB)
+        self.assertIn("actions: read", block)
+        self.assertIn("scripts/main-baseline.py", block)
+        self.assertIn("--emit-summary", block)
+        self.assertIn("github.run_id", block)
+        self.assertNotIn(
+            "needs.sanitize-cpu.result",
+            block,
+            "continue-on-error makes needs.<job>.result report success; use the API",
+        )
+
+    def test_the_windows_proofs_run_on_the_baseline_lane_and_not_on_push(self) -> None:
+        """#503: `main` could establish neither green nor red under MSVC.
+
+        Both jobs were `if: github.event_name == 'pull_request'`, so the
+        schedule/dispatch lane never DEFINED them -- and a job that is not
+        defined for an event is not `skipped`, it is absent, so it appeared in
+        no list `main-baseline.py` prints. The verdict read GREEN because it
+        graded a set that excluded them. Measured on the deliberate baseline run
+        32044993401 (`conclusion=success`): both jobs `skipped`. #1068 then
+        stopped `main` compiling under MSVC and surfaced on an unrelated
+        contributor's pull request rather than on `main`.
+
+        RESOLVED per event, not grepped, for the reason `resolve_boolean`
+        exists: `always()` and `github.event_name != 'push'` both admit the
+        baseline lane and both are wrong, and only the `push` half separates
+        them from the intended condition. The `push` assertion is not a style
+        preference -- that lane's jobs cancel one another by construction (26 of
+        40 runs in the window this suite measures) and 55 pushes/day times two
+        `windows-2022` runners buys nothing a baseline does not already have.
+        """
+        for name in ("windows-msvc-cpu", "windows-msvc-vulkan"):
+            block = job_block(self.text, name)
+            conditions = re.findall(r"(?m)^    if: (.+)$", block)
+            self.assertEqual(len(conditions), 1, f"{name} must have exactly one if:")
+            for event in EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertEqual(
+                        resolve_boolean(conditions[0], event),
+                        event != "push",
+                        f"{name} must run on {event}" if event != "push"
+                        else f"{name} must not run on push",
+                    )
+
+    def test_the_windows_proofs_are_covered_by_the_published_verdict(self) -> None:
+        """Running is half of it; the verdict has to GRADE them.
+
+        `baseline-summary` waits on its `needs:` list and `EXPECTED_JOBS` is
+        read from it, so a job that runs on the lane but is absent from both
+        would fail without moving the verdict -- the `continue-on-error` shape
+        of #274 reached by omission instead of by a masked conclusion.
+        """
+        needs = job_block(self.text, baseline.SUMMARY_JOB)
+        for name in ("windows-msvc-cpu", "windows-msvc-vulkan"):
+            with self.subTest(job=name):
+                self.assertIn(f"      - {name}\n", needs)
+                self.assertIn(name, baseline.EXPECTED_JOBS)
+
+    def test_a_red_windows_proof_makes_the_baseline_red(self) -> None:
+        """The consequence, executed rather than asserted about the workflow.
+
+        This is the state on the day it lands: #584 fast-fails
+        `test_openai_api_server.exe` with 0xC0000409 on every run of both lanes,
+        so the first baseline that can see them is RED. That is the correct
+        first verdict -- it was GREEN before only because it never ran them.
+        """
+        jobs = [
+            entry for entry in ALL_GREEN_JOBS if entry["name"] != "windows-msvc-cpu"
+        ] + [job("windows-msvc-cpu", "failure")]
+        item = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(item.green)
+        self.assertIn("windows-msvc-cpu", item.failing)
+        self.assertEqual(item.missing, [], "it ran; it is failing, not absent")
+
+    def test_a_windows_proof_skipped_back_off_the_lane_is_red_not_green(self) -> None:
+        """The exact regression #503 is about, as an executable statement.
+
+        Reverting the `if:` makes the API report the job `skipped`, which
+        `NOT_RUN_CONCLUSIONS` deliberately reads as absent rather than as a
+        pass. Before this row that absence discharged no expectation because
+        there was no expectation, and the verdict printed GREEN.
+        """
+        jobs = [
+            entry for entry in ALL_GREEN_JOBS if entry["name"] != "windows-msvc-vulkan"
+        ] + [job("windows-msvc-vulkan", "skipped")]
+        item = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(item.green)
+        self.assertIn("windows-msvc-vulkan", item.missing)
+        self.assertNotIn("windows-msvc-vulkan", item.failing)
+
+    def test_sanitize_cpu_stays_continue_on_error_for_the_push_and_pr_lanes(self) -> None:
+        """Out of scope for this row: it is the closing step of the hardening
+        row. The baseline lane gets its bindingness from baseline-summary."""
+        self.assertIn("continue-on-error: true", job_block(self.text, "sanitize-cpu"))
+
+
+class GroupEvictionTests(unittest.TestCase):
+    """A group that never cancels has ONE remaining behaviour: it queues.
+
+    GitHub's concurrency contract has two halves. `cancel-in-progress` is the
+    half this file already resolved per event. The other half is the queue, and
+    it holds exactly ONE pending run: when a third run joins a group that has
+    one run in progress and one pending, GitHub cancels the pending one.
+
+    That half discarded two of the last 39 scheduled baselines. Runs
+    32140419182 and 32206456661 each returned `startedAt: null` for EVERY job
+    and were cancelled at 16:46:51 and 04:49:54, the seconds their successors
+    32162114781 and 32217173498 were created -- 2 out of 2. `cancel-in-progress`
+    resolves to false for `schedule`, so it cancelled nothing; the shared key
+    `ci-schedule-refs/heads/main-mudler/vllm.cpp` did. The suite reached queue
+    depth two because run 32118587477 took 9 h 28 min with no predecessor to
+    wait for, on 345 job-minutes of work, so the four-hour cron laps it.
+
+    The invariant below is derived from `cancel-in-progress` rather than from a
+    list of jobs, and it runs over every concurrency block the file declares:
+
+      cancel-in-progress false for an event  =>  the group MUST vary per run
+      cancel-in-progress true  for an event  =>  the group MUST NOT vary
+
+    Both directions are load-bearing and neither implies the other. Dropping the
+    first discards a baseline. Dropping the second gives every push its own
+    group, which turns cancellation off while every substring still reads right
+    -- the `${{ github.sha }}` mutation `WorkflowLaneTests` was rebuilt for.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import yaml
+
+        cls.ci = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        cls.blocks = concurrency_blocks(cls.ci)
+
+    def test_the_enumeration_finds_every_block_this_suite_knows_about(self) -> None:
+        """A resolver that reads no block passes every assertion below."""
+        names = [name for name, _ in self.blocks]
+        self.assertEqual(len(names), len(set(names)), "duplicate block name")
+        self.assertIn("<workflow>", names)
+        for name in GROUPED_JOBS:
+            self.assertIn(name, names)
+        self.assertGreaterEqual(len(names), len(GROUPED_JOBS) + 1)
+        for name, block in self.blocks:
+            with self.subTest(block=name):
+                self.assertIn("group", block, f"{name}: concurrency without a group")
+                self.assertIn(
+                    "cancel-in-progress",
+                    block,
+                    f"{name}: a group with no cancel key defaults to FALSE, so it "
+                    "queues, so it can be evicted, and no assertion here can tell",
+                )
+
+    def test_no_non_cancellable_group_can_be_evicted(self) -> None:
+        """THE invariant. Red at 250db75a2 on all 11 blocks x 2 baseline events."""
+        for name, block in self.blocks:
+            group = str(block["group"])
+            cancel = str(block["cancel-in-progress"])
+            for event in EVENTS:
+                if resolve_boolean(cancel, event):
+                    continue
+                with self.subTest(block=name, event=event):
+                    self.assertTrue(
+                        varies_per_run(group, event),
+                        f"{name} never cancels on {event}, so it QUEUES on "
+                        f"{resolve_group(group, event, RUN_A)!r}. That queue "
+                        "holds one pending run and discards it when a third "
+                        "arrives, which cost runs 32140419182 and 32206456661 "
+                        "their whole verdict without executing a single job. "
+                        "Admit the run identity into the key for this event.",
+                    )
+
+    def test_a_cancellable_group_is_shared_so_it_has_something_to_cancel(self) -> None:
+        """The opposite direction, and it is not implied by the first.
+
+        A key that varies per run cannot cancel anything. Latest-only on the
+        push lane (#822) and pull request dedupe are exactly this property.
+        """
+        for name, block in self.blocks:
+            group = str(block["group"])
+            cancel = str(block["cancel-in-progress"])
+            for event in EVENTS:
+                if not resolve_boolean(cancel, event):
+                    continue
+                with self.subTest(block=name, event=event):
+                    self.assertFalse(
+                        varies_per_run(group, event),
+                        f"{name} cancels in progress on {event} but every run "
+                        "gets its own group, so it cancels nothing",
+                    )
+
+    def test_the_workflow_level_group_is_unique_per_baseline_run(self) -> None:
+        """Named separately because the run level is where the loss happened.
+
+        Both discarded runs were discarded as RUNS, before any job existed to
+        carry a job-level key. A fix applied only to the job blocks would leave
+        this file green and the lane broken in exactly the measured way.
+        """
+        block = self.ci["concurrency"]
+        for event in BASELINE_EVENTS:
+            with self.subTest(event=event):
+                self.assertFalse(
+                    resolve_boolean(str(block["cancel-in-progress"]), event)
+                )
+                self.assertTrue(varies_per_run(str(block["group"]), event))
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                self.assertFalse(varies_per_run(str(block["group"]), event))
+
+    def test_the_baseline_key_is_the_contributor_key_with_the_run_admitted(self) -> None:
+        """The run identity enters on the baseline events and NOWHERE else.
+
+        Pinned as a pair of equalities against the keys resolved for `push` and
+        `pull_request`, so widening the conditional to admit a third event, or
+        replacing `github.ref` outright, is red here rather than only in the
+        base-key equality one class up.
+        """
+        for name, block in self.blocks:
+            group = str(block["group"])
+            for event in ("push", "pull_request"):
+                with self.subTest(block=name, event=event):
+                    self.assertEqual(
+                        resolve_group(group, event, RUN_A),
+                        resolve_group(group, event, RUN_B),
+                        f"{name}: the {event} key moved between two runs",
+                    )
+            for event in BASELINE_EVENTS:
+                with self.subTest(block=name, event=event):
+                    resolved = resolve_group(group, event, RUN_A)
+                    self.assertIn(
+                        RUN_A["github.run_id"],
+                        resolved,
+                        f"{name}: the {event} key varies per run without "
+                        "carrying the run id, so say which token it varies on",
+                    )
+
+
+
+class VerdictJobCannotSwallowFailureTests(unittest.TestCase):
+    """`baseline-summary`'s own non-zero exit must reach the run.
+
+    Both mutations here rebuild the `sanitize-cpu` defect this row is about one
+    level up: the verdict job would compute RED, print RED, exit non-zero, and
+    the lane would still report green.
+    """
+
+    def setUp(self) -> None:
+        self.block = job_block(workflow_text(), baseline.SUMMARY_JOB)
+
+    def test_the_verdict_job_is_not_continue_on_error(self) -> None:
+        for line in code_lines(self.block):
+            self.assertNotRegex(
+                line,
+                r"^\s*continue-on-error\s*:",
+                "continue-on-error on the verdict job makes every baseline green",
+            )
+
+    def test_the_verdict_step_never_masks_its_own_exit_status(self) -> None:
+        steps = [
+            step
+            for step in steps_of(self.block)
+            if "--emit-summary" in "\n".join(step)
+        ]
+        self.assertEqual(len(steps), 1, "expected exactly one --emit-summary step")
+        body = step_run_body(steps[0])
+        self.assertIsNotNone(body)
+        for line in code_lines(body):
+            for masker in ("||", "; true", "set +e", "continue-on-error"):
+                with self.subTest(masker=masker):
+                    self.assertNotIn(
+                        masker,
+                        line,
+                        f"`{masker}` would discard the RED verdict's exit code",
+                    )
+        for line in code_lines("\n".join(steps[0])):
+            self.assertNotRegex(line, r"^\s+continue-on-error\s*:")
+
+
+class AgentRecordDiffRangeTests(unittest.TestCase):
+    """`agent-record` must be able to be GREEN on the baseline lane.
+
+    It is in `baseline-summary`'s `needs:`, and it carries diff-scoped checkers
+    keyed on `github.event.before` -- which a `schedule` or `workflow_dispatch`
+    payload does not have. Before the guard landed, replaying the step body with
+    EVENT_NAME=schedule and PUSH_BASE="" died under `set -eu`:
+
+        range=[..36fa56d0...]
+        check-commit-trailers.py: error: argument --range:
+            range must be exactly BASE..HEAD
+        STEP_EXIT=2
+
+    so the lane could never publish anything but RED. These tests execute the
+    real step bodies rather than reading them, and they assert BOTH directions:
+    no range-scoped call on the baseline lane, and the range-scoped calls still
+    happen on `push` and `pull_request`. Deleting the checkers instead of
+    guarding them fails the second half.
+    """
+
+    # The strict trailer walk moved to `commit-protocol-tag` (#863), which opts
+    # out of the baseline lane at the job level and so has no in-step guard to
+    # test here. `ConcurrencySemanticsTests` pins its placement and its base.
+    RANGE_SCOPED = ("check-role-discipline.py",)
+    FAKE_BASE = "1" * 40
+    FAKE_HEAD = "2" * 40
+
+    # ONLY agent-record. There are two valid ways to keep a diff-scoped checker
+    # off the baseline lane, and this class tests one of them. `agent-record`
+    # RUNS on that lane because most of it is tree-scoped, so its diff-scoped
+    # calls must be guarded IN THE STEP. `documentation-checkpoint` and
+    # `commit-protocol-tag` are diff-scoped end to end and opt out at the JOB
+    # level instead, so they carry no in-step guard and replaying their bodies
+    # here would fail for the wrong reason.
+    #
+    # The strict trailer walk moved OUT of this job to `commit-protocol-tag`
+    # (#863), which is why the counts below dropped by one.
+    DIFF_SCOPED_JOBS = ("agent-record",)
+
+    def setUp(self) -> None:
+        text = workflow_text()
+        self.job = "\n".join(job_block(text, name) for name in self.DIFF_SCOPED_JOBS)
+        self.steps = [
+            step
+            for name in self.DIFF_SCOPED_JOBS
+            for step in steps_of(job_block(text, name))
+            if step_env(step).get("PUSH_BASE") == "${{ github.event.before }}"
+        ]
+
+    def test_every_before_consumer_is_one_of_the_steps_under_test(self) -> None:
+        """No other route into `github.event.before` may exist in this job.
+
+        Counted over CODE only -- the guards' own comments name the variable
+        while explaining why it is empty on this lane, and a comment consumes
+        nothing.
+        """
+        # Role discipline is the only diff-scoped call left in this job.
+        self.assertEqual(len(self.steps), 1)
+        job_code = "\n".join(code_lines(self.job))
+        accounted = "\n".join(
+            "\n".join(code_lines("\n".join(step))) for step in self.steps
+        )
+        self.assertEqual(
+            job_code.count("github.event.before"),
+            accounted.count("github.event.before"),
+            "an unaccounted github.event.before consumer in a diff-scoped job",
+        )
+        self.assertEqual(accounted.count("github.event.before"), 1)
+
+    def test_the_baseline_lane_invokes_no_range_scoped_checker_and_exits_zero(self) -> None:
+        for event in BASELINE_EVENTS:
+            for step in self.steps:
+                body = step_run_body(step)
+                self.assertIsNotNone(body)
+                code, invocations, output = run_shimmed(
+                    body,
+                    {
+                        "EVENT_NAME": event,
+                        "PR_BASE": "",
+                        "PR_HEAD": "",
+                        "PUSH_BASE": "",
+                        "PUSH_HEAD": self.FAKE_HEAD,
+                    },
+                )
+                with self.subTest(event=event, step=step[0].strip()):
+                    self.assertEqual(code, 0, output)
+                    for argv in invocations:
+                        for checker in self.RANGE_SCOPED:
+                            self.assertNotIn(
+                                checker,
+                                " ".join(argv),
+                                "a diff-scoped checker ran with no diff range",
+                            )
+                        self.assertNotIn(f"..{self.FAKE_HEAD}", argv)
+                        if any("ci-walk-base.py" in item for item in argv):
+                            # The RESOLVER is handed every candidate, and on this
+                            # lane every candidate is legitimately empty -- that
+                            # is the input it exists to decide on, and its own
+                            # suite pins what it returns. The rule below is about
+                            # a CHECKER receiving an empty base, which is what
+                            # would pass vacuously.
+                            continue
+                        self.assertNotIn("", argv, "an empty argument means an empty base")
+
+    def test_push_and_pull_request_still_get_the_full_range_scoped_checks(self) -> None:
+        """The anti-overcorrection half: guarding is not deleting."""
+        cases = {
+            "push": {
+                "EVENT_NAME": "push",
+                "PR_BASE": "",
+                "PR_HEAD": "",
+                "PUSH_BASE": self.FAKE_BASE,
+                "PUSH_HEAD": self.FAKE_HEAD,
+            },
+            "pull_request": {
+                "EVENT_NAME": "pull_request",
+                "PR_BASE": self.FAKE_BASE,
+                "PR_HEAD": self.FAKE_HEAD,
+                "PUSH_BASE": "",
+                "PUSH_HEAD": self.FAKE_HEAD,
+            },
+        }
+        for event, environment in cases.items():
+            invoked: set[str] = set()
+            for step in self.steps:
+                code, invocations, output = run_shimmed(
+                    step_run_body(step) or "", environment
+                )
+                self.assertEqual(code, 0, output)
+                for argv in invocations:
+                    joined = " ".join(argv)
+                    for checker in self.RANGE_SCOPED:
+                        if checker not in joined:
+                            continue
+                        # `check-commit-trailers.py --message-file` validates the
+                        # pull request BODY, which under `PR_BODY` becomes the
+                        # landed commit message (#848). That invocation is not
+                        # diff-scoped and has no range to carry. It does not
+                        # count as the range-scoped run this case demands, so
+                        # `invoked` stays untouched and the assertion below still
+                        # requires the real range walk to have happened.
+                        if "--message-file" in joined:
+                            continue
+                        invoked.add(checker)
+                        self.assertIn(
+                            f"{self.FAKE_BASE}..{self.FAKE_HEAD}"
+                            if checker == "check-commit-trailers.py"
+                            else self.FAKE_BASE,
+                            joined,
+                            f"{checker} got the wrong range on {event}",
+                        )
+            with self.subTest(event=event):
+                self.assertEqual(invoked, set(self.RANGE_SCOPED))
+
+
+class SuiteRegistrationTests(unittest.TestCase):
+    """This file guards every claim in the row; nothing was running it.
+
+    `grep -rn test_main_baseline .` returned exactly one hit -- this file -- so
+    all 24 tests above ran on no machine, in no lane, ever. That is the same
+    class of defect as an unregistered CTest target, one layer up.
+    `scripts/check-test-registration.py` cannot see it: its `REQUIRED_TESTS` is
+    a fixed set naming one C++ target. Issue #408 tracks whether a checker
+    should cover the class; this pins the instance.
+    """
+
+    NAME = "test_main_baseline"
+
+    def test_registered_in_the_preflight_suite_array(self) -> None:
+        text = PREFLIGHT.read_text(encoding="utf-8")
+        block = re.search(r"(?ms)^SUITES=\(\n(.*?)^\)$", text)
+        self.assertIsNotNone(block, "preflight SUITES array not found")
+        suites = block.group(1).split()
+        self.assertIn(self.NAME, suites)
+
+    def test_registered_in_the_agent_record_ci_job(self) -> None:
+        job = job_block(workflow_text(), "agent-record")
+        self.assertIn(f"python3 tests/scripts/{self.NAME}.py", job)
+
+    def test_the_agent_record_job_is_unconditional(self) -> None:
+        """A CI registration behind an `if:` is not a registration.
+
+        #865 replaced this assertion with one permitting a condition, and three
+        pre-existing checkers went RED on `main` (#873): `check-release-binary-
+        contract.py` and `check-test-registration.py` credit a checker to CI
+        only through `_unconditional_ci_run_blocks`, which drops every job
+        carrying an `if:` at all. So this is not a style pin -- ANY condition
+        here, including the closed-pull-request one, un-registers every checker
+        this job owns.
+
+        #822's closed-PR skip is still enforced, by `needs:`. `last-gated-
+        commit` excludes the closed action, and a skipped dependency skips this
+        job with it, which `ConcurrencySemanticsTests.test_a_closed_pull_
+        request_executes_no_gate` asserts. `always()` would defeat that, so its
+        absence is asserted here too.
+        """
+        job = job_block(workflow_text(), "agent-record")
+        self.assertNotRegex(job, r"(?m)^    if:")
+        self.assertRegex(job, r"(?m)^    needs: \[last-gated-commit\]$")
+
+
+class ConcurrencySemanticsTests(unittest.TestCase):
+    """#822 lets a superseded run be cancelled. #863 is why that was unsafe.
+
+    A diff-scoped gate walks `base..head` once. If its run is cancelled, no
+    later run re-covers that range, because the next run's `before` is this
+    run's `sha`. The strict trailer walk sat in `agent-record`, which carries a
+    cancellable group keyed on `github.ref` -- constant for every push to main.
+    Measured on run 31851003245: `agent-record` cancelled, the commit fails the
+    strict walk, CI reported nothing.
+
+    Cancellation is safe only while BOTH hold: the diff-scoped gates carry no
+    group, and their base is the last SUCCESSFULLY gated commit rather than the
+    previous push. Each is asserted here, because reverting either one alone
+    silently reopens the hole.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import yaml
+        cls.ci = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        cls.ci_text = WORKFLOW.read_text(encoding="utf-8")
+        containers = ROOT / ".github/workflows/containers.yml"
+        cls.containers = yaml.safe_load(containers.read_text(encoding="utf-8"))
+
+    def owning_job(self, needle: str) -> str:
+        for name, job in self.ci["jobs"].items():
+            for step in job.get("steps", []) or []:
+                if needle in str(step.get("run", "")):
+                    return name
+        raise AssertionError(f"no job runs {needle!r}")
+
+    def test_the_strict_trailer_walk_lives_in_a_group_free_job(self) -> None:
+        owner = self.owning_job("check-commit-trailers.py --range")
+        self.assertIsNone(
+            self.ci["jobs"][owner].get("concurrency"),
+            f"{owner} walks a diff range and carries a concurrency group; a "
+            "cancelled run would skip that range forever (#863)",
+        )
+
+    def test_every_diff_scoped_step_bases_on_the_last_gated_commit(self) -> None:
+        """THE invariant, and it is not group-freeness.
+
+        A workflow-level `cancel-in-progress` cancels every job in the run,
+        including jobs that carry no group of their own. So moving a gate to a
+        group-free job protects nothing once the push lane is latest-only. What
+        protects it is the base: `github.event.before` is the previous push
+        whether or not it was gated, and the last GREEN commit is not. Any step
+        that consumes `before` without that fallback loses its range the first
+        time a push supersedes it.
+        """
+        for name, job in self.ci["jobs"].items():
+            for step in job.get("steps") or []:
+                env = {k: str(v) for k, v in (step.get("env") or {}).items()}
+                if "github.event.before" not in " ".join(env.values()):
+                    continue
+                with self.subTest(job=name, step=step.get("name")):
+                    self.assertIn(
+                        "LAST_GREEN", " ".join(env),
+                        "a diff-scoped step that does not consume the last "
+                        "gated commit; a cancelled push skips its range forever",
+                    )
+                    self.assertIn('LAST_GREEN:-', str(step.get("run", "")))
+
+    def test_agent_record_no_longer_walks_a_diff_range(self) -> None:
+        """It keeps its cancellable group, so it must hold nothing diff-scoped."""
+        body = " ".join(
+            str(s.get("run", "")) for s in self.ci["jobs"]["agent-record"]["steps"]
+        )
+        self.assertNotIn("--range", body)
+        self.assertIsNotNone(self.ci["jobs"]["agent-record"].get("concurrency"))
+
+    def test_the_diff_scoped_base_is_the_last_gated_commit(self) -> None:
+        """The enabling half. Without it, cancelling a push loses the range."""
+        self.assertIn("last-gated-commit", self.ci["jobs"])
+        owner = self.owning_job("check-commit-trailers.py --range")
+        self.assertIn("last-gated-commit", str(self.ci["jobs"][owner].get("needs")))
+        walk = next(
+            s for s in self.ci["jobs"][owner]["steps"]
+            if "check-commit-trailers.py --range" in str(s.get("run", ""))
+        )
+        self.assertIn("LAST_GREEN", str(walk.get("env")))
+
+    def test_the_base_falls_back_when_no_successful_run_is_found(self) -> None:
+        """A failed or rate-limited query must degrade to today's behaviour,
+        never to an empty range that passes vacuously.
+
+        The fallback moved out of this step's inline shell and into
+        `scripts/ci-walk-base.py` (#1809), so both halves are asserted: the step
+        still hands the resolver `github.event.before` alongside the last gated
+        commit, and the resolver EXECUTES the degradation. A string match on the
+        step alone would no longer see the rule at all, which is how a moved rule
+        becomes an unenforced one.
+        """
+        owner = self.owning_job("check-commit-trailers.py --range")
+        walk = next(
+            s for s in self.ci["jobs"][owner]["steps"]
+            if "check-commit-trailers.py --range" in str(s.get("run", ""))
+        )
+        run = str(walk["run"])
+        self.assertIn("scripts/ci-walk-base.py", run)
+        self.assertIn('--push-base "${PUSH_BASE:-}"', run)
+        self.assertIn('--last-green "${LAST_GREEN:-}"', run)
+        head = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+        ).strip()
+        before = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD~1"], text=True
+        ).strip()
+        # `--floor ""` isolates the fallback. The floor's interaction with the
+        # base is the subject of tests/scripts/test_ci_walk_base.py; here the
+        # question is only what an empty LAST_GREEN degrades to.
+        resolved = subprocess.check_output(
+            [
+                sys.executable,
+                str(ROOT / "scripts/ci-walk-base.py"),
+                "--event", "push",
+                "--head", head,
+                "--push-base", before,
+                "--last-green", "",
+                "--floor", "",
+                "--repo", str(ROOT),
+            ],
+            text=True,
+        ).strip()
+        self.assertEqual(resolved, before)
+
+    def test_the_push_lane_is_latest_only(self) -> None:
+        group = self.ci["concurrency"]["group"]
+        cancel = str(self.ci["concurrency"]["cancel-in-progress"])
+        self.assertIn("github.ref", group)
+        self.assertNotIn("github.sha", group)
+        self.assertIn("github.event_name == 'push'", cancel)
+
+    def test_the_baseline_lane_stays_non_cancellable(self) -> None:
+        """#274's schedule lane exists to answer 'is main green'. A cancelled
+        baseline answers nothing."""
+        cancel = str(self.ci["concurrency"]["cancel-in-progress"])
+        self.assertNotIn("schedule", cancel)
+        self.assertIn("github.event_name", self.ci["concurrency"]["group"])
+
+    # The exception, pinned so a third job cannot join it silently. The ENTIRE
+    # job mapping of these two is compared for equality against a literal by
+    # `scripts/check-release-workflow.py::validate_pr_ci` -- the read-only
+    # native Windows PR proof schema, which is how the PR lane proves it holds
+    # no release, upload, write-token or OIDC authority (#117). The schema
+    # admits no extra key, so `needs:` is rejected, and it fixes the `if:`
+    # string, so a closed-action clause is rejected. #865 added one anyway and
+    # left that checker and `test_release_pipeline.py` RED on `main` (#873).
+    # The pinned authority schema outranks a cost optimisation; the residual --
+    # two Windows runners started per closed pull request -- is #874.
+    UNGUARDABLE_JOBS = ("windows-msvc-cpu", "windows-msvc-vulkan")
+
+    def test_every_unguardable_job_is_one_the_pinned_schema_owns(self) -> None:
+        """The list above is an ALLOWLIST, and prose is not a ratchet.
+
+        The exemption is justified by one mechanical fact: `validate_pr_ci`
+        compares these jobs' WHOLE mapping against a literal, so neither
+        `needs:` nor a closed clause can be added to them. Assert that fact
+        rather than the two names, and a job can only be exempted by actually
+        being in that schema. Without this, appending a name to the tuple
+        exempts any job at all and every gate stays green -- measured.
+
+        `contracts` is a local inside the checker, so this PARSES the checker
+        instead of importing it. Exposing it would mean editing `scripts/`,
+        and the whole subject of this row is that a test may not reshape the
+        thing it pins in order to pin it.
+        """
+        import ast
+
+        checker = ROOT / "scripts/check-release-workflow.py"
+        pinned = {
+            entry.elts[0].value
+            for function in ast.walk(ast.parse(checker.read_text(encoding="utf-8")))
+            if isinstance(function, ast.FunctionDef)
+            and function.name == "validate_pr_ci"
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "contracts" for t in node.targets)
+            for entry in node.value.elts
+        }
+        self.assertTrue(
+            pinned,
+            f"no `contracts` tuple found in {checker.name}::validate_pr_ci; the "
+            "exemption below cannot be justified against a schema this cannot read",
+        )
+        self.assertLessEqual(
+            set(self.UNGUARDABLE_JOBS), pinned,
+            "UNGUARDABLE_JOBS may only name jobs whose whole mapping is pinned "
+            f"byte-for-byte by validate_pr_ci (it pins {sorted(pinned)}); every "
+            "other job can carry the closed guard and must (#874)",
+        )
+
+    # GitHub skips a job whose `needs:` dependency was skipped -- UNLESS the
+    # job's own `if:` calls a status check function. `always()` is not the only
+    # one: `!cancelled()`, `failure()` and `success() || failure()` resurrect a
+    # dependent exactly the same way, and a `documentation-checkpoint` written
+    # as `${{ !cancelled() && (...) }}` with no closed clause at all passed
+    # every gate before this landed.
+    #
+    # So this permits a SHAPE instead of forbidding four names: a job leaning on
+    # the transitive form may carry no expression call at all. Everything that
+    # defeats skip propagation is a call, which makes this a superset of
+    # `success` / `failure` / `cancelled` / `always` and keeps it correct if
+    # GitHub ever adds a fifth. It fails CLOSED -- a harmless `contains(...)` is
+    # refused too -- and the answer to that is to carry the closed clause
+    # directly, which every job but the two pinned Windows proofs can do.
+    _CALLS_AN_EXPRESSION_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*\(")
+
+    def _skipped_on_a_closed_pull_request(self, name: str, seen: frozenset) -> bool:
+        """A job executes no gate on a closed PR if it says so itself, or if it
+        `needs:` a job that does -- a skipped dependency skips its dependents.
+
+        The transitive form is only load-bearing while the dependent's own `if:`
+        cannot override the skip. A status check function is exactly what
+        overrides it, so a job leaning on `needs:` must call no function at all,
+        and this returns False when it does.
+        """
+        if name in seen:
+            return False
+        job = self.ci["jobs"][name]
+        condition = str(job.get("if", ""))
+        if "closed" in condition:
+            return True
+        if self._CALLS_AN_EXPRESSION_FUNCTION.search(condition):
+            return False
+        needs = job.get("needs") or []
+        if isinstance(needs, str):
+            needs = [needs]
+        return any(
+            self._skipped_on_a_closed_pull_request(dependency, seen | {name})
+            for dependency in needs
+        )
+
+    def test_a_closed_pull_request_executes_no_gate(self) -> None:
+        on = self.ci[True] if True in self.ci else self.ci["on"]
+        pr = on.get("pull_request") or {}
+        self.assertIn(
+            "closed", (pr.get("types") or []),
+            "the pull_request trigger must list `closed`, or a closed PR never "
+            "enters the concurrency group and its run is never superseded",
+        )
+        for name in self.ci["jobs"]:
+            with self.subTest(job=name):
+                if name in self.UNGUARDABLE_JOBS:
+                    self.assertNotIn(
+                        "closed", str(self.ci["jobs"][name].get("if", "")),
+                        f"{name} carries the guard, so it is no longer the "
+                        "byte-exact Windows PR proof schema (#874)",
+                    )
+                    continue
+                self.assertTrue(
+                    self._skipped_on_a_closed_pull_request(name, frozenset()),
+                    f"{name} runs on a closed pull request: neither its own "
+                    "`if:` nor any job it needs excludes that action",
+                )
+
+    def test_no_workflow_has_a_duplicate_mapping_key(self) -> None:
+        """PyYAML keeps the LAST duplicate key and says nothing. GitHub rejects
+        the whole file.
+
+        This is not hypothetical: an edit to this row added `LAST_GREEN` twice
+        to one env block. Every yaml.safe_load in this suite passed, and GitHub
+        refused to parse ci.yml at all -- the run carried the workflow's PATH
+        instead of its name, ran zero jobs, and reported failure. No PyYAML
+        based test can see that, so the check has to be structural.
+        """
+        import yaml
+
+        class Strict(yaml.SafeLoader):
+            pass
+
+        def no_duplicates(loader, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise AssertionError(
+                        f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
+                    )
+                seen.add(key)
+            return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+        Strict.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_duplicates
+        )
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                yaml.load(path.read_text(encoding="utf-8"), Loader=Strict)
+
+    def test_containers_has_a_concurrency_policy(self) -> None:
+        """#822 names it the largest source of queued duplicates, and it had
+        none at all."""
+        self.assertIsNotNone(self.containers.get("concurrency"))
+
+    def test_a_container_tag_run_is_never_cancelled(self) -> None:
+        """publish/manifest/attest/promote push by digest. A cancelled publish
+        can leave a manifest half-joined."""
+        cancel = str(self.containers["concurrency"]["cancel-in-progress"])
+        self.assertIn("refs/tags/", cancel)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

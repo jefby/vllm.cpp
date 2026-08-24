@@ -37,7 +37,12 @@ namespace vllm::entrypoints::openai {
 std::string SanitizeUtf8(const std::string& s);
 
 // SSE comment keepalives while the stream is silent (long prefill / TTFT).
-// VT_SERVER_SSE_PING_S: seconds between pings; default 15; <=0 disables.
+// VT_SERVER_SSE_PING_S: seconds between pings; DEFAULT 0 — OFF (#931); <=0,
+// unset and unparsable all disable; a positive value is capped at 600.
+// Off is the default because vLLM emits no comment frame from any streaming
+// endpoint, and vLLM's own `vllm bench serve` marks a request FAILED when one
+// arrives ahead of its first data frame. The full reason, and what it cost, is
+// at the definition in serving_utils.cpp.
 int SsePingIntervalSec();
 inline constexpr const char kSsePingFrame[] = ":\n\n";
 
@@ -78,6 +83,15 @@ CompletionLogProbs BuildCompletionLogProbs(const std::vector<int32_t>& token_ids
 ChatCompletionLogProbs BuildChatLogprobs(const std::vector<int32_t>& token_ids,
                                          const vllm::SampleLogprobs& top_logprobs,
                                          int num_output_top_logprobs);
+
+// Ported from: vllm/entrypoints/generate/base/serving.py:305-317
+// (clamp_prompt_logprobs). `-inf` has no JSON spelling, so upstream rewrites it
+// to -9999.0 before the response is built. The rewrite is IN PLACE and returns
+// the same object, which is why upstream's completion path can clamp once and
+// then pass `final_res.prompt_logprobs` to the choice (completion/serving.py:520
+// then :588) and still emit clamped values — mirrored here by taking a
+// reference. A `nullopt` in, and nothing happens (serving.py:308-309).
+void ClampPromptLogprobs(std::optional<vllm::PromptLogprobs>& prompt_logprobs);
 
 // SAMPLE-BEST-OF: rank `outputs` by descending cumulative logprob and keep the
 // top `return_n`, RE-INDEXING them 0..return_n-1 (classic OpenAI best_of: the

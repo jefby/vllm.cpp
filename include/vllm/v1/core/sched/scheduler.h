@@ -47,9 +47,13 @@
 //     update_draft_token_ids (scheduler.py:1937). All INERT when no
 //     SpeculativeConfig is supplied (num_lookahead_tokens == 0, every request's
 //     spec_token_ids stays empty), so the default path is byte-identical.
-//     STILL DEFERRED: the first-decode-step spec PADDING (placeholder -1 drafts /
-//     num_spec_tokens_to_schedule / num_invalid_spec_tokens), the dynamic-SD
-//     lookup, and the async draft-in-output path (update_draft_token_ids_in_output).
+//     SPEC-DFLASH2 W7 (#1824) un-deferred the ASYNC draft-in-output path:
+//     num_spec_tokens_to_schedule / num_invalid_spec_tokens on SchedulerOutput,
+//     update_draft_token_ids_in_output (scheduler.py:2072-2107), the
+//     async_tokens_to_discard rollback guard (:1670-1675) and the preempt-time
+//     spec_token_ids clear (:1217-1218). STILL DEFERRED: the sync scheduler's
+//     first-decode-step spec PADDING (pad_spec_decode, scheduler.py:827-843 — a
+//     cudagraph-uniformity optimization) and the dynamic-SD lookup.
 //   - num_output_placeholders / async scheduling (the early-continue on
 //     max_tokens, next_decode_eligible_step) — treated as 0 / inert.
 //   - DP prefill balancing (throttle_prefills / defer_prefills /
@@ -77,6 +81,7 @@
 
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
+#include "vllm/distributed/kv_events.h"  // KVEventsConfig, EventPublisher
 #include "vllm/v1/core/kv_cache_manager.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/request_queue.h"
@@ -119,16 +124,29 @@ class Scheduler {
   // present (e.g. SpeculativeConfig::ResolveMtp), num_lookahead_tokens is derived
   // from it (SpeculativeConfig::NumLookaheadTokens) and threaded into
   // allocate_slots so the verify slots are reserved ahead of time.
+  //
+  // kv_events_config (upstream vllm_config.kv_events_config, read at
+  // scheduler.py:86,116-119,155-158): OPTIONAL, and nullptr — the default, and
+  // what every non-event call site passes — is upstream's `None`. It resolves
+  // enable_kv_cache_events to FALSE, which is exactly the value this ctor used
+  // to hard-code, so the KVCacheManager, the BlockPool and update_from_output
+  // all behave byte-identically and the publisher is a no-op NullEventPublisher.
+  // The pointee is read only during construction (to derive the flag and build
+  // the publisher) and is NOT retained, so it need not outlive the call.
+  // data_parallel_rank mirrors parallel_config.data_parallel_index: the
+  // publisher stamps it onto every batch it emits.
   Scheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
             int block_size, bool enable_caching = false,
             StructuredOutputManager* structured_output_manager = nullptr,
-            std::optional<SpeculativeConfig> speculative_config = std::nullopt);
+            std::optional<SpeculativeConfig> speculative_config = std::nullopt,
+            const distributed::KVEventsConfig* kv_events_config = nullptr,
+            int data_parallel_rank = 0);
 
   // VIRTUAL destructor — REQUIRED, not cosmetic. `AsyncScheduler` derives from
   // this class and production/test code owns the derived object through a
-  // `std::unique_ptr<Scheduler>` base pointer (src/vllm/entrypoints/
-  // model_loader.cpp:176 `MakeScheduler`, include/vllm/entrypoints/
-  // model_loader.h:206 `scheduler_`, tests/vllm/v1/
+  // `std::unique_ptr<Scheduler>` base pointer
+  // (`src/vllm/entrypoints/model_loader.cpp::MakeScheduler`,
+  // `include/vllm/entrypoints/model_loader.h::scheduler_`, tests/vllm/v1/
   // test_async_admission_timing.cpp:167-170). Deleting a derived object through
   // a base pointer whose destructor is non-virtual is UNDEFINED BEHAVIOUR
   // ([expr.delete]/3) — the derived destructor never runs. GCC does not
@@ -202,6 +220,38 @@ class Scheduler {
     return kv_connector_;
   }
 
+  // KV-EVENTS W3: replace the publisher the ctor built from the config.
+  //
+  // Upstream has no such setter — it never needs one, because its only non-null
+  // publisher (ZmqEventPublisher) can be constructed from configuration alone.
+  // Ours cannot yet: the ZMQ transport is DEFERRED for want of a socket
+  // dependency, so the only publisher that can be OBSERVED is
+  // CollectingEventPublisher, and teaching EventPublisherFactory a
+  // `publisher="collecting"` kind would invent a --kv-events-config value vLLM
+  // does not have, making our config surface diverge for the sake of a test.
+  // This is the same injection shape set_kv_connector uses above, and for the
+  // same reason. Production never calls it: the config-driven path stays 1:1.
+  // The scheduler OWNS the publisher (unlike the connector).
+  void set_kv_event_publisher(
+      std::unique_ptr<distributed::EventPublisher> publisher) {
+    kv_event_publisher_ = std::move(publisher);
+  }
+  distributed::EventPublisher* kv_event_publisher() const {
+    return kv_event_publisher_.get();
+  }
+
+  // shutdown (scheduler.py:2456-2459): release the scheduler's external
+  // resources. Today that is only the KV-event publisher; upstream also shuts
+  // its KV and EC connectors down here, which are separate rows.
+  //
+  // NOTE: nothing in production calls this yet — upstream calls it from
+  // EngineCore.shutdown, and our EngineCore has no shutdown path at all. Both
+  // shipped publishers make that harmless (Null's shutdown is an empty body,
+  // Collecting's sets a flag); the real consumer is the deferred ZMQ
+  // publisher's background thread, which arrives with the transport.
+  // Idempotent, and safe to call on a scheduler that has no events configured.
+  virtual void shutdown();
+
   // update_draft_token_ids (scheduler.py:1937-1957): install the drafter's
   // freshly-proposed spec token ids onto their requests, to be scheduled for
   // verification on the NEXT step. For each (req_id, draft ids) pair: skip
@@ -213,6 +263,27 @@ class Scheduler {
   // take_draft_token_ids output. Inert unless a speculator is configured (the
   // runner never produces drafts otherwise).
   void update_draft_token_ids(const DraftTokenIds& draft_token_ids);
+
+  // update_draft_token_ids_in_output (scheduler.py:2072-2107, SPEC-DFLASH2 W7
+  // #1824): the ASYNC variant. Under async scheduling the request state holds
+  // only -1 placeholders (the worker keeps the real drafts), so when the
+  // deferred (structured-output) sampling path needs real draft values for its
+  // grammar bitmask, the worker's drafts are rewritten INTO the
+  // SchedulerOutput's scheduled_spec_decode_tokens: each row is trimmed to the
+  // scheduled count, a short row is padded back to it with -1, and the invalid
+  // tail is recorded in scheduler_output.num_invalid_spec_tokens (REPLACED
+  // whole per call). Unknown / finished requests and requests with no
+  // scheduled entry are skipped. The grammar validate_tokens arm is deferred
+  // exactly as in update_draft_token_ids above.
+  void update_draft_token_ids_in_output(const DraftTokenIds& draft_token_ids,
+                                        SchedulerOutput& scheduler_output);
+
+  // async_scheduling: whether this scheduler is the async-scheduling class.
+  // The engine core's post_step reads it to skip the out-of-band draft pull
+  // under async scheduling (core.py:617 `not self.async_scheduling`; upstream
+  // reads the resolved config — here the resolution PRODUCT is the scheduler
+  // class, model_loader.cpp::MakeScheduler, so the class answers).
+  virtual bool async_scheduling() const { return false; }
 
   // get_num_unfinished_requests: len(waiting) + len(running) (T0 subset).
   int get_num_unfinished_requests() const;
@@ -310,6 +381,16 @@ class Scheduler {
   // default). See set_kv_connector.
   kv_offload::KVConnector* kv_connector_ = nullptr;
 
+  // KV-EVENTS W3 (scheduler.py:116-119,155-158). enable_kv_cache_events_ is
+  // false unless a KVEventsConfig was supplied AND enables them; it is what the
+  // KVCacheManager (and through it the BlockPool) is constructed with, so with
+  // the default it is exactly the previously hard-coded `false`.
+  // kv_event_publisher_ is never null — EventPublisherFactory returns a
+  // NullEventPublisher when events are off — so the publish path needs no null
+  // check, matching upstream where the attribute is always set.
+  bool enable_kv_cache_events_ = false;
+  std::unique_ptr<distributed::EventPublisher> kv_event_publisher_;
+
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;
 
@@ -402,6 +483,12 @@ class Scheduler {
   // it in the ctor via SpeculativeConfig::NumLookaheadTokens (k for MTP). Threaded
   // into allocate_slots (schedule() lines below).
   int num_lookahead_tokens_ = 0;
+  // num_spec_tokens (scheduler.py:241 `self.num_spec_tokens =
+  // vllm_config.num_speculative_tokens`): the resolved per-step draft count.
+  // 0 when no SpeculativeConfig is supplied — which keeps
+  // SchedulerOutput::num_spec_tokens_to_schedule 0 and the AsyncScheduler's
+  // placeholder assignment inert on the default path. SPEC-DFLASH2 W7 (#1824).
+  int num_spec_tokens_ = 0;
   // log_stats (scheduler.py: `self.log_stats = ... not disable_log_stats`,
   // default True): gate for recording the per-request QUEUED/SCHEDULED/PREEMPTED
   // engine-core events. ON by default — upstream disable_log_stats defaults

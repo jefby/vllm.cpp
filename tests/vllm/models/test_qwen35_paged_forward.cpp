@@ -17,13 +17,19 @@
 //      (qwen_gdn_linear_attn.py:1513-1514) is wired.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
+#include <memory>
+
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -37,11 +43,25 @@ using vllm::OwnedTensor;
 using vllm::PagedKvCache;
 using vllm::Qwen3_5Model;
 using vllm::Qwen3_5MoeWeights;
+using vllm::ModelForwardInput;
+using vllm::ModelRegistry;
 using vllm::v1::CommonAttentionMetadata;
 using vllm::v1::GDNAttentionMetadata;
 using vt::DType;
 
 namespace {
+
+// GDN-MOE-BF16-OUT (#1168), fresh-review repair. Read VT_GDN_OUT_BF16 DIRECTLY
+// from the process environment, deliberately NOT through
+// `detail::GdnOutBf16FlagIsOn`: these cases exist to catch a resolver that was
+// hardwired or severed from its parser, and re-using either of them to compute
+// the expectation would make exactly that mutation self-consistent. Same reason
+// `LeverOn` exists in test_dense_gateup_fused_marlin.cpp. Default ON; only a
+// leading '0' turns it off.
+bool GdnOutBf16LeverOn() {
+  const char* e = std::getenv("VT_GDN_OUT_BF16");
+  return !(e != nullptr && e[0] == '0');
+}
 
 // splitmix64-based small deterministic weight values in [-0.08, 0.08).
 uint64_t Mix(uint64_t x) {
@@ -461,4 +481,302 @@ TEST_CASE("qwen35 paged: GDN state zeroing protects a fresh req in a mixed batch
   MESSAGE("mixed-batch fresh-A vs standalone-A max|diff| = " << d
           << " (garbage-seeded mamba block, zeroing must scrub)");
   CHECK(d < 1e-2);
+}
+
+// GDN-MOE-BF16-OUT (#1168). The GDN recurrence output `dcore` and the `z` gate
+// are the two largest OUTPUT-side activations of a GDN layer, and on a MoE
+// checkpoint both were f32 while vLLM keeps them at the bf16 model dtype:
+// `core_attn_out = torch.zeros(..., dtype=hidden_states.dtype)`
+// (vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:870-873 @
+// 5559679) and `z` is a split of the bf16 in_proj_qkvz output (:843, :859-860).
+// Nothing upstream branches on dense vs MoE; vLLM resolves one model dtype and
+// every layer inherits it.
+//
+// This case enters through ModelRegistry::Forward on a MoE config — the
+// production entry point, over the registered MoE factory's own forward — and
+// asks what the GDN block RAN, read off `dcore`'s tensor and the projected gate
+// rather than off the GdnOutDType predicate. A test that called the predicate
+// would prove the predicate answers; AGENTS.md's "Nothing lands dead" wants the
+// capability, and the reviewer's mutation is to restore the `dense_model` form
+// of GdnOutDType, which must turn this red.
+//
+// No token gate can see this axis: f32 is the MORE precise deviation, so the
+// goldens pass either way while the path moves twice the bytes.
+TEST_CASE("qwen35 paged MoE: the GDN recurrence output and z gate follow VT_GDN_OUT_BF16") {
+  const HfConfig c = MakeConfig();
+  REQUIRE(c.num_experts > 0);  // the arm that used to resolve f32.
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t T = 6;
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+  const std::vector<int32_t> logits_indices;
+
+  CachePool pool(c, /*num_blocks=*/8, /*block_size=*/8);
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+
+  vllm::detail::ResetGdnOutActivationDTypes();
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5MoeLoadedModel(w);
+  ModelForwardInput in{ids, pos, am, gm, pool.attn_kv, pool.gdn_state,
+                       c,   q,   logits_indices};
+  in.num_reqs = 1;
+  const vllm::ForwardLogits logits = ModelRegistry::Forward(*model, in);
+  CHECK((logits.host.size() == static_cast<size_t>(T * c.vocab_size) ||
+         logits.on_device()));
+
+  // `observed` separates "the forward produced f32" from "the forward never
+  // reached a paged GDN layer", which look identical to a dtype comparison.
+  const vllm::detail::GdnOutActivationDTypes dt =
+      vllm::detail::LastGdnOutActivationDTypes();
+  REQUIRE(dt.observed);
+
+  // Fresh-review repair, both halves. The case used to assert BF16
+  // UNCONDITIONALLY, which made it two things it should not be:
+  //
+  //  - a FALSE RED under the documented rollback. `VT_GDN_OUT_BF16=0` is what
+  //    the row's own `## Gates` A/B sets, and an operator who exported it and
+  //    re-ran this suite got 4/5 cases, 11/13 assertions and a FAILURE that was
+  //    not a regression. The resolver caches its getenv, so the case could not
+  //    neutralise the variable in-process either.
+  //  - blind to a SEVERED resolver. `GdnOutDType()` hardwired to BF16 — cut from
+  //    its parser and from the variable entirely — left this suite 5/5 13/13 and
+  //    test_qwen27_paged_forward 31/31 770/770.
+  //
+  // Asserting against the environment as this file reads it directly fixes both:
+  // the rollback arm now INVERTS rather than fails, and it is the arm in which a
+  // hardwired BF16 reads BF16 where F32 was ordered. tests/CMakeLists.txt
+  // registers this same binary a second time with VT_GDN_OUT_BF16=0 so both arms
+  // actually run, the shape `_glue_fuse_off` and
+  // `test_dense_gateup_fused_marlin_off_*` already use for a read-once lever.
+  const bool lever = GdnOutBf16LeverOn();
+  CAPTURE(lever);
+  const DType expect = lever ? DType::kBF16 : DType::kF32;
+  CHECK(dt.core_out == expect);
+  CHECK(dt.z_gate == expect);
+}
+
+// GDN-MOE-BF16-OUT (#1168), fresh-review repair. The RESOLVER, not the parser.
+//
+// The CPU tier already pins `detail::GdnOutBf16FlagIsOn`'s truth table
+// (test_qwen27_paged_forward), and the case above pins what the model RAN. Both
+// stayed green when `GdnOutDType()` was replaced with `return DType::kBF16;`,
+// because on the default environment BF16 is also the right answer. Nothing
+// asserted that the production resolver consumes the parser at all, and this
+// row's `## Gates` rest on a `VT_GDN_OUT_BF16=0|1` same-binary A/B: a lever
+// wired to nothing does not lose coverage, it invalidates the measurement.
+//
+// One process observes one value of the cached getenv, so the two env values are
+// two ctest registrations of this binary rather than two assertions here.
+TEST_CASE("qwen35: GdnOutDType resolves from VT_GDN_OUT_BF16, not from a constant") {
+  const bool lever = GdnOutBf16LeverOn();
+  CAPTURE(lever);
+  CHECK(vllm::detail::GdnOutDType() ==
+        (lever ? DType::kBF16 : DType::kF32));
+
+  // And the parser it is supposed to read agrees with the environment on this
+  // process's own value. Two separate statements: the one above says the
+  // resolver answers what the environment says, this one says the parser does
+  // too, so a divergence names WHICH of the two moved.
+  CHECK(vllm::detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16")) ==
+        lever);
+}
+
+// GDN-MOE-PACKED-BA (#1169). The MoE safetensors loader now builds the ONE
+// merged `in_proj_ba` owner (`[2*Hv, H]`, nk, rows [b; a]) that vLLM owns on
+// every Qwen3.5/3.6 GDN layer (packed_modules_mapping on
+// Qwen3_5ForCausalLMBase, qwen3_5.py:297 @ 555967922), and leaves the split
+// `in_proj_b` / `in_proj_a` empty. On CPU that moves `ProjectGdnBA` from two
+// `vt::Matmul` GEMMs over the transposed `[H,Hv]` pair onto two `vt::MatmulBT`
+// GEMMs over row slices of the owner (qwen3_5.cpp, ProjectGdnBA), with the same
+// f32 output dtype. The dense 27B made the same transition token-exact under
+// KERNEL-GDN-PACKED-DECODE W1; this case MEASURES it on the MoE synthetic model
+// instead of assuming it: the same weights, once split and once merged, run the
+// existing prefill-then-decode sequence through ModelRegistry::Forward (the
+// production entry) and the logits must be bit-identical. A difference here is
+// the spec's Risk 1 and stops the row (NEEDS_DECISION), it does not widen.
+namespace {
+
+// `[b; a]` owner from the split `[H,Hv]` Matmul-B pair: row r of the owner is
+// column r of the split tensor, so the owner is the transpose of the stacked
+// pair, which is the raw torch-Linear `[N,K]` orientation (nk=true) the real
+// loader's `LoadMergedBf16RawNK` produces.
+OwnedTensor MergedBaOwnerFromSplit(const OwnedTensor& b, const OwnedTensor& a) {
+  REQUIRE(b.rank == 2);
+  REQUIRE(a.rank == 2);
+  REQUIRE(b.shape[0] == a.shape[0]);
+  REQUIRE(b.shape[1] == a.shape[1]);
+  const int64_t H = b.shape[0], Hv = b.shape[1];
+  OwnedTensor o;
+  o.dtype = DType::kBF16;
+  o.rank = 2;
+  o.shape[0] = 2 * Hv;
+  o.shape[1] = H;
+  o.nk = true;
+  o.bytes.resize(static_cast<size_t>(2 * Hv * H) * 2);
+  auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
+  const auto* bs = reinterpret_cast<const uint16_t*>(b.bytes.data());
+  const auto* as = reinterpret_cast<const uint16_t*>(a.bytes.data());
+  for (int64_t r = 0; r < Hv; ++r) {
+    for (int64_t h = 0; h < H; ++h) {
+      dst[r * H + h] = bs[h * Hv + r];
+      dst[(Hv + r) * H + h] = as[h * Hv + r];
+    }
+  }
+  return o;
+}
+
+// The same model with every GDN layer's split pair replaced by the merged
+// owner. `split` keeps its fields so the two arms can be compared.
+Qwen3_5MoeWeights MergedBaWeights(const Qwen3_5MoeWeights& split) {
+  Qwen3_5MoeWeights w = split;
+  int merged = 0;
+  for (vllm::Qwen3_5MoeLayerWeights& lw : w.layers) {
+    if (!lw.is_linear_attention) continue;
+    lw.gdn.in_proj_ba =
+        MergedBaOwnerFromSplit(lw.gdn.in_proj_b, lw.gdn.in_proj_a);
+    lw.gdn.in_proj_b = OwnedTensor{};
+    lw.gdn.in_proj_a = OwnedTensor{};
+    ++merged;
+  }
+  REQUIRE(merged == 3);  // MakeConfig: layer_types [LA, LA, LA, FA]
+  return w;
+}
+
+struct PrefillThenDecode {
+  std::vector<float> prefill;
+  std::vector<float> decode;
+};
+
+// ModelRegistry::Forward hands the logits back on whichever carrier the model
+// chose (the MoE forward returns a device-resident `[rows, vocab]` view even on
+// the CPU backend); read either one into a host vector.
+std::vector<float> LogitsToHost(const vllm::ForwardLogits& fl, vt::Queue& q) {
+  if (!fl.on_device()) return fl.host;
+  std::vector<float> out(static_cast<size_t>(fl.rows * fl.vocab));
+  vt::Backend& be = vt::GetBackend(q.device.type);
+  be.Copy(q, out.data(), fl.device_tensor.data, out.size() * sizeof(float));
+  be.Synchronize(q);
+  return out;
+}
+
+// The existing "decode via KV cache" sequence (prefill T tokens, then ONE decode
+// token over the same persistent caches), through ModelRegistry::Forward.
+PrefillThenDecode RunPrefillThenDecode(const Qwen3_5MoeWeights& w,
+                                       const HfConfig& c) {
+  vt::Queue q = Q();
+  const int64_t T = 5;
+  const std::vector<int32_t> ids = {7, 1, 22, 4, 15};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4};
+  const std::vector<int32_t> next = {8};
+  const std::vector<int32_t> next_pos = {static_cast<int32_t>(T)};
+  const std::vector<int32_t> logits_indices;
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5MoeLoadedModel(w);
+  PrefillThenDecode out;
+  CachePool pool(c, 8, 8);
+  {
+    const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+    const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+    ModelForwardInput in{ids, pos, am, gm, pool.attn_kv, pool.gdn_state,
+                         c,   q,   logits_indices};
+    in.num_reqs = 1;
+    const vllm::ForwardLogits logits = ModelRegistry::Forward(*model, in);
+    out.prefill = LogitsToHost(logits, q);
+  }
+  {
+    CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = 1;
+    am.query_start_loc = {0, 1};
+    am.query_start_loc_cpu = am.query_start_loc;
+    am.seq_lens = {static_cast<int32_t>(T + 1)};
+    am.seq_lens_cpu = am.seq_lens;
+    am.max_query_len = 1;
+    am.max_seq_len = static_cast<int>(T + 1);
+    am.block_table_num_cols = 2;
+    am.block_table_tensor = {0, 1};
+    am.slot_mapping = {static_cast<int64_t>(T)};
+    am.causal = true;
+    GDNAttentionMetadata gm;
+    gm.num_prefills = 0;
+    gm.num_prefill_tokens = 0;
+    gm.num_decodes = 1;
+    gm.num_decode_tokens = 1;
+    gm.num_actual_tokens = 1;
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1};
+    ModelForwardInput in{next, next_pos, am, gm, pool.attn_kv, pool.gdn_state,
+                         c,    q,        logits_indices};
+    in.num_reqs = 1;
+    const vllm::ForwardLogits logits = ModelRegistry::Forward(*model, in);
+    out.decode = LogitsToHost(logits, q);
+  }
+  REQUIRE(out.prefill.size() == static_cast<size_t>(T * c.vocab_size));
+  REQUIRE(out.decode.size() == static_cast<size_t>(c.vocab_size));
+  return out;
+}
+
+// Bit-identity, not a tolerance: the count of elements whose float BITS differ,
+// beside the max abs difference the spec asks to be printed.
+struct BitDiff {
+  size_t differing = 0;
+  double max_abs = 0.0;
+};
+BitDiff CompareBits(const std::vector<float>& x, const std::vector<float>& y) {
+  REQUIRE(x.size() == y.size());
+  BitDiff d;
+  for (size_t i = 0; i < x.size(); ++i) {
+    uint32_t xb, yb;
+    std::memcpy(&xb, &x[i], 4);
+    std::memcpy(&yb, &y[i], 4);
+    if (xb != yb) ++d.differing;
+    d.max_abs = std::max(d.max_abs,
+                         std::abs(static_cast<double>(x[i]) - y[i]));
+  }
+  return d;
+}
+
+}  // namespace
+
+TEST_CASE("qwen35 paged MoE: a merged in_proj_ba owner is bit-identical to the split pair on CPU") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights split = MakeWeights(c);
+  const Qwen3_5MoeWeights merged = MergedBaWeights(split);
+
+  // The two arms really are the two arms: one carries the owner, one the pair.
+  for (size_t l = 0; l < split.layers.size(); ++l) {
+    if (!split.layers[l].is_linear_attention) continue;
+    CHECK(split.layers[l].gdn.in_proj_ba.Empty());
+    CHECK_FALSE(split.layers[l].gdn.in_proj_b.Empty());
+    CHECK_FALSE(merged.layers[l].gdn.in_proj_ba.Empty());
+    CHECK(merged.layers[l].gdn.in_proj_ba.nk);
+    CHECK(merged.layers[l].gdn.in_proj_ba.shape[0] ==
+          2 * c.linear_num_value_heads);
+    CHECK(merged.layers[l].gdn.in_proj_ba.shape[1] == c.hidden_size);
+    CHECK(merged.layers[l].gdn.in_proj_b.Empty());
+    CHECK(merged.layers[l].gdn.in_proj_a.Empty());
+  }
+
+  const PrefillThenDecode a = RunPrefillThenDecode(split, c);
+  const PrefillThenDecode b = RunPrefillThenDecode(merged, c);
+
+  const BitDiff prefill = CompareBits(a.prefill, b.prefill);
+  const BitDiff decode = CompareBits(a.decode, b.decode);
+  MESSAGE("merged-vs-split in_proj_ba, prefill: max|diff| = " << prefill.max_abs
+          << ", elements with differing bits = " << prefill.differing << " / "
+          << a.prefill.size());
+  MESSAGE("merged-vs-split in_proj_ba, decode:  max|diff| = " << decode.max_abs
+          << ", elements with differing bits = " << decode.differing << " / "
+          << a.decode.size());
+  CHECK(prefill.differing == 0u);
+  CHECK(decode.differing == 0u);
+  CHECK(prefill.max_abs == 0.0);
+  CHECK(decode.max_abs == 0.0);
+
+  // And the sequence is not vacuous: the prefill logits are finite and non-zero.
+  double mag = 0.0;
+  for (float v : a.prefill) mag = std::max(mag, std::abs(static_cast<double>(v)));
+  CHECK(mag > 0.0);
 }

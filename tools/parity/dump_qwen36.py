@@ -10,7 +10,8 @@ by vLLM itself. We attach forward hooks to capture per-layer hidden states and
 compute logits from the model's own bf16 lm_head. See
 .agents/specs/qwen36-forward-notes.md for the full recipe + rationale.
 
-Run on dgx (GB10, 119 GiB unified) in the pip oracle venv (`~/venvs/vllm-oracle`,
+Run on the gate host (a GB10 with 119 GiB unified memory) in the pip oracle
+venv (`${VLLM_ORACLE}`,
 pip vLLM 0.24.0 — same release family as pin e24d1b24). The pinned-Python-over-
 pip-kernels overlay was TRIED and BLOCKED (the post-0.24.0-tag pinned Python
 expects a newer vendored/compiled API than the pip 0.24.0 wheel ships — see
@@ -18,8 +19,8 @@ expects a newer vendored/compiled API than the pip 0.24.0 wheel ships — see
 forward-math module in these checkpoints is byte-identical to the pin; only
 weight-loader plumbing + ROCm code differ. The ACTUAL working command (§4):
 
-    ssh dgx.casa 'cd ~/work/vllm.cpp && VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-        PATH=~/venvs/vllm-oracle/bin:$PATH ~/venvs/vllm-oracle/bin/python \
+    ssh "${GATE_HOST}" 'cd "${GATE_CHECKOUT}" && VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+        PATH="${VLLM_ORACLE}/bin:$PATH" "${VLLM_ORACLE}/bin/python" \
         tools/parity/dump_qwen36.py --model <snapshot_dir> --tag <27b|35b> \
         --out tests/parity/goldens'
 
@@ -213,6 +214,11 @@ def main():
     ap.add_argument("--prompt",
                     default="The capital of France is Paris, and the")
     ap.add_argument("--gpu-mem", type=float, default=0.5)
+    # The oracle revision this capture actually ran against. Defaults to the
+    # historical constant so an old invocation reproduces byte-for-byte; a
+    # capture on an advanced pin passes it and records the truth rather than
+    # inheriting e24d1b24 from a file nobody re-reads.
+    ap.add_argument("--pin", default=UPSTREAM_PIN)
     ap.add_argument(
         "--layer-trace",
         help="optional directory for every prefill layer's f32 residual-stream in/out",
@@ -261,15 +267,28 @@ def main():
     # coherently ("The capital of France is" -> " Paris"). Deviation from the
     # "pinned-only" rule is documented in the notes.
     src = "pinned" if "pinenv" in vllm.__file__ else "pip-vllm"
+    # GATE-27B-FP8-TOWER-GOLDEN (issue #466). `detail` used to hardcode ONE
+    # sentence about how the weights are quantized -- "GDN in_proj, embed,
+    # norms, lm_head are bf16" -- which is true of unsloth/Qwen3.6-27B-NVFP4
+    # @890bdef7 and FALSE of nvidia/Qwen3.6-27B-NVFP4@0893e160, whose GDN
+    # in_proj/out_proj and attention projections are FP8 W8A8. A manifest whose
+    # job is to say WHICH model a golden belongs to must not assert the wrong
+    # layout for the next checkpoint someone captures. Read the resolved
+    # quantization and KV dtype off the engine instead of asserting them.
+    mc = llm.llm_engine.vllm_config.model_config
+    cc = llm.llm_engine.vllm_config.cache_config
+    quant = getattr(mc, "quantization", None)
+    kv_dtype = getattr(cc, "cache_dtype", None)
     meta = {
         "source": f"{src}:{vllm.__version__}",
-        "pin_reference": UPSTREAM_PIN,
-        "detail": ("vLLM v1 offline engine (pip vllm "
-                   f"{vllm.__version__}, same release family as pin "
-                   f"{UPSTREAM_PIN}). Quantized linears run the real NVFP4 "
-                   "path (cutlass FP4 for compressed-tensors W4A4 [27B] / "
-                   "modelopt W4A16 [35B]); GDN in_proj, embed, norms, lm_head "
-                   "are bf16."),
+        "pin_reference": args.pin,
+        "detail": (f"vLLM v1 offline engine ({src} {vllm.__version__}, pin "
+                   f"{args.pin}), enforce_eager, max_model_len=256, "
+                   f"max_num_seqs=1, dtype=bfloat16. Engine-resolved "
+                   f"quantization={quant!r}, kv_cache_dtype={kv_dtype!r}; the "
+                   "quantized linears run that method's real kernel path. Which "
+                   "modules are quantized is the CHECKPOINT's business and is "
+                   "not asserted here -- read `model` above."),
         "torch": torch.__version__.split("+")[0],
         "device": torch.cuda.get_device_name(0),
         "model": args.model,

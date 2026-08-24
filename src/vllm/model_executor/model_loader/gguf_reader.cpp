@@ -2,15 +2,15 @@
 // vLLM e24d1b24 has no GGUF load format.
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
-#include <fcntl.h>
+#if !defined(_WIN32)
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -18,6 +18,11 @@
 namespace vllm {
 
 namespace {
+
+std::filesystem::path Utf8Path(const std::string& path) {
+  return std::filesystem::path(std::u8string(
+      reinterpret_cast<const char8_t*>(path.data()), path.size()));
+}
 
 [[noreturn]] void Fail(const std::string& path, const std::string& what) {
   throw std::runtime_error("gguf: " + what + " in " + path);
@@ -245,6 +250,25 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 98, "IQ3_XXS"};
       return &t;
     }
+    case 19: {
+      // block_iq1_s (ggml-common.h:414-419): f16 d + QK_K/8 u8 qs
+      // + QK_K/32 u16 qh = 2 + 32 + 16 = 50, i.e. 1.5625 bpw. Carries the
+      // routed experts (ffn_down/gate/up_exps) of the Qwen3.8-2.4T-A95B
+      // UD-IQ1_S checkpoint, which is 96.92 % of that model's parameters
+      // (codebook dequant in cpu_quant_dequant.cpp / vt DType kIQ1_S).
+      static constexpr GgmlTypeTraits t{256, 50, "IQ1_S"};
+      return &t;
+    }
+    case 66: {
+      // block_iq1_xxxs, from the PINNED FORK oracle `llama-cpp-unsloth`
+      // (.agents/oracles/llama-cpp-unsloth.md, ggml-common.h:478-483):
+      // f16 d + QK_K/8 u8 qs + QK_K/64 u8 sc = 2 + 32 + 4 = 38, i.e.
+      // 1.1875 bpw. NO upstream llama.cpp defines type 66. It carries the
+      // routed experts of the Qwen3.8-2.4T-A95B UD-Q1_0 checkpoint, 96.92 % of
+      // that model's parameters.
+      static constexpr GgmlTypeTraits t{256, 38, "IQ1_XXXS"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.
@@ -327,22 +351,13 @@ GgufFile GgufFile::OpenOne(const std::string& path) {
   auto mapping = std::make_shared<GgufMapping>();
   f.map_ = mapping;
 
-  mapping->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (mapping->fd < 0)
-    Fail(path, std::string("cannot open file: ") + std::strerror(errno));
-  struct stat st{};
-  if (::fstat(mapping->fd, &st) != 0)
-    Fail(path, std::string("fstat failed: ") + std::strerror(errno));
-  if (st.st_size <= 0) Fail(path, "empty file");
-  const size_t file_size = static_cast<size_t>(st.st_size);
-
-  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, mapping->fd, 0);
-  if (map == MAP_FAILED)
-    Fail(path, std::string("mmap failed: ") + std::strerror(errno));
-  mapping->addr = map;
-  mapping->size = file_size;
-
-  Cursor cur{static_cast<const uint8_t*>(map), file_size, 0, path};
+  try {
+    mapping->file = detail::ReadOnlyFileMapping::Open(Utf8Path(path));
+  } catch (const std::runtime_error& e) {
+    Fail(path, e.what());
+  }
+  const size_t file_size = mapping->file->size();
+  Cursor cur{mapping->file->data(), file_size, 0, path};
 
   // Header: magic "GGUF", u32 version, u64 tensor_count, u64 kv_count.
   cur.Need(4, "magic");
@@ -579,17 +594,13 @@ const GgufTensorInfo& GgufFile::Get(const std::string& name) const {
   return tensors_[it->second];
 }
 
-GgufMapping::~GgufMapping() {
-  if (addr != nullptr) ::munmap(addr, size);
-  if (fd >= 0) ::close(fd);
-}
-
 bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
   const auto in = [&](const GgufMapping* m) {
-    if (m == nullptr || m->addr == nullptr) return false;
-    const auto* base = static_cast<const uint8_t*>(m->addr);
-    return data >= base && nbytes <= m->size &&
-           static_cast<size_t>(data - base) <= m->size - nbytes;
+    if (m == nullptr || m->file == nullptr) return false;
+    const auto* base = m->file->data();
+    const size_t size = m->file->size();
+    return data >= base && nbytes <= size &&
+           static_cast<size_t>(data - base) <= size - nbytes;
   };
   if (in(map_.get())) return true;
   // A merged split GGUF: the span may live in any sibling shard's mapping.
@@ -597,6 +608,32 @@ bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
     for (const auto& s : map_->siblings)
       if (in(s.get())) return true;
   return false;
+}
+
+GgufFile::SpanSource GgufFile::SourceOfSpan(const uint8_t* data,
+                                            size_t nbytes) const {
+  SpanSource out;
+#if !defined(_WIN32)
+  const auto try_map = [&](const GgufMapping* m) {
+    if (m == nullptr || m->file == nullptr) return false;
+    const uint8_t* base = m->file->data();
+    const size_t size = m->file->size();
+    if (base == nullptr || data < base) return false;
+    const size_t off = static_cast<size_t>(data - base);
+    if (nbytes > size || off > size - nbytes) return false;
+    out.fd = m->file->fd();
+    out.offset = off;
+    return out.fd >= 0;
+  };
+  if (try_map(map_.get())) return out;
+  if (map_ != nullptr)
+    for (const auto& s : map_->siblings)
+      if (try_map(s.get())) return out;
+#else
+  (void)data;
+  (void)nbytes;
+#endif
+  return out;
 }
 
 void GgufFile::DropSpanResidency(const uint8_t* data, size_t nbytes) const {

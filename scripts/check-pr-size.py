@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Enforce explicit path classification and the checker-evidence contract.
 
-The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10;
-see the note where they stood. What remains: every changed path must classify
-explicitly, binaries fail closed, a governance-checker change must carry
-executable mutation evidence, and product paths must arrive on a PR."""
+The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10,
+and the fail-closed BINARY GUARD was retired 2026-08-13; see the notes where
+each stood. What remains: every changed path must classify explicitly, a
+governance-checker change must carry executable mutation evidence, and product
+paths must arrive on a PR. Nothing here measures the size of a diff."""
 
 from __future__ import annotations
 
@@ -54,8 +55,8 @@ PATH_CLASSES = frozenset(
 #
 # Everything else this checker enforces is unchanged and is NOT a size rule:
 # explicit path classification (no blanket directory exemptions), the
-# fail-closed binary guard, the checker-change mutation-evidence contract, and
-# the role checks that keep product paths on a PR.
+# checker-change mutation-evidence contract, and the role checks that keep
+# product paths on a PR.
 
 # Machine-generated artifacts, each of which MUST be (a) emitted by a tracked
 # generator in this repository, (b) reproduced byte-for-byte by a gate that runs
@@ -85,6 +86,11 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
+        # The intake surface moved out of roadmap_v1.md into its own append-only
+        # file (#840) and was never classified here. Classification is a hard
+        # error by design, so pr-size aborted on EVERY pull request that appends
+        # an index row, which under the same policy is nearly all of them (#856).
+        ".agents/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",
@@ -104,6 +110,14 @@ PROCEDURE_FILES = frozenset(
         "CLAUDE.md",
         ".agents/workflow.md",
         ".agents/verification.md",
+        # The "nothing lands dead" task guide (#888, `8f49ac3be`). Never
+        # classified, and classify_path FAILS CLOSED, so pr-size refused every
+        # PR that touched it and this file's own suite has been red on main ever
+        # since -- silently, because that suite runs in no CI job and only the
+        # next checker change loads it (#989). Third instance of the same class
+        # after #856 and #668; listed explicitly rather than letting .agents/
+        # become a blanket exemption.
+        ".agents/reachability.md",
         ".agents/porting.md",
         # The per-model coverage checklist that porting.md points at (#318). Same
         # procedure class as its sibling guides; listed explicitly rather than
@@ -111,6 +125,14 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
+        # The writing guides AGENTS.md delegates to, and the skill routes that
+        # point at them (#827). Same procedure class as their sibling guides.
+        # They were never classified, so classify_path FAILED CLOSED and this
+        # test has been red on main ever since that row landed (#856).
+        ".agents/style/commits.md",
+        ".agents/style/prose.md",
+        ".claude/skills/writing-commits-and-prs/SKILL.md",
+        ".claude/skills/writing-technical-english/SKILL.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",
@@ -173,6 +195,12 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+# One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
+# Same shape and therefore the same class as SPEC and CLAIM: a per-key record
+# globbed for reading, deliberately NOT a shared table every change must write.
+# Absent until #668 -- the registry landed with no pattern here, so every one of
+# its files was unclassified and a required check refused any PR touching a pin.
+ORACLE = re.compile(r"\.agents/oracles/[A-Za-z0-9_.-]+\.md\Z")
 # Retired state evidence, moved wholesale under completed/ when history became
 # git. It is archived evidence, classified like every other completed record.
 COMPLETED_STATE_EVENT = re.compile(
@@ -181,6 +209,33 @@ COMPLETED_STATE_EVENT = re.compile(
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
+# A PER-RUN evidence directory: docs/bench-evidence/<run-id>/<file> (#1448).
+# AGENTS.md requires the exact build and run recipe beside a measurement, so one
+# run arrives as a dated directory of logs, dumps and the scripts that produced
+# them, not as one flat file. BENCH_EVIDENCE above matches exactly ONE path
+# segment, so all ten files of the first such directory
+# (`gdn-replayssm-w0-20260818`, landed 2026-08-18) were unclassified.
+# `classify_path` FAILS CLOSED, and the sweep in
+# tests/scripts/test_check_pr_size.py classifies every TRACKED path, so that
+# suite went red on `main` and every PR touching this checker was refused
+# through its own evidence contract. Fourth instance of the class after #856,
+# #668 and #989, and repaired the same way: name the surface, do not widen a
+# rule.
+#
+# The extension list is EXACTLY the set this directory carries, and it
+# deliberately omits `.md` and `.json`. Those two already classify as
+# public_document through DOC below, and the evidence arm is tested FIRST, so
+# admitting them here would silently RECLASSIFY
+# docs/bench-evidence/mxfp4-qwen/*.md and its golden .json. Preserving the class
+# of a path that already had one matters more than making the directory
+# uniform.
+#
+# `.sh` and `.cu` are evidence, not product: they are the recipe that produced
+# the number. Nothing builds them, nothing installs them, and no entry point
+# reaches them.
+BENCH_EVIDENCE_RUN = re.compile(
+    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
+)
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
     r"\.agents/completed/state-migration-manifest-"
@@ -273,6 +328,11 @@ CREATION_MUTATIONS = {
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
     "scripts/check-triton-aot-multiarch.py": DISABLED_CREATION_CHECKER,
+    # ENG-RELEASE-WINDOWS. The portability suite loads this checker as a module
+    # and calls its validation functions, so the disabled stub leaves the test
+    # cases executable but red instead of inventing a permissive BASE checker.
+    "scripts/check-windows-portability.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-windows-release-state.py": DISABLED_CREATION_CHECKER,
     # A new checker has no BASE version to mutate, so it registers the disabled
     # form its own tests must reject. The empty stub exits 0 and prints nothing,
     # which fails every case in tests/scripts/test_check_site.py -- including
@@ -284,6 +344,34 @@ CREATION_MUTATIONS = {
     # reduced one.
     "scripts/check-container-matrix.py": DISABLED_CREATION_CHECKER,
     "scripts/check-container-workflow.py": DISABLED_CREATION_CHECKER,
+    # GATE-SYMBOL-ANCHORS (#1143). Created here, so there is no BASE version to
+    # mutate. The empty stub exits 0 and prints nothing, which fails 20 of the
+    # 21 cases in tests/scripts/test_check_symbol_anchors.py -- including the
+    # clean-tree case, which asserts a checked count at or above the recorded
+    # floor and so cannot be satisfied by silence.
+    "scripts/check-symbol-anchors.py": DISABLED_CREATION_CHECKER,
+    # 2026-08-16: the CUDA arch-gate registration guard (#960). Created in the
+    # same PR, so there is no BASE version to mutate; its own suite loads the
+    # checker as a module and calls into it, so the disabled stub fails at import
+    # rather than quietly passing a reduced set of cases.
+    "scripts/check-cuda-op-arch-gate.py": DISABLED_CREATION_CHECKER,
+    # GATE-CONFLICT-MARKERS (#1417). Created in this range, so there is no BASE
+    # version to mutate. The empty stub exits 0 and prints nothing, which fails
+    # 16 of the 21 cases in tests/scripts/test_check_conflict_markers.py --
+    # measured, not asserted. The five survivors are the four OrdinaryTextTests
+    # cases, which assert only that an ordinary document exits 0 and are
+    # therefore satisfied by silence, and the registration case, which reads two
+    # files and never runs the checker at all. Every case that reads an exit
+    # code of 1 or an examined count out of the report goes red, which is what
+    # makes the stub a mutation rather than a weaker checker.
+    "scripts/check-conflict-markers.py": DISABLED_CREATION_CHECKER,
+    # KERNEL-ATTN-DENSE-FLASH (#1544). Created in this range, so there is no BASE
+    # version to mutate. Its suite loads the checker as a module at import time and
+    # then calls scan_file / has_marker / drift_sites / stale_allowlist_entries /
+    # main on it, none of which the stub defines, so every case that touches the
+    # checker raises AttributeError. Measured: 31 of 31 red under the stub, because
+    # the suite has no case that passes without calling into the checker at all.
+    "scripts/check-attention-rung-consistency.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
@@ -362,6 +450,7 @@ def classify_path(path: str) -> str:
         path in PROCEDURE_FILES
         or SPEC.fullmatch(path)
         or CLAIM.fullmatch(path)
+        or ORACLE.fullmatch(path)
         or COMPLETED.fullmatch(path)
         or COMPLETED_STATE_EVENT.fullmatch(path)
     ):
@@ -372,6 +461,7 @@ def classify_path(path: str) -> str:
         or SPEC_EVIDENCE.fullmatch(path)
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
+        or BENCH_EVIDENCE_RUN.fullmatch(path)
     ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:
@@ -399,6 +489,10 @@ def classify_path(path: str) -> str:
     if path in {
         "release/manifest-v1.schema.json",
         "release/release-matrix.json",
+        # The single immutable prerelease identity consumed by planning,
+        # workflows, and the post-publication audit (#117). Exact-path only:
+        # mutable or future release state must still fail closed until classified.
+        "release/release-version.json",
         "release/container-matrix.json",
         "scripts/env-doc-allowlist.txt",
     }:
@@ -468,9 +562,15 @@ def change_errors(
         except ValueError as exc:
             errors.append(str(exc))
             continue
-        if change.lines is None:
-            errors.append(f"binary change {change.path!r} is not reviewable as text")
-            continue
+        # NO BINARY GUARD. A `lines is None` path used to error here as "not
+        # reviewable as text" (GATE-PR-SIZE-BINARY, #615). Retired 2026-08-13:
+        # it made every golden-bearing PR unmergeable by construction -- parity
+        # goldens are binary by nature -- while adding nothing, because the
+        # protection that matters is classification, which runs directly above
+        # and still refuses any path without a class. The classifier was always
+        # built to give binaries a class; see the `SITE_ASSET` note. Note
+        # `lines is None` still matters downstream: the evidence contract below
+        # tests it, so a binary cannot serve as mutation evidence.
         if path_class == "governance_checker":
             evidence = recognized_evidence(change.path)
             evidence_change = changed_paths.get(evidence)
@@ -525,16 +625,39 @@ def resolve_commit(repo: Path, revision: str) -> str:
     return oid
 
 
-def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
+def range_base(repo: Path, base_oid: str, head_oid: str) -> str:
+    """The merge base of base and head -- i.e. what a pull request actually is.
+
+    This used to demand that `base_oid` be an ANCESTOR of head (#773). CI passes
+    `pull_request.base.sha`, the TIP of the base branch, which stops being an
+    ancestor the moment main advances after the branch was cut -- continuously,
+    on this repo. So the checker aborted BEFORE classifying anything, and no
+    fork PR was ever checked. The sibling trailer gate aborted the same way,
+    which is why CI has never validated an external contributor's trailers.
+
+    Diffing two-dot against a moved main is not merely stricter, it is WRONG:
+    main's own commits appear as reversions inside the contributor's diff, so
+    paths they never touched get classified and charged to them. `git diff
+    A...B` is defined as `git diff $(git merge-base A B) B` and is what GitHub
+    itself shows.
+
+    Unrelated histories still fail closed. No merge base means there is no range
+    to compute, and reporting one would be an invention -- absence of
+    information must never look like absence of work.
+    """
     result = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", base_oid, head_oid],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["git", "-C", str(repo), "merge-base", base_oid, head_oid],
+        capture_output=True,
+        text=True,
         timeout=EVIDENCE_TIMEOUT_SECONDS,
         shell=False,
     )
-    if result.returncode == 1:
-        raise ValueError("base must be an ancestor of head")
+    if result.returncode != 0:
+        raise ValueError("base and head have no merge base (unrelated histories)")
+    oid = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", oid) is None:
+        raise ValueError("merge base did not resolve to one commit")
+    return oid
     if result.returncode != 0:
         raise ValueError("could not establish base/head ancestry")
 
@@ -542,9 +665,10 @@ def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
 def changed_paths(base: str, head: str, *, repo: Path = ROOT) -> list[ChangedPath]:
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # From the MERGE BASE, not the base tip -- see range_base() (#773).
     return parse_numstat(
-        git("diff", "--no-renames", "--numstat", base_oid, head_oid, repo=repo)
+        git("diff", "--no-renames", "--numstat",
+            range_base(repo, base_oid, head_oid), head_oid, repo=repo)
     )
 
 
@@ -559,11 +683,34 @@ def load_role_discipline():
     return module
 
 
+EVIDENCE_REQUIRED_TOOLS = {
+    "tests.scripts.test_check_windows_portability": ("cmake", "ninja"),
+}
 
 
-def _sanitized_env(home: Path) -> dict[str, str]:
+
+def _prepare_evidence_tools(container: Path, module: str) -> Path:
+    """Expose exact host tools privately without inheriting their PATH."""
+
+    tools = container / "tools"
+    tools.mkdir()
+    for name in EVIDENCE_REQUIRED_TOOLS.get(module, ()):
+        source = shutil.which(name)
+        if source is None:
+            raise ValueError(f"semantic evidence requires executable {name}")
+        resolved = Path(source).resolve()
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise ValueError(f"semantic evidence tool is not executable: {resolved}")
+        (tools / name).symlink_to(resolved)
+    return tools
+
+
+def _sanitized_env(home: Path, tools: Path | None = None) -> dict[str, str]:
+    path = os.defpath
+    if tools is not None:
+        path = str(tools) + os.pathsep + path
     return {
-        "PATH": os.defpath,
+        "PATH": path,
         "HOME": str(home),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -572,12 +719,14 @@ def _sanitized_env(home: Path) -> dict[str, str]:
     }
 
 
-def _run_test_module(worktree: Path, module: str) -> tuple[int, bool, str]:
+def _run_test_module(
+    worktree: Path, module: str, tools: Path | None = None
+) -> tuple[int, bool, str]:
     try:
         result = subprocess.run(
             [sys.executable, "-m", "unittest", "-v", module],
             cwd=worktree,
-            env=_sanitized_env(worktree),
+            env=_sanitized_env(worktree, tools),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -619,7 +768,9 @@ def executable_evidence(
 
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # The BASE version of a checker, for the red-before half, is the one at the
+    # merge base -- not at a base tip that has moved past this branch (#773).
+    base_oid = range_base(repo, base_oid, head_oid)
     changed = {item.path for item in changes}
     checkers = sorted(
         item.path
@@ -637,6 +788,7 @@ def executable_evidence(
         )
         worktree = container / "worktree"
         try:
+            tools = _prepare_evidence_tools(container, module)
             subprocess.run(
                 [
                     "git",
@@ -656,11 +808,15 @@ def executable_evidence(
                 shell=False,
                 env=_sanitized_env(container),
             )
-            head_count, head_passed, head_detail = _run_test_module(worktree, module)
+            head_count, head_passed, head_detail = _run_test_module(
+                worktree, module, tools
+            )
             target = worktree / checker_path
             target.write_bytes(_base_checker(repo, base_oid, checker_path))
             target.chmod(0o755)
-            base_count, base_passed, base_detail = _run_test_module(worktree, module)
+            base_count, base_passed, base_detail = _run_test_module(
+                worktree, module, tools
+            )
             results[checker_path] = EvidenceResult(
                 checker=checker_path,
                 test_module=module,

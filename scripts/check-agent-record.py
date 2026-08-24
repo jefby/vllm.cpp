@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
+import json
 import re
 import subprocess
 import sys
@@ -39,7 +42,95 @@ MATRICES = {
     # delegates it. Its only upstream implementation is the still-OPEN
     # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 362),
+    # 369 since 2026-08-13: +7 rows for the architectures behind official
+    # `vllm-project/recipes` models that had no row at all (#609, #610). One is
+    # pin-lag — `BailingMoeV3ForCausalLM` is registered on vLLM `main` and
+    # absent only at `555967922`. Six are out-of-repo: `MossTTSDelayModel`,
+    # `MossTTSRealtime`, `Qwen3TTSForConditionalGeneration` and
+    # `HiggsMultimodalQwen3ForConditionalGeneration` are registered by
+    # `vllm-project/vllm-omni`, and `VoxtralRealtimeForConditionalGeneration`
+    # and `BailingMMNativeForConditionalGeneration` are target-pending — their
+    # exact `config.json` architecture strings are registered in neither core
+    # vLLM `main` nor `vllm-omni`, so the rows record what was searched instead
+    # of an invented anchor. SEVEN, not eight: the audit's eighth architecture
+    # `Qwen3_5MoeForCausalLM` is rowed by #490 / PR #601, which registers it
+    # rather than only inventorying it. Two branches ADDING the same keyed row
+    # merge without a conflict and define it twice, so the row is left to its
+    # owner. None of the seven touches the at-the-pin model inventory below
+    # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
+    # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
+    # because seven new rows EXIST, never to make a transition pass.
+    # 370 since 2026-08-13: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
+    # (Lightricks LTX-2.5, 21.00B joint video+audio DiT, released 2026-08). A FOURTH
+    # beyond-pin row, and like Muse Glimmer it is absent from `555967922` because it
+    # did not exist yet. Unlike the others it is also out-of-repo: the architecture
+    # reference is Lightricks' own `LTX-2` (`ltx-core`), and vLLM-Omni's `ltx2` module
+    # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
+    # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    #
+    # This entry READ `363 since 2026-08-11` until #651. Both halves were wrong,
+    # and 363 is a value this pin has never held at any commit in its history —
+    # so the entry described a transition that never happened, in a log whose
+    # whole job is to say why each bump was legitimate. Re-derived from git
+    # rather than carried forward, which is the only way any number in this
+    # block is ever allowed to move: `git log -S` on the row id finds exactly
+    # one commit, `cefacd2d0` (2026-08-13), and the pin reads 369 at
+    # `cefacd2d0~1` and 370 at `cefacd2d0`. What makes that checkable rather
+    # than plausible is the block itself — 358, 360, 361, 362, 369, 370, 372,
+    # 373, 375, 377 is the sequence of values this pin has actually held, in the
+    # order it held them, and an append-log that ran 369, 363, 372 was
+    # self-evidently not a history. `test_model_pin_log_records_only_transitions_that_happened`
+    # is what ties this entry to that sequence.
+    # 372 since 2026-08-13: +2 for IndexTTS-2.5, which vLLM-Omni registers as TWO
+    # architectures (`IndexTTS2TalkerForConditionalGeneration` stage 0 and
+    # `IndexTTS2S2MelDecoder` stage 1), so a port described in prose as "a model"
+    # moves this pin by two. Both land `INVENTORIED`, unclaimed and blocked on the
+    # absent vllm-omni pin (#633). Bumped because two rows EXIST, never to make a
+    # transition pass. #634.
+    # 373 since 2026-08-13: +1 for `MiniMaxMusic3ForConditionalGeneration`, landing
+    # `SPIKE` with its spec committed (#672). Two independent rows moved this pin on
+    # the same day and BOTH branches read 371, so an auto-merge taking either side
+    # would have left the matrix internally consistent while short a real
+    # architecture. Re-derived, which is the only way this pin is ever allowed to
+    # move. test_music3_and_indextts_rows_both_survive_their_collision names all
+    # three rows, because a count alone cannot see that failure.
+    # 375 since 2026-08-14: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
+    # +`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` (issue #490), the TEXT-ONLY
+    # arms of the Qwen3.5 backbone — the eighth architecture the #609/#610 audit
+    # found and deliberately left to its owner, plus its dense sibling. Both are
+    # beyond-pin: they are not among the 355 registry architectures at
+    # `555967922` because they landed upstream afterwards (PR vllm#50210 @
+    # `ad5d29db7`), exactly like the Muse Glimmer row above. Their Upstream cells
+    # deliberately carry no pinned module/class target, so the pin-derived static
+    # invariants in check_model_invariants are UNCHANGED (324/373/356/310/261) —
+    # this is the row-EXISTS count only, bumped because two new rows exist, never
+    # to make a transition pass. This row was authored against 362 -> 364, then
+    # re-derived to 370 -> 372, and is now RE-DERIVED AGAIN to 373 -> 375: the
+    # #609/#610 backfill, LTX-2.5, IndexTTS-2.5 and MiniMax-Music3 all landed
+    # while it was in review, and every one of them moved this pin. The number is
+    # counted off the matrix as it stands after the merge, never carried forward
+    # from the branch — a justification framed against a number this file no
+    # longer carries would be false about the file it sits in, and
+    # `Qwen35TextOnlyRowsAreCounted` is what ties this value to the two rows the
+    # matrix actually holds.
+    # 377 since 2026-08-14, and RE-DERIVED rather than carried forward: +2 for
+    # dots3-note, which vLLM registers as TWO architectures
+    # (`Dots3NoteForCausalLM` and its speculative head `Dots3NoteMTPModel`),
+    # landing `SPIKE` and `INVENTORIED` respectively with the spec committed
+    # (#699). This is the collision the Music3/IndexTTS comment above warns
+    # about, happening again on the same day: the #490 branch took 373 -> 375
+    # for the Qwen3.5 text-only arms while the dots3 branch took 373 -> 375 for
+    # its own two rows. BOTH read 375 and neither was right -- the merged tree
+    # holds four new rows, so it is 377. An auto-merge keeping either side would
+    # have left this file internally consistent while silently short two real
+    # architectures, which is why the number is counted off the matrix AFTER the
+    # merge and why `test_dots3_rows_are_inside_the_model_ratchet` names the rows
+    # instead of trusting the count. dots3-note is beyond-pin (vLLM `main` only,
+    # vllm#51255, still being patched), carries no pinned-registry target, and
+    # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
+    # because two rows EXIST, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 377),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -50,7 +141,19 @@ MATRICES = {
     # ADVANCED to `ACTIVE` (keep-quant compute landed) by `CLAIM-DEEPSEEK-V4-W8` —
     # the `UD-IQ2_XXS` down-projection routed experts (`ffn_down_exps`) are IQ3_XXS;
     # no row count change (an in-place advance, not a new row).
-    "QUANT": (AGENTS / "quantization-matrix.md", 82),
+    # 84 since 2026-08-18: +`QUANT-QWEN38-27B-GGUF-ARM` and
+    # +`QUANT-QWEN38-27B-NVFP4-ARM`, the two quantized arms of Qwen3.8-27B whose bf16
+    # arm is already gated (#915) and which #821 has owned with no row of its own.
+    # Two rows and not one: they share nothing but a model name -- different file
+    # format, different loader translation unit, different oracle (llama.cpp for the
+    # GGUF arm, because vLLM has no in-tree GGUF at the pin and SGLang's alias table
+    # does not reach `qwen3_5`; pinned vLLM for NVFP4, which it runs), different
+    # external blockers (#857 vs #1185), and even different tokenizers on disk.
+    # Merging them would let one external blocker hold the other's work. Neither is
+    # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
+    # encoding rather than on a checkpoint. Both `READY`, spec
+    # `specs/qwen38-27b-quant-arms.md`, issue #821.
+    "QUANT": (AGENTS / "quantization-matrix.md", 84),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
@@ -174,7 +277,63 @@ MATRICES = {
     # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
     # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
     # the broad CPU-backend row.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
+    # 52 since 2026-08-18 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
+    # output-only GDN decode. A genuinely new family, not a variant of the packed
+    # decode row: it changes WHEN the state is written (every L steps, from a ring
+    # of rank-1 factors) rather than how one step is tiled, and it adds three cache
+    # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
+    # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
+    # 53 since 2026-08-19 (#1314): +`KERNEL-DFLASH2-GROUPED-CONV`, the DFlash2
+    # draft's grouped DYNAMIC depthwise convolution. A genuinely new family and
+    # not a variant of `KERNEL-DEPTHWISE-CONV1D`, on all three axes that decide
+    # a kernel's shape: the weights are DYNAMIC (a per-position delta projected
+    # from the sublayer input, added to a static per-channel base) rather than
+    # static, they are GROUPED (one delta per group of channels against one base
+    # per channel) rather than per-channel, and the tap mask is over the QUERY
+    # BLOCK (`i mod (1+k)`) rather than causal over the sequence. It also carries
+    # a SIDE axis no other convolution here has: one projection of the sublayer
+    # input produces both the prepare-side and the finish-side coefficients.
+    # Bumped because the row EXISTS, never to make a state transition pass; the
+    # row is `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # (spec `## Owed` O6, no `nvcc` on the authoring host).
+    # 54 since 2026-08-20 (#1007): +`KERNEL-CONV3D`, the general 3-D convolution
+    # `vt` had on NO device. It is not a variant of `KERNEL-CPU-CONV2D-SUBSAMPLE`:
+    # the ACCUMULATION ORDER differs and is part of the contract (one f32 partial
+    # per input channel with the bias seeded first, against kConv2d's single flat
+    # accumulator with the bias last), which is the same sibling relationship
+    # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
+    # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
+    # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
+    # 56 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
+    # +`KERNEL-TOPK-PAIRS`, the DFlash2 candidate selector's two kernels. TWO
+    # rows and not one because they are two kernels with different shapes and
+    # different gates: the first is a small dense contraction over two
+    # per-token codebooks, whose difficulty is the PREDECESSOR indexing (step 0
+    # is the verified anchor, every later step is the previous step's candidate)
+    # and the bf16 ROUNDING PLACEMENT; the second is a sort-free selection over a
+    # 248320 vocabulary, whose difficulty is the TIE-BREAK, because the
+    # pivot-bracket search converges to an exact array VALUE and therefore keeps
+    # whole tie groups. `KERNEL-TOPK-PAIRS` is also a distinct family from the
+    # shipped sampling threshold search rather than a variant of it: that kernel
+    # masks below the k-th largest IN PLACE and returns no indices, this one
+    # compacts the survivors, orders them and emits (id, value) pairs. Bumped
+    # because the rows EXIST, never to make a state transition pass; both are
+    # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
+    # (spec `## Owed` O10, no `nvcc` on the authoring host).
+    # 57 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-PATH-WALK`, the DFlash2
+    # candidate selector's PATH WALK. A separate family from
+    # `KERNEL-DFLASH2-SELECTOR-EDGES` rather than a second entry point into it,
+    # on the axis that decides kernel families here: the lattice op is a dense
+    # CONTRACTION whose difficulty is a reduction (and which is therefore gated
+    # within an f32 envelope), while the walk performs no arithmetic at all --
+    # only comparisons and one gather -- and is specified BIT-EXACT across
+    # backends. Their grids follow from that: one block per (request, step,
+    # predecessor slot) against one block per REQUEST with the step loop INSIDE
+    # it, which is spec `## Risks/decisions` D3's requirement and upstream's own
+    # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
+    # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
+    # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
+    "KERNEL": (AGENTS / "kernel-matrix.md", 57),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -203,7 +362,34 @@ MATRICES = {
     # 80 since 2026-08-09: +`BACKEND-TENSTORRENT`, an extension platform
     # proposal (Tenstorrent Blackhole, ttnn C++ adapter) in the same class as
     # Metal/Vulkan. INVENTORIED; spec-only, not yet reviewed or accepted.
-    "BACKEND": (AGENTS / "backend-matrix.md", 80),
+    # 81 since 2026-08-11: +`BACKEND-TENSTORRENT-RESIDUAL-GOLDEN`, the child
+    # row owing residual-RMS numerics evidence at the device boundary (rows>=32
+    # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
+    # RED-first probe lands.
+    # 82 since 2026-08-11: +`BACKEND-TENSTORRENT-MISTRAL`, allowlist
+    # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
+    # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
+    # gate.
+     # 83 since 2026-08-16: +`BACKEND-GATE-CUDA-LLAMACPP` (#979), the llama.cpp
+     # floor on a CURRENT CUDA card. Neither existing llama.cpp row covers it:
+     # `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
+     # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to Pascal/Volta/Turing,
+     # where vLLM has no entry at all. The four-way Qwen3.8-27B campaign needs
+     # it because llama.cpp is the ONLY comparator that runs the Q4_K_M arm:
+     # vLLM removed GGUF from its tree at our pin. INVENTORIED, no run.
+     # 84 since 2026-08-12: +`BACKEND-TENSTORRENT-TRACE-RUNNER`, feasibility
+     # spike for wiring the landed #354 graph-capture foundation into a
+     # capturable forward region (decode host-free region? capture tok/s cost?
+     # ttnn program-cache warm-up?). No code; decision record only.
+     # 85 since 2026-08-13: +`BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, the plan
+     # row decomposing the host-free decode forward (R1 RmsNorm+RoPE, R2
+     # QkvSplit+RAC, R3 PA decode, R4 capture wire) that the trace-runner
+     # spike revealed as the real prerequisite for decode capture.
+     # 86 since 2026-08-22: +`BACKEND-TENSTORRENT-GDN` (#1715), the GDN
+     # linear-attention op chain as native TT kernels — the hard prerequisite
+     # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
+     # implementation yet.
+    "BACKEND": (AGENTS / "backend-matrix.md", 86),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -351,8 +537,175 @@ ENGINE_PREFIXES = (
 # marched every PR into it. User-directed, issue #374; `ACTIVE` on its committed
 # spec. No checker semantic beyond the row's own scope and no product source is
 # changed by the bump.
+# 150 since 2026-08-11: +`ENG-TRAILER-MERGE-ARTIFACTS` (the trailer gate rejects
+# correct commits because GitHub appends `Co-authored-by:` as a separate
+# paragraph, which hides the block from `git interpret-trailers --parse`; 13 of
+# the last 30 commits on main failed the check, unnoticed because those runs were
+# cancelled). User-directed, issue #406; `ACTIVE` on its committed spec. No rule
+# in that checker is relaxed and no product source changes.
+# 151 since 2026-08-11: +`ENG-FORGE-COAUTHOR` (the forbidden-AI-trailer rule was
+# catching GitHub's auto-generated `Co-authored-by`, which attributes the ACCOUNT
+# that opened the PR rather than claiming a model wrote the code; most PRs here
+# are bot-opened, so nearly every squash red main). Developer-approved,
+# issue #418; `ACTIVE` on its committed spec. Sign-off keeps its rule with no
+# exemption and no product source changes.
+# 152 since 2026-08-11: +`ENG-RELEASE-WINDOWS` (native Windows x86_64 CPU and
+# Vulkan pre-alpha release extension). User-directed, issue #117; `INVENTORIED`
+# while its committed specification awaits implementation and hosted evidence.
+# No build, artifact, runtime evidence, workflow, or publication is claimed by
+# this row-count bump.
+# 153 since 2026-08-13: +`SERVE-RECIPE-ARGS` (accepted-and-inert serve arguments).
+# `vllm-serve` aborts on any unrecognized flag, so `--enable-auto-tool-choice`
+# (89 of 157 official vLLM recipes) and `--trust-remote-code` (82 of 157) stop the
+# server before model load even though neither means anything to this engine —
+# including for models we ship token-exact and gated. Found by the 2026-08-13
+# recipe-surface sweep, issue #606. The row was `SPIKE` when this bump was first
+# written against the spec-only commit; it lands `ACTIVE`, because the squash that
+# carries this line also carries the seam (`kAcceptedInertArgs` in
+# `server_main.cpp`), its test (`test_serve_recipe_args.cpp`) and the
+# `docs/USAGE.md` entry. Stated as of THIS tree rather than as of the spec commit:
+# `main` is squash-only, so a justification framed at an intermediate commit would
+# ship as a comment that is false about the file it sits in.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 149
+# 154 since 2026-08-13: +`ENG-UPSTREAM-OMNI-PIN` (a parity pin for the separate
+# `vllm-project/vllm-omni` repository). A genuinely-new protocol capability, not a
+# restatement of the vLLM pin: it is a SECOND pin that may legitimately disagree
+# with the first, because vllm-omni requires vLLM 0.27.0+ against our 0.26.0.dev0
+# core pin. Landed the same day as the 153 bump above and merged against it: both
+# rows are real and neither replaces the other, which is why this line reads 154
+# rather than restating 153. `READY`, spec `specs/upstream-omni-pin.md`, issue #633.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 155 since 2026-08-14: +`ENG-HYBRID-PLACEMENT` (per-tensor-group device placement,
+# delivering routed-MoE expert COMPUTE on the CPU backend while the rest of the
+# model stays on GPU). Genuinely new, not a restatement of either offload row it
+# sits beside: `ENG-WEIGHT-OFFLOAD` and `ENG-EXPERT-STREAM` both move weights
+# toward the compute, and this row moves compute toward the weights, so no
+# existing row can express it. Surpass-track — vLLM ships CPU MoE kernels but
+# selects them platform-wide via `current_platform.is_cpu()`, so hybrid placement
+# is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
+# `READY`, spec `specs/hybrid-placement.md`, issue #149.
+# 156 since 2026-08-14: +`ENG-RECORD-ANCHOR-RATCHET` (the record's own `path:line`
+# citations were checked for RANGE but never for CONTENT, and a failing check was
+# silently DROPPED. `local_line_anchors` in THIS file parses both citation forms
+# -- markdown links, and (since ee511ca8a) bare `file.cpp:123` under the
+# `RAW_LOCAL_ANCHOR_RE` prefixes -- but on a missing file or an out-of-range line
+# it `continue`s, so the bad anchor is omitted from the list and swallowed by
+# `is_code_anchor`'s `any()`. There was no symbol test and no report. 32 of the
+# 38 offenders this row banks are IN RANGE, so range-checking alone could never
+# have found them. Found by three stale anchors that humans caught by reading
+# during the 2026-08-13/14 campaign, all of them IN RANGE. Issue #632.
+# It lands `ACTIVE`, not `SPIKE`: the same change carries the parser, the
+# STALE/BROKEN classifier, `scripts/record-anchor-baseline.json` and the
+# `RecordAnchorRatchet` suite, so a comment framed at the spec-only commit would
+# be false about the file it sits in. The COUNT is unchanged by that -- the row
+# already existed at 156 and this is not a bump.
+# 157 since 2026-08-17: +`ENG-RESIDENCY-CONFIG` (the host-RAM->DISK weight-residency
+# tier as a CONFIG surface -- a `vllm_cpp` extension key inside the existing
+# `--offload-config` document, reaching the loader through
+# `EngineParams::weight_residency`). Genuinely new, and not expressible by either
+# offload row it sits beside: `ENG-WEIGHT-OFFLOAD` owns the MIRRORED device->host
+# tier and may not grow a disk arm without breaking a 1:1 transcription of
+# `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming MECHANISM
+# rather than its configuration -- this row changes where a value comes from and
+# nothing about what it does. `ACTIVE`, spec `specs/weight-residency-config.md`,
+# issue #1110 (also fixes #1109 in flow).
+# 158 since 2026-08-18: +`SPEC-DSPARK-QWEN3-ROUTING` (the DSpark draft-ARCHITECTURE
+# route: `architectures=["DSparkDraftModel"]` + `model_type` `qwen3` must resolve to
+# the landed Qwen3 DSpark lane, and `IsDsparkDraft` must be reached from the loader).
+# Genuinely new and not expressible by `SPEC-DSPARK` beside it: that row owns the
+# DSpark MECHANISM -- the Markov head, the block draft, the sequential sample -- and
+# its W1-W8 all landed, while this row changes only which lane a draft config is
+# classified into before any of that runs. BEYOND-PIN on vLLM PR 52197 (merged
+# 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
+# ported here, so this row records a divergence that already exists rather than
+# introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
+# 164 since 2026-08-18: +`LOAD-GGUF-MMPROJ` (a SECOND, `clip`-architecture GGUF
+# projector file beside the language file, and the Qwen3-VL vision tower loaded out
+# of it). Genuinely new and not expressible by `LOAD-GGUF` beside it: that row owns
+# the reader, the dequantization and the Qwen name transforms for ONE file, and the
+# single-file assumption it was built on is structural rather than incidental --
+# `ModelSource` carries a vector of safetensors shards and exactly one `GgufFile*`
+# (`model_registry.h:98`), and `EngineParams` has no projector field, so an mmproj
+# has nowhere to arrive. Sharding is already handled and is not this: `DetectSplit`
+# merges shards of ONE split, never a second, differently-architected file. Nothing
+# in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
+# whose only caller is a test, and that refusal becomes reachable production code the
+# moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
+# 165 since 2026-08-19: +`SPEC-DFLASH2` (the `DFlash2DraftModel` architecture: a
+# grouped dynamic depthwise convolution inside each draft block, and a candidate
+# selector that replaces the per-slot argmax with a scored path walk over the target
+# head's top-K). Genuinely new and not expressible by `SPEC-DFLASH` beside it: that
+# row owns the DFlash mechanism and reached `DONE`, and upstream itself carries
+# DFlash2 as a SECOND architecture rather than as a change to the first -- DFlash1
+# gains two subclass seams and keeps every behaviour, so a `DFlashDraftModel`
+# checkpoint resolves exactly as it does today. BEYOND-PIN on vLLM PR 52816 (OPEN at
+# head `19c93519`, base `9842d701`); the parity pin `555967922` does not carry the
+# architecture at all, so this row does not advance the pin. `READY`, spec
+# `specs/dflash2-spec-decode.md`, issue #1314.
+# 163 since 2026-08-18: +`ENG-EXPERT-STREAM-DEVICE` (the DESTINATION half of expert
+# streaming -- where a streamed slice lives and which platform may read it). Genuinely
+# new and not expressible by `ENG-EXPERT-STREAM` beside it: that row owns the streaming
+# MECHANISM -- the slot cache, the streamer, the `pread` filler and the host store --
+# and all of it landed and runs on `--device cpu`, while this row changes only the
+# destination those bytes are written to and the predicate that decides who may read
+# them. The two have different hardware requirements and different lifecycle states:
+# the parent is `READY` with a live CPU lane, and this one cannot reach its own
+# discrete-GPU gate on any box the project owns. Surpass-track, no oracle: inference-time
+# disk expert paging is absent in pinned vLLM (`offloader/uva.py:21`,
+# `offloader/prefetch.py:557-560`) and no secondary oracle implements it either.
+# `READY`, spec `specs/expert-stream-device-slots.md`, issue #1124.
+# 167: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
+# container image and no release archive can obtain a checkpoint: the runtime
+# stage carries no Python and no `curl`, while `docker/Dockerfile:188-192`
+# already sets `HF_HOME=/cache` and declares the `/cache` volume for a fetch
+# that does not exist. The row is not a duplicate of `LOAD-SAFETENSORS` or
+# `LOAD-GGUF`, which both start from bytes already on disk, and it is not
+# `LOAD-CONFIG-SURFACE`, which parses a flag it never resolves. The one adjacent
+# implementation, `model_loader.cpp:279-303`, reads an existing cache for the
+# DFlash draft alone and never downloads. `READY`, spec
+# `specs/hf-model-download.md`, issue #1280.
+# 168 since 2026-08-19: +`SPEC-BPE-QUADRATIC-MERGE` (the BPE merge loop is O(n^2)
+# in pretoken length, on the request path, before `ValidatePromptLen`). Genuinely
+# new and not expressible by the two tokenizer rows beside it: `LOAD-HF-BPE` and
+# `LOAD-SENTENCEPIECE` both own a FORMAT -- which `tokenizer.json` shapes parse and
+# which token identifiers come out -- and both are token-exact against HF goldens
+# today and stay that way. This row changes no identifier at all. It replaces the
+# algorithm underneath both of them, and its gate is a COST bound, which is the one
+# thing a token gate provably cannot see. It is also not a benchmark row: the encode
+# runs synchronously on the HTTP worker five lines before the only length check, so
+# `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
+# MEASURED, and stated as the two SESSION-INVARIANT quantities only: over 1 KB to
+# 64 KB of ordinary English prose the fit through the committed Mistral golden has
+# exponent 2.01, and at 64 KB our cost is 2,507x HF `tokenizers` 0.22.2's on the
+# same file for byte-identical identifiers. Both are ratios taken inside one
+# session, so contention cancels. The ABSOLUTE milliseconds are deliberately not
+# repeated here: they moved 54% between two runs of one binary on one input, so a
+# constant copied into this comment would be a fourth place for a number nobody
+# can reproduce to drift. They live in the spec's tables, each beside its own load
+# average, and `## Gates` owes the idle-host re-measure. The exponent, not the
+# constant, is what makes this a row.
+# `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
+# 169 since 2026-08-21: +`SPEC-DRAFTER-CHAIN` (a preference-ordered chain of
+# speculators: try the first, and if it yields no draft for a sequence, try the
+# next). Genuinely new and not expressible by the per-method rows beside it: each
+# of `SPEC-MTP`, `SPEC-DFLASH`, `SPEC-DSPARK` and `SPEC-NGRAM` owns ONE
+# speculator's mechanism, and every one of them assumes it is the only speculator
+# resolved for a step. This row owns the composition -- a new optional field on
+# `--speculative-config` that is inert when absent, per-sequence resolution, and
+# the per-drafter attribution none of those rows has any reason to carry. vLLM
+# implements no composition at all (`SpeculativeMethod` is a single `Literal` at
+# the pin AND at `origin/main` `c20572610`), so this is a DIVERGENCE with
+# llama.cpp as a secondary oracle for semantics only, not a port. `READY`, spec
+# `specs/drafter-chain.md`, issue #1522.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 170 since 2026-08-22: +`SERVE-REQUEST-LENGTH-GUARD` (the REFUSING byte bound at
+# the request boundary, #1541). A genuinely-new serving capability rather than a
+# state move: `67823aee2` removed the quadratic term from the BPE merge loop and
+# added no bound, and nothing between an unauthenticated body and the tokenizer
+# limited its size except httplib's 100 MB default. `GATING`, spec
+# `specs/serve-request-length-guard.md`. Bumped for a real new row, never to make
+# a failing state transition pass.
+ENGINE_ROWS = 170
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
@@ -373,6 +726,7 @@ REQUIRED = [
     ROOT / "README.md",
     ROOT / "docs/BENCHMARKS.md",
     AGENTS / "roadmap_v1.md",
+    AGENTS / "issue-index.md",
     AGENTS / "coordination.md",
     AGENTS / "feature-matrix.md",
     AGENTS / "specs/model-family-inventory.md",
@@ -410,6 +764,12 @@ ID_RE = re.compile(
 )
 STATE_RE = re.compile(r"`(" + "|".join(re.escape(state) for state in STATES) + r")`")
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+# Group 1 is the run of fence characters, group 2 everything after it, which is
+# the INFO STRING on an opening fence and must be empty on a closing one. Both
+# groups are load-bearing: see strip_code_spans for the pairing rule and for the
+# live file that mis-paired without it.
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
 CLAIM_RE = re.compile(r"CLAIM-[A-Za-z0-9_.-]+")
 LINE_FRAGMENT_RE = re.compile(r"L(\d+)(?:-L?(\d+))?")
 COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -570,27 +930,108 @@ def parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]:
     return rows
 
 
-def link_base(source: Path, text: str) -> Path:
-    """Resolve migrated legacy links from their original .agents/ location."""
+def strip_code_spans(text: str) -> str:
+    """Blank out fenced blocks and inline code, preserving line and column count.
+
+    A target inside a code span is NOT a link: CommonMark renders it as literal
+    text, so no reader can follow it and there is nothing for "every link
+    resolves" to be about. Before 2026-08-12 this checker validated them anyway
+    (#460), which meant no document in the tree could SHOW a link in sample
+    output, and, worse, that a docs/BENCHMARKS.md row quoting its evidence link
+    could not be archived into .agents/ byte-for-byte.
+
+    THE PAIRING RULE IS COMMONMARK'S, not "the next line that looks like a
+    fence". A closing fence must use the OPENER'S character, be at least as
+    long, and carry nothing but whitespace after the marker; a line with an info
+    string opens a block and never closes one. Getting that wrong does not fail
+    safe, it INVERTS fence phase for the rest of the file: with the one
+    unbalanced fence this tree already has, a bare ``` at
+    .agents/completed/state-events/0000-00/STATE-LEGACY-000001.md:17697 was
+    "closed" by the ```sh at :17948, and ordinary prose at :18297 was blanked,
+    so a live reader-followable link stopped being validated. Measured
+    tree-wide, the loose rule dropped 5 targets and the CommonMark rule drops 4.
+
+    Blanking rather than deleting preserves every line and column offset. Note
+    that check_links reports no line numbers today, so this buys nothing yet; it
+    is kept so that a caller that does report positions cannot be broken by this
+    function, and test_stripping_preserves_line_and_column_positions holds it.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    fence_len = 0
+    for line in text.splitlines():
+        marker = FENCE_RE.match(line)
+        if fence is None:
+            # CommonMark: a backtick opening fence's info string may not contain
+            # a backtick, which is what keeps `` `a` and `b` `` from opening one.
+            if marker is not None and not (
+                marker.group(1)[0] == "`" and "`" in marker.group(2)
+            ):
+                fence = marker.group(1)[0]
+                fence_len = len(marker.group(1))
+                out.append(" " * len(line))
+                continue
+            out.append(INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line))
+            continue
+        if (
+            marker is not None
+            and marker.group(1)[0] == fence
+            and len(marker.group(1)) >= fence_len
+            and not marker.group(2).strip()
+        ):
+            fence = None
+        out.append(" " * len(line))
+    return "\n".join(out)
+
+
+def extract_links(text: str) -> list[str]:
+    """Return every link target a READER could follow in this document."""
+    return LINK_RE.findall(strip_code_spans(text))
+
+
+def link_bases(source: Path, text: str) -> tuple[Path, ...]:
+    """Return every directory a relative link in this file may resolve from.
+
+    Normally exactly one, the file's own directory. Two files are archives that
+    hold content written somewhere else and moved here verbatim, so a target in
+    them was authored against the ORIGINAL directory: migrated legacy
+    state-event payloads came from .agents/, and .agents/benchmark-record.md is
+    the declared archive of docs/BENCHMARKS.md (#460).
+
+    BE PRECISE ABOUT WHAT THE SECOND BASE BUYS. It does NOT make the archived
+    copy clickable: a reader opening .agents/benchmark-record.md on GitHub and
+    clicking a docs/-relative target such as USAGE.md, BUILD.md or
+    bench-evidence/... gets a 404, because the browser resolves it against
+    .agents/. What it enforces is that the EVIDENCE STILL EXISTS in the tree
+    under one of the two declared bases, so archiving a row byte-for-byte cannot
+    silently orphan the file it points at. That is the property the archive
+    exists to give, and it is weaker than followability. Making the archived
+    copy followable means rewriting the target or recording its origin, which is
+    spec W5 and is deliberately not done here: rewriting a target would break
+    the byte-for-byte guarantee, and W5 records the origin instead.
+    """
     if (
         source.is_relative_to(AGENTS / "completed/state-events")
         and "<!-- legacy-payload:begin -->" in text
     ):
-        return AGENTS
-    return source.parent
+        return (AGENTS,)
+    if source == AGENTS / "benchmark-record.md":
+        return (source.parent, ROOT / "docs")
+    return (source.parent,)
 
 
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
         text = source.read_text(encoding="utf-8")
-        base = link_base(source, text)
-        for raw_target in LINK_RE.findall(text):
+        bases = link_bases(source, text)
+        for raw_target in extract_links(text):
             target = raw_target.strip().strip("<>")
             if not target or target.startswith(("http://", "https://", "mailto:")):
                 continue
             target_path, _, fragment = target.partition("#")
-            resolved = (base / target_path).resolve()
-            if not resolved.exists():
+            candidates = [(base / target_path).resolve() for base in bases]
+            resolved = next((c for c in candidates if c.exists()), None)
+            if resolved is None:
                 errors.append(f"{source.relative_to(ROOT)}: dangling link {raw_target}")
                 continue
             line_match = LINE_FRAGMENT_RE.fullmatch(fragment)
@@ -780,6 +1221,370 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
         for path in local_line_anchors(value, source)
         if path == ".agents/parity-ledger.md"
     ]
+
+
+# --- record-anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) ------------------
+#
+# Records cite code as `server_main.cpp:505`. Code moves; the citation does not.
+# The checker above LOOKS like it catches that and does not:
+#
+#   1. NO REPORT, not "no parser". `local_line_anchors` reads BOTH citation
+#      forms: the markdown link through `LINK_RE`, and the bare
+#      `file.cpp:123` form through `RAW_LOCAL_ANCHOR_RE` since ee511ca8a. It
+#      range-checks each one. What it does not do is REPORT: on a missing file
+#      and on an out-of-range line the loop runs `continue`, so the bad anchor
+#      never enters the returned list, and `is_code_anchor`'s `any()` swallows
+#      what is left. There was no symbol test either, which is the gap that
+#      matters: 32 of the 38 offenders recorded here are IN RANGE, so a range
+#      check could not have found them.
+#   2. `any`, NOT `all`. `is_code_anchor` returns true if ONE anchor in a cell
+#      qualifies, so a single good link covers arbitrarily many rotted citations
+#      beside it. That is not a bug in the STATE gate -- a row IS evidenced by
+#      one good anchor, and the `any` stays -- but it is why nothing counted the
+#      others.
+#   3. STATE. `EVIDENCED_STATES` omits `ACTIVE` and `READY`, so 92 live rows got
+#      no anchor check at all.
+#
+# TWO POPULATIONS, TWO RATIOS, and quoting one without its denominator is what
+# produced the false "the bare form was never parsed" claim this comment
+# replaces. Measured at `8daa67b39`, the head before this branch merged `main` a
+# second time, counting a citation only where it is the WHOLE of a backtick
+# span, which is what the parser requires:
+#
+#   * ALL citation forms in the five matrices, ours and upstream: 492 links and
+#     1708 bare, 2200 in total. 525 of the bare forms sit under a
+#     `RAW_LOCAL_ANCHOR_RE` prefix, so 1017 of 2200 (46.2%) were already parsed.
+#     Most of the remainder are upstream paths that reach no local checker.
+#   * The citations this ratchet CLASSIFIES, which is the population that
+#     matters: 867. Of those 832 (96.0%) were already parsed AND range-checked
+#     before this row, and 35 (4.0%) are genuinely new to parsing, under
+#     `.agents/`, `docs/` and `website/`. Every offender recorded then sat in
+#     the 96%. The value this row adds is the symbol test and the report, not the
+#     parser.
+#
+# A range check is not the fix: every stale anchor found
+# by hand during the 2026-08-13/14 campaign was IN RANGE --
+# `docs/USAGE.md:902` (the count line had moved to :1126), `multimodal.py:17-43`
+# (the block ends at :45) and `server_main.cpp:308` (a different table entry
+# after a 4-line comment landed above). Only "does this line contain the symbol
+# named beside it" separates those from a live citation.
+#
+# THE RATCHET. Enforcing correctness over the whole backlog in one landing would
+# surface an unknown amount of unrelated rot, so this mirrors the DSR ratchet in
+# scripts/check-device-leakage.py, which this repo already trusts:
+# scripts/record-anchor-baseline.json holds the accepted STALE + BROKEN counts,
+# a bucket ABOVE its baseline fails, and a bucket BELOW it fails too, with the
+# instruction to lower the baseline in the SAME commit as the repair. The number
+# only ever moves down, and only deliberately. `--report` names every offender
+# so the backlog is legible rather than a number.
+#
+# WHERE THE CONSERVATIVE LINE IS DRAWN, and why each side of it is where it is.
+# A checker that cries wolf gets disabled, and this one has to survive a
+# four-figure backlog, so every rule below prefers a missed rot to a false one:
+#
+#   * ONLY the `code` and `tests` cells of rows in RECORD_ANCHOR_STATES. The
+#     `upstream` column is never read. That is what keeps the upstream
+#     references (`vllm/model_executor/...py:123`, `csrc/...cu:44`) out of the
+#     count structurally, rather than by a path heuristic.
+#   * A bare citation must be the WHOLE of a backtick span, so running prose can
+#     never be parsed as a path.
+#   * It must resolve to a file in the tree, or be a near miss: at least two path
+#     separators AND an existing parent directory, i.e. "a directory we own with
+#     a filename we do not" -- a rename or a deletion. `vllm/utils/hashing.py`
+#     and `tests/v1/core/test_scheduler.py` have no such parent here and are
+#     silently skipped, which is correct: they are upstream, and we cannot
+#     validate an anchor into a tree we do not have.
+#   * A symbol is inferred ONLY from an immediately adjacent backtick span --
+#     whitespace between them, or whitespace and one `(` for the trailing
+#     `path:line (`Symbol`)` form. Nothing else, and never from prose.
+#   * That span must LOOK like a symbol: an identifier, at least 4 characters,
+#     carrying `_`, `::`, `()` or an uppercase letter. `bf16` and `nvfp4` sit
+#     next to citations constantly and are not symbols; `MoeAuxStream`,
+#     `evict_blocks` and `Scheduler::shutdown()` are.
+#   * With no inferable symbol the citation is OK by construction. 801 of the
+#     867 in-scope citations land there, which is 92.4%, or about 13 in 14.
+#     That is the intended polarity: this gate exists to be believed when it
+#     does fire.
+#   * The symbol test asks whether the cited LINES CONTAIN the name. A comment
+#     that mentions the symbol therefore reads OK. That is a measured limit and
+#     not a defect: `KERNEL-ATTN-MLA-SPARSE` cites
+#     `include/vllm/v1/attention/backend.h:271` for `get_kv_cache_shape`, whose
+#     real declaration is at :341, and drift on `main` moved a ROCm comment
+#     naming the symbol onto :271. Tightening this would need a parser per
+#     language, which is the cry-wolf trade this whole block refuses.
+RECORD_ANCHOR_BASELINE = ROOT / "scripts/record-anchor-baseline.json"
+RECORD_ANCHOR_VERDICTS = ("ok", "stale", "broken")
+# The BUDGET is the rot only. `ok` is counted and printed but deliberately NOT
+# stored: a baseline that pinned it would make every PR that adds or removes any
+# citation rewrite this file, which is exactly the shared-file lock AGENTS.md
+# forbids. Per-bucket rather than one total, so a repaired BROKEN cannot pay for
+# a new STALE.
+RECORD_ANCHOR_BUCKETS = ("stale", "broken")
+# Gap 3. `EVIDENCED_STATES` itself is deliberately NOT widened. Making ACTIVE and
+# READY *require* an anchor raises 85 errors across 53 rows that carry prose
+# evidence today, which is the bulk cleanup this row exists to avoid. (The unit
+# is errors, not rows: the contract check emits one per missing anchor field, so
+# a row can raise more than one -- 32 rows raise two here and 21 raise one.)
+# They join the COUNT instead, and the ratchet absorbs what that surfaces.
+RECORD_ANCHOR_STATES = EVIDENCED_STATES | {"ACTIVE", "READY"}
+RECORD_ANCHOR_FIELDS = ("code", "tests")
+BARE_CITATION_RE = re.compile(
+    r"([A-Za-z0-9_./+-]*[A-Za-z0-9_+-]\.[A-Za-z0-9_+-]+):(\d+)(?:-(\d+))?"
+)
+BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?")
+
+
+@dataclass(frozen=True)
+class Citation:
+    # No matrix field: row IDs are unique across the matrices (check_matrices
+    # enforces it), so the item id already locates the offender.
+    item_id: str
+    path: str
+    start: int
+    end: int
+    symbol: str | None
+    verdict: str
+
+    def describe(self) -> str:
+        span = f"{self.start}" if self.end == self.start else f"{self.start}-{self.end}"
+        want = f" expected `{self.symbol}`" if self.symbol else ""
+        return f"{self.verdict:<6} {self.item_id} -> {self.path}:{span}{want}"
+
+
+@dataclass
+class RecordAnchorResult:
+    counts: dict[str, int] = dataclasses.field(
+        default_factory=lambda: dict.fromkeys(RECORD_ANCHOR_VERDICTS, 0)
+    )
+    citations: list[Citation] = dataclasses.field(default_factory=list)
+
+    @property
+    def offenders(self) -> list[Citation]:
+        return [c for c in self.citations if c.verdict in {"STALE", "BROKEN"}]
+
+    @property
+    def total(self) -> int:
+        """STALE + BROKEN. `ok` is reported but is not part of the budget."""
+        return sum(self.counts[bucket] for bucket in RECORD_ANCHOR_BUCKETS)
+
+
+def looks_like_symbol(text: str) -> bool:
+    text = text.strip()
+    if len(text) < 4 or SYMBOL_RE.fullmatch(text) is None:
+        return False
+    # A LEADING underscore in a record is nearly always an abbreviated suffix --
+    # "the text-only `_ModelInfo`" naming the `ModelInfo` beside it, not a
+    # symbol spelled `_ModelInfo`. Searching for it literally produced the one
+    # false STALE this rule was measured against, on an anchor that was right.
+    if text.startswith("_"):
+        return False
+    return "_" in text or "::" in text or text.endswith("()") or any(c.isupper() for c in text)
+
+
+def cell_citations(cell: str, source: Path, root: Path) -> list[tuple[Path, int, int, str | None]]:
+    """Every citation of THIS tree in one record cell, with its expected symbol.
+
+    Returns `(resolved_path, start, end, symbol_or_None)`. Both citation forms
+    are recognised -- the markdown link `[label](path#L12)` the old parser saw,
+    and the bare `` `path:12` `` / `` `path:12-20` `` span that is six times
+    more common here and was never parsed as a citation at all.
+    """
+    tokens: list[tuple[int, int, str, object]] = []
+    links: list[tuple[int, int]] = []
+    for match in LINK_RE.finditer(cell):
+        target = match.group(1).strip().strip("<>")
+        links.append((match.start(), match.end()))
+        if not target or target.startswith(("http://", "https://", "mailto:")):
+            continue
+        target_path, _, fragment = target.partition("#")
+        line_match = LINE_FRAGMENT_RE.fullmatch(fragment)
+        if line_match is None:
+            continue
+        start = int(line_match.group(1))
+        end = int(line_match.group(2) or start)
+        resolved = (source.parent / target_path).resolve()
+        tokens.append((match.start(), match.end(), "citation", (resolved, start, end)))
+    for match in BACKTICK_SPAN_RE.finditer(cell):
+        # A backtick span inside a link is that link's LABEL, not a token beside
+        # it: `[`foo.cpp`](../src/foo.cpp#L4)` must not be read as a neighbour.
+        if any(lo <= match.start() < hi for lo, hi in links):
+            continue
+        inner = match.group(1).strip()
+        bare = BARE_CITATION_RE.fullmatch(inner)
+        if bare is not None:
+            start = int(bare.group(2))
+            end = int(bare.group(3) or start)
+            resolved = (root / bare.group(1)).resolve()
+            tokens.append((match.start(), match.end(), "citation", (resolved, start, end)))
+        elif looks_like_symbol(inner):
+            tokens.append((match.start(), match.end(), "symbol", inner))
+        else:
+            tokens.append((match.start(), match.end(), "other", inner))
+    tokens.sort(key=lambda t: t[0])
+
+    found: list[tuple[Path, int, int, str | None]] = []
+    for index, (lo, hi, kind, payload) in enumerate(tokens):
+        if kind != "citation":
+            continue
+        resolved, start, end = payload  # type: ignore[misc]
+        symbol: str | None = None
+        if index > 0 and tokens[index - 1][2] == "symbol":
+            if not cell[tokens[index - 1][1]:lo].strip():
+                symbol = str(tokens[index - 1][3]).strip()
+        if symbol is None and index + 1 < len(tokens) and tokens[index + 1][2] == "symbol":
+            if cell[hi:tokens[index + 1][0]].strip() in {"", "("}:
+                symbol = str(tokens[index + 1][3]).strip()
+        found.append((resolved, start, end, symbol))
+    return found
+
+
+def classify_citation(
+    resolved: Path, start: int, end: int, symbol: str | None, root: Path
+) -> str | None:
+    """OK / STALE / BROKEN, or None when the citation is not about this tree."""
+    if not resolved.is_file():
+        # "A directory we own with a filename we do not" -- a rename or a
+        # deletion, and the one missing-file case worth calling BROKEN. Require
+        # THREE path components so a one-segment upstream name whose top-level
+        # directory happens to match ours (llama.cpp's `src/llama-model.cpp`,
+        # vLLM's `cmake/utils.cmake`) is skipped rather than blamed on us.
+        try:
+            depth = len(resolved.relative_to(root).parts)
+        except ValueError:
+            return None
+        if depth >= 3 and resolved.parent.is_dir():
+            return "BROKEN"
+        return None
+    lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    if start < 1 or end < start or end > len(lines):
+        return "BROKEN"
+    if symbol is None:
+        return "OK"
+    base = symbol.removesuffix("()").split("::")[-1]
+    body = "\n".join(lines[start - 1:end])
+    return "OK" if re.search(r"\b" + re.escape(base) + r"\b", body) else "STALE"
+
+
+def scan_record_anchors(
+    rows: list[ClaimRow] | None = None, root: Path | None = None
+) -> RecordAnchorResult:
+    root = ROOT if root is None else root
+    if rows is None:
+        rows, _ = check_matrices([])
+    result = RecordAnchorResult()
+    for row in rows:
+        if row.state not in RECORD_ANCHOR_STATES:
+            continue
+        # BY INDEX, not by name: several matrices carry one `Local evidence`
+        # column that field_index resolves for BOTH `code` and `tests`, and
+        # reading it twice would count every citation in it twice.
+        indices = {field_index(row.header, name) for name in RECORD_ANCHOR_FIELDS}
+        for index in sorted(i for i in indices if i is not None):
+            cell = row.cells[index] if index < len(row.cells) else ""
+            if is_placeholder(cell):
+                continue
+            for resolved, start, end, symbol in cell_citations(cell, row.path, root):
+                verdict = classify_citation(resolved, start, end, symbol, root)
+                if verdict is None:
+                    continue
+                try:
+                    shown = resolved.relative_to(root).as_posix()
+                except ValueError:
+                    shown = resolved.as_posix()
+                result.counts[verdict.lower()] += 1
+                result.citations.append(
+                    Citation(
+                        item_id=row.item_id,
+                        path=shown,
+                        start=start,
+                        end=end,
+                        symbol=symbol,
+                        verdict=verdict,
+                    )
+                )
+    return result
+
+
+def load_record_anchor_baseline() -> dict[str, int]:
+    if not RECORD_ANCHOR_BASELINE.is_file():
+        return {}
+    data = json.loads(RECORD_ANCHOR_BASELINE.read_text(encoding="utf-8"))
+    return {bucket: int(data["buckets"][bucket]) for bucket in RECORD_ANCHOR_BUCKETS}
+
+
+def write_record_anchor_baseline(result: RecordAnchorResult) -> int:
+    previous = load_record_anchor_baseline()
+    if previous and result.total > sum(previous.values()):
+        print(
+            "REFUSING to write a HIGHER record-anchor baseline "
+            f"({sum(previous.values())} -> {result.total}). The ratchet only turns one "
+            "way: repair the anchors instead of banking the rot.",
+            file=sys.stderr,
+        )
+        return 1
+    payload = {
+        "_comment": [
+            "Record-anchor baseline for scripts/check-agent-record.py",
+            "(ENG-RECORD-ANCHOR-RATCHET, .agents/specs/record-anchor-ratchet.md).",
+            "STALE = the cited line exists but does not contain the symbol named",
+            "beside it. BROKEN = the line is out of range, or the file is gone.",
+            "THESE NUMBERS MAY ONLY EVER GO DOWN. Lower them in the SAME commit as",
+            "the repair that earned it, by running:",
+            "  python3 scripts/check-agent-record.py --write-baseline",
+            "It is a rot budget, never to be raised to make a failing check pass.",
+            "Only the rot is stored. The OK count is printed by --report but kept out",
+            "of this file on purpose: pinning it would make every change that adds or",
+            "removes a citation rewrite this file, which is a lock, not a ratchet.",
+        ],
+        "total": result.total,
+        "buckets": {bucket: result.counts[bucket] for bucket in RECORD_ANCHOR_BUCKETS},
+    }
+    RECORD_ANCHOR_BASELINE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(f"baseline written: {RECORD_ANCHOR_BASELINE.name} -> {result.total}")
+    return 0
+
+
+def record_anchor_report(result: RecordAnchorResult) -> str:
+    lines = [
+        "Record anchors in the `code` / `tests` cells of "
+        f"{'/'.join(sorted(RECORD_ANCHOR_STATES))} rows:",
+        "",
+    ]
+    lines.extend(f"  {c.describe()}" for c in result.offenders)
+    if result.offenders:
+        lines.append("")
+    lines.append(
+        "record anchors: "
+        + ", ".join(f"{b}={result.counts[b]}" for b in RECORD_ANCHOR_VERDICTS)
+        + f"  -> rot {result.total}"
+    )
+    return "\n".join(lines)
+
+
+def check_record_anchors(result: RecordAnchorResult, errors: list[str]) -> None:
+    baseline = load_record_anchor_baseline()
+    if not baseline:
+        errors.append(
+            f"no record-anchor baseline at {RECORD_ANCHOR_BASELINE.relative_to(ROOT)}; "
+            "run --write-baseline to establish one"
+        )
+        return
+    for bucket in RECORD_ANCHOR_BUCKETS:
+        got, want = result.counts[bucket], baseline[bucket]
+        if got > want:
+            errors.append(
+                f"RECORD ANCHOR REGRESSION in bucket '{bucket}': {got} > baseline {want}. "
+                "A citation names a line that no longer holds what the prose says it "
+                "does. Run `python3 scripts/check-agent-record.py --report` for the "
+                "offenders and repair the anchor. NEVER raise the baseline to pass."
+            )
+        elif got < want:
+            errors.append(
+                f"record-anchor baseline STALE in bucket '{bucket}': {got} < baseline "
+                f"{want}. A repair must lower the baseline in the SAME commit: run "
+                "`python3 scripts/check-agent-record.py --write-baseline` and commit it."
+            )
 
 
 def commit_exists(commit: str) -> bool:
@@ -1073,45 +1878,147 @@ ISSUE_ROW = re.compile(
 )
 
 
-def check_issue_table(errors: list[str]) -> None:
-    """Every tracked issue is well-formed and its row link is consistent.
+ISSUE_INDEX = AGENTS / "issue-index.md"
+
+# The index carries `merge=union`, so an edited preamble line is DUPLICATED
+# rather than merged. Holding the expected text here means the preamble cannot
+# drift without a deliberate edit to both sides.
+INDEX_PREAMBLE = """# Issue index
+
+**No work without an open issue.** Before claiming a row or writing code,
+confirm an issue tracks the work; open one if it does not. The number is linked
+from here, from the row's spec, and from the PR.
+
+This file is append-only. Add a row at the end. Never edit a row and never
+delete one. GitHub holds the open and closed state, so closing an issue costs no
+edit here. `Row` is the owning roadmap block or area-matrix row, or a dash when
+a spec lists the issue under `## Owed`.
+
+The path carries `merge=union` in `.gitattributes`, so two branches that each
+append a row merge without a conflict. That driver is only safe while the rule
+above holds. An edited row and an edited line of this preamble are duplicated
+rather than merged. `scripts/check-agent-record.py` gates both.
+
+| Issue | Row | Title | Kind |
+|---:|---|---|---|
+"""
+
+# Rows naming no owning row AND not listed under a spec's `## Owed`. A RATCHET:
+# it may only fall, and a fall must lower this number in the same change.
+# Measured 2026-08-14 on 186 rows. Raising it is a checker semantic change and
+# needs a spec plus a red-before test, which is the point.
+UNOWNED_HIGH_WATER = 33
+
+
+def owed_issues() -> set[str]:
+    """Issue numbers a spec claims under `## Owed`, read with a glob.
+
+    Per-row surface by construction: one file per spec, so filing an owed issue
+    never makes two branches write the same line.
+    """
+
+    owed: set[str] = set()
+    for path in sorted((AGENTS / "specs").glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if "\n## Owed" not in text:
+            continue
+        body = text.split("\n## Owed", 1)[1].split("\n## ", 1)[0]
+        owed |= set(re.findall(r"#(\d+)", body))
+        owed |= set(re.findall(r"issues/(\d+)", body))
+    return owed
+
+
+def check_issue_index(
+    errors: list[str],
+    text: str | None = None,
+    owed: set[str] | None = None,
+    high_water: int | None = None,
+) -> None:
+    """Every tracked issue is well-formed, consistent, and owned.
 
     Deliberately NETWORK-FREE. Querying GitHub would make this gate fail on
     connectivity, which is exactly the class of flake this protocol exists to
-    remove. It checks the FORM and the internal consistency; whether the issue
-    is still open is the agent's job at intake, not a CI blocker.
+    remove. It checks the FORM, the internal consistency, and whether an owner
+    is named; whether the issue is still open is GitHub's record, not a CI
+    blocker.
+
+    `text`, `owed` and `high_water` are injectable so a test can build a small
+    index. Without an injectable mark every fixture would be red for having the
+    wrong number of unowned rows, which would hide whatever the fixture is
+    actually about.
     """
 
-    path = AGENTS / "roadmap_v1.md"
-    text = path.read_text(encoding="utf-8")
-    if "## Open issues" not in text:
-        errors.append(f"{path.relative_to(ROOT)}: missing the '## Open issues' intake table")
-        return
+    label = ISSUE_INDEX.relative_to(ROOT)
+    if text is None:
+        if not ISSUE_INDEX.is_file():
+            errors.append(f"{label}: missing the issue index")
+            return
+        text = ISSUE_INDEX.read_text(encoding="utf-8")
+    if owed is None:
+        owed = owed_issues()
+    if high_water is None:
+        high_water = UNOWNED_HIGH_WATER
 
-    section = text.split("## Open issues", 1)[1].split("\n## ", 1)[0]
+    if not text.startswith(INDEX_PREAMBLE):
+        actual = text.split("| [#", 1)[0]
+        expected_lines = INDEX_PREAMBLE.splitlines()
+        for number, line in enumerate(actual.splitlines(), 1):
+            if number > len(expected_lines) or line != expected_lines[number - 1]:
+                errors.append(
+                    f"{label}:{number}: preamble drifted from the checker's copy; "
+                    f"got {line[:60]!r}. A union merge DUPLICATES an edited "
+                    "preamble line instead of merging it"
+                )
+                break
+        else:
+            errors.append(f"{label}: preamble is shorter than the checker's copy")
+
     seen: set[str] = set()
     rows = 0
-    for line in section.splitlines():
+    unowned: list[str] = []
+    for line in text.splitlines():
+        # Any table line that is not the header or the separator. Matching only
+        # `| [#` would make a row that LOST its link invisible instead of
+        # malformed, which is the failure this loop exists to report.
         if not line.startswith("|") or line.startswith("| Issue") or set(line) <= set("|-: "):
             continue
         match = ISSUE_ROW.match(line)
         if not match:
             errors.append(
-                f"{path.relative_to(ROOT)}: malformed issue row {line[:60]!r}; "
+                f"{label}: malformed issue row {line[:60]!r}; "
                 "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
             )
             continue
         rows += 1
         number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
         if number != url_number:
-            errors.append(
-                f"{path.relative_to(ROOT)}: issue #{number} links to {url}, a different issue"
-            )
+            errors.append(f"{label}: issue #{number} links to {url}, a different issue")
         if number in seen:
-            errors.append(f"{path.relative_to(ROOT)}: issue #{number} listed twice")
+            errors.append(
+                f"{label}: issue #{number} listed twice. Under `merge=union` a "
+                "duplicate is what two branches appending the same issue look like"
+            )
         seen.add(number)
+        if row_id is None and number not in owed:
+            unowned.append(number)
+
     if rows == 0:
-        errors.append(f"{path.relative_to(ROOT)}: the open-issue table has no rows")
+        errors.append(f"{label}: the issue index has no rows")
+
+    if len(unowned) > high_water:
+        fresh = unowned[high_water:]
+        errors.append(
+            f"{label}: {len(unowned)} rows name no owner, above the recorded "
+            f"{high_water}: {', '.join('#' + n for n in fresh[:5])}. "
+            "Name an owning row ID, or list the issue under `## Owed` in the "
+            "spec that owes it. Filing an issue does not defer the fix"
+        )
+    elif len(unowned) < high_water:
+        errors.append(
+            f"{label}: {len(unowned)} rows name no owner, below the recorded "
+            f"{high_water}. Lower UNOWNED_HIGH_WATER to {len(unowned)} "
+            "in the same change, so the ratchet cannot slip back"
+        )
 
 
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
@@ -1160,7 +2067,20 @@ def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
                 errors.append(f"{source.relative_to(ROOT)}: references unknown stable row {item_id}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="print every STALE/BROKEN record anchor with the symbol expected",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="rewrite scripts/record-anchor-baseline.json (only ever DOWNWARD)",
+    )
+    args = parser.parse_args(argv)
+
     errors: list[str] = []
     for path in REQUIRED:
         if not path.is_file():
@@ -1170,23 +2090,58 @@ def main() -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
-        check_issue_table(errors)
+        check_issue_index(errors)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)
         check_model_invariants(errors)
         spec_paths = [path for row in rows if row.state in READY_STATES for path in local_spec_paths(row)]
+        # ISSUE_INDEX is here for the same reason every other record table is:
+        # nothing else counts its cells. It was the ONE record surface every
+        # change must write and the only markdown table in the set with no shape
+        # gate, so a row that lost its trailing pipe, or carried an unescaped one
+        # inside a code span, mis-rendered on GitHub while every gate stayed
+        # green (#1033). The constant is reused rather than respelled so this
+        # gate and check_issue_index cannot drift onto different files.
         check_table_shapes(
-            [AGENTS / "roadmap_v1.md", AGENTS / "coordination.md", *MATRIX_PATHS, *spec_paths],
+            [
+                AGENTS / "roadmap_v1.md",
+                AGENTS / "coordination.md",
+                ISSUE_INDEX,
+                *MATRIX_PATHS,
+                *spec_paths,
+            ],
             errors,
         )
         check_spec_location(errors)
         check_roadmap(by_id, errors)
 
+        anchors = scan_record_anchors(rows)
+        if args.report:
+            print(record_anchor_report(anchors))
+        if not args.write_baseline:
+            # Writing is a MODE, not a step: it must not also report the gate it
+            # is about to move, or a run that lowered the baseline would print a
+            # regression against the value it just replaced.
+            check_record_anchors(anchors, errors)
+    elif args.write_baseline:
+        print(
+            "REFUSING to write a baseline from a tree whose record does not parse.",
+            file=sys.stderr,
+        )
+
     if errors:
         for error in dict.fromkeys(errors):
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
+
+    if args.write_baseline:
+        # AFTER the error gate, deliberately. The mode used to return the moment
+        # it had a number, so a tree that failed some OTHER record check could
+        # still bank its rot, and the banked figure would carry the authority of
+        # a run that never passed. A baseline is a measurement of the record, so
+        # it is only taken from a record that checks out.
+        return write_record_anchor_baseline(anchors)
 
     counts = [
         "ENGINE="
@@ -1203,6 +2158,7 @@ def main() -> int:
             f"{prefix}="
             + str(sum(row.item_id.startswith(prefix + "-") for row in rows if row.path == path))
         )
+    counts.append(f"ANCHOR-ROT={anchors.total}")
     print("agent record OK: " + " ".join(counts))
     return 0
 

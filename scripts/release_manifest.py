@@ -337,12 +337,22 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
     policies = {
         "linux-x86_64-glibc-cpu": ("linux", "x86_64", "glibc", "cpu", "static-core", {"preview", "stable"}),
         "linux-aarch64-glibc-cpu": ("linux", "aarch64", "glibc", "cpu", "static-core", {"preview", "stable"}),
-        "linux-x86_64-glibc-cuda-fat": ("linux", "x86_64", "glibc", "cuda", "static-core", {"preview", "stable"}),
-        "linux-aarch64-glibc-cuda-fat": ("linux", "aarch64", "glibc", "cuda", "static-core", {"preview", "stable"}),
+        "linux-x86_64-glibc-cuda": ("linux", "x86_64", "glibc", "cuda", "static-core", {"preview", "stable"}),
+        "linux-aarch64-glibc-cuda": ("linux", "aarch64", "glibc", "cuda", "static-core", {"preview", "stable"}),
         "macos-arm64-metal": ("macos", "aarch64", "macos", "metal", "static-core", {"preview", "stable"}),
         "macos-arm64-metal-mlx": ("macos", "aarch64", "macos", "mlx", "static-core", {"preview"}),
         "linux-x86_64-glibc-vulkan": ("linux", "x86_64", "glibc", "vulkan", "static-core", {"preview"}),
+        # Issue #1547. The container `vulkan` lane publishes a multi-arch
+        # manifest, so its arm64 leg produces this tuple. PREVIEW ONLY, and the
+        # narrower set is the point: no arm64 Vulkan leg has ever been built or
+        # gated here, `.agents/roadmap_v1.md` records both arm64 container legs
+        # as unbuilt, and `scripts/build-linux-accelerator-release.sh` passes
+        # `--channel preview` for every accelerator artifact. A `stable` entry
+        # would claim evidence that does not exist.
+        "linux-aarch64-glibc-vulkan": ("linux", "aarch64", "glibc", "vulkan", "static-core", {"preview"}),
         "linux-x86_64-musl-cpu-static": ("linux", "x86_64", "musl", "cpu", "literal-static", {"experimental-preview"}),
+        "windows-x86_64-msvc-cpu": ("windows", "x86_64", "msvc", "cpu", "static-core", {"preview"}),
+        "windows-x86_64-msvc-vulkan": ("windows", "x86_64", "msvc", "vulkan", "static-core", {"preview"}),
     }
     policy = policies.get(artifact_id)
     if policy is None and artifact.get("kind") == "diagnostic" and name == "cuda":
@@ -364,6 +374,13 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         errors.append(f"$.artifact.channel: wrong channel for {artifact_id}")
     if artifact.get("kind") != "primary":
         errors.append(f"$.artifact.kind: matrix artifact {artifact_id} must be primary")
+    if os_name == "windows":
+        for field in ("toolset_version", "ucrt_version"):
+            if not isinstance(host.get(field), str) or not host[field]:
+                errors.append(f"$.host.{field}: Windows artifacts require a pinned value")
+        build = manifest.get("build", {})
+        if not isinstance(build, dict) or "/MT" not in str(build.get("toolchain", "")):
+            errors.append("$.build.toolchain: Windows artifacts require the /MT static CRT")
     return errors
 
 
@@ -474,6 +491,11 @@ def _dependency_policy(manifest: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"$.dependencies[{index}]: bundled dynamic dependency is not permitted"
                 )
+        if (
+            manifest.get("host", {}).get("os") == "windows"
+            and re.match(r"(?i)^(?:vcruntime|msvcp|msvcr|ucrtbase|concrt).*\.dll$", str(dependency_name))
+        ):
+            errors.append(f"$.dependencies[{index}]: Windows release requires the static CRT")
     if len(names) != len(set(names)):
         errors.append("$.dependencies: dependency names must be unique")
 

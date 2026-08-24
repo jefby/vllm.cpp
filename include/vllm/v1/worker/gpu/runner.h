@@ -76,6 +76,7 @@
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/sample/device_scratch.h"  // HostBufferStaging (#1313)
 #include "vllm/v1/sample/sampler.h"
 #include "vllm/v1/worker/gpu/async_output.h"
 #include "vllm/v1/worker/gpu/input_batch.h"
@@ -207,23 +208,50 @@ class GPUModelRunner final : public ModelRunnerBase {
   }
 
   // runner_supports_async (mirror of the vLLM compat gate feeding
-  // SchedulerConfig::ResolveAsyncScheduling — vllm/config/vllm.py:990-1038). TRUE
-  // iff the runner advertises the placeholder-aware async device path: it is
-  // engaged (async_input_combine(), from VT_ASYNC_RUNNER / set_async_input_combine)
-  // AND runs on a backend whose async-output primitives are wired (CUDA, or CPU's
-  // synchronous degeneration for the CPU gate). DEFAULT ON since the 2026-07-17
-  // flip (VT_ASYNC_RUNNER default ON, async_runner_flag.h): with async on this
-  // returns true, so ResolveAsyncScheduling resolves the AsyncScheduler + mcb=2 by
-  // default, mirroring vLLM's async-scheduling default. VT_ASYNC_RUNNER=0 rolls the
-  // runner back to the synchronous host path (returns false → sync Scheduler);
-  // VT_ASYNC_SCHED=0 rolls only the scheduler back to synchronous in the same binary
-  // while the runner stays async-capable.
-  bool runner_supports_async() const override { return async_input_combine_; }
+  // SchedulerConfig::ResolveAsyncScheduling — vllm/config/vllm.py:990-1038).
+  // TRUE iff the runner advertises async SCHEDULING capability: the env opt-in
+  // (VT_ASYNC_RUNNER, default ON since the 2026-07-17 flip) on a backend whose
+  // async-output primitives are wired (CUDA, or CPU's synchronous
+  // degeneration for the CPU gate). With it true, ResolveAsyncScheduling
+  // resolves the AsyncScheduler + mcb=2 by default, mirroring vLLM.
+  // VT_ASYNC_RUNNER=0 rolls the runner back (false → sync Scheduler);
+  // VT_ASYNC_SCHED=0 rolls only the scheduler back in the same binary.
+  //
+  // SPEC-DFLASH2 W7 (#1824): this is deliberately NOT async_input_combine_ —
+  // that lever carries the spec veto (the device combine is not draft-aware,
+  // I5e) and stays OFF under a speculator, while async SCHEDULING now stays ON
+  // for the Eagle-type family exactly as upstream resolves it
+  // (vllm/config/vllm.py:1064-1112): the spec engine keeps the synchronous
+  // host input path and the host spec sampler, and the scheduler still
+  // overlaps step N+1 with step N's output processing. The two were one flag
+  // while spec forced sync scheduling; W7 is the commit that splits them.
+  bool runner_supports_async() const override { return async_sched_supported_; }
+
+  // SPEC-DFLASH2 W7 (#1824): whether the ENGINE resolved async scheduling ON.
+  // Set once by LoadedEngine after ResolveAsyncEnabled (the runner cannot know
+  // — the resolution also reads VT_ASYNC_SCHED and the pooling arm); read by
+  // execute_model's draft-placeholder fill and computed-token correction.
+  void set_async_scheduling(bool enabled) { use_async_scheduling_ = enabled; }
+  bool use_async_scheduling() const { return use_async_scheduling_; }
 
   // ─── Accessors (for tests + the ordering identity gate) ────────────────────
   InputBatch& input_batch() { return input_batch_; }
   const InputBatch& input_batch() const { return input_batch_; }
   const std::vector<PagedKvCache>& attn_kv() const { return attn_kv_; }
+  // The ENGINE-level attention backend selected PER full-attention KV GROUP
+  // (resolved inside initialize_kv_cache's full-attn region via
+  // vllm::v1::SelectAttentionBackendName — the same walk the registry test
+  // covers), parallel to attn_kv(): one name per attention layer, in layer
+  // order. Dense groups always resolve (a platform with no registered dense
+  // backend throws loudly at init). An MLA group resolves TRITON_MLA where one
+  // is registered (CUDA); on a device without a registered MLA backend (CPU,
+  // ROCm today) the entry is EMPTY and that group's execution stays op-driven
+  // (TritonMLAImpl on the fused cache — not registry-gated), which is why the
+  // vector as a whole is empty only when no full-attention group exists at all
+  // (a pure-GDN / pooling model caches no paged KV).
+  const std::vector<std::string>& attn_backend_names() const {
+    return attn_backend_names_;
+  }
   const std::vector<GdnStateCache>& gdn_state() const { return gdn_state_; }
   // The compact GDN state-slot pool size (== max_num_reqs). Exposed for the
   // state-slot uniqueness regression tests.
@@ -240,6 +268,81 @@ class GPUModelRunner final : public ModelRunnerBase {
   // SPEC-MTP I5d acceptance telemetry accessors (the gate reads these).
   int64_t spec_drafts_proposed() const { return spec_drafts_proposed_; }
   int64_t spec_drafts_accepted() const { return spec_drafts_accepted_; }
+  // SPEC-MTP-K-GT-1 (#81) PER-DEPTH acceptance. Index d counts the drafts
+  // verified and accepted at draft depth d+1, so `[0]` is each request's first
+  // drafted token and `[k-1]` its deepest. The aggregate counters above cannot
+  // answer "how deep did acceptance actually reach", which is what #81's M1 asks
+  // for and the only signal an acceptance-driven depth policy could use. The
+  // vectors grow to the deepest draft the engine has verified.
+  //
+  // Their SIZE is NOT a witness that the propose loop ran k times, and an earlier
+  // revision of this comment claimed it was. The size is grown from
+  // `step.num_draft_tokens_per_req[i]`, which is the LENGTH of the emitted draft
+  // list, a pure function of how `propose_drafts` slices whatever the proposer
+  // returned. A propose that runs ONE forward and pads all k columns with its
+  // step-0 draft satisfies it exactly, and the emitted tokens do not move either,
+  // because greedy plus accept-iff-equal makes the sequence independent of k.
+  // That mutation was applied and the whole depth suite stayed green on it. The
+  // witness that DOES separate them is `spec_mtp_draft_decode_forwards()` below.
+  const std::vector<int64_t>& spec_drafts_proposed_by_depth() const {
+    return spec_drafts_proposed_by_depth_;
+  }
+  const std::vector<int64_t>& spec_drafts_accepted_by_depth() const {
+    return spec_drafts_accepted_by_depth_;
+  }
+  // SPEC-MTP-K-GT-1 (#81): the WORK witness, counted where the work happens.
+  //
+  // `spec_mtp_propose_calls()` counts MTP propose invocations that reached the
+  // proposer. `spec_mtp_draft_decode_forwards()` counts draft DECODE forwards
+  // those calls actually executed, incremented after each forward returns.
+  // Upstream runs `num_speculative_steps - 1` of them per propose
+  // (`_multi_step_decode`, autoregressive/speculator.py:374-419 @ 555967922), so
+  // the exact relation a caller asserts is
+  //
+  //     spec_mtp_draft_decode_forwards() == spec_mtp_propose_calls() * (k - 1)
+  //
+  // with both sides falling to 0 forwards at k=1. Nothing about the shape of the
+  // emitted draft list can satisfy that equality, so it is the assertion a
+  // propose that SHORT-CIRCUITS or CLAMPS the loop fails.
+  //
+  // It does NOT see padding, and an earlier revision of this comment said it
+  // did. A propose that runs every forward, discards the results and writes the
+  // step-0 draft into all k columns increments this counter exactly as the real
+  // loop does. That mutation was applied and the whole depth suite stayed green
+  // on it. `spec_mtp_proposals_with_varied_drafts()` below is the counter that
+  // separates those two.
+  int64_t spec_mtp_propose_calls() const { return spec_mtp_propose_calls_; }
+  int64_t spec_mtp_draft_decode_forwards() const {
+    return spec_mtp_draft_decode_forwards_;
+  }
+  // SPEC-MTP-K-GT-1 (#81): the RESULT witness, computed on the array the
+  // proposer DELIVERED rather than inside the loop that filled it.
+  //
+  // It counts propose calls whose returned draft row held, for at least one
+  // request, a column that differed from column 0. A propose that pads every
+  // column with its step-0 draft leaves this at 0 at every k, because a padded
+  // row is by construction a pure function of its own first column, and that is
+  // the whole reason the counter exists. At k=1 it is 0 by definition, since a
+  // one-column row has nothing to differ from.
+  //
+  // Its bound is stated here because it is easy to over-read. It says the
+  // delivered array carries information the prefill draft alone does not
+  // determine. It does NOT say that column j came from forward j, so an
+  // off-by-one in the column index or a broken carry still satisfies it. It is
+  // also a NECESSARY rather than a sufficient condition, and one the fixture
+  // participates in: a drafter that resampled the same token on every step of
+  // every call would leave it 0 while running the loop correctly. Measured on
+  // the synthetic CPU gate model that does happen on individual calls (a
+  // `2 2 2` row at k=3) and never on all of them, so the assertion the depth
+  // suite makes is `> 0` over a run and never a per-call one. Per-column
+  // provenance stays owed to the DGX gate on real weights, and NOT as a
+  // non-zero acceptance count at depth, which a padded row also earns whenever
+  // the target's greedy continuation repeats a token. It is owed as an
+  // acceptance-RATE comparison against a padded control, specified in the
+  // row spec under `## Owed`.
+  int64_t spec_mtp_proposals_with_varied_drafts() const {
+    return spec_mtp_proposals_with_varied_drafts_;
+  }
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
@@ -251,6 +354,23 @@ class GPUModelRunner final : public ModelRunnerBase {
   // unexercised path leaves it 0, and a `page_size_padded` spec produces a
   // value the old HF-config arithmetic could not.
   int64_t fa_page_size_bytes() const { return fa_page_size_bytes_; }
+
+  // #810: the per-layer KV class `initialize_kv_cache` RESOLVED, index == model
+  // layer index, one entry per hidden layer. `kNone` is a layer that no KV
+  // cache group named and that therefore caches nothing — NemotronH's 23
+  // MoE blocks, which upstream's module walk yields no kv_cache_spec entry for
+  // (`gpu_model_runner.py:7785-7801`). Recorded because the routing decision is
+  // otherwise observable only as buffer COUNTS, and a count cannot see a
+  // routing inversion: 3 recurrent + 1 attention has the same counts whichever
+  // three layers got which.
+  enum class LayerKvClass : uint8_t {
+    kNone = 0,
+    kFullAttention = 1,
+    kRecurrent = 2,
+  };
+  const std::vector<LayerKvClass>& layer_kv_class() const {
+    return layer_kv_class_;
+  }
 
   // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
   // ON, execute_model rebuilds each decode row's input token id from the
@@ -424,6 +544,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model_;
   std::vector<PagedKvCache> draft_attn_kv_;
   vt::Queue queue_;
+  // #1313 — the [rows, vocab] logits the ON-DEVICE sampler runs on are assembled
+  // from a HOST buffer whenever the forward returned ForwardLogits.host
+  // (nemotron_h, laguna, qwen3_vl). Those bytes must be reachable by the queue
+  // device before any sampling kernel dereferences them: free on a unified
+  // backend (GB10 wraps in place, unchanged), a grow-only H2D copy on a discrete
+  // one, where the old host address was simply illegal.
+  //
+  // TWO buffers, not one: collect_prompt_logprobs stages the prompt rows while
+  // the assembled sample-logits tensor is still live (sample_tokens calls it
+  // between assemble_sample_logits and the sampler), so a shared buffer would
+  // invalidate the tensor the sampler is about to read.
+  HostBufferStaging sample_logits_staging_;
+  HostBufferStaging prompt_logprobs_staging_;
   InputBatch input_batch_;
   Sampler sampler_;
   // ARCH-ONE-SURFACE ROW 6 (mirror of gpu/model_runner.py:368-369
@@ -441,6 +574,8 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Per-block attention-cache bytes as reported by the KV spec (see the
   // fa_page_size_bytes() accessor).
   int64_t fa_page_size_bytes_ = 0;
+  // #810: per-layer KV class, index == model layer index (layer_kv_class()).
+  std::vector<LayerKvClass> layer_kv_class_;
   // Persistent-batch capacity = max concurrent sequences. The GDN mamba-state
   // cache is sized by this (one recurrent state per sequence), decoupled from
   // the attention num_blocks. See remap_gdn_state_slots.
@@ -467,6 +602,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Async-scheduling device-input opt-in (see set_async_input_combine). Default
   // from VT_ASYNC_RUNNER at construction; OFF keeps the sync host path.
   bool async_input_combine_ = false;
+  // Async SCHEDULING capability (see runner_supports_async): the same
+  // env/backend predicate WITHOUT the spec veto. W7 (#1824).
+  bool async_sched_supported_ = false;
+  // Whether the engine resolved async scheduling ON (set_async_scheduling;
+  // LoadedEngine calls it once after ResolveAsyncEnabled). Gates the
+  // draft-placeholder fill + computed-token correction in execute_model.
+  bool use_async_scheduling_ = false;
+  // W7 (#1824): req_id -> the draft count the PREVIOUS step scheduled for it,
+  // recorded at splice time under async scheduling. The computed-token
+  // correction applies only to requests with an entry here (the scheduler's
+  // num_computed_tokens can carry that step's not-yet-rolled-back rejected
+  // drafts). Rebuilt every spec step; empty otherwise.
+  std::map<std::string, int> prev_sched_draft_counts_;
   // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD. sample_tokens_async DEFERS the main
   // queue's completion to the consuming step's get_output() (one step_with_batch_
   // queue call later), so when it returns the previous step's forward / sample /
@@ -651,6 +799,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // rate; total generated / total verify steps is the effective speedup proxy.
   int64_t spec_drafts_proposed_ = 0;
   int64_t spec_drafts_accepted_ = 0;
+  // SPEC-MTP-K-GT-1 (#81): the same two counts, split by draft depth. Grown on
+  // demand to the deepest draft verified, so they stay EMPTY on the default
+  // no-speculation path.
+  std::vector<int64_t> spec_drafts_proposed_by_depth_;
+  std::vector<int64_t> spec_drafts_accepted_by_depth_;
+  // SPEC-MTP-K-GT-1 (#81): the propose-side depth witnesses. All three stay 0
+  // unless the MTP proposer runs. The first two carry the RATIO k-1, which the
+  // draft list shape cannot produce. The third reads the delivered array, which
+  // is the only place padding is visible. See the accessors above for why the
+  // per-depth vectors serve neither purpose.
+  int64_t spec_mtp_propose_calls_ = 0;
+  int64_t spec_mtp_draft_decode_forwards_ = 0;
+  int64_t spec_mtp_proposals_with_varied_drafts_ = 0;
   // ── SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION) ──────────────────────────────────
   // The separately-loaded DFlash draft (borrows owned by LoadedEngine; null
   // unless method=="dflash"). use_dflash() gates the aux-tap capture + the DFlash
@@ -710,6 +871,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
+  // Per-layer attention backend names, parallel to attn_kv_ (see accessor).
+  // A dense entry is never empty; an MLA entry may be (op-driven execution).
+  std::vector<std::string> attn_backend_names_;
 
   // ── KV-EXTERNAL-CACHE (LMCache) worker-side store/load ──────────────────────
   // Non-owning; null (default) = inert. See set_kv_connector.

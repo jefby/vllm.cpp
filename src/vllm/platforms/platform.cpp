@@ -10,7 +10,7 @@
 
 namespace vllm::platforms {
 
-// interface.py:417-439 has_device_capability — is this platform's capability >=
+// interface.py:433-454 has_device_capability — is this platform's capability >=
 // the required (major, minor)? Lexicographic on (major, minor), mirroring the
 // DeviceCapability tuple comparison; false when there is no queryable
 // capability (get_device_capability() -> None).
@@ -21,7 +21,7 @@ bool Platform::has_device_capability(int major, int minor) const {
   return cap.minor >= minor;
 }
 
-// interface.py:441-476 is_device_capability_family — is the device capability any
+// interface.py:481-493 is_device_capability_family — is the device capability any
 // <major>.x? Mirrors upstream exactly: `(to_int() // 10) == (capability // 10)`,
 // so sm_120 and sm_121 both map to the 12.x family. False when there is no
 // queryable capability (CPU / get_device_capability() -> None).
@@ -100,6 +100,15 @@ Platform& CurrentPlatform() {
 const DeviceType* CurrentPlatformPriority(size_t& count) {
   count = sizeof(kCurrentPriority) / sizeof(kCurrentPriority[0]);
   return kCurrentPriority;
+}
+
+bool HostMemoryIsDeviceAddressableFromAttrs(int pageable_memory_access,
+                                            int integrated) {
+  // BOTH, and the header says which device class each term excludes. It lives in
+  // this always-compiled translation unit rather than in `cuda.cpp` so that the
+  // CPU tier can run it: `cuda.cpp` compiles only in a CUDA build, which is the
+  // reason the conjunction went ungated in the first place.
+  return pageable_memory_access != 0 && integrated != 0;
 }
 
 }  // namespace vllm::platforms

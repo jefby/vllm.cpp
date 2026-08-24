@@ -10,13 +10,14 @@
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
 //          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
+//          [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]
 //          [--max-num-seqs N] [--max-num-batched-tokens N]
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
 //          [--scheduling-policy fcfs|priority]
 //          [--tool-call-parser <name>|auto|none]
 //          [--reasoning-parser <name>|auto|none]
-//          [--kv-transfer-config '<json>']
+//          [--kv-transfer-config '<json>'] [--offload-config '<json>']
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
 // shards. A supported GGUF file is also accepted and supplies model metadata
@@ -28,6 +29,7 @@
 // this binary is only built + smoke-tested against a synthetic engine (see
 // tests/vllm/entrypoints/openai/test_api_server.cpp). The wiring below is the
 // same either way.
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -45,26 +47,31 @@
 #include <vector>
 #include <atomic>
 #include <cerrno>
-#include <csignal>
 #include <functional>
 #include <thread>
-#include <sys/wait.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#include <process.h>
+#endif
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>  // ::getpid below; guarded because MSVC has no such header
 #include <thread>
 #endif
 
 #include "vllm.h"
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
+#include "vllm/config/offload.h"
+#include "vllm/http_transport_abi.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/transformers_utils/model_resolver.h"
 #include <fstream>
 #include "vllm/entrypoints/openai/server_main.h"
 #include "vllm/entrypoints/openai/api_server.h"
@@ -78,10 +85,17 @@
 #include "vllm/entrypoints/openai/tool_parsers/detect.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/platform/console_shutdown.h"
+#include "vllm/platform/process.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
+#include "vllm/multimodal/video_engine.h"
+#include "vllm/multimodal/speech_engine.h"
+#include "vllm/model_executor/models/minimax_music3_speech.h"
+#include "vllm/entrypoints/openai/speech_api.h"
+#include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -96,7 +110,7 @@
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
 #include "vt/dtype.h"
@@ -108,34 +122,69 @@ namespace fs = std::filesystem;
 using vllm::HfConfig;
 using vllm::Qwen3_5MoeWeights;
 
+fs::path NativeUtf8Path(const std::string& value) {
+#if defined(_WIN32)
+  const std::u8string utf8(
+      reinterpret_cast<const char8_t*>(value.data()), value.size());
+  return fs::path(utf8);
+#else
+  return fs::path(value);
+#endif
+}
+
+std::string PathUtf8(const fs::path& path) {
+#if defined(_WIN32)
+  const std::u8string utf8 = path.u8string();
+  return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+#else
+  return path.string();
+#endif
+}
+
+void SetEnvironment(const char* name, const char* value) {
+#if defined(_WIN32)
+  if (_putenv_s(name, value) != 0) {
+    throw std::runtime_error(std::string("could not set environment variable ") +
+                             name);
+  }
+#else
+  if (setenv(name, value, /*overwrite=*/1) != 0) {
+    throw std::runtime_error(std::string("could not set environment variable ") +
+                             name);
+  }
+#endif
+}
+
+// DSR-ALLOW(ENG-RELEASE-WINDOWS): the profiler process-ID adapter is POSIX-only; #117 keeps native Windows on its CRT process boundary, not a device-dispatch fork.
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
+uint64_t CurrentProcessId() {
+  return static_cast<uint64_t>(::getpid());
+}
+#endif
+
 // Run an argv to completion and return its exit status — the ONE process
 // spawn in the MiniMax-H3 path, and it lives HERE, in examples/, by the
 // developer-ratified 2026-08-03 decision: the library (the
 // MiniMaxH3VideoEngine seam behind /v1/videos) writes the artifacts and
 // BUILDS this argv, and spawns nothing.
 int RunFfmpegArgv(const std::vector<std::string>& args) {
-  std::vector<char*> c_args;
-  c_args.reserve(args.size() + 1);
-  for (const std::string& arg : args) {
-    c_args.push_back(const_cast<char*>(arg.c_str()));
-  }
-  c_args.push_back(nullptr);
-  const pid_t pid = fork();
-  if (pid < 0) throw std::runtime_error("fork failed");
-  if (pid == 0) {
-    execvp(c_args[0], c_args.data());
-    _exit(127);  // exec failed; never run the parent's atexit handlers
-  }
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0) throw std::runtime_error("waitpid failed");
-  if (WIFSIGNALED(status)) {
-    throw std::runtime_error("ffmpeg died on signal " + std::to_string(WTERMSIG(status)));
-  }
-  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  return vllm::platform::RunProcessArgv(args);
 }
 
 struct Args {
   std::string model_dir;
+  // ENG-HF-MODEL-DOWNLOAD W4 (#1280): what the user TYPED after `--model`,
+  // kept because the resolver replaces `model_dir` with a cache path and the
+  // served model name still defaults to the name the user asked for, exactly
+  // as vLLM's `served_model_name` defaults to `model` (`arg_utils.py:839`).
+  std::string model_argument;
+  // vLLM's own `--revision` (`arg_utils.py:839`, `config/model.py:183`).
+  // Applies to both HuggingFace forms. There is deliberately no inline
+  // `org/repo@rev` syntax, because vLLM does not spell it that way.
+  std::string revision;
+  // vLLM's own `--download-dir` (`config/model.py:183`): the directory that
+  // holds the `models--org--repo` folders.
+  std::string download_dir;
   std::string host = "0.0.0.0";
   int port = 8000;
   std::string tokenizer_config;  // default: <model_dir>/tokenizer_config.json
@@ -148,8 +197,22 @@ struct Args {
   // engine (needs the M3 profile run; inert until then). --kv-cache-memory: an
   // absolute KV-pool size in bytes that sizes the block count directly (0 =>
   // unset).
-  double gpu_memory_utilization = 0.92;
+  //
+  // TRI-STATE (FIX-GPU-MEM-UTIL-INERT, #1165), like enable_prefix_caching
+  // below: nullopt means the flag was NOT passed. It carries a value only when
+  // the user typed one, which is what lets the engine warn that a chosen
+  // fraction sized nothing without warning on a default nobody chose. A plain
+  // double pre-filled with 0.92 could not express the difference.
+  std::optional<double> gpu_memory_utilization = std::nullopt;
   long long kv_cache_memory_bytes = 0;
+  // --kv-cache-dtype: vLLM CacheConfig.cache_dtype (config/cache.py:19-36,76).
+  // "auto" (the default) uses the model dtype and is byte-identical to before
+  // the flag existed; "fp8"/"fp8_e4m3" stores the paged K/V as 1-byte fp8, which
+  // HALVES the bytes per KV block and so doubles the pool at the same
+  // --kv-cache-memory. The value is resolved against the checkpoint's own
+  // `kv_cache_quant_algo` inside LoadedEngine::FromModelDir, and an explicit
+  // value always beats the checkpoint (torch_utils.py:380-381).
+  std::string kv_cache_dtype = "auto";
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
@@ -169,6 +232,33 @@ struct Args {
   int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
   std::string video_partition;  // served partition (fl2va|ref2va); see the #77 guard
+  // The video model FAMILY to load. EMPTY keeps detection, which is the default
+  // and what every pre-L9B invocation gets. See the --video-family block below
+  // for why it now exists.
+  std::string video_family;
+  // ── Speech + music generation (W6 of #672). OPT-IN: absent =>
+  // /v1/audio/speech is never registered and the server answers 404 exactly as
+  // it did before this flag existed. ────────────────────────────────────────
+  // The checkpoint SET directory (MiniMax-Music3 ships six component
+  // directories beside a modular_model_index.json).
+  std::string speech_model;
+  // The family to load. EMPTY keeps DETECTION, which inspects the artifact; an
+  // unregistered name is refused at ParseArgs naming what is registered, and is
+  // never treated as a hint, because the wrong family would not fail — it would
+  // render noise.
+  std::string speech_family;
+  // WHERE the speech family runs. 0 = CPU, the default and the arm every Music3
+  // correctness gate was taken on; 1 = the accelerator this build resolves.
+  // A value the seam cannot serve is refused BY NAME at load, not substituted.
+  int32_t speech_device = 0;
+  // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
+  // family is useless if that family's required load knobs are unreachable:
+  // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
+  // no __metadata__) and `audio_prompt_embeds_path` (its audio stream conditions
+  // at a second width), and neither has — or should have — a dedicated flag on a
+  // family-generic server. `--video-partition` remains the documented alias for
+  // the H3 key "partition".
+  std::vector<std::pair<std::string, std::string>> video_extras;
   // Keep-quant is the library seam's DEFAULT arm; --video-dequant-bf16 selects
   // the bf16 dequant/stream arm (the throughput trade the gen example ships).
   // --video-keep-quant is still accepted (it names the default).
@@ -189,8 +279,14 @@ struct Args {
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
   bool verbose = false;
-  // Gemma4 HF/vLLM: --default-chat-template-kwargs enable_thinking (default OFF).
-  bool enable_thinking = false;
+  // Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking`.
+  // TRI-STATE, and the third state is the default and the point (#1681):
+  // upstream's own default is `None`, so unless somebody asks, `enable_thinking`
+  // is not a template variable at all and a template that gates on
+  // `{% if enable_thinking is undefined %}` gets its own answer. Storing a plain
+  // `false` here made that test permanently false and silently inverted the
+  // Qwen3.8 family's reasoning default against vLLM and SGLang.
+  std::optional<bool> enable_thinking;
   // Request logging (Python vLLM --enable-log-requests parity). Default ON.
   bool enable_log_requests = true;
   bool enable_log_outputs = false;
@@ -217,15 +313,103 @@ struct Args {
   // "auto" opts into the chat-template detection the C ABI uses.
   std::string tool_call_parser = "hermes";
   std::string reasoning_parser = "none";
+  // vLLM's --enable-auto-tool-choice (cli_args.py:105, default False). Accepted
+  // and INERT here (see kAcceptedInertArgs below) but still RECORDED, because
+  // cli_args.py:395 validates it against --tool-call-parser and that validation
+  // is mirrored, not dropped.
+  bool enable_auto_tool_choice = false;
   // vLLM's --kv-transfer-config: the external KV connector selection, as the
   // same JSON object vLLM takes. Empty (default) == no connector == the inert
   // production path. See docs/KV-OFFLOAD.md.
   std::string kv_transfer_config;
+  // ENG-WEIGHT-OFFLOAD W0b — vLLM's OffloadConfig, the WEIGHT-offload selection
+  // (distinct from --kv-transfer-config, which offloads KV blocks), as the same
+  // JSON object vLLM takes. Empty (default) == no offloading == the inert
+  // production path. Accepted and validated today; the offloader that MOVES a
+  // weight is W2/W5.
+  std::string offload_config;
   // vLLM's --speculative-config: the speculative-decoding selection, as the same
   // JSON object vLLM takes (e.g. '{"method":"mtp","num_speculative_tokens":1}').
   // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
   std::string speculative_config;
+  // ── Multimodal input limits (ENG-MM-INPUT-PIPELINE wave L2, #607) ─────────
+  // --language-model-only (arg_utils.py:555,1276,1691) and --limit-mm-per-prompt
+  // (arg_utils.py:556,1279,1692), the two flags 43 of the 157 official recipes
+  // need. They are sugar over vllm::MultiModalConfig, which is the mechanism:
+  // the flag sets every modality limit to 0, and the REFUSAL those zeros produce
+  // (BaseProcessingInfo::ValidateNumItems, #607 L1) is the observable effect.
+  //
+  // Defaults reproduce today's behaviour exactly: language_model_only false and
+  // an empty map resolve to the 999-per-modality default, so a server started
+  // without either flag refuses nothing it used to serve.
+  vllm::MultiModalConfig multimodal;
+  // ── The `clip` multimodal projector (row `LOAD-GGUF-MMPROJ`, #821) ────────
+  // llama.cpp's `--mmproj`: the SECOND GGUF file, beside a `.gguf` --model.
+  // Empty (default) == no projector == every load that existed before the row.
+  // Deliberately explicit: a sibling `mmproj*.gguf` is NOT auto-discovered,
+  // because a directory holding two unrelated models must not silently fuse
+  // them.
+  std::string mmproj_path;
 };
+
+// ── Accepted-and-inert serve arguments (SERVE-RECIPE-ARGS, #606) ────────────
+// A published `vllm serve` line must reach model load. Measured over
+// vllm-project/recipes @ 86c7777a (157 official model recipes), 89 pass
+// `--enable-auto-tool-choice` and 82 pass `--trust-remote-code`; neither means
+// anything to this engine, and both used to stop the server at the unknown-
+// argument guard below before a single weight was read.
+//
+// THIS IS NOT A CATCH-ALL, and that is the whole point. A flag that is inert
+// because we LACK the capability -- --tensor-parallel-size, the EP flags,
+// --mm-encoder-tp-mode -- keeps aborting, because silently swallowing it would
+// let a user believe they got tensor parallelism. Only a flag that is inert BY
+// CONSTRUCTION earns an entry, and the per-entry `reason` is the enforcement:
+// an entry that cannot state an honest reason cannot be written.
+//
+// Inert is also not UNVALIDATED. --enable-auto-tool-choice is recorded on Args
+// and still checked against --tool-call-parser after the loop, mirroring
+// vllm/entrypoints/openai/cli_args.py:395.
+struct InertArg {
+  const char* flag;
+  bool takes_value;   // consume the following argv entry as this flag's value
+  const char* reason;  // printed on use; see rule 2 -- accepting is ANNOUNCED
+};
+
+constexpr bool kNoValue = false;
+
+// NOTE on `takes_value`: no entry needs it today (both flags are bare), but the
+// field is part of the table's shape rather than a later retrofit -- a value-
+// taking recipe flag must not silently leave its value to be re-parsed as the
+// next flag.
+constexpr InertArg kAcceptedInertArgs[] = {
+    // cli_args.py:105 (`enable_auto_tool_choice: bool = False`), threaded on as
+    // `enable_auto_tools` at api_server.py:426,441,529,544.
+    //
+    // The trailing caveat clause is deliberate and must stay: upstream defaults
+    // --tool-call-parser to None, we default it to "hermes"
+    // (docs/USAGE.md), so upstream's flag genuinely gates something and ours
+    // cannot. The notice must not let a reader infer the two agree when the
+    // parser is unset. Reconciling that default is out of scope here.
+    {"--enable-auto-tool-choice", kNoValue,
+     // Do not write `open (` here: check-windows-portability.py scans this file
+     // with comments stripped but STRING LITERALS intact, and its POSIX-call
+     // pattern matches the bare word `open` before a parenthesis. The semicolon
+     // keeps the sentence and keeps the Windows gate green.
+     "tool parsing is already unconditional once --tool-call-parser resolves, "
+     "so there is no second gate to open; note --tool-call-parser defaults to "
+     "hermes here, where upstream's defaults to unset"},
+    // Authorizes executing Python from the checkpoint. N/A BY CONSTRUCTION, not
+    // unimplemented: this engine has no Python runtime.
+    {"--trust-remote-code", kNoValue,
+     "no Python runtime, so there is no remote code to trust"},
+};
+
+const InertArg* FindAcceptedInertArg(const std::string& flag) {
+  for (const InertArg& entry : kAcceptedInertArgs) {
+    if (flag == entry.flag) return &entry;
+  }
+  return nullptr;
+}
 
 [[noreturn]] void Usage(const char* argv0, int code) {
   std::cerr
@@ -235,6 +419,7 @@ struct Args {
          "[--num-blocks N] [--max-model-len N]\n"
          "               [--gpu-memory-utilization F] "
          "[--kv-cache-memory BYTES]\n"
+         "               [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]\n"
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--device auto|cpu|cuda]\n"
@@ -244,6 +429,7 @@ struct Args {
          "               [--enable-force-include-usage]\n"
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
+         "               [--revision REF] [--download-dir DIR]\n"
          "               [--verbose]\n"
          "               [--enable-thinking|--no-enable-thinking]\n"
          "               [--enable-log-requests|--disable-log-requests]\n"
@@ -256,8 +442,21 @@ struct Args {
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
+         "               [--offload-config '<json>']\n"
          "               [--speculative-config '<json>']\n"
-         "               [--version]\n";
+         "               [--[no-]language-model-only]\n"
+         "               [--limit-mm-per-prompt '<json>']\n"
+         "               [--mmproj <mmproj-*.gguf>]\n"
+         "               [--speech-model <checkpoint-dir>] "
+         "[--speech-family <name>]\n"
+         "               [--speech-device 0|1]\n"
+         "               [--version]\n"
+         "  --speech-model WITHOUT --model serves /v1/audio/speech ALONE (no "
+         "text model is loaded)\n"
+         "  --speech-device 0 (default) runs the speech family on the CPU, 1 on "
+         "the accelerator this build resolves\n"
+         "  accepted for published-recipe compatibility, NO effect: "
+         "--enable-auto-tool-choice, --trust-remote-code\n";
   std::exit(code);
 }
 
@@ -272,6 +471,11 @@ Args ParseArgs(int argc, char** argv) {
     const std::string flag = argv[i];
     if (flag == "--model") {
       a.model_dir = NextArg(argc, argv, i, argv[0]);
+      a.model_argument = a.model_dir;
+    } else if (flag == "--revision") {
+      a.revision = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--download-dir") {
+      a.download_dir = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--host") {
       a.host = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--port") {
@@ -282,12 +486,22 @@ Args ParseArgs(int argc, char** argv) {
       a.served_model_name = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--block-size") {
       a.block_size = std::stoi(NextArg(argc, argv, i, argv[0]));
+      // The attention backends (FLASH_ATTN / ROCM_ATTN get_kv_cache_shape)
+      // enforce block_size % 16 == 0 and the runner validates at init — fail
+      // here with a clear message rather than at engine init.
+      if (a.block_size <= 0 || a.block_size % 16 != 0) {
+        std::cerr << argv[0] << ": --block-size must be a positive multiple of 16"
+                  << " (got " << a.block_size << ")\n";
+        Usage(argv[0], 2);
+      }
     } else if (flag == "--num-blocks") {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--gpu-memory-utilization") {
       a.gpu_memory_utilization = std::stod(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--kv-cache-memory") {
       a.kv_cache_memory_bytes = std::stoll(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--kv-cache-dtype") {
+      a.kv_cache_dtype = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--max-model-len") {
       a.max_model_len = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-num-seqs") {
@@ -337,6 +551,26 @@ Args ParseArgs(int argc, char** argv) {
       a.video_device = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-partition") {
       a.video_partition = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-family") {
+      a.video_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-model") {
+      a.speech_model = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-family") {
+      a.speech_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-device") {
+      a.speech_device = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--video-extra") {
+      const std::string kv = NextArg(argc, argv, i, argv[0]);
+      const std::string::size_type eq = kv.find('=');
+      // A bare KEY is refused rather than read as KEY="": an extra whose value
+      // silently became empty is how a mistyped knob renders the default and
+      // looks like the feature not working, which is the same failure the
+      // families' own unknown-extra refusals exist to stop.
+      if (eq == std::string::npos || eq == 0) {
+        std::cerr << "server: --video-extra takes KEY=VALUE, got '" << kv << "'\n";
+        Usage(argv[0], 2);
+      }
+      a.video_extras.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
     } else if (flag == "--video-keep-quant") {
       // the seam's default arm; accepted for pre-fold CLI compatibility
       a.video_dequant_bf16 = false;
@@ -349,7 +583,7 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--enable-thinking") {
       a.enable_thinking = true;
     } else if (flag == "--no-enable-thinking") {
-      a.enable_thinking = false;
+      a.enable_thinking = false;  // an EXPLICIT false, unlike passing neither
     } else if (flag == "--enable-log-requests") {
       a.enable_log_requests = true;
     } else if (flag == "--disable-log-requests") {
@@ -403,21 +637,106 @@ Args ParseArgs(int argc, char** argv) {
       a.reasoning_parser = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--kv-transfer-config") {
       a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--offload-config") {
+      a.offload_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--mmproj") {
+      // llama.cpp's own spelling for the second file (`b10451`
+      // `tools/mtmd/mtmd-cli.cpp`). NOT validated here: unlike the JSON flags
+      // above, whose value can be refused without touching the disk, this is a
+      // path whose contents decide the answer — and the loader already refuses
+      // it BY NAME before the tokenizer and before any language weight byte, so
+      // a second check here would be a second implementation of the same
+      // refusal rather than an earlier one.
+      a.mmproj_path = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--language-model-only" ||
+               flag == "--no-language-model-only") {
+      // arg_utils.py:1276 over a bool field, which _compute_kwargs gives
+      // argparse.BooleanOptionalAction (arg_utils.py:346-348) — so upstream
+      // accepts BOTH spellings and the negative one is the default. Mirrored,
+      // rather than accepting only the positive: a recipe that switches the flag
+      // off explicitly must not die on an unknown argument.
+      a.multimodal.language_model_only = flag == "--language-model-only";
+    } else if (flag == "--limit-mm-per-prompt") {
+      // arg_utils.py:1279 over a dict field => type=parse_type(json.loads)
+      // (arg_utils.py:379-381 — the plain-dict branch, NOT the
+      // `union_dict_and_str` one at :374-378, which needs a `str` arm or a
+      // non-builtin hint that `dict[str, BaseDummyOptions]` does not have):
+      // the value is a JSON OBJECT. Parsed HERE, before
+      // the multi-GB model load, for the same reason the parser dialects are:
+      // a malformed limit costs a second rather than a full load, and it is
+      // REFUSED rather than defaulted — a typo that silently became 999 is a
+      // limit that is not there.
+      //
+      // NAMED RESIDUAL, and it is not this flag's: upstream's dotted spelling
+      // (`--limit-mm-per-prompt.image 2`) is a FlexibleArgumentParser feature
+      // that rewrites any dotted key into the JSON form before argparse sees it
+      // (argparse_utils.py:389-425). It applies equally to --kv-transfer-config
+      // and --speculative-config, which this server also takes as JSON only, so
+      // adding it for one flag would be the bespoke path. It belongs to a parser
+      // brick covering all three.
+      const std::string value = NextArg(argc, argv, i, argv[0]);
+      std::vector<std::string> ignored_options;
+      try {
+        a.multimodal.limit_per_prompt =
+            vllm::ParseLimitMmPerPromptJson(value, &ignored_options);
+      } catch (const std::exception& e) {
+        std::cerr << "server: --limit-mm-per-prompt: " << e.what() << "\n";
+        Usage(argv[0], 2);
+      }
+      // Accepting is ANNOUNCED (the kAcceptedInertArgs rule, applied to a
+      // partially-inert VALUE): the dummy-profiling options are validated and
+      // then dropped, so a reader learns `num_frames` did nothing here instead
+      // of inferring that it worked.
+      for (const std::string& key : ignored_options) {
+        std::cerr << "server: --limit-mm-per-prompt " << key
+                  << " accepted and IGNORED: only the modality's count is read "
+                     "here. A key upstream DECLARES sizes dummy inputs for "
+                     "memory profiling, a surface this engine does not have; a "
+                     "key it does not declare is one its BaseDummyOptions "
+                     "fallback drops too\n";
+      }
     } else if (flag == "--version") {
       std::cout << "vllm.cpp " << vllm::Version()
                 << " c-abi=" << VLLM_ABI_VERSION << "\n";
       std::exit(0);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], 0);
+    } else if (const InertArg* inert = FindAcceptedInertArg(flag);
+               inert != nullptr) {
+      // Rule 2: accepting is ANNOUNCED. One notice per accepted flag AS USED,
+      // naming the flag and its reason, so a log reader learns the flag did
+      // nothing rather than inferring that it worked.
+      if (inert->takes_value) (void)NextArg(argc, argv, i, argv[0]);
+      if (flag == "--enable-auto-tool-choice") {
+        a.enable_auto_tool_choice = true;  // validated below, cli_args.py:395
+      }
+      std::cerr << "server: accepted '" << flag
+                << "' for published-recipe compatibility; it has no effect "
+                   "here: "
+                << inert->reason << "\n";
     } else {
       std::cerr << "server: unknown argument '" << flag << "'\n";
       Usage(argv[0], 2);
     }
   }
-  if (a.model_dir.empty()) {
-    std::cerr << "server: --model <dir> is required\n";
+  // --model is required EXCEPT for a speech-only server (#672). Upstream's own
+  // spelling for MiniMax-Music3 is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3`
+  // and nothing else — there is no text model in that command, because a music
+  // model is not an accessory to one. Requiring --model here made the documented
+  // recipe unrunnable on any box whose smallest text checkpoint is tens of GB:
+  // serving a 28.5 GB music model also staged a model no request would touch.
+  //
+  // This is a NEW ACCEPTED COMBINATION, not a change of behaviour: `--model` with
+  // or without `--speech-model` resolves exactly as before, and the case that
+  // changes verdict — NEITHER flag — was and remains an error. It mirrors the
+  // task-conditional dispatch already in this file for pooling and
+  // transcription-only models (vLLM api_server.py:255-265): the routes a server
+  // registers follow from what it loaded.
+  if (a.model_dir.empty() && a.speech_model.empty()) {
+    std::cerr << "server: --model <dir> is required (or --speech-model <dir> for "
+                 "a speech/music-only server)\n";
     Usage(argv[0], 2);
   }
   if (a.max_num_seqs <= 0 || a.max_num_batched_tokens < 0 ||
@@ -444,6 +763,65 @@ Args ParseArgs(int argc, char** argv) {
     std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
     Usage(argv[0], 2);
   }
+  // The declared video family, checked HERE for the same reason the parser
+  // dialects below are: `LoadVideoEngine` would refuse an unregistered name
+  // anyway, but only after the TEXT model has loaded, so a typo would cost a
+  // multi-GB load instead of a second. The REGISTRY is the authority — never a
+  // literal list here — so a family added in its own file is accepted with no
+  // edit to this one, which is the whole point of the registration seam.
+  if (!a.video_family.empty()) {
+    const std::vector<std::string> registered =
+        vllm::multimodal::RegisteredVideoFamilies();
+    if (std::find(registered.begin(), registered.end(), a.video_family) ==
+        registered.end()) {
+      std::cerr << "server: --video-family '" << a.video_family
+                << "' is not a registered video family. Registered families:";
+      for (const std::string& name : registered) std::cerr << " " << name;
+      std::cerr << "\n";
+      Usage(argv[0], 2);
+    }
+  }
+  if (!a.speech_family.empty()) {
+    vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+    vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+    const std::vector<std::string> registered = registry.families();
+    if (std::find(registered.begin(), registered.end(), a.speech_family) == registered.end()) {
+      std::cerr << "server: --speech-family '" << a.speech_family
+                << "' is not a registered speech family. Registered families:";
+      for (const std::string& name : registered) std::cerr << " " << name;
+      std::cerr << "\n";
+      Usage(argv[0], 2);
+    }
+  }
+  if (!a.speech_family.empty() && a.speech_model.empty()) {
+    std::cerr << "server: --speech-family names a family but --speech-model names no "
+                 "checkpoint; there is nothing to load it from\n";
+    Usage(argv[0], 2);
+  }
+  if (a.speech_device != 0 && a.speech_model.empty()) {
+    // Same shape as the --speech-family check above, and for the same reason: a
+    // knob that silently applies to nothing reads as "it was honoured".
+    std::cerr << "server: --speech-device selects where the speech family runs but "
+                 "--speech-model names no checkpoint; there is nothing to place\n";
+    Usage(argv[0], 2);
+  }
+  // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
+  //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
+  // when the flag is set and `args.tool_call_parser` is falsy. Upstream's falsy
+  // value is the unset default `None`; ours is the explicit selection "none",
+  // because our --tool-call-parser defaults to "hermes" and so is never unset.
+  // Accepting the flag as inert does NOT drop the validation it came with.
+  // Ordered before the dialect check below so a contradiction is reported as
+  // the contradiction; "none" is itself a registered selection, so that check
+  // would pass and say nothing about the conflict.
+  if (a.enable_auto_tool_choice && a.tool_call_parser == "none") {
+    std::cerr << "server: Error: --enable-auto-tool-choice requires "
+                 "--tool-call-parser\n"
+                 "server: (--tool-call-parser none selects NO parser; name a "
+                 "parser, or drop --tool-call-parser to keep the hermes "
+                 "default)\n";
+    Usage(argv[0], 2);
+  }
   // Validate a NAMED parser dialect here, before the (multi-GB) model load, so a
   // typo costs a second rather than a full load. "auto" cannot be checked yet —
   // it resolves against the chat template — but detection only ever returns
@@ -459,83 +837,42 @@ Args ParseArgs(int argc, char** argv) {
 }
 
 
-// Clean shutdown on SIGTERM/SIGINT -- issue #312.
+// ENG-HF-MODEL-DOWNLOAD W4 (#1280): turn what the user typed after `--model`
+// into a path the loader can open, fetching the checkpoint when it names a
+// HuggingFace repository.
 //
-// Without this the server ignores SIGTERM outright when it is PID 1, because
-// the kernel does not apply default signal dispositions to PID 1. Every
-// `docker stop`, Kubernetes rolling update and `compose down` therefore waited
-// out its grace period and then SIGKILLed, dropping in-flight requests.
+// THIS IS THE PRODUCTION CALL SITE, and the ONLY one. `vllm-server` reaches
+// `--model` through `VllmServerMain`, so a repository identifier that is not
+// resolved here is not resolved anywhere. Deleting this call leaves the loader
+// opening `org/repo` as a relative path, which is the behavior this row
+// replaces, and the end-to-end case in
+// `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` turns red.
 //
-// The handler itself only write()s one byte to a self-pipe, which IS
-// async-signal-safe; a watcher thread does the actual stop(). That is the same
-// shape the VT_BENCH_PROFILE_CONTROL FIFO shutdown already uses, so both paths
-// converge on one stop().
-class SignalShutdown {
- public:
-  explicit SignalShutdown(std::function<void()> stop) : stop_(std::move(stop)) {
-    if (pipe(pipe_fds_) != 0) {
-      std::cerr << "server: could not install signal handlers (pipe failed); "
-                   "shutdown will not be graceful\n";
-      return;
-    }
-    write_fd.store(pipe_fds_[1], std::memory_order_release);
-    armed_ = Install(SIGTERM) && Install(SIGINT);
-    if (!armed_) return;
-    watcher_ = std::thread([this]() {
-      char byte = 0;
-      while (true) {
-        const ssize_t bytes = read(pipe_fds_[0], &byte, 1);
-        if (bytes == 1) {
-          if (byte == kCancel) return;
-          std::cerr << "server: shutting down on signal "
-                    << static_cast<int>(byte) << "\n";
-          stop_();
-          return;
-        }
-        if (bytes < 0 && errno == EINTR) continue;
-        return;
-      }
-    });
-  }
-
-  ~SignalShutdown() {
-    if (armed_) {
-      std::signal(SIGTERM, SIG_DFL);
-      std::signal(SIGINT, SIG_DFL);
-      const char cancel = kCancel;
-      const ssize_t ignored = write(pipe_fds_[1], &cancel, 1);
-      (void)ignored;
-    }
-    if (watcher_.joinable()) watcher_.join();
-    for (int fd : pipe_fds_) {
-      if (fd >= 0) close(fd);
-    }
-    write_fd.store(-1, std::memory_order_release);
-  }
-
-  SignalShutdown(const SignalShutdown&) = delete;
-  SignalShutdown& operator=(const SignalShutdown&) = delete;
-
-  static inline std::atomic<int> write_fd{-1};
-
- private:
-  static constexpr char kCancel = 0;
-
-  static void Handle(int signum) {
-    const int fd = write_fd.load(std::memory_order_acquire);
-    if (fd < 0) return;
-    const char byte = static_cast<char>(signum);
-    const ssize_t ignored = write(fd, &byte, 1);
-    (void)ignored;
-  }
-
-  static bool Install(int signum) { return std::signal(signum, Handle) != SIG_ERR; }
-
-  std::function<void()> stop_;
-  std::thread watcher_;
-  int pipe_fds_[2] = {-1, -1};
-  bool armed_ = false;
-};
+// `vllm-cli` deliberately does NOT reach it. That example includes `vllm.h` and
+// nothing else, because an example is an application binary interface client
+// only, and this row adds no ABI function, so `vllm-cli --model org/repo` still
+// takes a local path. It is recorded under `## Owed` in
+// `.agents/specs/hf-model-download.md`.
+//
+// An existing directory and an existing `.gguf` file come back unchanged and
+// open no socket, so a local run is byte-identical to the one before this row.
+void ResolveModelArgument(Args& a) {
+  if (a.model_dir.empty()) return;
+  vllm::transformers_utils::ModelResolveOptions opts;
+  opts.revision = a.revision;
+  opts.download_dir = a.download_dir;
+  opts.verbose = a.verbose;
+  const std::string resolved =
+      vllm::transformers_utils::ResolveModelPath(a.model_dir, opts);
+  if (resolved == a.model_dir) return;
+  // The SERVED name stays the name the user asked for. Without this the
+  // default would become the 40 character commit directory the cache happens
+  // to hold, and no client could name the model it just started.
+  if (a.served_model_name.empty()) a.served_model_name = a.model_argument;
+  std::cerr << "server: --model " << a.model_argument << " resolved to "
+            << resolved << "\n";
+  a.model_dir = resolved;
+}
 
 }  // namespace
 
@@ -545,11 +882,24 @@ namespace openai {
 
 int VllmServerMain(int argc, char** argv) {
   try {
-    const Args args = ParseArgs(argc, argv);
+    // ENG-HF-MODEL-DOWNLOAD W5 (#1280). BEFORE anything is parsed, bound or
+    // fetched: `CPPHTTPLIB_OPENSSL_SUPPORT` is a whole-header switch that
+    // changes the layout of `httplib::Result`, and this binary carries both a
+    // listener and a hub client compiled from that one header. A build that
+    // defined it for some translation units and not for others LINKS CLEANLY
+    // and then corrupts every response object handed across the seam. Refusing
+    // here is the only place a user finds out before a wrong answer.
+    const std::string transport_mismatch = vllm::HttpTransportAbiMismatch();
+    if (!transport_mismatch.empty()) {
+      std::cerr << transport_mismatch << "\n";
+      return 2;
+    }
+    Args args = ParseArgs(argc, argv);
     if (args.verbose) {
-      setenv("VT_SERVER_VERBOSE", "1", /*overwrite=*/1);
+      SetEnvironment("VT_SERVER_VERBOSE", "1");
       std::cerr << "server: verbose stage logging enabled (debug_stages)\n";
     }
+    ResolveModelArgument(args);
     {
       vllm::entrypoints::openai::RequestLogConfig log_cfg;
       log_cfg.enable_log_requests = args.enable_log_requests;
@@ -567,18 +917,163 @@ int VllmServerMain(int argc, char** argv) {
                 << "\n";
     }
 
-    const fs::path dir(args.model_dir);
-    const std::string config_path = (dir / "config.json").string();
-    const std::string tokenizer_path = (dir / "tokenizer.json").string();
+    // The RESOLVED multimodal limits, printed before the model load so the
+    // startup log records what the two flags actually produced rather than what
+    // was typed. GetLimitPerPrompt is the single accessor every consumer asks
+    // (multimodal.py:321-336), so printing through it is what makes the flag's
+    // PRECEDENCE visible: --language-model-only alongside an explicit
+    // `image=4` prints image=0, because the flag is checked before the map.
+    {
+      std::cerr << "server: multimodal limits language-model-only="
+                << (args.multimodal.language_model_only ? "ON" : "OFF");
+      // Print every modality the user named, plus the ones the flag zeroes even
+      // though nobody named them, so "--language-model-only" is not a line that
+      // says only "ON" with no consequence next to it.
+      std::vector<std::string> shown;
+      for (const auto& [modality, unused] : args.multimodal.limit_per_prompt) {
+        (void)unused;
+        shown.push_back(modality);
+      }
+      if (shown.empty() && args.multimodal.language_model_only) {
+        shown = {"audio", "image", "video"};
+      }
+      for (const std::string& modality : shown) {
+        std::cerr << " " << modality << "="
+                  << args.multimodal.GetLimitPerPrompt(modality);
+      }
+      if (shown.empty()) {
+        std::cerr << " (no per-modality limit set; default "
+                  << vllm::kDefaultLimitPerPrompt << ")";
+      }
+      std::cerr << "\n";
+    }
+
+    // ── SPEECH TASK DISPATCH (#672): --speech-model with NO --model serves
+    // /v1/audio/speech and nothing else. It is the same task-conditional shape
+    // the pooling and transcription-only branches below take, and the same one
+    // vLLM's api_server.py:255-265 uses: a server registers the routes its
+    // loaded task can answer, rather than every route it knows how to spell.
+    //
+    // It exists because upstream's own recipe is `sgl-omni serve --model
+    // MiniMaxAI/MiniMax-Music3` — one model, no text tower — and because pairing
+    // a 28.5 GB music checkpoint with an unrelated text checkpoint nobody
+    // queries is not a smaller cost than the music model itself. NOTHING here
+    // touches the combined path: --model + --speech-model still loads both and
+    // registers both, byte for byte as before.
+    if (args.model_dir.empty()) {
+      vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+      vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+      vllm::multimodal::SpeechModelParams smp;
+      smp.path = args.speech_model;
+      smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      smp.device = args.speech_device;   // 0 => CPU, the byte-identical default
+      std::string why;
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech = registry.Load(smp, &why);
+      if (loaded_speech == nullptr) {
+        throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
+      }
+      std::shared_ptr<vllm::multimodal::SpeechEngine> speech_only(std::move(loaded_speech));
+      // The served name defaults to the FAMILY rather than to the directory
+      // basename, because a speech-only server has no config.json to name and
+      // the family is what a client puts in `"model"`. An explicit
+      // --served-model-name still wins.
+      const std::string speech_served_name =
+          args.served_model_name.empty() ? speech_only->family() : args.served_model_name;
+      vllm::openai::SpeechCapabilities caps;
+      caps.family = speech_only->family();
+      caps.sample_rate = speech_only->sample_rate();
+      caps.requires_reference_audio = speech_only->requires_reference_audio();
+      std::cerr << "server: speech/music-only model (family=" << caps.family << ", "
+                << caps.sample_rate << " Hz, "
+                << (caps.requires_reference_audio ? "reference clip REQUIRED"
+                                                  : "text-only synthesis")
+                << ", family "
+                << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                // GRANTED, not requested. A log that echoed --speech-device back
+                // would say "cuda" on a build that resolved CPU.
+                << ", device " << vt::DeviceTypeName(speech_only->device().type)
+                << "); serving /v1/audio/speech\n";
+      namespace oai = vllm::entrypoints::openai;
+      oai::OpenAIServingModels speech_models(speech_served_name);
+      oai::ApiServer speech_server(speech_models, vllm::Version());
+      speech_server.set_synthesizer(
+          [speech_only](const vllm::openai::SpeechRequest& req)
+              -> vllm::openai::SpeechResponse {
+            return vllm::openai::SynthesizeSpeechRequest(*speech_only, req);
+          },
+          caps);
+      std::cerr << "server: listening on http://" << args.host << ":" << args.port
+                << " (model '" << speech_served_name << "')\n";
+      vllm::platform::ConsoleShutdown shutdown_on_signal(
+          [&]() { speech_server.stop(); });
+      if (!speech_server.listen(args.host, args.port)) {
+        std::cerr << "server: failed to bind " << args.host << ":" << args.port << "\n";
+        return 1;
+      }
+      return 0;
+    }
+
+    const fs::path dir = NativeUtf8Path(args.model_dir);
+    const std::string config_path = PathUtf8(dir / "config.json");
+    const std::string tokenizer_path = PathUtf8(dir / "tokenizer.json");
     const std::string tokenizer_config_path =
         args.tokenizer_config.empty()
-            ? (dir / "tokenizer_config.json").string()
+            ? PathUtf8(dir / "tokenizer_config.json")
             : args.tokenizer_config;
     const std::string served_model_name =
         args.served_model_name.empty()
-            ? (dir.has_filename() ? dir.filename().string()
-                                  : dir.parent_path().filename().string())
+            ? PathUtf8(dir.has_filename() ? dir.filename()
+                                          : dir.parent_path().filename())
             : args.served_model_name;
+
+    // ── --offload-config, PARSED ONCE, AHEAD OF THE TASK BRANCH (#1135) ───────
+    //
+    // It used to be parsed after the branch below, in the text path only, so the
+    // pooling and transcription-only paths built their engine parameters without
+    // it. An embedding server started with `--offload-config` placed its weights
+    // as though the flag were absent and said nothing. That dropped BOTH halves
+    // of the document — vLLM's mirrored `uva`/`prefetch` weight offload and the
+    // vllm.cpp `vllm_cpp` residency extension — and had done so since before the
+    // extension existed.
+    //
+    // ONE PARSE, and every branch below now answers for the document: the text
+    // path and the pooling path take both halves, and the transcription-only
+    // path refuses a non-empty flag rather than dropping it.
+    //
+    // Both halves come out of the SAME string:
+    // `parse_offload_config_json` reads vLLM's three keys and
+    // `parse_weight_residency_extension_json` reads the extension and closes the
+    // document against a typo at every level. Two parsers over one string is what
+    // keeps `include/vllm/config/offload.h` a byte-faithful transcription of
+    // `vllm/config/offload.py` (which has no disk tier) while the operator still
+    // types one flag for one concept.
+    //
+    // Parsing HERE also refuses a malformed document, an unknown key or a
+    // validator violation BEFORE the architecture is peeked and before the
+    // `server: loading model from` line, rather than after both. Upstream's three
+    // backend/field mismatches are WARNINGS in vLLM and stay warnings here.
+    std::optional<vllm::OffloadConfig> parsed_offload_config;
+    std::optional<vllm::WeightResidencyConfig> parsed_weight_residency;
+    if (!args.offload_config.empty()) {
+      vllm::OffloadConfig off_cfg =
+          vllm::parse_offload_config_json(args.offload_config);
+      off_cfg.Validate();
+      for (const std::string& w : off_cfg.warnings) {
+        std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
+      }
+      parsed_offload_config = std::move(off_cfg);
+      // ENG-RESIDENCY-CONFIG (#1110): the SAME document also carries the
+      // vllm.cpp-original `vllm_cpp` key, which governs the tier BELOW vLLM's —
+      // weights borrowed out of the file mapping rather than moved to host RAM.
+      //
+      // Its parser REFUSES a key it does not know, which the mirrored parser does
+      // not do, and that refusal is load-bearing: a silently ignored
+      // `{"vllm_cpp":{"mmapp":...}}` starts a server running this tier at its
+      // defaults and is met as an out-of-memory kill instead of an error.
+      vllm::WeightResidencyConfig res_cfg =
+          vllm::parse_weight_residency_extension_json(args.offload_config);
+      if (!res_cfg.empty()) parsed_weight_residency = std::move(res_cfg);
+    }
 
     // ── TASK DISPATCH (ARCH-ONE-SURFACE ROW 1): a model dir whose
     // architectures resolve to a SupportsTranscription-ONLY registration
@@ -629,6 +1124,18 @@ int VllmServerMain(int argc, char** argv) {
         embed_params.max_num_seqs = args.max_num_seqs;
         embed_params.max_num_batched_tokens = args.max_num_batched_tokens;
         embed_params.enable_prefix_caching = args.enable_prefix_caching;
+        // #1135: BOTH halves of `--offload-config`, on the same terms as the text
+        // path. This branch reaches `LoadedEngine::FromModelDir`, which installs
+        // the residency document and the weight offloader ahead of every path and
+        // weight operation it performs — so an embedding model is loaded by the
+        // same loader and nothing about pooling makes either half inapplicable.
+        // Before this, both were dropped here in silence.
+        //
+        // The other engine flags this block still drops, `--device` among them,
+        // are #1196. They are the same shape over a wider set and belong to the
+        // row that owns this dispatch.
+        embed_params.offload_config = parsed_offload_config;
+        embed_params.weight_residency = parsed_weight_residency;
         auto loaded_embed = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
             vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                           embed_params));
@@ -665,7 +1172,8 @@ int VllmServerMain(int argc, char** argv) {
             });
         std::cerr << "server: listening on http://" << args.host << ":"
                   << args.port << "\n";
-        SignalShutdown shutdown_on_signal([&]() { embed_server.stop(); });
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { embed_server.stop(); });
         if (!embed_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
@@ -675,6 +1183,33 @@ int VllmServerMain(int argc, char** argv) {
       }
 
       if (transcription_only) {
+        // #1135, and this arm is a REFUSAL rather than a wiring. The
+        // transcription stack has no seam either half of `--offload-config`
+        // could reach: `ParakeetTranscriber::FromDir` builds no `EngineParams`
+        // and calls no `LoadedEngine::FromModelDir`, so this path runs no
+        // `SetWeightResidencyConfig`, no `CreateWeightOffloader`, no GGUF
+        // mapping and no expert slot store. There is no field of either half
+        // that any code here could read.
+        //
+        // AGENTS.md: refuse an unimplemented arm with a message that names the
+        // missing part, and record the arm as owed. Accepting the flag and
+        // warning would leave a server running while it holds a placement
+        // instruction it does not follow, which is the failure #1135 was filed
+        // about. The document is still PARSED above, so a typo in it is refused
+        // here on the same terms as everywhere else.
+        if (!args.offload_config.empty()) {
+          throw std::invalid_argument(
+              "--offload-config is not supported on a transcription-only model "
+              "(" + archs[0] +
+              "). THE MISSING PART: this path serves /v1/audio/transcriptions "
+              "through ParakeetTranscriber, which loads its own weights and "
+              "never builds an engine, so neither vLLM's uva/prefetch weight "
+              "offload nor vllm.cpp's vllm_cpp weight-residency tier has a call "
+              "site on it. Both halves of the document would be accepted and "
+              "then ignored, which is issue #1135. Remove the flag, or serve a "
+              "text-generation or embedding model, which honour it. Tracked as "
+              "issue #1195");
+        }
         std::cerr << "server: transcription-only model (" << archs[0]
                   << "); serving /v1/audio/transcriptions\n";
         auto transcriber =
@@ -689,7 +1224,8 @@ int VllmServerMain(int argc, char** argv) {
             });
         std::cerr << "server: listening on http://" << args.host << ":"
                   << args.port << "\n";
-        SignalShutdown shutdown_on_signal([&]() { asr_server.stop(); });
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { asr_server.stop(); });
         if (!asr_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
@@ -710,10 +1246,15 @@ int VllmServerMain(int argc, char** argv) {
     engine_params.num_blocks = args.num_blocks;
     engine_params.gpu_memory_utilization = args.gpu_memory_utilization;
     engine_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+    engine_params.kv_cache_dtype = args.kv_cache_dtype;
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
+    // #607 L2: the multimodal input limits go onto the ENGINE, not into a
+    // server-local variable, so the C ABI and this server resolve one limit the
+    // same way and the chat seam can borrow the engine's copy.
+    engine_params.multimodal = args.multimodal;
     // --device: explicit device selection (ARCH-ONE-SURFACE ROW 8). "auto"
     // (default) keeps the accelerator-first probe byte-identical; an unknown
     // name throws HERE (a startup error), and an explicitly named ABSENT
@@ -761,6 +1302,17 @@ int VllmServerMain(int argc, char** argv) {
       }
       engine_params.kv_transfer_config = std::move(kv_cfg);
     }
+    // --offload-config: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b) and the
+    // vllm.cpp `vllm_cpp` residency tier (ENG-RESIDENCY-CONFIG). Both halves were
+    // parsed and validated above, ahead of the task branch, so that the pooling
+    // path gets them too and a malformed document is refused before the
+    // architecture peek (#1135). Empty (default) leaves both optionals unset —
+    // the byte-identical no-offload path.
+    engine_params.offload_config = parsed_offload_config;
+    engine_params.weight_residency = parsed_weight_residency;
+    // --mmproj: the second GGUF (LOAD-GGUF-MMPROJ, #821). Empty leaves the
+    // loader on its single-file path, byte-identically.
+    engine_params.mmproj_path = args.mmproj_path;
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The
     // parse validates method/k here; n_predict + the resolved k are finalized in
@@ -779,6 +1331,24 @@ int VllmServerMain(int argc, char** argv) {
     std::cerr << "server: prefix caching "
               << (loaded->prefix_caching_enabled() ? "enabled" : "disabled")
               << "\n";
+    // #607 L3: what the zero limits actually FREED, read back off the loaded
+    // MODEL rather than off `args`. The limits line above says what was asked
+    // for; this one says what happened, and until L3 the two could differ
+    // completely — the flag was accepted, every limit went to 0, and the tower
+    // was loaded anyway. Printing from `args` would restore exactly that gap,
+    // which is the mistake the weight-residency line records having made
+    // (model_loader.cpp, `ActiveWeightResidencyConfig`). Silent when nothing was
+    // skipped, so a text model and a multimodal model at their default limits
+    // both print nothing new.
+    {
+      const std::vector<std::string> skipped = loaded->skipped_towers();
+      if (!skipped.empty()) {
+        std::cerr << "server: multimodal towers NOT loaded (every modality they "
+                     "serve is at limit 0):";
+        for (const std::string& stage : skipped) std::cerr << " " << stage;
+        std::cerr << "\n";
+      }
+    }
     // W2: the production server uses AsyncLLM over EngineCoreProc's dedicated
     // engine thread. HTTP workers submit independently and stream from their
     // per-request collectors; no server-wide engine mutex remains.
@@ -787,11 +1357,11 @@ int VllmServerMain(int argc, char** argv) {
 
     if (args.cuda_profile_graph_replays > 0) {
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
       vt::cuda::ConfigureCudaGraphReplayProfiler(
           static_cast<uint32_t>(args.cuda_profile_graph_replays),
           static_cast<uint32_t>(args.cuda_profile_graph_batch));
-      std::cerr << "[VT_CUDA_PROFILE] ready pid=" << getpid()
+      std::cerr << "[VT_CUDA_PROFILE] ready pid=" << CurrentProcessId()
                 << " signal=SIGUSR2 target_replays="
                 << args.cuda_profile_graph_replays << "\n";
 #else
@@ -821,14 +1391,17 @@ int VllmServerMain(int argc, char** argv) {
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
       const std::string eos =
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
-      chat_prompt_fn =
-          vllm::entrypoints::MakeChatTemplatePromptFn(
-              chat_template, bos, eos, args.enable_thinking);
+      chat_prompt_fn = vllm::entrypoints::MakeChatTemplatePromptFn(
+          chat_template, bos, eos,
+          vllm::entrypoints::DefaultChatTemplateKwargs(args.enable_thinking));
       std::cerr << "server: using chat template (" << chat_template.size()
                 << " chars) from " << tokenizer_config_path
                 << " or sibling chat_template.jinja"
                 << " enable_thinking="
-                << (args.enable_thinking ? "true" : "false") << "\n";
+                << (args.enable_thinking.has_value()
+                        ? (*args.enable_thinking ? "true" : "false")
+                        : "unset (the template's own default)")
+                << "\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";
@@ -876,10 +1449,23 @@ int VllmServerMain(int argc, char** argv) {
     // tower + merge + MRoPE/DeepStack on the GPU worker consuming
     // Request.mm_features) is the remaining MM-SERVE-E2E residual — the engine
     // model runner has no mm-forward path yet. Kept alive for the server loop.
+    //
+    // #607 L2 / #686: the seam now REFUSES rather than truncates. It is
+    // constructed with a BaseProcessingInfo folding the engine's limits
+    // (loaded->mm_config(), where --limit-mm-per-prompt / --language-model-only
+    // landed) against this seam's own ceiling (Qwen3VLChatSupportedMmLimits —
+    // one image, no video, no audio), so a three-image request is answered with
+    // HTTP 400 "At most 1 image(s) may be provided in one prompt." instead of
+    // being served with its first image. Declared AFTER `loaded` so it is
+    // destroyed BEFORE the MultiModalConfig it references. It shares
+    // `mm_image_proc`'s lifetime shape exactly — both are borrowed by the
+    // closure `chat` holds and both outlive the server loop, which is the only
+    // time the closure runs.
+    std::unique_ptr<vllm::multimodal::BaseProcessingInfo> mm_proc_info;
     std::unique_ptr<vllm::multimodal::Qwen3VLImageProcessor> mm_image_proc;
     const std::string preprocessor_config_path =
-        (dir / "preprocessor_config.json").string();
-    if (fs::exists(preprocessor_config_path)) {
+        PathUtf8(dir / "preprocessor_config.json");
+    if (fs::exists(NativeUtf8Path(preprocessor_config_path))) {
       try {
         vllm::multimodal::Qwen3VLProcessorConfig pcfg =
             vllm::multimodal::LoadQwen3VLProcessorConfig(
@@ -911,8 +1497,16 @@ int VllmServerMain(int argc, char** argv) {
               "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
               "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
         };
+        mm_proc_info =
+            std::make_unique<vllm::multimodal::BaseProcessingInfo>(
+                loaded->mm_config(), oai::Qwen3VLChatSupportedMmLimits());
         chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
-            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec)));
+            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec),
+            *mm_proc_info));
+        for (const auto& [modality, limit] : mm_proc_info->AllowedMmLimits()) {
+          std::cerr << "server: multimodal limit " << modality << "=" << limit
+                    << " (over the request limit for this seam)\n";
+        }
         std::cerr << "server: multimodal image seam wired (Qwen3-VL processor "
                      "from "
                   << preprocessor_config_path << ")\n";
@@ -948,10 +1542,10 @@ int VllmServerMain(int argc, char** argv) {
     // file keeps exactly what an example may own: flag plumbing, the job
     // directory, and the ONE process spawn (ffmpeg, ratified 2026-08-03 — the
     // library builds the argv and spawns nothing). ────────────────────────────
-    std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> video_engine;
+    std::shared_ptr<vllm::multimodal::VideoEngine> video_engine;
     if (!args.video_dit.empty()) {
-      std::cerr << "server: loading MiniMax-H3 video checkpoints...\n";
-      vllm::multimodal::MiniMaxH3VideoModelParams vmp;
+      std::cerr << "server: loading video checkpoints...\n";
+      vllm::multimodal::VideoModelParams vmp;
       vmp.dit_path = args.video_dit;
       vmp.encoder_path = args.video_encoder;
       vmp.tokenizer_path = args.video_tokenizer;
@@ -960,12 +1554,41 @@ int VllmServerMain(int argc, char** argv) {
       vmp.audio_vae_path = args.audio_vae;
       vmp.audio_vae_config_path = args.audio_vae_config;
       vmp.prompt_embeds_path = args.video_prompt_embeds;
-      vmp.partition = args.video_partition;
+      // The H3-specific partition rides in the generic extras (LTX-2.5 L1).
+      if (!args.video_partition.empty()) vmp.extras["partition"] = args.video_partition;
+      // ...and every other family-specific knob rides there too, from
+      // --video-extra KEY=VALUE. Applied AFTER the partition alias so the two
+      // spellings of one key cannot disagree silently: a --video-extra
+      // partition=X that contradicts --video-partition Y is refused by name
+      // rather than resolved by whichever assignment ran last.
+      for (const auto& kv : args.video_extras) {
+        const auto existing = vmp.extras.find(kv.first);
+        if (existing != vmp.extras.end() && existing->second != kv.second) {
+          throw std::runtime_error("server: --video-extra " + kv.first + "=" + kv.second +
+                                   " contradicts the value already supplied for '" + kv.first +
+                                   "' ('" + existing->second +
+                                   "'). Refusing rather than preferring one.");
+        }
+        vmp.extras[kv.first] = kv.second;
+      }
       vmp.device = args.video_device == "cuda" ? 1 : 0;
       vmp.dequant_bf16 = args.video_dequant_bf16 ? 1 : 0;
       vmp.encoder_max_layers = args.video_encoder_max_layers;
-      video_engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(vmp);
-      std::cerr << "server: /v1/videos on (device=" << args.video_device
+      // --video-family PINS the family; empty keeps detection, which is what
+      // every invocation before this flag existed got and still gets. The flag
+      // exists now because a SECOND family is registered (LTX-2.5), and the two
+      // shipped LTX DiTs are separate files whose comparison is only a statement
+      // about the files if the family is declared rather than inferred. It is
+      // never a hint: an unregistered name was already refused at ParseArgs, and
+      // a declared family that cannot load the checkpoint fails loudly instead
+      // of falling back to detection.
+      vmp.family = args.video_family;
+      video_engine = vllm::multimodal::LoadVideoEngine(vmp);
+      std::cerr << "server: video family "
+                << (args.video_family.empty() ? "DETECTED" : "DECLARED (--video-family)")
+                << "\n";
+      std::cerr << "server: /v1/videos on (family=" << video_engine->family()
+                << ", device=" << args.video_device
                 << (args.video_dequant_bf16 ? ", dequant-bf16" : ", keep-quant") << ")\n";
       // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT
       // into conditioning needs the H3-Encoder; without one every request is
@@ -989,8 +1612,8 @@ int VllmServerMain(int argc, char** argv) {
         const std::string dir = workdir + "/job" + std::to_string(id);
         // The library-owned request mapping + generation: conditioning, task
         // resolution, the #77 partition guard, reference encoding, artifacts.
-        const vllm::multimodal::MiniMaxH3VideoResult out = video_engine->Generate(
-            vllm::multimodal::MiniMaxH3VideoGenParamsFromRequest(req, dir));
+        const vllm::multimodal::VideoResult out =
+            video_engine->Generate(vllm::multimodal::VideoGenParamsFromRequest(req, dir));
         // The ONE process spawn: exec the argv the library composed.
         std::vector<std::string> argv_mux = out.mux_argv;
         if (!argv_mux.empty()) argv_mux[0] = ffmpeg;
@@ -1000,6 +1623,54 @@ int VllmServerMain(int argc, char** argv) {
         }
         return out.mux_output_path;
       });
+    }
+
+    // ── Speech + music generation (W6 of #672). OPT-IN: with no --speech-model
+    // the route is never registered and the server is byte-identical to one
+    // built before this existed. ─────────────────────────────────────────────
+    std::shared_ptr<vllm::multimodal::SpeechEngine> speech_engine;
+    if (!args.speech_model.empty()) {
+      vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+      vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+      vllm::multimodal::SpeechModelParams smp;
+      smp.path = args.speech_model;
+      smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      smp.device = args.speech_device;   // 0 => CPU, the byte-identical default
+      std::string why;
+      // NOT `loaded`: that name is already taken by the TEXT engine in the
+      // enclosing scope, and MSVC's C4456 is a warning-as-error there, so the
+      // shadow red every pull request's `windows-msvc-*` pair with a failure
+      // about a line the author had not touched (#965).
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech_engine =
+          registry.Load(smp, &why);
+      if (loaded_speech_engine == nullptr) {
+        // `why` names every family that was tried and the path, so a startup
+        // failure is evidence rather than a verdict.
+        throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
+      }
+      speech_engine = std::move(loaded_speech_engine);
+      vllm::openai::SpeechCapabilities caps;
+      caps.family = speech_engine->family();
+      caps.sample_rate = speech_engine->sample_rate();
+      caps.requires_reference_audio = speech_engine->requires_reference_audio();
+      std::cerr << "server: /v1/audio/speech on (family=" << caps.family << ", "
+                << caps.sample_rate << " Hz, "
+                << (caps.requires_reference_audio ? "reference clip REQUIRED"
+                                                  : "text-only synthesis")
+                << ", speech family "
+                << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                << ", device " << vt::DeviceTypeName(speech_engine->device().type)
+                << ")\n";
+      // The request mapping is `vllm::openai::SynthesizeSpeechRequest` (library,
+      // speech_api.h) rather than a lambda body here: a mapping that only a
+      // running server can reach is a mapping no gate can call, and this route
+      // is the one an end-to-end claim is made about.
+      server.set_synthesizer(
+          [speech_engine](const vllm::openai::SpeechRequest& req)
+              -> vllm::openai::SpeechResponse {
+            return vllm::openai::SynthesizeSpeechRequest(*speech_engine, req);
+          },
+          caps);
     }
 
     oai::UtilityEndpointOptions endpoint_opts;
@@ -1040,7 +1711,7 @@ int VllmServerMain(int argc, char** argv) {
     std::cerr << ")\n";
 
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
     std::atomic<bool> benchmark_shutdown_waiter_ready{false};
     std::atomic<bool> benchmark_shutdown_received{false};
     std::atomic<bool> benchmark_shutdown_failed{false};
@@ -1069,7 +1740,7 @@ int VllmServerMain(int argc, char** argv) {
           return;
         }
         benchmark_shutdown_waiter_ready.store(true, std::memory_order_release);
-        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << getpid()
+        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << CurrentProcessId()
                   << " control=fifo\n";
         while (!benchmark_shutdown_cancelled.load(std::memory_order_acquire)) {
           char command = '\0';
@@ -1120,11 +1791,12 @@ int VllmServerMain(int argc, char** argv) {
     }
 #endif
 
-    SignalShutdown shutdown_on_signal([&]() { server.stop(); });
+    vllm::platform::ConsoleShutdown shutdown_on_signal(
+        [&]() { server.stop(); });
     const bool listen_ok = server.listen(args.host, args.port);
 
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
     if (benchmark_shutdown_thread.joinable()) {
       benchmark_shutdown_cancelled.store(true, std::memory_order_release);
       benchmark_shutdown_thread.join();

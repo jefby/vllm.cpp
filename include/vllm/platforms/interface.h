@@ -1,5 +1,8 @@
-// Faithful 1:1 port of vllm/platforms/interface.py:134-229 (class Platform) @
-// pin e24d1b24 — the device-capability / memory-model seam. See
+// Faithful 1:1 port of vllm/platforms/interface.py:134-1290 (class Platform) @
+// pin 5559679229 — the device-capability / memory-model seam. (Re-anchored from
+// `:134-229 @ e24d1b24`, the pin retired at W5: the class is unchanged in the
+// parts we mirror, and the cited `supported_dtypes` / `get_device_capability`
+// members moved rather than changing.) See
 // .agents/porting-inventory.md §9 note 8 (the platforms/ tree is a faithful
 // mirror of the upstream seam, NOT a deviation) and
 // .agents/specs/extensibility-platform-seam-2026-07-18.md.
@@ -53,6 +56,23 @@ struct ResidencyPolicy {
   // Optional soft cap (bytes) on pooled device scratch; 0 == uncapped (today).
   // Consumed by the DevicePool: a discrete GPU sets a bound; GB10 leaves it 0.
   size_t device_pool_cap_bytes = 0;
+  // Total device memory this platform can draw weight allocations from (bytes).
+  // 0 == UNKNOWN, and unknown must never be read as "unlimited" or as "nothing
+  // fits": a caller that cannot learn the budget declines to decide. Consumed by
+  // the load-time GGUF fit refusal (`gguf_device_fit.h`, issue #1123).
+  //
+  // TOTAL rather than FREE, because `free` at load time carries the page cache
+  // and whatever else the box is doing, which would make a load-time verdict a
+  // function of contention.
+  //
+  // This is NOT `vt::Backend::DeviceMemoryInfo`, which is a live free/total
+  // probe whose only consumer is `Gemma4MoE`'s device-expert LRU and which
+  // `CudaBackend` does not override at all -- so wiring CUDA into that seam
+  // would wake a landed residency policy that is currently dead on CUDA, which
+  // is a behaviour change with its own measurement to make (issue #1126).
+  // Probed once at platform registration; on a GB10 `cudaMemGetInfo` reports
+  // 128452956160 (119.631 GiB) where `nvidia-smi` reports `[N/A]`.
+  size_t device_memory_total_bytes = 0;
 };
 
 // Residency DECISIONS derived from a ResidencyPolicy — the single, testable place
@@ -75,15 +95,49 @@ inline bool ShouldInterleaveLoadStream(const ResidencyPolicy& policy,
   return marlin_committed && policy.release_host_weights_after_upload;
 }
 
-// The selection inputs of vllm/platforms/cuda.py::_get_backend_priorities @ pin
-// e24d1b24 (`use_mla`, `device_capability`, `num_heads`, `kv_cache_dtype`) plus
-// the sparse flag that `AttentionBackend.is_sparse()` /
-// `vllm/v1/attention/backend.py:307-360 validate_configuration` keys on. The
-// capability itself is NOT a field — it is the platform's own
-// `get_device_capability()`, exactly as upstream passes it in.
+// The CUDA platform's residency policy, assembled from the values its registrar
+// probes. `src/vllm/platforms/cuda.cpp` calls this and supplies
+// `cudaMemGetInfo`'s `total`; it holds no policy of its own.
 //
-// Defaults reproduce today's non-MLA dense selection EXACTLY, so every existing
-// caller (`get_attn_backend_priority()` with no argument) is unchanged.
+// A free function HERE, rather than a body inside that file, because that
+// translation unit compiles ONLY in a CUDA build. While the assembly lived there,
+// nothing on a host without a CUDA toolkit could reach it — no test, and no
+// mutation, which is why "delete the `device_memory_total_bytes` assignment" was
+// recorded as an owed mutation by #1123 instead of being proven. This header
+// compiles everywhere, so tests/vllm/platforms/test_platform.cpp pins the
+// assembly on every host and `cuda.cpp` is left holding only the probe it alone
+// can make (#1136). The probe itself is still not mutation-proven; a CUDA build
+// is the only thing that reaches the `cudaMemGetInfo` call.
+//
+// `device_memory_total_bytes` is 0 when the probe failed, which the load-time
+// GGUF fit refusal reads as UNKNOWN and never as "nothing fits".
+inline ResidencyPolicy CudaResidencyPolicy(size_t device_memory_total_bytes) {
+  ResidencyPolicy p;
+  p.release_host_weights_after_upload = true;  // freed after the Marlin build
+  p.uses_device_memory_pool = true;            // qwen3_5.cpp DevicePool
+  p.device_pool_cap_bytes = 0;                 // uncapped
+  p.device_memory_total_bytes = device_memory_total_bytes;
+  return p;
+}
+
+// A 1:1 port of `vllm/v1/attention/selector.py::AttentionSelectorConfig`
+// (`:24-39`) @ pin `5559679229` — the ONE request description upstream feeds to
+// BOTH `vllm/platforms/cuda.py::_get_backend_priorities` (`:83-163`) and
+// `vllm/v1/attention/backend.py::AttentionBackend.validate_configuration`
+// (`:320-393`). The capability itself is NOT a field — it is the platform's own
+// `get_device_capability()`, exactly as upstream passes it in beside the config
+// (`cuda.py:381-384`).
+//
+// It lives under `platforms/` rather than under `v1/` because
+// `Platform::get_attn_backend_priority` takes it and `platforms/` must not depend
+// on `v1/`. That is also why `attn_type` below is a STRING: upstream's
+// `AttentionType` is a `str` enum (`backend.py:38-46`) and `supports_attn_type`
+// takes a `str` (`:292-298`), so the string IS the faithful shape;
+// `vllm::v1::AttentionTypeName` converts our enum to it.
+//
+// Every default is upstream's, so every existing caller
+// (`get_attn_backend_priority()` with no argument, and the runner's dense walk)
+// keeps its exact selection behavior.
 struct AttnSelectorConfig {
   // model_config.use_mla — the MLA branch of _get_backend_priorities:93-142.
   // On our gate models (Qwen3 dense / GDN) this is false.
@@ -97,9 +151,44 @@ struct AttnSelectorConfig {
   // cuda.py:105 `num_heads is not None and num_heads <= 16` (sm_100 sparse-MLA
   // ordering only). 0 == unknown, upstream's `None`.
   int num_heads = 0;
-  // cuda.py:96 `is_quantized_kv_cache(kv_cache_dtype)` (sm_100 sparse-MLA
-  // ordering only). Our KV cache is bf16/f32 today, so false.
+  // cuda.py:98 `is_quantized_kv_cache(kv_cache_dtype)` (sm_100 sparse-MLA
+  // ordering only). Our KV cache is bf16/f32 today, so false. Upstream DERIVES
+  // this from `kv_cache_dtype` below; it stays a separate field because the MLA
+  // priority rows and their tests already read it, and the two are asserted
+  // consistent nowhere — recorded as such rather than silently unified.
   bool quantized_kv_cache = false;
+
+  // ─── selector.py:25-28 — the four inputs upstream makes REQUIRED ───────────
+  // The attention head dimension. 0 is accepted by every predicate whose
+  // supported list is empty, which is upstream's answer for an unconstrained
+  // backend (`backend.py:159-161`).
+  int head_size = 0;
+  // The model/query dtype (`supports_dtype`, backend.py:163-165). Upstream has
+  // no `None` here. The runner does not yet supply it (issue #1332 M4), so on
+  // the production path it keeps this default.
+  DType dtype = DType::kBF16;
+  // The KV-cache quantization name ("auto", "fp8", "fp8_e4m3", ...). EMPTY is
+  // upstream's `None`, which `supports_kv_cache_dtype` accepts outright
+  // (`backend.py:167-173`).
+  std::string kv_cache_dtype;
+  // The framework block size. 0 is upstream's `None`, accepted outright
+  // (`backend.py:176-178`).
+  int block_size = 0;
+
+  // ─── selector.py:30-39 — the request flags, upstream defaults ─────────────
+  bool has_sink = false;
+  bool use_mm_prefix = false;
+  bool use_per_head_quant_scales = false;
+  // `AttentionType` is a `str` enum upstream; "decoder" is `AttentionType.DECODER`.
+  std::string attn_type = "decoder";
+  bool has_sliding_window = false;
+  // Non-causal (bidirectional) decoder attention — DFlash's drafter sets it.
+  // Also a `_get_backend_priorities` input at this pin (`cuda.py:88,148`), which
+  // is issue #1333.
+  bool use_non_causal = false;
+  bool use_batch_invariant = false;
+  bool use_kv_connector = false;
+  bool use_pcp = false;
 };
 
 // Faithful port of vllm/platforms/interface.py:134-229 `class Platform`. Exposes
@@ -127,14 +216,40 @@ class Platform {
   // Graph/command capture capability (backend.h:80 SupportsGraphCapture).
   bool supports_graph_capture() const { return backend().SupportsGraphCapture(); }
 
-  // interface.py:409-415 get_device_capability. `present() == false` on CPU.
+  // interface.py:420-431 get_device_capability. **THE UNIT IS AN NVIDIA SM
+  // VERSION**, and upstream's docstring says so outright: "Stateless version of
+  // torch.cuda.get_device_capability". Every predicate written against this value
+  // — FlashAttentionBackend::supports_compute_capability (flash_attn.py:200-202,
+  // `>= (8, 0)`), CudaPlatform::supports_fp8 (`has_device_capability(8, 9)`) — is
+  // a statement about SM versions and about nothing else.
+  //
+  // A PLATFORM WITH NO SM VERSION REPORTS ABSENT (`present() == false`). It must
+  // never answer in a unit of its own, however natural that unit is on the
+  // device. That is upstream's rule, applied by upstream to itself in
+  // xpu.py:228-234: "capacity format differs from cuda's and will cause
+  // unexpected failure, so use None directly".
+  //
+  // Absent is also what makes ONE shared selector correct. Upstream reaches
+  // `validate_configuration` only from CudaPlatform (cuda.py:381,410, guarded by
+  // `assert device_capability is not None` at :404) and RocmPlatform
+  // (rocm.py:531,558); every other platform has its own get_attn_backend_cls and
+  // never evaluates the SM predicate (cpu.py:75-87). Our
+  // SelectAttentionBackendName is shared across every DeviceType, so what
+  // upstream gets from its callers we get from this contract: absent skips the
+  // predicate exactly as upstream's CPU/XPU platforms skip it, present feeds it
+  // an SM value exactly as upstream's CUDA/ROCm platforms do.
+  //
+  // Answering in a foreign unit was #1823: Metal reported the Apple GPU family
+  // and Vulkan the Vulkan API version, and an SM-8.0 bar was applied to both.
+  // tests/vllm/platforms/test_platform.cpp gates the contract for every
+  // registered platform.
   virtual DeviceCapability get_device_capability() const = 0;
 
-  // interface.py:417-439 has_device_capability — is this platform >= a required
+  // interface.py:433-454 has_device_capability — is this platform >= a required
   // (major, minor)? False when the platform has no queryable capability (CPU).
   bool has_device_capability(int major, int minor) const;
 
-  // interface.py:441-476 is_device_capability_family — is the device capability
+  // interface.py:481-493 is_device_capability_family — is the device capability
   // any <major>.x (CUDA-13 "family" architecture semantics, e.g. 10.x, 11.x,
   // 12.x)? Argument is a full capability int (e.g. 120), mirroring upstream's
   // `(current_capability.to_int() // 10) == (capability // 10)`. False when the
@@ -181,6 +296,46 @@ class Platform {
   // registration (torch is_integrated analogue, cudaDevAttrIntegrated); else
   // false. Surface parity for the ROCm/memory-reporting port; unwired today.
   virtual bool is_integrated_gpu() const { return false; }
+
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). May a KERNEL on this platform
+  // DEREFERENCE ordinary host storage — a `std::vector<uint8_t>`, an mmap'd
+  // file page — with no staging copy, no registration and no map/unmap call?
+  //
+  // This is a PROBED PHYSICAL PROPERTY, never a device name, an architecture
+  // string or a compute capability. CUDA answers from
+  // `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated`, probed once at
+  // registration; ROCm from the `pageable_memory_access` + `integrated` pair it
+  // already probes. The conjunction is the point: a DISCRETE card with HMM
+  // reports pageable access alone and would then serve every expert slice over
+  // PCIe with page migration, which is the opposite of what the caller wants.
+  //
+  // WHY NOT AN EXISTING PREDICATE. `is_cpu()` is what this lifts. Every one of
+  // the other four answers a different question:
+  //
+  //   needs_weight_staging()  is TRUE on CUDA everywhere, GB10 included, and is
+  //                           a PROGRAMMING-MODEL policy — the model's forward
+  //                           binds distinct device pointers. It would gate
+  //                           nothing here, and the two deliberately DISAGREE on
+  //                           GB10 (stages: yes; can read host memory: yes).
+  //   is_unified_memory()     answers the OPPOSITE question: CUDA on GB10
+  //                           reports unified because host and device address one
+  //                           physical pool, while a `cudaMalloc` pointer is
+  //                           still not host-dereferenceable — see
+  //                           `include/vt/backend.h::DeviceMemoryIsHostAddressable`.
+  //   is_integrated_gpu()     alone is insufficient:
+  //                           `src/vllm/platforms/rocm.cpp::is_integrated_gpu`
+  //                           records integrated-WITHOUT-pageable-access as a
+  //                           real device class, and on it a host pointer faults.
+  //   Backend::DeviceMemoryIsHostAddressable()
+  //                           is the MIRROR of this one and not a substitute. It
+  //                           asks whether a pointer from `Alloc()` may be
+  //                           dereferenced by the HOST; this asks whether a host
+  //                           pointer may be dereferenced by the DEVICE. GB10
+  //                           answers false to that one and true to this one.
+  //
+  // Base false, because being wrong here hands a host pointer to a device kernel.
+  // A platform must OPT IN from a probe, exactly like the backend seam above.
+  virtual bool host_memory_is_device_addressable() const { return false; }
 
   // interface.py:1058 + cuda.py:662 support_static_graph_mode — does this platform
   // support static (CUDA-graph) capture mode? CUDA: true; else false. Distinct
@@ -327,5 +482,34 @@ Platform& CurrentPlatform();
 // so the next backend cannot reintroduce that silence. Returns a pointer to a
 // static array of `count` entries.
 const DeviceType* CurrentPlatformPriority(size_t& count);
+
+// ENG-EXPERT-STREAM-DEVICE W0b, issue #1378. The DECISION behind
+// `CudaPlatform::host_memory_is_device_addressable()`, as a pure function of the
+// two probed attribute values, so it can be checked without the hardware.
+//
+// It exists because the conjunction was gated by nothing. The rule is declared
+// load-bearing in three places -- the base predicate's own comment above,
+// `src/vllm/platforms/cuda.cpp`'s probe, and this row's spec -- and the only CUDA
+// box this project can reach reports BOTH attributes as 1, so `test_platform`
+// could assert the implication (`!hmda || integrated`) and the board value and
+// still pass with either term deleted. Both mutations were run in the fresh
+// review of #1377 and both came back GREEN. A rule that no reachable input can
+// falsify is a comment, not a guard.
+//
+// The device class the conjunction is FOR is the one nobody here owns: a discrete
+// card with HMM answers `pageable = 1, integrated = 0`, and on it the lane would
+// serve ~6.95 GB of expert slices per token over PCIe with page migration. Taking
+// the arguments as the raw `int`s `cudaDeviceGetAttribute` writes, rather than as
+// `bool`s, keeps this callable with exactly the values the probe produced --
+// including the 0 a FAILED probe leaves behind, which is the conservative answer
+// and is part of what the cases pin.
+//
+// The ROCm leg answers the identical conjunction inside
+// `vt::rocm::HostMemoryIsDeviceAddressable` (`src/vt/rocm/rocm_backend.hip`). It
+// does NOT call this function and cannot: `vt` does not depend on `vllm`, and
+// inverting that layering to share four bytes of boolean algebra would be the
+// worse trade. The duplication is recorded here rather than left to be found.
+bool HostMemoryIsDeviceAddressableFromAttrs(int pageable_memory_access,
+                                            int integrated);
 
 }  // namespace vllm::platforms

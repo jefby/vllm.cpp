@@ -4,28 +4,13 @@
 //
 // MatmulBT: out[M,N] = a[M,K] @ b[N,K]^T  (b = Linear weight row-major)
 // Matmul:   out[M,N] = a[M,K] @ b[K,N]
-#include <hip/hip_bf16.h>
-#include <hip/hip_runtime.h>
-// hipBLAS ships TWO generations of the *Ex entry points and picks between them
-// in the header. The legacy generation takes `hipblasDatatype_t` (HIPBLAS_R_*);
-// the current one takes the HIP-wide `hipDataType` (HIP_R_*). This file is
-// written entirely against the current one — every data type below is HIP_R_*,
-// and the compute type is already the current `hipblasComputeType_t` — but it
-// never ASKED for it, so it only compiled on a ROCm new enough to make that
-// generation the default (7.x, where the row was developed on gfx1201).
-//
-// On ROCm 6.4 the legacy generation is the default, the two enums are distinct
-// types with no implicit conversion, and all six *Ex call sites fail with
-// "no matching function for call to 'hipblasGemmEx' ... no known conversion
-// from 'const hipDataType' to 'hipblasDatatype_t' for 9th argument" (issue #201,
-// gfx1100). Selecting the generation the file is written for fixes all six at
-// the include, rather than teaching six call sites to switch enums.
-//
-// Must precede <hipblas/hipblas.h>: it is what the header dispatches on. Newer
-// hipBLAS, where this generation is already the default, ignores it.
+// Required on ROCm 6.x for hipblasGemmEx overloads (#201/#132).
 #ifndef HIPBLAS_V2
 #define HIPBLAS_V2
 #endif
+
+#include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 
@@ -41,6 +26,10 @@
 #include <vector>
 
 #include "vt/ops.h"
+#include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_getblas_dualslot.h"
+#include "vt/rocm/rocm_runtime.h"
+#include "vt/rocm/rocm_skinny_gemm_arch.h"
 
 namespace vt::rocm {
 namespace {
@@ -81,31 +70,53 @@ struct BlasCtx {
   hipblasHandle_t handle = nullptr;
 };
 
-// Per-thread handle: hipBLAS is not free-threaded; decode is single-threaded per
-// engine worker. Avoid global mutex + SetStream on every GEMM (100s×/token).
+// Per-thread handles: hipBLAS is not free-threaded; decode is single-threaded
+// per engine worker. Avoid global mutex + SetStream on every GEMM (100s×/token).
+// Dual-slot (#837): hop 0→1 must not hipblasDestroy GPU0 while GPU0 GEMMs may
+// still be queued. Device 1 → slot 1; every other id shares slot 0.
+struct HipBlasHooks {
+  using handle_t = hipblasHandle_t;
+  using stream_t = hipStream_t;
+  static handle_t NullHandle() { return nullptr; }
+  static stream_t NullStream() { return nullptr; }
+  static bool IsNull(handle_t h) { return h == nullptr; }
+  static bool StreamIsCapturing(stream_t s) { return vt::rocm::StreamIsCapturing(s); }
+  static int GetDevice() {
+    int cur = -1;
+    if (hipGetDevice(&cur) != hipSuccess) return -1;
+    return cur;
+  }
+  static void SetDevice(int d) { CheckHip(hipSetDevice(d), "hipSetDevice"); }
+  static handle_t Create() {
+    handle_t h = nullptr;
+    CheckBlas(hipblasCreate(&h), "hipblasCreate");
+    return h;
+  }
+  static void Destroy(handle_t h) { (void)hipblasDestroy(h); }
+  static void SetStream(handle_t h, stream_t s) {
+    CheckBlas(hipblasSetStream(h, s), "hipblasSetStream");
+  }
+};
+
 BlasCtx GetBlas(int device, hipStream_t stream) {
-  struct Tls {
-    int dev = -1;
-    hipStream_t stream = nullptr;
-    hipblasHandle_t handle = nullptr;
-  };
-  static thread_local Tls tls;
-  if (tls.handle == nullptr || tls.dev != device) {
-    if (tls.handle) {
-      // device switch rare — destroy old handle
-      (void)hipblasDestroy(tls.handle);
-      tls.handle = nullptr;
-    }
-    CheckBlas(hipblasCreate(&tls.handle), "hipblasCreate");
-    tls.dev = device;
-    tls.stream = nullptr;
-  }
-  if (tls.stream != stream) {
-    CheckBlas(hipblasSetStream(tls.handle, stream), "hipblasSetStream");
-    tls.stream = stream;
-  }
-  return BlasCtx{tls.handle};
+  static thread_local GetBlasDualSlotEngine<HipBlasHooks> tls_slots;
+  HipBlasHooks hooks;
+  return BlasCtx{RocmProductGetBlasOn(tls_slots, device, stream, hooks)};
 }
+
+}  // namespace
+
+hipblasHandle_t ProductGetBlasHandle(int device, hipStream_t stream) {
+  // Same-TU call into file-local GetBlas (HipBlasHooks + tls_slots).
+  return GetBlas(device, stream).handle;
+}
+
+bool ProductGetBlasStreamIsCapturing(hipStream_t stream) {
+  // Exact production hook. Always-false mutation must turn the HIP probe RED.
+  return HipBlasHooks::StreamIsCapturing(stream);
+}
+
+namespace {
 
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
   return std::string("(") + Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(out.dtype);
@@ -136,48 +147,88 @@ hipblasComputeType_t GemmCompute(DType dt) {
   return k;
 }
 
-// VT_ROCM_GEMV=1 enables naive M=1 BF16 GEMV (default OFF — hipblas faster on gfx1201).
+// VT_ROCM_GEMV: 1=force custom M=1 BF16 GEMV, 0/unset=hipblas (faster on gfx1201 lab).
 bool GemvEnabled() {
   static const bool on = [] {
     if (const char* e = std::getenv("VT_ROCM_GEMV")) return e[0] == '1';
-    return false;
+    return false;  // hipblasGemmEx wins A/B 2026-08-09 (~52 vs ~40 t/s)
+  }();
+  return on;
+}
+
+// wvSplitK skinny GEMM (rocm_skinny_gemm.hip, #487): the split-K/LDS-staged
+// decode path that beats the 128x128-tile rocBLAS GEMM at M<=4. Default ON for
+// decode-skinny shapes; VT_ROCM_SKINNY=0 restores the BLAS path for A/B.
+bool SkinnyGemmEnabled() {
+  static const bool on = [] {
+    if (const char* e = std::getenv("VT_ROCM_SKINNY")) return e[0] != '0';
+    return true;
   }();
   return on;
 }
 
 // y[n] = alpha * dot(x[0:K], W[n,0:K]) + beta * y[n]
-// W row-major [N,K].
-// Strategy: cache x in LDS; each block owns a tile of output rows.
-// VT_ROCM_GEMV=1 to enable (default off — A/B vs hipblas).
-__global__ void Bf16GemvBTKernel(__hip_bfloat16* __restrict__ y,
-                                 const __hip_bfloat16* __restrict__ x,
-                                 const __hip_bfloat16* __restrict__ W, int N, int K,
-                                 float alpha, float beta) {
-  // Dynamic shared: x_cache[K] floats
+// grid = N — one block per output row; x cached in LDS; block-reduce over K.
+__global__ void Bf16GemvBTRowKernel(__hip_bfloat16* __restrict__ y,
+                                    const __hip_bfloat16* __restrict__ x,
+                                    const __hip_bfloat16* __restrict__ W, int N, int K,
+                                    float alpha, float beta) {
+  const int n = static_cast<int>(blockIdx.x);
+  if (n >= N) return;
   extern __shared__ float smem[];
   float* x_cache = smem;
-
-  // Cooperative load of x into LDS
-  for (int k = static_cast<int>(threadIdx.x); k < K; k += static_cast<int>(blockDim.x)) {
-    x_cache[k] = __bfloat162float(x[k]);
-  }
+  const int tid = static_cast<int>(threadIdx.x);
+  constexpr int kBlock = 256;
+  for (int k = tid; k < K; k += kBlock) x_cache[k] = __bfloat162float(x[k]);
   __syncthreads();
 
-  // Each thread owns one or more output rows
-  for (int n = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); n < N;
-       n += static_cast<int>(gridDim.x * blockDim.x)) {
-    const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
-    float acc = 0.f;
-    // Unroll-friendly scalar loop; x from LDS
-    int k = 0;
-    for (; k + 3 < K; k += 4) {
-      acc += x_cache[k] * __bfloat162float(wrow[k]);
-      acc += x_cache[k + 1] * __bfloat162float(wrow[k + 1]);
-      acc += x_cache[k + 2] * __bfloat162float(wrow[k + 2]);
-      acc += x_cache[k + 3] * __bfloat162float(wrow[k + 3]);
-    }
-    for (; k < K; ++k) acc += x_cache[k] * __bfloat162float(wrow[k]);
-    float v = alpha * acc;
+  const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
+  float acc = 0.f;
+  const int K16 = K & ~15;
+  for (int k = tid * 16; k < K16; k += kBlock * 16) {
+#pragma unroll
+    for (int t = 0; t < 16; ++t) acc += x_cache[k + t] * __bfloat162float(wrow[k + t]);
+  }
+  for (int k = K16 + tid; k < K; k += kBlock) acc += x_cache[k] * __bfloat162float(wrow[k]);
+
+  __shared__ float red[256];
+  red[tid] = acc;
+  __syncthreads();
+#pragma unroll
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float v = alpha * red[0];
+    if (beta != 0.f) v += beta * __bfloat162float(y[n]);
+    y[n] = __float2bfloat16(v);
+  }
+}
+
+// Fallback when K*f32 LDS too big: no x cache, threads stride K from global.
+__global__ void Bf16GemvBTRowNoLdsKernel(__hip_bfloat16* __restrict__ y,
+                                         const __hip_bfloat16* __restrict__ x,
+                                         const __hip_bfloat16* __restrict__ W, int N, int K,
+                                         float alpha, float beta) {
+  const int n = static_cast<int>(blockIdx.x);
+  if (n >= N) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  constexpr int kBlock = 256;
+  const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
+  float acc = 0.f;
+  for (int k = tid; k < K; k += kBlock)
+    acc += __bfloat162float(x[k]) * __bfloat162float(wrow[k]);
+  __shared__ float red[256];
+  red[tid] = acc;
+  __syncthreads();
+#pragma unroll
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float v = alpha * red[0];
     if (beta != 0.f) v += beta * __bfloat162float(y[n]);
     y[n] = __float2bfloat16(v);
   }
@@ -187,12 +238,16 @@ void Bf16GemvBT(hipStream_t s, void* out, const void* a, const void* b, int N, i
                 float alpha, float beta) {
   constexpr int kBlock = 256;
   if (K <= 0 || N <= 0) return;
-  const int grid = (N + kBlock - 1) / kBlock;
   const size_t shmem = static_cast<size_t>(K) * sizeof(float);
-  if (shmem > 48 * 1024) return;  // caller falls through if we no-op — keep K small
-  Bf16GemvBTKernel<<<grid, kBlock, shmem, s>>>(
-      static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
-      static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  if (shmem <= 48 * 1024) {
+    Bf16GemvBTRowKernel<<<N, kBlock, shmem, s>>>(
+        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
+        static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  } else {
+    Bf16GemvBTRowNoLdsKernel<<<N, kBlock, 0, s>>>(
+        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
+        static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  }
 }
 
 // VT_ROCM_HIPBLASLT=1 enables. Default OFF — heuristic path aborted on gfx1201 in lab.
@@ -412,11 +467,17 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 }
 
 // out[M,N] = a[M,K] @ b[N,K]^T
+// wvSplitK skinny-GEMM host entry (rocm_skinny_gemm.hip, #487). External
+// vt::rocm linkage to match the definition; declared beside its only caller.
+void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, int N,
+                int K, int device);
+
 // Row-major trick: gemm(OP_T, OP_N, N, M, K, B, K, A, a_rs, C, N)
 //   BLAS: C = op(A)*op(B) with opA=T => A is KxN in col form = row B[N,K]
 //   opB=N, B is KxM col = row A[M,K] with ld=a_rs
 //   C is NxM col = row out[M,N] ld=N
 void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  EnsureQueueDevice(q);
   const bool bf16 = a.dtype == DType::kBF16 && b.dtype == DType::kBF16;
   const bool f32 = a.dtype == DType::kF32 && b.dtype == DType::kF32;
   if (!bf16 && !f32) {
@@ -437,6 +498,26 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
   if (a.stride[0] < K) {
     throw std::runtime_error("vt rocm: matmul_bt: bad a stride");
+  }
+
+  // Decode-skinny (M<=4) bf16: the wvSplitK port wins over the 128-tile GEMM
+  // (#487). The dispatch guards mirror the donor EXACTLY (review sweep on
+  // #506 found all three of these dropped, two of them memory-unsafe):
+  //   * N > 8 (upstream `m > 8`, utils.py:181 — the feature-dim lower bound;
+  //     at N==1 the kernel's y=1 store writes C[1] past the end of a 1-wide
+  //     output);
+  //   * N % YTILE == 0 (skinny_gemms.cu:1217 `M_in % _YTILE == 0`; YTILE=2 —
+  //     the last wave's y=1 store lands at C[N] on odd N);
+  //   * wave32 arch only (the gfx9 ROW_BCAST reduction arm is not ported);
+  //   * K % 8 == 0 and the LDS-fit (K*M activation fits the staging buffer);
+  //   everything else stays on the BLAS path.
+  if (bf16 && out.dtype == DType::kBF16 && M >= 1 && M <= 4 && (K % 8) == 0 &&
+      N > 8 && (N % 2) == 0 && a.stride[0] == K && K * M <= 32768 &&
+      SkinnyGemmEnabled() &&
+      vt::rocm::SkinnyGemmArchOk(q.device.index, vt::rocm::DeviceArchName)) {
+    WvSplitKBT(s, out.data, a.data, b.data, static_cast<int>(M), static_cast<int>(N),
+               static_cast<int>(K), q.device.index);
+    return;
   }
 
   // Decode: M=1 BF16 GEMV

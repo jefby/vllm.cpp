@@ -23,9 +23,41 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vllm {
+
+// SPEC-DRAFTER-CHAIN W1 (#1522): one entry of the preference-ordered drafter
+// chain — the `vllm_cpp.drafter_chain` extension of `--speculative-config`.
+//
+// It is a list of OBJECTS and not llama.cpp's comma-separated `--spec-type`
+// name string (`common/arg.cpp:3754-3763`), because each entry carries its own
+// draft checkpoint and its own k. The fields are exactly the five HONOURED
+// top-level keys of the same document, with the same meanings, so an entry is
+// read the way a single-method config is read and there is no second spelling
+// of anything.
+//
+// vLLM has NO composition surface to mirror: `SpeculativeMethod` is a single
+// `Literal` and `SpeculativeConfig.method` one value of it, verified at the
+// parity pin `555967922` and at upstream `origin/main` `c20572610`
+// (.agents/specs/drafter-chain.md `## Upstream chain`). llama.cpp is the
+// secondary oracle for the SEMANTICS only.
+struct SpeculativeChainEntry {
+  // "mtp", "dflash", "dspark" or "ngram" — the four this engine implements and
+  // the four the row scopes. Never empty on a parsed entry.
+  std::string method;
+  // The entry's own k (`num_speculative_tokens`). std::nullopt = "not given",
+  // resolved per method exactly as the top-level key is.
+  std::optional<int> num_speculative_tokens = std::nullopt;
+  // The entry's own draft checkpoint (`model`). Required for "dflash" and
+  // "dspark"; meaningless for "mtp" (whose draft lives in the target) and for
+  // "ngram" (which has no draft model).
+  std::optional<std::string> draft_model_path = std::nullopt;
+  // The entry's own n-gram window. Only meaningful for "ngram".
+  std::optional<int> prompt_lookup_min = std::nullopt;
+  std::optional<int> prompt_lookup_max = std::nullopt;
+};
 
 // SpeculativeConfig (T0 scheduler subset). Value type; the Scheduler ctor reads
 // it (upstream vllm_config.speculative_config).
@@ -66,6 +98,22 @@ struct SpeculativeConfig {
   // reject P-EAGLE on the V2 runner (config/vllm.py:2168-2177); for us it is the
   // declarative marker that the propose path is block-shaped.
   bool parallel_drafting = false;
+
+  // SPEC-DRAFTER-CHAIN W1 (#1522): the preference-ordered drafter chain, in the
+  // order the user gave it. EMPTY is "no chain", which is every document that
+  // predates this field and every document vLLM accepts — the additivity the
+  // row is built on (.agents/specs/drafter-chain.md D1).
+  //
+  // W1 lands the field, its validation and its refusals, and NO chain
+  // behaviour. `LoadedEngine::ResolveSpecConfig` is the production reader: it
+  // refuses a chain BY NAME, before any weight I/O, rather than reducing it to
+  // one drafter or to no speculation at all. Resolution is owed by W3.
+  std::vector<SpeculativeChainEntry> drafter_chain;
+
+  // use_drafter_chain: whether this config asks for a chain at all. The one
+  // predicate every consumer asks, so "empty vector means absent" is stated
+  // once instead of at each call site.
+  bool use_drafter_chain() const { return !drafter_chain.empty(); }
 
   // ResolveMtp: build the scheduler-facing SpeculativeConfig for a Qwen3.5 MTP
   // checkpoint. Mirrors speculative.py:480-489 (method "mtp",
@@ -111,14 +159,59 @@ struct SpeculativeConfig {
     return cfg;
   }
 
+  // IsDflash2Draft: whether a DFlash draft is a DFlash2 one, by the architecture
+  // upstream itself selects on.
+  //
+  // BEYOND-PIN (SPEC-DFLASH2 W1, #1314). vllm-project/vllm#52816 MERGED upstream
+  // on 2026-08-21 at 05:27:22Z, at head
+  // `3406ec1dae9916f920b90f0dbf90dcf54923d042`, merge commit
+  // `b389ac29465b33f9e9c534df221ea3c129e9793f`. This comment said OPEN at head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f` -- the FIRST of three heads the
+  // pull request carried -- and was doubly stale; corrected 2026-08-21 by the
+  // W6 repair wave. The parity pin `555967922` still does not carry the
+  // architecture at all, this row does NOT advance the pin, and reconciling the
+  // port onto the merged head is owed under #1561.
+  // Upstream registers `"DFlash2DraftModel" -> ("qwen3_dflash2",
+  // "DFlash2Qwen3ForCausalLM")` (`model_executor/models/registry.py:628`) and
+  // asks exactly this question in two places: the speculator selection
+  // (`v1/worker/gpu/spec_decode/__init__.py:12`) and `_is_dflash2_draft`
+  // (`config/vllm.py:668-676`), both spelled as membership of the string in the
+  // draft config's `architectures`. The precedent for mirroring an open pull
+  // request ahead of the pin is `SPEC-DSPARK-QWEN3-ROUTING` toward vllm#52197,
+  // argued at .agents/specs/dflash2-spec-decode.md D1.
+  //
+  // It answers a QUESTION and refuses nothing. The refusal — with the missing
+  // parts named — belongs to the loader, which is where a user arrives
+  // (src/vllm/entrypoints/model_loader.cpp::ResolveSpecConfig).
+  static bool IsDflash2Draft(const std::vector<std::string>& architectures) {
+    for (const std::string& arch : architectures) {
+      if (arch == "DFlash2DraftModel") return true;
+    }
+    return false;
+  }
+
   // IsDsparkDraft: the DSpark half of upstream's method auto-detection
   // (speculative.py:881-887) — a draft whose model id contains "dspark"
   // (case-insensitively, e.g. deepseek-ai/dspark_qwen3_8b_block7 or
   // RedHatAI/Qwen3.6-35B-A3B-speculator.dspark) OR whose architectures name
   // "Qwen3DSparkModel" / "Gemma4DSparkModel". Kept separate from ResolveDspark so
   // the loader can classify a checkpoint before building any config.
+  //
+  // BEYOND-PIN (SPEC-DSPARK-QWEN3-ROUTING, #1193): the fourth arm — the
+  // "DSparkDraftModel" + model_type "qwen3" PAIR — is vllm-project/vllm#52197
+  // hunk 1, merged 2026-08-17 at 7075ddac28c25d4fd2b84bc2a9a6c5ffde0345c8 and
+  // absent from the pin 555967922. It is mirrored AHEAD of the pin because the
+  // pinned behavior is wrong for a checkpoint that is published and loads here
+  // today (RadixArk/Qwen3.8-27B-DSpark declares exactly that pair);
+  // .agents/specs/dspark-qwen3-routing.md §2 carries the decision and the three
+  // model-matrix precedents for the mark.
+  //
+  // `model_type` defaults to the empty string so a caller holding only the
+  // architecture list asks exactly the pinned question and gets the pinned
+  // answer.
   static bool IsDsparkDraft(const std::string& draft_model_id,
-                            const std::vector<std::string>& architectures) {
+                            const std::vector<std::string>& architectures,
+                            const std::string& model_type = "") {
     std::string lowered = draft_model_id;
     for (char& c : lowered) {
       c = static_cast<char>(
@@ -131,8 +224,89 @@ struct SpeculativeConfig {
       if (arch == "Qwen3DSparkModel" || arch == "Gemma4DSparkModel") {
         return true;
       }
+      // vllm#52197 hunk 1 (BEYOND-PIN): the same architecture string names a
+      // DeepSeek-V4 draft when model_type is "deepseek_v4", so the PAIR is the
+      // condition and the architecture alone is not.
+      if (arch == "DSparkDraftModel" && model_type == "qwen3") {
+        return true;
+      }
     }
     return false;
+  }
+
+  // ResolveDsparkArchitecture: the architecture normalization upstream performs
+  // before a DSpark draft loads (speculative.py:934-944 @ 555967922, plus
+  // vllm-project/vllm#52197 hunk 2, BEYOND-PIN). Upstream writes the result back
+  // onto the draft's hf_config and calls update_arch_(); this returns it,
+  // because our loader dispatches on the value instead of mutating a config
+  // object it will read again.
+  //
+  // Upstream's three branches, in upstream's own order:
+  //   1. "DSparkDraftModel" + model_type "qwen3" -> ["Qwen3DSparkModel"] (#52197)
+  //   2. neither "Qwen3DSparkModel" nor "Gemma4DSparkModel" -> the DeepSeek-V4
+  //      rewrite (model_type "deepseek_v4", architectures ["DSparkDraftModel"])
+  //   3. "Gemma4DSparkModel" -> key normalization only; the architecture stands
+  //
+  // The order is the whole of #52197: branch 1 is a guard in front of a
+  // catch-all, so the specific case is claimed before the general one rewrites
+  // it.
+  //
+  // TWO TRACKED DIVERGENCES, and both are deliberate.
+  //
+  // DIVERGENCE 1, at branch 2. Upstream rewrites the config and lets the
+  // DeepSeek-V4 model path take it. That path does not exist here:
+  // DeepseekV4Model is a stub that fails a VT_CHECK
+  // (src/vllm/model_executor/models/deepseek_v4_registry.cpp) and the lane needs
+  // two Sparks. Mirroring the rewrite would send the draft into the stub and
+  // fail on an internal check instead of naming the missing arm, so branch 2
+  // REFUSES by name — which is what AGENTS.md requires of an unimplemented arm.
+  // .agents/specs/dspark-qwen3-routing.md §7 R2 records the decision.
+  //
+  // DIVERGENCE 2, at branch 3. Upstream leaves a Gemma4 draft's architecture
+  // ALONE — "Gemma4DSparkModel" stands and only its keys are normalized
+  // (speculative.py:945-961) — because upstream has a Gemma4 DSpark model class
+  // to dispatch to. This engine does not: LoadQwen3DSpark is the one DSpark
+  // draft lane, and both published layouts load through it
+  // (src/vllm/entrypoints/model_loader.cpp::LoadDsparkDraft). So branch 3
+  // COLLAPSES onto "Qwen3DSparkModel" together with branch 1, and this function
+  // answers exactly one lane or throws. The collapse is what makes a
+  // lane-dispatch guard at the call site dead code today; it is undone by the
+  // change that lands a second lane, not before.
+  // .agents/specs/dspark-qwen3-routing.md §3 designs it this way.
+  static std::string ResolveDsparkArchitecture(
+      const std::vector<std::string>& architectures,
+      const std::string& model_type) {
+    bool has_draft_model = false;
+    bool has_qwen3 = false;
+    bool has_gemma4 = false;
+    for (const std::string& arch : architectures) {
+      if (arch == "DSparkDraftModel") has_draft_model = true;
+      if (arch == "Qwen3DSparkModel") has_qwen3 = true;
+      if (arch == "Gemma4DSparkModel") has_gemma4 = true;
+    }
+    if (has_draft_model && model_type == "qwen3") {
+      return "Qwen3DSparkModel";  // #52197 hunk 2, the leading branch
+    }
+    if (!has_qwen3 && !has_gemma4) {
+      std::string listed;
+      for (const std::string& arch : architectures) {
+        if (!listed.empty()) listed += ", ";
+        listed += "\"" + arch + "\"";
+      }
+      throw std::invalid_argument(
+          "speculative-config: this DSpark draft routes to the DeepSeek-V4 "
+          "DSpark lane, which is not implemented here. Upstream rewrites a "
+          "draft whose architectures name neither \"Qwen3DSparkModel\" nor "
+          "\"Gemma4DSparkModel\" onto model_type \"deepseek_v4\" and "
+          "architectures [\"DSparkDraftModel\"] "
+          "(vllm/config/speculative.py:934-944 @ 555967922), and this engine "
+          "carries only a DeepseekV4Model stub for that lane, which also needs "
+          "two Sparks. Got architectures [" +
+          listed + "] with model_type \"" + model_type +
+          "\". Owed by row SPEC-DSPARK-QWEN3-ROUTING "
+          "(.agents/specs/dspark-qwen3-routing.md).");
+    }
+    return "Qwen3DSparkModel";
   }
 
   // ResolveDspark: build the scheduler-facing SpeculativeConfig for a DSpark
@@ -153,9 +327,20 @@ struct SpeculativeConfig {
   //
   // `n_predict` / `dspark_block_size` are std::nullopt when the draft's HF config
   // carries no such key, mirroring upstream's getattr(..., None).
-  static SpeculativeConfig ResolveDspark(std::optional<int> n_predict,
-                                         std::optional<int> dspark_block_size,
-                                         std::optional<int> user_num_speculative_tokens) {
+  //
+  // `block_size_key` names the config key `dspark_block_size` was read from, and
+  // exists only so the refusal can quote it. Upstream has one key and can name it
+  // literally; we have two, because the fallback below reads `block_size` on the
+  // published Qwen3 drafts (the divergence argued in
+  // .agents/specs/dspark-block-size-guard.md section 2). A message that says
+  // `dspark_block_size` when the 7 came from `block_size` sends the user looking
+  // for a key their checkpoint does not carry, which on both published drafts is
+  // always the case. It defaults to upstream's key, so a caller that supplies the
+  // upstream field gets upstream's wording unchanged.
+  static SpeculativeConfig ResolveDspark(
+      std::optional<int> n_predict, std::optional<int> dspark_block_size,
+      std::optional<int> user_num_speculative_tokens,
+      std::string_view block_size_key = "dspark_block_size") {
     SpeculativeConfig cfg;
     cfg.method = "dspark";
     cfg.parallel_drafting = true;
@@ -177,11 +362,17 @@ struct SpeculativeConfig {
           "\"num_speculative_tokens\" was not provided");
     }
     if (dspark_block_size.has_value() && *k < *dspark_block_size) {
+      // speculative.py:1021-1026 verbatim, including the third sentence that
+      // says which value to use. It was dropped when the check was first ported
+      // and is restored here: the first two sentences tell the user the k is
+      // wrong, and only the third tells them what to type.
       throw std::invalid_argument(
-          "speculative-config: DSpark requires num_speculative_tokens >= "
-          "dspark_block_size (" +
+          "speculative-config: DSpark requires num_speculative_tokens >= " +
+          std::string(block_size_key) + " (" +
           std::to_string(*dspark_block_size) + "); got " + std::to_string(*k) +
-          ". Smaller values produce incorrect output.");
+          ". Smaller values produce incorrect output. Use "
+          "num_speculative_tokens=" +
+          std::to_string(*dspark_block_size) + " or larger (e.g. 7).");
     }
     cfg.num_speculative_tokens = k;
     return cfg;
@@ -306,6 +497,22 @@ struct SpeculativeConfig {
   // separate bonus query.
   bool use_dspark() const { return method == "dspark"; }
 
+  // async_scheduling_compatible (SPEC-DFLASH2 W7, #1824): whether async
+  // scheduling stays ON with this speculative method. Mirrors the pin's
+  // resolution predicate (vllm/config/vllm.py:1076-1087 @ 555967922): async is
+  // disabled only for a method OUTSIDE
+  //   EagleModelTypes ∪ NgramGPUTypes ∪ {"dspark"}
+  // where EagleModelTypes = eagle / eagle3 / extract_hidden_states / every MTP
+  // type / dflash (speculative.py:60-65). Over the methods THIS engine
+  // implements that is exactly use_eagle() — mtp, dflash (DFlash2 rides method
+  // "dflash", same as upstream at b389ac2946 speculative.py:952-956), dspark,
+  // eagle, eagle3. Host "ngram" is NOT upstream's async lane ("ngram_gpu" is a
+  // different, GPU-side implementation this engine does not have), and
+  // "draft_model" is refused AT THE PIN (b389ac2946 later allows it —
+  // vllm/config/vllm.py:1291 there — but the pin governs; reconcile when the
+  // pin advances past that commit).
+  bool async_scheduling_compatible() const { return use_eagle(); }
+
   // NumLookaheadTokens: the scheduler's num_lookahead_tokens for this config
   // (scheduler.py:275-292). This is the value threaded into allocate_slots so the
   // verify slots are reserved ahead of time. 0 for a method the scheduler does
@@ -324,12 +531,23 @@ struct SpeculativeConfig {
 
 // Parse vLLM's `--speculative-config` JSON (SPEC-MTP I5d). Mirrors the subset of
 // vllm/engine/arg_utils.py speculative-config handling the CLI needs: the
-// `method` string and the optional `num_speculative_tokens`. "mtp" and "dflash"
-// (SPEC-DFLASH D4) are supported at this pin; any other method throws. The
-// returned config has n_predict == 0 — the loader resolves it from the model's
-// mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp (MTP) or the draft's
-// dflash_config via ResolveDflash (DFlash) once the HF config is known. Throws
-// std::invalid_argument on a malformed document / unknown method.
+// `method` string and the optional `num_speculative_tokens`. The accepted
+// methods at this pin are "mtp", "dflash" (SPEC-DFLASH D4), "dspark"
+// (SPEC-DSPARK W1), "ngram" (SPEC-NGRAM) and "draft_model" (SPEC-DRAFT-MODEL);
+// any other method throws. Every key is judged by name and none is dropped
+// (#1160). The returned config has n_predict == 0 — the loader resolves it from
+// the model's mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp (MTP) or
+// the draft's dflash_config via ResolveDflash (DFlash) once the HF config is
+// known. Throws std::invalid_argument on a malformed document / unknown method.
+//
+// SPEC-DRAFTER-CHAIN W1 (#1522): the document also accepts this engine's own
+// `vllm_cpp` extension object, whose only key is `drafter_chain` — a JSON array
+// of speculator entries in preference order, filling `drafter_chain` above.
+// `method` is REQUIRED exactly when that field is ABSENT: the two are mutually
+// exclusive, so a chain document leaves `method` empty and a chain-free one is
+// unchanged in every respect (spec `.agents/specs/drafter-chain.md` D7). This
+// function parses and validates the chain; `LoadedEngine::ResolveSpecConfig`
+// refuses one by name, because nothing resolves a chain at this wave.
 SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text);
 
 }  // namespace vllm

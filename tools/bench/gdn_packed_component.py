@@ -39,6 +39,7 @@ from tools.bench.online_gate import (
     TRACE_CLEAN_FIXED_ENV,
     TRACE_REQUIRED_ENV,
     TRACE_SYSTEM_PATH,
+    VLLM_DISTRIBUTION_VERSION,
     VLLM_ORACLE_VERSION,
     _fingerprint_tree,
     _parse_fp4_plan_log,
@@ -52,10 +53,12 @@ from tools.bench.serve_low_common import (
     HarnessError,
     SGLANG_COMMIT,
     VLLM_COMMIT,
+    assert_oracle_commit,
     canonical_json,
     coefficient_of_variation,
     percentile,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     sha256_file,
     write_json_atomic,
@@ -383,6 +386,10 @@ def _run_metrics(record: Mapping[str, Any]) -> dict[str, float]:
 def _recompute_timing_metrics(record: Mapping[str, Any]) -> dict[str, float]:
     """Recompute every accepted timing axis from the detailed raw samples."""
 
+    # #931: every axis below is a rate over the leg's wall duration, and that
+    # duration still contains whatever a dead request spent before failing.
+    # The caller validates too; this is the site that produces the number.
+    require_complete_request_set(record, source="component raw result")
     duration = require_number(record.get("duration"), "duration")
     if duration <= 0.0:
         raise HarnessError("duration must be positive")
@@ -1586,10 +1593,14 @@ def _validate_execution(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, 
         oracle.get("bench_dependencies") != execution["bench_dependencies"]
         or oracle.get("client_contract_source_commit") != VLLM_COMMIT
         or oracle.get("cutlass_source_tree") != cutlass_record
-        or oracle.get("oracle_version") != VLLM_ORACLE_VERSION
+        # `oracle_version` is the DISTRIBUTION metadata string, which differs
+        # from the runtime one on the pin (#520); they were both compared to the
+        # runtime constant while the two happened to be equal at 0.25.0.
+        or oracle.get("oracle_version") != VLLM_DISTRIBUTION_VERSION
         or oracle.get("runtime_version") != VLLM_ORACLE_VERSION
     ):
         raise HarnessError("component execution oracle manifest differs")
+    assert_oracle_commit(oracle.get("runtime_version"))
     oracle_artifacts = oracle.get("artifacts")
     if not isinstance(oracle_artifacts, Mapping) or set(oracle_artifacts) != set(
         _ORACLE_ARTIFACT_NAMES
@@ -1927,6 +1938,12 @@ _WARMUP_MARKER_RE = re.compile(
     r"^warmup_leg_(begin|end) arm=(packed|rollback) "
     rf"label={re.escape(WARMUP_LABEL)}$"
 )
+# The lock path is resolved on the running host from `${GPU_LOCK:-$HOME/gpu.lock}`
+# (#777), so the marker records WHICH file was held rather than asserting a
+# literal here. `\S+` and not `.+`: an empty or whitespace path is a driver bug,
+# not a lock, and must not read as a recorded acquisition.
+_LOCK_ACQUIRED_RE = re.compile(r"^gpu_lock_acquired path=(?P<path>\S+)$")
+_LOCK_RELEASED_RE = re.compile(r"^gpu_lock_released path=(?P<path>\S+)$")
 
 
 def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
@@ -1935,10 +1952,24 @@ def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError as error:
         raise HarnessError(f"missing evidence artifact: {path}") from error
-    if lines.count("gpu_lock_acquired path=/tmp/gpu") != 1:
+    # The lock PATH is `${GPU_LOCK:-$HOME/gpu.lock}` and therefore host-resolved
+    # (#777) -- it used to be a literal here, naming the private lock file that
+    # serialised with nothing. What this must still pin is unchanged: exactly one
+    # acquisition and exactly one release, and they name the SAME file. A run
+    # that acquired one path and released another never held one lock, and that
+    # is now expressible, so it is checked rather than assumed.
+    acquired = [line for line in lines if _LOCK_ACQUIRED_RE.fullmatch(line)]
+    released = [line for line in lines if _LOCK_RELEASED_RE.fullmatch(line)]
+    if len(acquired) != 1:
         raise HarnessError("component does not record one GPU-lock acquisition")
-    if lines.count("gpu_lock_released path=/tmp/gpu") != 1:
+    if len(released) != 1:
         raise HarnessError("component does not record one GPU-lock release")
+    lock_path = _LOCK_ACQUIRED_RE.fullmatch(acquired[0]).group("path")
+    if _LOCK_RELEASED_RE.fullmatch(released[0]).group("path") != lock_path:
+        raise HarnessError(
+            "component acquires and releases DIFFERENT GPU-lock paths, so it "
+            "never held one lock"
+        )
     if lines.count("gpu_series_complete") != 1:
         raise HarnessError("component GPU series terminus is absent")
     if lines.count("corpus_validated") != 1:
@@ -1974,9 +2005,9 @@ def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
         raise HarnessError(
             "component warmup discard legs do not follow the exact per-arm order"
         )
-    acquisition = lines.index("gpu_lock_acquired path=/tmp/gpu")
+    acquisition = lines.index(acquired[0])
     corpus_validated = lines.index("corpus_validated")
-    release = lines.index("gpu_lock_released path=/tmp/gpu")
+    release = lines.index(released[0])
     first_marker = lines.index(
         f"leg_begin concurrency={CONCURRENCIES[0]} arm=packed repetition=1"
     )

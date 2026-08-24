@@ -4,11 +4,6 @@ How to port a model, kernel, or feature. The rules are in
 [`AGENTS.md`](../AGENTS.md); this is the method. Nothing here is binding on its
 own.
 
-Porting a **model** specifically? Work through
-[`porting-a-model.md`](porting-a-model.md) as well — this file is the method,
-that one is the coverage checklist (weight formats including GGUF k-quants,
-multimodal, speculative decoding, the serving surface, records).
-
 ## Before you write anything
 
 Verify the recorded gap against the *current* pinned upstream and the current
@@ -27,9 +22,11 @@ Commit the spike spec with source and dependency anchors. Then implement.
 ## The port cycle
 
 Implement the smallest coherent *vertical* slice — something that runs
-end-to-end, not a layer that nothing calls yet. Keep local names and structure
-mechanically traceable to upstream so the next person can diff them by eye.
-Record every C++ adaptation you had to make and why.
+end-to-end, not a layer that nothing calls yet. That is a rule, not a
+preference: see [`reachability.md`](reachability.md) for what counts as reached,
+and for how to land a staged slice that is not reached yet. Keep local names and
+structure mechanically traceable to upstream so the next person can diff them by
+eye. Record every C++ adaptation you had to make and why.
 
 Port the upstream test before the behavior. Capture the red. Implement. Get
 focused green. Run the full gate. Then hand to a fresh reviewer.
@@ -48,6 +45,57 @@ Anything genuinely written from scratch is recorded as such in
 [`porting-inventory.md`](porting-inventory.md) §9. "I couldn't find it upstream"
 is a search result, not a conclusion — say which paths you searched.
 
+### Name the symbol, not only the line
+
+A line number is a coordinate into a moving file, so it decays. Write
+`` `path/to/file.cpp::SymbolName` `` whenever a citation crosses a file
+boundary. Keep the line number beside it only while you are reading; a citation
+that has to survive somebody else's edit carries the symbol.
+
+`src/vllm/entrypoints/model_loader.cpp` is the measured case
+([#1143](https://github.com/mudler/vllm.cpp/issues/1143)): cited by line from
+109 sites in 45 files, and one 45-line insertion near its top moved 203 of those
+references at once, in files that change never opened. The same defect at
+upstream scale is [#1139](https://github.com/mudler/vllm.cpp/issues/1139), where
+a pin advance left three `vllm/v1/worker/**` line anchors pointing at unrelated
+code and two of them had already been copied elsewhere.
+
+`scripts/check-symbol-anchors.py` gates the in-repo half of the convention: the
+symbol a citation names must still be in the file it names. `--upstream-root
+<vllm-checkout>` runs the same question against the pinned oracle, which CI
+cannot do because it has no checkout. Design, limits, and what the two runs
+measured: [`specs/citation-anchor-freshness.md`](specs/citation-anchor-freshness.md).
+
+## Mirror the memory format, not just the math
+
+**A token-exactness gate cannot catch a dtype that is too WIDE.** F32 where
+upstream uses bf16 is *more* precise: tokens still match, SACRED still passes,
+and we quietly move twice the bytes. Every correctness gate we own is blind to
+it. So it has to be checked deliberately, once per ported path:
+
+| Ask | Where upstream answers it |
+|---|---|
+| What dtype does the linear method OUTPUT? | the quant method's `apply`/`out_dtype` (e.g. ModelOpt fp8 uses `torch.get_default_dtype()` = bf16) |
+| What `kv_cache_dtype` is RESOLVED for this checkpoint? | it is not always the CLI default — vLLM derives it from `kv_cache_quant_algo` in the checkpoint's `quantization_config` |
+| What dtype do the intermediate activation buffers carry? | read the consumer, not the producer: a buffer is only as narrow as whoever reads it |
+| Is a projection one physical GEMM or several? | merged linears (`QKVParallelLinear`, `MergedColumnParallelLinear`) are one, and upstream may requantize mismatched shards rather than decline to merge |
+
+Record the answers in the row's spec. If we deliberately diverge — a wider
+accumulate for a reason — say so and say what it costs in bytes per token.
+
+**Confirm the resolved config at RUNTIME, not from source.** Upstream logs its
+resolved engine config on startup; read it. This project has repeatedly had a
+confident source reading contradicted by a runtime log — a kernel name read as a
+fusion, a code path read as selected when a capability predicate excluded it, a
+cache dtype read as the CLI default when the checkpoint overrode it. Source
+inspection establishes candidates; the running engine establishes what ran.
+
+**Why this section exists:** a dtype divergence on the largest activation
+buffers is a per-token cost. It is therefore invisible at batch 1 with a short
+prompt, invisible to token gates, and shows up only as a flat throughput deficit
+that does not shrink with concurrency — the hardest signature to attribute after
+the fact.
+
 ## Shared seams
 
 Route through the shared path or record one exact tracked exception:
@@ -61,7 +109,9 @@ Route through the shared path or record one exact tracked exception:
 
 A capability reachable only through an example's internals is not shipped. Grow
 the ABI first, then rewrite the example as a thin client, then delete the
-parallel implementation.
+parallel implementation. The same holds for the shapes no checker sees: a
+parameter no caller passes, a branch no released config selects, a flag with no
+default path through it.
 
 New hardware and new models are additive files mirroring vLLM's structure — not
 edits that special-case an existing path.

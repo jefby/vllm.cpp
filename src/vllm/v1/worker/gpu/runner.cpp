@@ -14,21 +14,29 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre: Qwen3_5MTPModel complete type for the owned draft member
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
+#include "vllm/v1/attention/backend.h"  // AttentionBackend / get_kv_cache_shape (M3)
+#include "vllm/v1/attention/registry.h"  // SelectAttentionBackendName / MakeAttentionBackend (M3)
 #include "vllm/v1/kv_cache_dtype.h"  // ResolveKvCacheDType (VT_KV_CACHE_F32 A/B)
 #include "vllm/v1/kv_offload/lmcache/lmcache_connector.h"  // KV-EXTERNAL-CACHE worker store/load
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) the graph-eligibility predicate
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
-#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
+#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 SampleDflashBlockDrafts
+#include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"  // SPEC-DFLASH2 W3/W4: Dflash2SelectCandidates, Dflash2WalkPath
 #include "vllm/v1/worker/gpu/spec_decode/dspark/speculator.h"  // SPEC-DSPARK W5 SampleDsparkBlockDrafts
 #include "vllm/v1/spec_decode/ngram_proposer.h"  // SPEC-NGRAM D3 NgramPropose
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
@@ -308,6 +316,66 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
   }
   return sizes;
 }
+
+// ── #810: per-layer KV membership from the GROUP the model published ────────
+//
+// Upstream never parses a per-layer config string to decide what a layer's
+// cache is. `get_kv_cache_spec()` walks the instantiated modules
+// (`gpu_model_runner.py:7785-7787`), groups layers by their SPEC OBJECT
+// (`kv_cache_utils.py:1209-1211` `same_type_layers[layer_spec].append(name)`),
+// and then fans metadata out BY LAYER NAME (`gpu_model_runner.py:2548-2549`).
+// `KVCacheGroupSpec.layer_names` (`kv_cache_interface.py:938-947`, mirrored at
+// `include/vllm/v1/kv_cache_interface.h:343`) is the durable signal; a config
+// spelling such as `layer_types` is not, and a hybrid whose config does not
+// speak Qwen3.5's dialect (NemotronH ships `layers_block_type`, no
+// `layer_types`) has an EMPTY one.
+//
+// Our runner still indexes buffers by layer POSITION, so a published name has
+// to be resolved back to an index. `LayerIndexOfName` does exactly that and
+// nothing else: the integer of the `.layers.<N>.` segment of an upstream-style
+// module path ("backbone.layers.5.mixer", "model.layers.12.self_attn").
+//
+// It deliberately returns nullopt for a PLACEHOLDER group name — "fa", "gdn",
+// "mla", "kda", "fa_draft", the single-name convention every other registry
+// uses today — because such a name carries no layer identity at all. That is
+// what keeps this additive: a group that does not publish per-layer names falls
+// back to the historical `config_.layer_types` predicate, byte for byte.
+std::optional<int64_t> LayerIndexOfName(std::string_view name) {
+  constexpr std::string_view kSep = ".layers.";
+  const size_t at = name.find(kSep);
+  if (at == std::string_view::npos) return std::nullopt;
+  size_t i = at + kSep.size();
+  const size_t start = i;
+  int64_t value = 0;
+  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+    value = value * 10 + (name[i] - '0');
+    if (value > (1 << 20)) return std::nullopt;  // not a layer index
+    ++i;
+  }
+  if (i == start) return std::nullopt;              // ".layers.mixer"
+  if (i < name.size() && name[i] != '.') return std::nullopt;  // ".layers.5x"
+  return value;
+}
+
+// The per-layer membership mask of one KV cache group, or nullopt when the
+// group does not publish per-layer names.
+//
+// ALL-OR-NOTHING on purpose: a group is only read by name when EVERY one of its
+// names resolves to a distinct in-range layer index. A partially-parseable
+// group would silently drop the layers whose names did not parse, which is the
+// silent-wrong-answer shape this whole row exists to remove.
+std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
+                                                int64_t num_layers) {
+  if (group.layer_names.empty()) return std::nullopt;
+  std::vector<bool> mask(static_cast<size_t>(num_layers), false);
+  for (const std::string& name : group.layer_names) {
+    const std::optional<int64_t> l = LayerIndexOfName(name);
+    if (!l.has_value() || *l < 0 || *l >= num_layers) return std::nullopt;
+    if (mask[static_cast<size_t>(*l)]) return std::nullopt;  // duplicate index
+    mask[static_cast<size_t>(*l)] = true;
+  }
+  return mask;
+}
 }  // namespace
 
 GPUModelRunner::GPUModelRunner(
@@ -333,12 +401,22 @@ GPUModelRunner::GPUModelRunner(
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
   // draft token at a verify step's draft position with the committed token.
-  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // so force the sync host input path here. Byte-identical for non-spec
-  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  // and its sampler is the sync one, so the host arrays stay fresh).
+  // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
+  // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
+  // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
+  // this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
+  // env/backend predicate WITHOUT the spec veto above — a spec engine keeps
+  // the sync host input path (the combine is not draft-aware) while still
+  // advertising the scheduler overlap, mirroring upstream keeping async
+  // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
+  async_sched_supported_ =
+      AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -374,12 +452,22 @@ GPUModelRunner::GPUModelRunner(
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
   // draft token at a verify step's draft position with the committed token.
-  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // so force the sync host input path here. Byte-identical for non-spec
-  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  // and its sampler is the sync one, so the host arrays stay fresh).
+  // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
+  // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
+  // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
+  // this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
+  // env/backend predicate WITHOUT the spec veto above — a spec engine keeps
+  // the sync host input path (the combine is not draft-aware) while still
+  // advertising the scheduler overlap, mirroring upstream keeping async
+  // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
+  async_sched_supported_ =
+      AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -438,6 +526,22 @@ GPUModelRunner::CacheBuffer::~CacheBuffer() {
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   num_blocks_ = kv_cache_config.num_blocks;
+  // ENGINE-LEVEL ATTENTION-BACKEND SELECTION (M3, issue #41) happens INSIDE the
+  // full-attention region below, never here: a pure-GDN / pooling model that
+  // caches no paged KV must not pay selection, and a platform whose priority
+  // list yields no dense backend must fail loudly only for models that actually
+  // need one (the empty-list loud-throw design, rocm.cpp W0). The resolution
+  // block lives in the full-attn region; the per-group validation in the view
+  // loop below.
+  // Resolved LAZILY per group kind, on first use in the view loop below: a
+  // pure-MLA model never resolves (or validates) a dense backend, and a dense
+  // model never resolves MLA. `dense_backend` throws loudly if the platform has
+  // no registered dense backend (the empty-list loud-throw design); `mla_backend`
+  // stays empty on a device with no registered MLA backend (op-driven MLA).
+  std::string dense_backend;
+  std::string mla_backend;
+  bool dense_backend_resolved = false;
+  bool mla_backend_resolved = false;
   // GDN mamba-state slots = max concurrent sequences (one recurrent state per
   // sequence), decoupled from the attention num_blocks. Guard against a 0 (e.g.
   // a test path that skipped the ctor arg) by falling back to num_blocks.
@@ -495,16 +599,37 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // layer, in LAYER ORDER (matches Qwen3_5Model::Forward's per-layer fa_idx /
   // gdn_idx indexing). As in upstream, MambaSpec is the source of truth for the
   // recurrent tensors' order, shapes, dtypes, and page bytes.
-  const int64_t Hk = config_.linear_num_key_heads;
-  const int64_t Hv = config_.linear_num_value_heads;
-  const int64_t Dk = config_.linear_key_head_dim;
-  const int64_t Dv = config_.linear_value_head_dim;
-  const int64_t Kw = config_.linear_conv_kernel_dim;
-  const int64_t key_dim = Hk * Dk;
-  const int64_t value_dim = Hv * Dv;
-  const int64_t conv_dim = 2 * key_dim + value_dim;
-  // SPEC-MTP I5d: conv state row width, (Kw-1)+num_spec under speculation.
-  const int64_t conv_state_len = spec_on() ? (Kw - 1 + num_spec()) : (Kw - 1);
+  //
+  // #810: SPEC-DRIVEN, exactly like the attention half below. This block used
+  // to rebuild the geometry from `config_.linear_num_key_heads` /
+  // `linear_conv_kernel_dim` and then REFUSE when the model's own published
+  // spec disagreed with that reconstruction — so the comment above stated a
+  // polarity the code did not have, and every hybrid whose config does not
+  // speak Qwen3.5's `linear_*` dialect (NemotronH ships `mamba_num_heads`,
+  // `mamba_head_dim`, `ssm_state_size`, `conv_kernel`) was refused by Qwen3.5's
+  // name for shapes it never claimed.
+  //
+  // Upstream cannot express that cross-check at all. Its runner allocates raw
+  // BYTES (`gpu_model_runner.py:7311-7313` `torch.zeros(..., dtype=torch.int8)`)
+  // and hands the Mamba layer an untyped page view (`:7429-7441`); the unpack
+  // into typed conv/SSM views happens in the LAYER
+  // (`mamba/abstract.py:38-43`: `nbytes = prod(shape) * get_dtype_size(dtype)`).
+  // The runner never holds a conv shape, so it has nothing to compare. That is
+  // why the check is DELETED rather than widened or put behind a per-arch
+  // switch: it was a SECOND, independent derivation of a number the model had
+  // already published, and a second derivation is the thing that can disagree.
+  // It is also why `MambaSpec` (`kv_cache_interface.py:690-703`, mirrored at
+  // `include/vllm/v1/kv_cache_interface.h:302-323`) deliberately carries no
+  // num_heads/head_dim/conv_dim: the geometry IS `shapes`.
+  //
+  // SPEC-MTP I5d is now free: the conv row widened to (K-1)+num_spec under
+  // speculation is simply what `MakeQwen3_5KVCacheSpec` publishes
+  // (mamba_utils.py:226), so reading the spec picks it up with no spec_on()
+  // branch here at all.
+  std::vector<int64_t> conv_state_shape;  // per SLOT, spec order [0]
+  std::vector<int64_t> ssm_state_shape;   // per SLOT, spec order [1]
+  int64_t conv_row_elems = 0;
+  int64_t ssm_row_elems = 0;
 
   const MambaSpec* mamba_spec = nullptr;
   if (gdn_group_id_ >= 0) {
@@ -512,19 +637,27 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         kv_cache_config.kv_cache_groups[static_cast<size_t>(gdn_group_id_)]
             .kv_cache_spec.get());
     VT_CHECK(mamba_spec != nullptr,
-             "runner: GDN cache group must carry a MambaSpec");
+             "runner: recurrent cache group must carry a MambaSpec");
     VT_CHECK(mamba_spec->shapes.size() == 2 &&
                  mamba_spec->dtypes.size() == 2,
-             "runner: Qwen3.5 MambaSpec must contain conv then temporal state");
-    // SPEC-MTP I5d: the conv state row is widened to (Kw-1)+num_spec when
-    // speculation is on (MakeQwen3_5KVCacheSpec / mamba_utils.py:226), so accept
-    // the spec-driven width rather than the fixed Kw-1. The SSM state shape is
-    // unchanged (the extra draft snapshots live in extra SLOTS, not a wider row).
-    const std::vector<int64_t> expected_conv_shape{conv_dim, conv_state_len};
-    const std::vector<int64_t> expected_ssm_shape{Hv, Dv, Dk};
-    VT_CHECK(mamba_spec->shapes[0] == expected_conv_shape &&
-                 mamba_spec->shapes[1] == expected_ssm_shape,
-             "runner: Qwen3.5 MambaSpec shapes disagree with model config");
+             "runner: recurrent MambaSpec must contain conv then temporal state");
+    conv_state_shape = mamba_spec->shapes[0];
+    ssm_state_shape = mamba_spec->shapes[1];
+    // The GdnStateCache view prepends the SLOT dim, so a state shape may carry
+    // at most kMaxRank-1 dims. Refuse rather than silently truncate.
+    VT_CHECK(!conv_state_shape.empty() && !ssm_state_shape.empty() &&
+                 conv_state_shape.size() < static_cast<size_t>(vt::kMaxRank) &&
+                 ssm_state_shape.size() < static_cast<size_t>(vt::kMaxRank),
+             "runner: MambaSpec state shapes must be 1..kMaxRank-1 dims");
+    const auto row_elems = [](const std::vector<int64_t>& shape) {
+      int64_t n = 1;
+      for (int64_t d : shape) n *= d;
+      return n;
+    };
+    conv_row_elems = row_elems(conv_state_shape);
+    ssm_row_elems = row_elems(ssm_state_shape);
+    VT_CHECK(conv_row_elems > 0 && ssm_row_elems > 0,
+             "runner: MambaSpec state shapes must be positive");
     gdn_conv_cache_dtype_ = mamba_spec->dtypes[0];
     gdn_ssm_cache_dtype_ = mamba_spec->dtypes[1];
     const auto supported_state_dtype = [](vt::DType dtype) {
@@ -533,7 +666,18 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     };
     VT_CHECK(supported_state_dtype(gdn_conv_cache_dtype_) &&
                  supported_state_dtype(gdn_ssm_cache_dtype_),
-             "runner: Qwen3.5 MambaSpec state dtypes must be floating");
+             "runner: recurrent MambaSpec state dtypes must be floating");
+    // The per-slot byte cost the allocator will use IS the spec's page size —
+    // upstream's `MambaSpec.page_size_bytes` is the sum of `prod(shape) *
+    // dtype_size` over the state tensors (`kv_cache_interface.py:699-703`).
+    // Assert the identity rather than re-deriving it anywhere else.
+    VT_CHECK(conv_row_elems *
+                     static_cast<int64_t>(vt::SizeOf(gdn_conv_cache_dtype_)) +
+                 ssm_row_elems *
+                     static_cast<int64_t>(vt::SizeOf(gdn_ssm_cache_dtype_)) ==
+                 mamba_spec->page_size_bytes(),
+             "runner: MambaSpec page_size_bytes disagrees with its own "
+             "shapes and dtypes");
   }
 
   // SPEC-DRIVEN attention-cache sizing and layout (MLA campaign W1).
@@ -563,6 +707,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   int64_t Dh = 0;
   int64_t fa_page_bytes = 0;
   vt::DType kv_dtype = ResolveKvCacheDType();
+  // KV-FP8 W3: the group-level fp8 interpretation + scales, defaulting to the
+  // inert float path. Read off the SAME AttentionSpec as `kv_dtype` below.
+  vt::Fp8KVCacheDataType kv_fp8_kind = vt::Fp8KVCacheDataType::kAuto;
+  float kv_k_scale = 1.0F;
+  float kv_v_scale = 1.0F;
   if (full_attn_group_id_ >= 0) {
     const KVCacheSpec* fa_spec =
         kv_cache_config.kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
@@ -574,6 +723,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     Hkv = attn_spec->num_kv_heads;
     Dh = attn_spec->head_size;
     kv_dtype = attn_spec->dtype;
+    kv_fp8_kind = attn_spec->fp8_kind;
+    kv_k_scale = attn_spec->k_scale;
+    kv_v_scale = attn_spec->v_scale;
     fa_page_bytes = attn_spec->page_size_bytes();
     // The PagedKvCache view carries ONE head_size, so an asymmetric-V full
     // attention layer cannot be viewed by it. MLA's own view (a later W) is a
@@ -585,6 +737,32 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     }
     VT_CHECK(fa_page_bytes > 0,
              "runner: full-attention spec reported a non-positive page size");
+
+    // ENGINE-LEVEL ATTENTION-BACKEND SELECTION (M3, issue #41) is the first
+    // runtime call of the selection seam, and it happens PER GROUP in the view
+    // loop below — lazily per kind, inside the full-attn region, never for a
+    // pure-GDN / pooling model (which has no full-attn groups and therefore no
+    // paged KV to validate).
+    //
+    // Dense: LOUD. A model with dense full-attention groups needs a dense
+    // backend; a platform whose priority list yields none (how Vulkan and ROCm
+    // started) fails at init instead of silently running unlabelled. On ROCm
+    // this resolves "ROCM_ATTN" (backend.cpp, M3); on CPU "CPU_ATTN"
+    // (cpu_attn.cpp, issue #1371 — upstream's own CPU answer at cpu.py:75-87);
+    // on CUDA/Metal/Vulkan "FLASH_ATTN". All four names report the same NHD KV
+    // layout, which is the layout every one of those device kernels reads — the
+    // name changed on CPU, the geometry validated below did not.
+    // Mirrors upstream resolving get_attn_backend_cls per attention layer
+    // (gpu_model_runner.py:6994-7099); we group by KV-cache kind because this
+    // engine allocates exactly one layout per kind.
+    //
+    // MLA: TOLERANT. The engine executes MLA through TritonMLAImpl on a fused
+    // 3-dim cache regardless of the registry (deepseek_v2.cpp:576-578), so on a
+    // device with no registered MLA backend (CPU, ROCm today) the name stays
+    // empty and the group keeps running op-driven — a loud throw would regress
+    // working MLA paths. On CUDA this resolves "TRITON_MLA", whose
+    // get_kv_cache_shape is exactly the fused view the engine allocates.
+
     // Positive signal that the SPEC (not the HF config) drove this allocation:
     // opt-in, one line, never on the hot path.
     if (const char* dbg = std::getenv("VT_KV_ALLOC_LOG");
@@ -633,6 +811,55 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // group), then the per-layer layer_types tag. This is model-shape-agnostic:
   // the hybrid gate models keep a GDN group, so their path is byte-identical.
   const bool has_mamba_group = gdn_group_id_ >= 0;
+  // #810: PER-LAYER MEMBERSHIP FROM THE PUBLISHED GROUP, when the model
+  // publishes one. `KVCacheGroupSpec::layer_names` is what upstream keys
+  // per-layer KV on end to end (see LayerIndexOfName above); the runner keyed
+  // on `config_.layer_types[l] == "linear_attention"` instead, which is a
+  // Qwen3.5 config spelling. NemotronH's `layer_types` is EMPTY, so all 52
+  // layers classified as full attention: zero recurrent buffers and ~8.7x the
+  // attention pages actually needed (52 against 6 real GQA layers).
+  //
+  // BYTE-NEUTRALITY CONTRACT, mirroring the one `per_layer_attn_specs` states
+  // at `include/vllm/v1/kv_cache_interface.h:354-374`: the by-name path is
+  // entered ONLY when the recurrent group — and the target attention group, if
+  // there is one — publish per-layer names that all resolve to distinct
+  // in-range layer indices. Every registry shipping today publishes a single
+  // PLACEHOLDER name per group ("fa"/"gdn", "mla"/"kda", "fa_draft"), which
+  // resolves to nothing, so every existing model takes the `layer_types`
+  // fallback below and gets byte-identical allocation, view, indexing and
+  // kernel dispatch to before this field was read. This is a capability probe
+  // on the record the model published, NOT a per-architecture switch: any
+  // future hybrid that publishes real names is routed correctly with no new
+  // branch, which is the whole point (`hf_config.cpp:484-528` synthesizing
+  // Qwen3.5's dialect for Kimi-Linear is the anti-pattern this replaces).
+  const int64_t num_layers = config_.num_hidden_layers;
+  std::optional<std::vector<bool>> gdn_layer_mask;
+  std::optional<std::vector<bool>> attn_layer_mask;
+  if (has_mamba_group) {
+    gdn_layer_mask = GroupLayerMask(
+        kv_cache_config.kv_cache_groups[static_cast<size_t>(gdn_group_id_)],
+        num_layers);
+    if (gdn_layer_mask.has_value() && full_attn_group_id_ >= 0) {
+      attn_layer_mask =
+          GroupLayerMask(kv_cache_config
+                             .kv_cache_groups[static_cast<size_t>(
+                                 full_attn_group_id_)],
+                         num_layers);
+      // A recurrent group that names its layers next to an attention group that
+      // does not leaves the non-recurrent layers unclassifiable. Fall back
+      // wholesale rather than guess.
+      if (!attn_layer_mask.has_value()) gdn_layer_mask.reset();
+    }
+  }
+  const bool membership_by_name = gdn_layer_mask.has_value();
+  if (membership_by_name && attn_layer_mask.has_value()) {
+    for (int64_t l = 0; l < num_layers; ++l) {
+      VT_CHECK(!((*gdn_layer_mask)[static_cast<size_t>(l)] &&
+                 (*attn_layer_mask)[static_cast<size_t>(l)]),
+               "runner: a layer is named by BOTH the attention and the "
+               "recurrent KV cache group");
+    }
+  }
   // PER-LAYER KV head_dim (Gemma-4 G1b). When the model publishes a per-layer
   // attention spec (heterogeneous head_dim: sliding 256 / global 512), each
   // non-GDN layer allocates + views its OWN head_size/num_kv_heads/page_size.
@@ -654,21 +881,46 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     int64_t num_kv_heads;
     int64_t head_size;
     vt::DType dtype;
+    // KV-FP8 W3: the fp8 interpretation + per-tensor scales, carried from the
+    // same spec that supplied `dtype` and `page_size_bytes()`. They travel with
+    // the dtype because the page width and the byte's meaning are one decision.
+    vt::Fp8KVCacheDataType fp8_kind;
+    float k_scale;
+    float v_scale;
   };
   std::vector<FaDims> fa_dims;
-  for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
-    const bool is_gdn =
-        has_mamba_group && !config_.layer_types.empty() &&
-        config_.layer_types[static_cast<size_t>(l)] == "linear_attention";
+  // Parallel to fa_dims: 1 when the layer's spec kind is kMlaAttention (the
+  // fused 3-dim cache view) vs 0 for a dense NHD layer.
+  std::vector<char> mla_layer_mask;
+  layer_kv_class_.assign(static_cast<size_t>(num_layers), LayerKvClass::kNone);
+  for (int64_t l = 0; l < num_layers; ++l) {
+    bool is_gdn = false;
+    bool is_full_attn = false;
+    if (membership_by_name) {
+      is_gdn = (*gdn_layer_mask)[static_cast<size_t>(l)];
+      is_full_attn = !is_gdn && attn_layer_mask.has_value() &&
+                     (*attn_layer_mask)[static_cast<size_t>(l)];
+    } else {
+      // The historical predicate, unchanged. A full-attention-only model (e.g.
+      // dense Qwen3ForCausalLM) has NO recurrent group and an EMPTY
+      // layer_types — indexing layer_types[l] would be out of bounds.
+      is_gdn = has_mamba_group && !config_.layer_types.empty() &&
+               config_.layer_types[static_cast<size_t>(l)] ==
+                   "linear_attention";
+      is_full_attn = !is_gdn;
+    }
+    layer_kv_class_[static_cast<size_t>(l)] =
+        is_gdn ? LayerKvClass::kRecurrent
+               : (is_full_attn ? LayerKvClass::kFullAttention
+                               : LayerKvClass::kNone);
     if (is_gdn) {
       VT_CHECK(mamba_spec != nullptr,
                "runner: linear-attention layer has no MambaSpec");
       // Raw buffers use their independent cache dtypes. Zero bytes are +0.0f
-      // for every supported floating storage type.
+      // for every supported floating storage type. Per-slot element counts come
+      // from the SPEC's shapes (#810), not from HF-config arithmetic.
       const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
       const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
-      const int64_t conv_row_elems = conv_dim * conv_state_len;
-      const int64_t ssm_row_elems = Hv * Dv * Dk;
       ssm_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
           static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
@@ -677,7 +929,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           dev, queue_,
           static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
           kv_cache_backend_resident_));
-    } else {
+    } else if (is_full_attn) {
       // Bytes come from the SPEC, not from HF-config arithmetic: exactly
       // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
       // `kv_cache_interface.py:380-398` sizing contract. For a symmetric
@@ -694,6 +946,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       int64_t l_Dh = Dh;
       int64_t l_page = fa_page_bytes;
       vt::DType l_dtype = kv_dtype;
+      vt::Fp8KVCacheDataType l_fp8_kind = kv_fp8_kind;
+      float l_k_scale = kv_k_scale;
+      float l_v_scale = kv_v_scale;
       if (has_per_layer) {
         const std::shared_ptr<AttentionSpec>& sp =
             kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
@@ -702,6 +957,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         l_Hkv = sp->num_kv_heads;
         l_Dh = sp->head_size;
         l_dtype = sp->dtype;
+        l_fp8_kind = sp->fp8_kind;
+        l_k_scale = sp->k_scale;
+        l_v_scale = sp->v_scale;
         l_page = sp->page_size_bytes();
         // Same guard as the group spec: the PagedKvCache view carries ONE
         // head_size, so an asymmetric-V layer is not expressible in it.
@@ -717,8 +975,28 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           dev, queue_,
           static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
-      fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
+      fa_dims.push_back(
+          FaDims{l_Hkv, l_Dh, l_dtype, l_fp8_kind, l_k_scale, l_v_scale});
+      // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
+      // backend name (TRITON_MLA for an MLA group) and the right expected KV
+      // shape (fused 3-dim, not the NHD 5-dim) per group.
+      const KVCacheSpecKind layer_kind = has_per_layer
+          ? kv_cache_config
+                .per_layer_attn_specs[static_cast<size_t>(l)]->kind()
+          : kv_cache_config
+                .kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
+                .kv_cache_spec->kind();
+      mla_layer_mask.push_back(layer_kind == KVCacheSpecKind::kMlaAttention);
     }
+    // else: this layer is named by NO KV cache group, so it caches nothing.
+    // Reachable only on the by-name path, and it is the correct answer there:
+    // NemotronH's 52 blocks are 6 attention + 23 Mamba2 + 23 MoE, and an MoE
+    // block registers no attention module at all, so upstream's
+    // `get_kv_cache_spec()` yields no entry for it
+    // (`gpu_model_runner.py:7785-7801` walks `AttentionLayerBase` instances).
+    // The `layer_types` fallback cannot express this third class — every
+    // non-recurrent layer there is an attention layer — which is why it
+    // allocated 52 attention pages for a model that needs 6.
   }
 
   // Build the views over the (now stable) backing storage. `fa_dims` is parallel
@@ -726,6 +1004,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   VT_CHECK(fa_dims.size() == full_attn_buf_.size(),
            "runner: per-layer KV view geometry out of sync with buffers");
   attn_kv_.clear();
+  attn_backend_names_.clear();
   for (size_t i = 0; i < full_attn_buf_.size(); ++i) {
     PagedKvCache kv;
     kv.data = full_attn_buf_[i]->data();
@@ -734,6 +1013,102 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.block_size = fa_block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
+    // KV-FP8 W3: the fp8 interpretation + scales reach the model's attention
+    // block ONLY through this view, which is what makes `--kv-cache-dtype fp8`
+    // a served capability rather than a resized allocation.
+    kv.fp8_kind = fa_dims[i].fp8_kind;
+    kv.k_scale = fa_dims[i].k_scale;
+    kv.v_scale = fa_dims[i].v_scale;
+    // M3: the backend selection resolved for THIS group must describe the view
+    // geometry the engine allocates + KvSlice reads — the NHD 5-dim
+    // (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group,
+    // the fused MLA 3-dim (num_blocks, block_size, head_size) for an MLA group
+    // (vllm::v1::CheckKvCacheShape). An empty name (MLA on a device with no
+    // registered MLA backend) means op-driven execution — nothing to validate.
+    // A future backend with a different layout fails LOUDLY here at init.
+    const bool is_mla =
+        mla_layer_mask[static_cast<size_t>(i)] != 0;
+    // #1332 M1: the selector now applies the full validate_configuration
+    // capability surface, so the request it is asked has to BE the request. The
+    // three fields this site can answer come straight from the geometry it just
+    // resolved. `dtype` (the model/query dtype) is NOT available here — the
+    // runner resolves only ResolveKvCacheDType() — so it keeps its bf16 default;
+    // that is owed to #1332 M4 and recorded under `## Owed` in
+    // .agents/specs/attn-validate-configuration.md.
+    //
+    // AND READ THIS BEFORE READING A GREEN SELECTION AS A WORKING BACKEND: the
+    // name resolved here still reaches only attn_backend_names_, the
+    // VT_ATTN_SELECT_LOG print below and CheckKvCacheShape. dense_attn::AttnBlock
+    // calls vt::PagedAttention unconditionally. Nothing DISPATCHES on this. #1332
+    // M4 owns that, and until it lands a valid name is a claim, not a route.
+    vllm::platforms::AttnSelectorConfig cfg;
+    cfg.head_size = static_cast<int>(fa_dims[i].head_size);
+    cfg.num_heads = static_cast<int>(fa_dims[i].num_kv_heads);
+    cfg.block_size = static_cast<int>(fa_block_size);
+    // KV-FP8 W3: `KvCacheDTypeName` cannot answer this one, and deliberately so
+    // — a bare `kI8` byte does not know its semantic type (`vt/dtype.h:20-32`),
+    // exactly as upstream stores every fp8 flavour as `torch.uint8`
+    // (`torch_utils.py:38-40`) and reads the flavour off the layer. The
+    // interpretation is the thing that knows, so ask it.
+    cfg.kv_cache_dtype =
+        fa_dims[i].fp8_kind == vt::Fp8KVCacheDataType::kFp8E4M3
+            ? "fp8_e4m3"
+            : (fa_dims[i].fp8_kind == vt::Fp8KVCacheDataType::kFp8E5M2
+                   ? "fp8_e5m2"
+                   : vllm::v1::KvCacheDTypeName(fa_dims[i].dtype));
+    cfg.quantized_kv_cache = vllm::v1::IsQuantizedKvCacheName(cfg.kv_cache_dtype);
+
+    std::string name;
+    if (is_mla) {
+      if (!mla_backend_resolved) {
+        mla_backend_resolved = true;
+        vllm::platforms::AttnSelectorConfig mla_cfg = cfg;
+        mla_cfg.use_mla = true;
+        try {
+          mla_backend = vllm::v1::SelectAttentionBackendName(
+              vllm::platforms::GetPlatform(queue_.device.type), "", mla_cfg);
+        } catch (const std::exception&) {
+          // Op-driven MLA (no registered MLA backend for this device) —
+          // recorded, not an error; see attn_backend_names_ in runner.h.
+        }
+      }
+      name = mla_backend;
+    } else {
+      if (!dense_backend_resolved) {
+        dense_backend_resolved = true;
+        dense_backend = vllm::v1::SelectAttentionBackendName(
+            vllm::platforms::GetPlatform(queue_.device.type), "", cfg);
+      }
+      name = dense_backend;
+    }
+    attn_backend_names_.push_back(name);
+    if (const char* dbg = std::getenv("VT_ATTN_SELECT_LOG");
+        dbg != nullptr && dbg[0] == '1') {
+      if (is_mla) {
+        std::fprintf(stderr,
+                     "[attn-select] kind=mla backend=%s device=%d "
+                     "shape=[%lld,%lld,%lld]\n",
+                     name.empty() ? "(op-driven)" : name.c_str(),
+                     static_cast<int>(queue_.device.type),
+                     static_cast<long long>(num_blocks_),
+                     static_cast<long long>(fa_block_size),
+                     static_cast<long long>(fa_dims[i].head_size));
+      } else {
+        std::fprintf(stderr,
+                     "[attn-select] kind=dense backend=%s device=%d "
+                     "shape=[%lld,2,%lld,%lld,%lld]\n",
+                     name.c_str(), static_cast<int>(queue_.device.type),
+                     static_cast<long long>(num_blocks_),
+                     static_cast<long long>(fa_block_size),
+                     static_cast<long long>(fa_dims[i].num_kv_heads),
+                     static_cast<long long>(fa_dims[i].head_size));
+      }
+    }
+    if (!name.empty()) {
+      vllm::v1::CheckKvCacheShape(queue_.device.type, name, num_blocks_,
+                                  fa_block_size, fa_dims[i].num_kv_heads,
+                                  fa_dims[i].head_size, is_mla);
+    }
     attn_kv_.push_back(kv);
   }
 
@@ -764,22 +1139,44 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       dkv.block_size = fa_block_size;
       dkv.num_kv_heads = Hkv;
       dkv.head_size = Dh;
+      // The draft layer is sized from `fa_page_bytes` — the TARGET group's page
+      // — so it must carry the target's storage dtype AND its fp8 interpretation
+      // or the two disagree about element width over one shared block table.
+      dkv.fp8_kind = kv_fp8_kind;
+      dkv.k_scale = kv_k_scale;
+      dkv.v_scale = kv_v_scale;
       draft_attn_kv_.push_back(dkv);
       break;  // exactly one fa_draft group at k=1.
     }
   }
 
+  // #810: the recurrent VIEWS carry the spec's own per-slot shape with the slot
+  // dim prepended — the mirror of `mamba/abstract.py:38-43`'s
+  // `state.view(-1, *shape)`. Rank-general up to vt::kMaxRank (checked above),
+  // so a 2-D conv state and a 3-D temporal state are both expressible without
+  // the runner knowing what either MEANS.
+  const auto slot_major_view = [&](void* data, vt::DType dtype,
+                                   const std::vector<int64_t>& shape) {
+    switch (shape.size()) {
+      case 1:
+        return vt::Tensor::Contiguous(data, dtype, dev,
+                                      {gdn_state_slots_, shape[0]});
+      case 2:
+        return vt::Tensor::Contiguous(data, dtype, dev,
+                                      {gdn_state_slots_, shape[0], shape[1]});
+      default:
+        return vt::Tensor::Contiguous(
+            data, dtype, dev,
+            {gdn_state_slots_, shape[0], shape[1], shape[2]});
+    }
+  };
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
-    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g]->data(),
-                                          gdn_ssm_cache_dtype_,
-                                          dev, {gdn_state_slots_, Hv, Dv, Dk});
-    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g]->data(),
-                                           gdn_conv_cache_dtype_,
-                                           dev,
-                                           {gdn_state_slots_, conv_dim,
-                                            conv_state_len});
+    gs.ssm_state = slot_major_view(ssm_buf_[g]->data(), gdn_ssm_cache_dtype_,
+                                   ssm_state_shape);
+    gs.conv_state = slot_major_view(conv_buf_[g]->data(), gdn_conv_cache_dtype_,
+                                    conv_state_shape);
     gdn_state_.push_back(gs);
   }
 }
@@ -930,12 +1327,111 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // token_ids_cpu after each request's committed prefix (gpu_input_batch.py:
   // 484-509 update_req_spec_token_ids) so prepare_inputs reads the k draft tokens
   // at the verify positions. No-op on the default path (empty map / no speculator).
+  //
+  // SPEC-DFLASH2 W7 (#1824), the async draft-in-output WORKER half. Under
+  // async scheduling two things differ from the sync flow, both handled here:
+  //
+  // (a) COMPUTED-TOKEN CORRECTION. The scheduler's num_computed_tokens for a
+  //     request whose PREVIOUS step scheduled drafts may still include that
+  //     step's rejected drafts — the rollback runs in update_from_output,
+  //     which the depth-2 loop applies AFTER this schedule. Upstream corrects
+  //     optimistically on-device (gpu_model_runner.py:1356-1396 prev_num_
+  //     draft_len + the _prepare_inputs GPU correction) because its rejection
+  //     result is not host-visible in time; OUR rejection ran on the host
+  //     last step, so the exact value is STRUCTURAL: the newest committed
+  //     token's position, num_tokens_no_spec - 1. That equals the scheduler's
+  //     value when the rollback already ran (the depth-1 LLMEngine::step
+  //     order) and subtracts exactly num_rejected when it has not (the
+  //     depth-2 batch-queue order) — both orders are live in production,
+  //     which is why the rule is structural rather than temporal.
+  //
+  // (b) PLACEHOLDER FILL. The scheduler ships -1 placeholders
+  //     (async_scheduler.py:43-45); the real values are the drafts THIS
+  //     runner proposed at the previous step's sampling (pending_drafts_,
+  //     host-resident because our propose is host-synchronous — the
+  //     device-resident variant is the row's owed A2). The fill patches a
+  //     LOCAL copy for the splice: the engine-side SchedulerOutput keeps its
+  //     placeholders, exactly as upstream's worker-side scatter leaves the
+  //     scheduler's copy untouched (gpu_input_batch.py:520-523). Reads the
+  //     stash WITHOUT consuming it — take_draft_token_ids (the deferred-
+  //     grammar pull) stays the only mover.
   if (spec_on()) {
+    if (use_async_scheduling_) {
+      const CachedRequestData& cached = scheduler_output.scheduled_cached_reqs;
+      for (int ci = 0; ci < cached.num_reqs(); ++ci) {
+        const std::string& req_id = cached.req_ids[static_cast<size_t>(ci)];
+        const auto prev_it = prev_sched_draft_counts_.find(req_id);
+        if (prev_it == prev_sched_draft_counts_.end() || prev_it->second <= 0) {
+          continue;  // no drafts scheduled for it last step: value is exact.
+        }
+        const auto idx_it = input_batch_.req_id_to_index.find(req_id);
+        if (idx_it == input_batch_.req_id_to_index.end()) {
+          continue;  // not in the persistent batch (resumed-as-new path).
+        }
+        const int req_index = idx_it->second;
+        const int sent =
+            input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)];
+        const int corrected =
+            input_batch_.num_tokens_no_spec[static_cast<size_t>(req_index)] - 1;
+        // sent == corrected (rollback already applied) or exceeds it by at
+        // most the previous step's rejected count (bounded by its draft
+        // count). Anything else is a bookkeeping defect — refuse loudly.
+        VT_CHECK(sent - corrected >= 0 && sent - corrected <= prev_it->second,
+                 "async spec computed-token correction out of range for '" +
+                     req_id + "': scheduler sent " + std::to_string(sent) +
+                     ", structural value " + std::to_string(corrected) +
+                     ", prev drafts " + std::to_string(prev_it->second));
+        input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)] =
+            corrected;
+      }
+    }
+
+    const std::map<std::string, std::vector<int32_t>>* sched_spec =
+        &scheduler_output.scheduled_spec_decode_tokens;
+    std::map<std::string, std::vector<int32_t>> filled_spec;
+    if (use_async_scheduling_ && !sched_spec->empty()) {
+      std::map<std::string, const std::vector<int32_t>*> own;
+      if (pending_drafts_.has_value()) {
+        const std::size_t n = std::min(pending_drafts_->req_ids.size(),
+                                       pending_drafts_->draft_token_ids.size());
+        for (std::size_t i = 0; i < n; ++i) {
+          own[pending_drafts_->req_ids[i]] = &pending_drafts_->draft_token_ids[i];
+        }
+      }
+      for (const auto& [req_id, placeholders] : *sched_spec) {
+        const auto own_it = own.find(req_id);
+        // Placeholders are only ever assigned to requests this runner sampled
+        // AND proposed for on the previous step (update_after_schedule skips
+        // prefill chunks; preemption clears them), so a miss is a defect and
+        // must say so rather than embed a -1.
+        VT_CHECK(own_it != own.end(),
+                 "async draft fill: no drafts proposed for request '" + req_id +
+                     "' (placeholders scheduled without a matching propose)");
+        VT_CHECK(own_it->second->size() >= placeholders.size(),
+                 "async draft fill: request '" + req_id + "' proposed " +
+                     std::to_string(own_it->second->size()) +
+                     " drafts but the scheduler placed " +
+                     std::to_string(placeholders.size()) + " placeholders");
+        filled_spec[req_id] = std::vector<int32_t>(
+            own_it->second->begin(),
+            own_it->second->begin() +
+                static_cast<std::ptrdiff_t>(placeholders.size()));
+      }
+      sched_spec = &filled_spec;
+    }
+
     const int nr = input_batch_.num_reqs();
     for (int i = 0; i < nr; ++i) {
       const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(i)];
-      input_batch_.update_req_spec_token_ids(
-          i, req_id, scheduler_output.scheduled_spec_decode_tokens);
+      input_batch_.update_req_spec_token_ids(i, req_id, *sched_spec);
+    }
+
+    if (use_async_scheduling_) {
+      // Record THIS step's scheduled draft counts for (a) next step.
+      prev_sched_draft_counts_.clear();
+      for (const auto& [rid, toks] : *sched_spec) {
+        prev_sched_draft_counts_[rid] = static_cast<int>(toks.size());
+      }
     }
   }
 
@@ -976,8 +1472,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // Ordering, all on the MAIN queue and therefore exact: replay -> uploads ->
     // combine -> forward. The forward is handed `device_input_ids` below, so the
     // host copy of step.input_token_ids is deliberately left stale for decode
-    // rows; nothing on this path reads it (the rejection-sampler path that does is
-    // spec-only, and spec forces the sync runner).
+    // rows; nothing on this path reads it (the rejection-sampler path that does
+    // is spec-only, and a speculator keeps async_input_combine_ OFF — since W7
+    // that is the runner-INPUT lever alone, async SCHEDULING staying on; the
+    // spec host arrays stay fresh because the spec sampler is the sync one).
     if (AsyncDeviceInputs* dev = get_or_create_async_device_inputs();
         dev != nullptr) {
       replay_last_sampled_ops(*dev);
@@ -1119,7 +1617,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 
   // Flattened dense-order forward inputs (positions int64 -> int32 for RoPE).
   const std::vector<int32_t>& token_ids = step.input_token_ids;
-  std::vector<int32_t> positions(step.positions.begin(), step.positions.end());
+  std::vector<int32_t> positions;
+  positions.reserve(step.positions.size());
+  for (const int64_t position : step.positions) {
+    positions.push_back(static_cast<int32_t>(position));
+  }
 
   // THE FORWARD (Task 3, over the persistent KV caches). Returns f32 logits
   // (lm_head already applied): [num_reqs, vocab] when the gather-before-lm_head
@@ -1142,6 +1644,45 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // same gate.
   const bool pure_decode = attn_meta.num_actual_tokens == num_reqs &&
                            gdn_meta.num_prefill_tokens == 0;
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, and this is
+  // the line the row exists to move. Until here the runner shipped ONE boolean
+  // that means "query length is 1", and a model wanting anything wider had to
+  // re-derive the whole test for itself -- which two of them did, in twenty
+  // duplicated lines each (`qwen3_5_moe.cpp`, `qwen3_5_dense.cpp` @ #442). The
+  // runner now names the step's ACTUAL uniform query length once and every model
+  // reads the answer.
+  //
+  // IT IS ALSO THE FIX FOR [#1020]. Those two copies compared the uniform length
+  // against the CONFIGURED `num_spec()`, so a step the scheduler clamped to a
+  // shorter -- but still perfectly uniform -- draft depth missed the predicate
+  // and ran its verify eager, with no log and no counter.
+  // `ActualUniformDecodeQueryLen` reads the length the step HAS, bounded above
+  // by `1 + num_spec()` because nothing in this tree captures a longer one.
+  //
+  // The GDN prefill conjunct is `pure_decode`'s and stays: a step with GDN
+  // prefill tokens carries recurrent-prefill segmentation no decode capture was
+  // built for, and the two model copies each tested it separately.
+  //
+  // THE ARM ABOVE 1 IS A SPECULATIVE VERIFY AND NOTHING ELSE, and the shape
+  // alone does not say so. A single request prefilling three tokens is uniform
+  // at query length 3 by every arithmetic test upstream applies, and at k >= 2
+  // it would pass a bare `q <= 1 + k` bound straight into a DECODE capture --
+  // measured on this tree's own CPU spec fixture, where a 20-token run reported
+  // 19 "uniform spec" steps before this conjunct existed. So the widened arm
+  // additionally requires that EVERY request in the step is verifying at exactly
+  // `q - 1` drafts, read off the scheduler's own per-request draft counts. That
+  // is narrower than the shape test, never wider, and it is what makes
+  // `uniform_query_len > 1` mean what its comment says it means.
+  const std::optional<int64_t> uniform_qlen =
+      gdn_meta.num_prefill_tokens == 0
+          ? v1::GraphEligibleQueryLen(num_reqs, attn_meta.num_actual_tokens,
+                                      attn_meta.max_query_len, num_spec(),
+                                      step.num_draft_tokens_per_req)
+          : std::nullopt;
+  // #1020 is titled on the word SILENTLY. A step that finds no captured shape
+  // now moves a counter, on the shared path every registered model reaches.
+  v1::NoteGraphDispatch(uniform_qlen.value_or(0),
+                        v1::UniformDecodeQueryLen(num_spec()));
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
@@ -1178,6 +1719,14 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       .num_reqs = num_reqs,
       .gdn_state_slots = gdn_state_slots_,
       .pure_decode = pure_decode,
+      // SPEC-DSPARK W8 (#442): the decode-graph gate mirrors vLLM's UNIFORM
+      // decode predicate, whose captured length is 1 + num_speculative_tokens
+      // (cudagraph_dispatcher.py:37). 0 when speculation is off, which makes
+      // the predicate reduce to today's pure-decode shape.
+      .num_speculative_tokens = num_spec(),
+      // W6 (#1374): the eligibility answer itself. 0 == no captured decode graph
+      // in this tree serves this step.
+      .uniform_query_len = uniform_qlen.value_or(0),
       .gather_logits = gather,
       // SPEC-MTP I5d: capture the target's post-final-norm [T,H] hidden for the
       // MTP drafter. Non-null only when a speculator is configured — the Qwen3.5
@@ -1342,13 +1891,13 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
       b.Copy(queue_, sampled_logits.data(), fl.device_tensor.data,
              sampled_logits.size() * sizeof(float));
       b.Synchronize(queue_);
-      logits = vt::Tensor::Contiguous(
-          sampled_logits.data(), vt::DType::kF32, queue_.device,
+      logits = sample_logits_staging_.Stage(
+          queue_.device, queue_, sampled_logits.data(), vt::DType::kF32,
           {static_cast<int64_t>(num_logits), vocab});
     }
   } else if (fl.rows == num_logits) {
-    logits = vt::Tensor::Contiguous(
-        fl.host.data(), vt::DType::kF32, queue_.device,
+    logits = sample_logits_staging_.Stage(
+        queue_.device, queue_, fl.host.data(), vt::DType::kF32,
         {static_cast<int64_t>(num_logits), vocab});
   } else {
     // (B) VT_LOGITS_GATHER=0: re-gather the logits rows from full [T,vocab] host.
@@ -1362,8 +1911,8 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
               static_cast<size_t>(row) * static_cast<size_t>(vocab),
           static_cast<size_t>(vocab) * sizeof(float));
     }
-    logits = vt::Tensor::Contiguous(
-        sampled_logits.data(), vt::DType::kF32, queue_.device,
+    logits = sample_logits_staging_.Stage(
+        queue_.device, queue_, sampled_logits.data(), vt::DType::kF32,
         {static_cast<int64_t>(num_logits), vocab});
   }
 
@@ -1456,10 +2005,11 @@ void GPUModelRunner::collect_prompt_logprobs(
       if (fl.on_device()) {
         view = fl.device_tensor.Slice(0, first, first + r.num_rows);
       } else {
-        view = vt::Tensor::Contiguous(
+        view = prompt_logprobs_staging_.Stage(
+            queue_.device, queue_,
             fl.host.data() +
                 static_cast<size_t>(first) * static_cast<size_t>(vocab),
-            vt::DType::kF32, queue_.device,
+            vt::DType::kF32,
             {static_cast<int64_t>(r.num_rows), vocab});
       }
 
@@ -1580,6 +2130,24 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
     if (kr > 0 && !chunked_prefilling[static_cast<size_t>(i)]) {
       spec_drafts_proposed_ += kr;
       spec_drafts_accepted_ += (ns > 1 ? ns - 1 : 0);
+      // SPEC-MTP-K-GT-1 (#81): the same accounting split by DEPTH. The rejection
+      // sampler accepts a PREFIX of the draft, so with `ns - 1` drafts accepted
+      // the draft at 0-based depth d was accepted exactly when `d < ns - 1`.
+      // #81's M1 asks for per-depth acceptance, and it is the only signal an
+      // acceptance-driven depth policy could read: the aggregate ratio cannot
+      // tell "every request accepted its first draft" from "one request accepted
+      // three". The vectors stay EMPTY when nothing speculates.
+      if (static_cast<int32_t>(spec_drafts_proposed_by_depth_.size()) < kr) {
+        spec_drafts_proposed_by_depth_.resize(static_cast<size_t>(kr), 0);
+        spec_drafts_accepted_by_depth_.resize(static_cast<size_t>(kr), 0);
+      }
+      const int32_t accepted_drafts = ns > 1 ? ns - 1 : 0;
+      for (int32_t d = 0; d < kr; ++d) {
+        spec_drafts_proposed_by_depth_[static_cast<size_t>(d)] += 1;
+        if (d < accepted_drafts) {
+          spec_drafts_accepted_by_depth_[static_cast<size_t>(d)] += 1;
+        }
+      }
       // PER-BLOCK acceptance trace (VT_SPEC_TRACE=1), off by default. The
       // aggregate proposed/accepted totals cannot distinguish a diffuse
       // per-block difference from one displaced block, which is exactly the
@@ -1949,14 +2517,68 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
         input_batch_.token_id(i, seq_len);
   }
 
-  const std::vector<int32_t> drafts = MtpProposePrefill(
+  // SPEC-MTP-K-GT-1 (#81): the depth THIS step drafts at. Resolved here, once,
+  // and passed down as a value rather than read from spec_config_ inside the
+  // propose loop, so a scheduler-supplied depth (upstream decides it at
+  // scheduler.py:1122-1126) has one place to come from. Today it is the
+  // configured k, and no depth policy exists.
+  const int k = num_spec();
+  VT_CHECK(k >= 1, "propose_drafts: a configured speculator must draft >= 1");
+  VT_CHECK(!draft_attn_kv_.empty() && draft_attn_kv_[0].block_size > 0,
+           "propose_drafts: the draft KV group has no block geometry");
+
+  const MtpDraftProposal proposal = MtpProposeDrafts(
       *draft_model_, exec_state_.attn_meta, draft_attn_kv_[0],
       exec_state_.spec_hidden.tensor, exec_state_.step.input_token_ids,
       exec_state_.step.positions, idx_mapping,
       input_batch_.last_sampled_tokens, next_prefill, num_sampled, num_rejected,
-      /*max_num_reqs=*/num_reqs, queue_);
+      /*max_num_reqs=*/num_reqs, /*num_speculative_tokens=*/k,
+      /*max_model_len=*/input_batch_.max_model_len,
+      /*block_size=*/static_cast<int>(draft_attn_kv_[0].block_size), queue_);
+  const std::vector<int32_t>& drafts = proposal.draft_tokens;
+  VT_CHECK(drafts.size() ==
+               static_cast<size_t>(num_reqs) * static_cast<size_t>(k),
+           "propose_drafts: the MTP propose must return k drafts per request");
+  // SPEC-MTP-K-GT-1 (#81): the WORK witness, recorded here because this is the
+  // only place that knows both the configured k and the forwards the propose
+  // actually ran. The check above is a SHAPE check and cannot stand in for it:
+  // a propose that ran one forward and padded all k columns passes it, emits the
+  // same greedy tokens, and grows the per-depth counters to size k. The exact
+  // relation these two counters carry is
+  // `spec_mtp_draft_decode_forwards_ == spec_mtp_propose_calls_ * (k - 1)`,
+  // which no draft-list shape can produce. Counted on every reaching call,
+  // including the discarded-row case below, because the forwards ran either way.
+  ++spec_mtp_propose_calls_;
+  spec_mtp_draft_decode_forwards_ += proposal.num_draft_decode_forwards;
 
-  // Stash the per-request draft (k=1: one token/request) for the out-of-band pull.
+  // SPEC-MTP-K-GT-1 (#81): the RESULT witness, and the reason it is computed
+  // HERE rather than inside the propose. The equality above counts the forwards
+  // a propose RAN, and says nothing about whether their results reached this
+  // array. A propose that runs all k-1 forwards, throws the sampled tokens away
+  // and writes its step-0 draft into every column satisfies that equality
+  // exactly, and was measured green on the whole depth suite. Read at the
+  // CONSUMER, on the bytes the proposer handed over, such a row is a pure
+  // function of its own first column and this counter stays 0 at every k. The
+  // accessor in runner.h states what it does NOT prove: per-column provenance,
+  // which the DGX gate owes. A non-zero acceptance count at depth does not show
+  // it either, because a padded row is accepted at column 1 whenever the
+  // target's greedy continuation repeats its own token. Only an acceptance-RATE
+  // comparison against a padded control separates the two.
+  for (int i = 0; i < num_reqs; ++i) {
+    const size_t base = static_cast<size_t>(i) * static_cast<size_t>(k);
+    bool varied = false;
+    for (int j = 1; j < k && !varied; ++j) {
+      varied = drafts[base + static_cast<size_t>(j)] != drafts[base];
+    }
+    if (varied) {
+      ++spec_mtp_proposals_with_varied_drafts_;
+      break;
+    }
+  }
+
+  // Stash each request's k drafts, in draft order, for the out-of-band pull. The
+  // DraftTokenIds seam already carries variable-length drafts (the n-gram
+  // proposer returns 0..k), so nothing downstream changes shape with depth.
   // A discarded (still-prefilling) row gets no draft — an empty list clears its
   // spec tokens (scheduler.update_draft_token_ids skips prefill-chunk requests).
   DraftTokenIds out;
@@ -1968,7 +2590,10 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
         exec_state_.discard[static_cast<size_t>(i)]) {
       out.draft_token_ids.push_back({});
     } else {
-      out.draft_token_ids.push_back({drafts[static_cast<size_t>(i)]});
+      const size_t base = static_cast<size_t>(i) * static_cast<size_t>(k);
+      out.draft_token_ids.emplace_back(
+          drafts.begin() + static_cast<std::ptrdiff_t>(base),
+          drafts.begin() + static_cast<std::ptrdiff_t>(base) + k);
     }
   }
   pending_drafts_ = std::move(out);
@@ -1991,9 +2616,19 @@ void GPUModelRunner::propose_drafts_dflash(
   propose_drafts_block(
       num_rejected_in, *dflash_weights_, *dflash_config_,
       /*num_query_per_req=*/1 + k,
-      [k, draft_vocab](const std::vector<float>& block_logits, int P,
-                       const std::vector<int32_t>& anchors) {
+      [k, draft_vocab, weights = dflash_weights_](
+          const std::vector<float>& block_logits, int P,
+          const std::vector<int32_t>& anchors) {
         (void)anchors;  // DFlash's anchor is a bonus token, never a prediction.
+        // SPEC-DFLASH2 W4 (#1314): the guard lives HERE, inside the DFlash1
+        // sampler's own closure, rather than beside the walk it protects. A
+        // guard adjacent to the call site it defends is deleted in the same edit
+        // that deletes that call site; one function away, losing the walk still
+        // costs a named throw. `propose_drafts_block` enters this callback only
+        // when the DFlash2 branch produced nothing, and a DFlash2 block that
+        // reaches the per-slot argmax proposes worse tokens with NO visible
+        // symptom -- the verify is lossless, so only acceptance falls.
+        vllm::v1::RefuseDflash1ArgmaxOnDflash2Block(*weights);
         return SampleDflashBlockDrafts(block_logits, P, k, draft_vocab);
       });
 }
@@ -2154,27 +2789,24 @@ void GPUModelRunner::propose_drafts_block(
     dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
   }
 
-  // 1. Download the [T_total, H×taps] bf16 aux tap to host and cast to f32.
+  // SPEC-DFLASH2 W8 (#1838): the propose pre-phase timer. Before W8 everything
+  // up to `t_fwd0` was untimed, which is how ~31 ms/step of aux round trips and
+  // hard syncs stayed unattributed in `VT_SPEC_TRACE`.
+  const auto t_pre0 = std::chrono::steady_clock::now();
+
+  // 1+2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states),
+  // straight off the DEVICE aux tap (SPEC-DFLASH2 W8, #1838). The pre-W8 chain —
+  // bf16 D2H + full queue drain + host scalar cast + f32 H2D + cast + GEMM +
+  // f32 D2H — was a sequence of exact bf16<->f32 round trips around this same
+  // GEMM, so this is bit-identical and moves nothing across the host boundary.
+  // Upstream: `combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))`
+  // consuming the target's device tensors (dflash/speculator.py::propose).
   const int64_t T_total = exec_state_.num_actual_tokens;
   const vt::Tensor& aux = exec_state_.spec_aux.tensor;
   VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
            "propose_drafts_block: aux tap shape mismatch");
-  std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
-                                 static_cast<size_t>(H) * static_cast<size_t>(taps));
-  vt::Backend& b = vt::GetBackend(queue_.device.type);
-  b.Copy(queue_, aux_bf16.data(), aux.data, aux_bf16.size() * sizeof(uint16_t));
-  b.Synchronize(queue_);
-  std::vector<float> aux_f32(aux_bf16.size());
-  for (size_t j = 0; j < aux_bf16.size(); ++j) {
-    const uint32_t bits = static_cast<uint32_t>(aux_bf16[j]) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    aux_f32[j] = f;
-  }
-
-  // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
-  const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
-      aux_f32, T_total, backbone, config, queue_);
+  const Qwen3DFlashModel::DflashCombinedDevice combined =
+      Qwen3DFlashModel::CombineAuxFeaturesDevice(aux, backbone, config, queue_);
 
   // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
   //    rows to the persistent per-request KV store (D9 — no full recompute), and
@@ -2218,21 +2850,33 @@ void GPUModelRunner::propose_drafts_block(
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
+    // SPEC-DFLASH2 W8 (#1838): the runner's counter and the DEVICE store must
+    // agree, or the append is dead. The W8 mutation run proved the check above
+    // cannot see that state: with the append call deleted, `dflash_ctx_len_`
+    // kept advancing, the store stayed empty, every propose ran CONTEXT-FREE,
+    // and every gate stayed green — well-formed drafts, lossless verify, only
+    // ACCEPTANCE falls, the exact invisible-defect class this row exists to
+    // remove. This host integer comparison is what makes that state loud.
+    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*dflash_kv_store_[static_cast<size_t>(i)]),
+             "propose_drafts_block: the runner's context length and the device "
+             "store's num_ctx disagree — the context-KV append is dead or "
+             "double-run (SPEC-DFLASH2 W8, #1838)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
     // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical
     // to the D5/D7 full recompute of the whole context by per-row projection independence.
-    std::vector<float> new_feats;
-    new_feats.reserve(static_cast<size_t>(append) * static_cast<size_t>(H));
+    // SPEC-DFLASH2 W8 (#1838): the gather is a device IndexSelect over the row
+    // indices this host loop already determined — the accepted-prefix decision
+    // stays host integer bookkeeping; only the floats stop commuting.
+    std::vector<int32_t> new_rows(static_cast<size_t>(append));
     std::vector<int32_t> new_pos(static_cast<size_t>(append));
     for (int j = 0; j < append; ++j) {
-      const float* src =
-          combined.data() + static_cast<size_t>(rows[j]) * static_cast<size_t>(H);
-      new_feats.insert(new_feats.end(), src, src + H);
+      new_rows[static_cast<size_t>(j)] = static_cast<int32_t>(rows[static_cast<size_t>(j)]);
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
-    Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                            new_pos, backbone, config, queue_);
+    Qwen3DFlashModel::AppendContextKVDeviceRows(*dflash_kv_store_[static_cast<size_t>(i)],
+                                                combined.tensor, new_rows, new_pos, backbone,
+                                                config, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -2269,10 +2913,22 @@ void GPUModelRunner::propose_drafts_block(
   // first row's drafts were. The aggregate acceptance trace on the VERIFY side
   // cannot distinguish "proposed nothing" from "proposed and everything was
   // rejected", which is exactly the question the first DSpark e2e raised.
-  static const bool propose_trace = [] {
+  //
+  // SPEC-DFLASH2 W9 (#1849): the value is a LEVEL now. Any nonzero value keeps
+  // exactly what "1" always meant; ">= 2" additionally brackets the DFlash2
+  // draft phase's four seams with queue synchronizes and prints the
+  // per-segment `[spec-phase-dev]` split below — the level-1 `sample=` figure
+  // aggregates pre-phase device work, graph replay, selector and walk into one
+  // number, which is what left #1849's flat ~23 ms unattributable. The syncs
+  // run ONLY at level >= 2, so every existing level-1 recipe keeps its
+  // overlap-preserving shape; synchronization changes no value anywhere.
+  static const int propose_trace_level = [] {
     const char* v = std::getenv("VT_SPEC_TRACE");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    if (v == nullptr || v[0] == '\0' || v[0] == '0') return 0;
+    const int lvl = std::atoi(v);
+    return lvl > 0 ? lvl : 1;  // a non-numeric nonzero value stays level 1
   }();
+  const bool propose_trace = propose_trace_level >= 1;
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
     // D11 A-wire: run the block forward straight off the per-request DEVICE stores
@@ -2291,24 +2947,97 @@ void GPUModelRunner::propose_drafts_block(
       total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
+    // SPEC-DFLASH2 W3 (#1314), reshaped by W8 (#1837): a DFlash2 draft ALSO
+    // captures the post-final-norm hidden off this forward -- the candidate
+    // selector's `hidden_projection` input. Upstream's `_generate_draft` takes
+    // both from one forward, and it must: the selector projects the SAME hidden
+    // states these logits came from. Since W8 both come back as DEVICE handles
+    // (`DflashBlockDeviceOut`), which is what re-arms the single-request PAGED
+    // fast path and its CUDA-graph capture for a DFlash2 draft — the W4-era
+    // `final_out` host contract disqualified that branch and cost every DFlash2
+    // step the graph lane plus a full-logits download. A DFlash1 draft passes
+    // nullptr and this call is byte-for-byte what it was.
+    const bool dflash2 = backbone.IsDflash2();
+    // SPEC-DFLASH2 W9 (#1849): the level-2 device-segment split. Each
+    // Synchronize drains the queue at a phase seam so the wall clock between
+    // seams IS that phase's device work; on the CPU backend the sync is a
+    // no-op and the segments are the host time of each call, which is the
+    // same number the level-1 line already reports in aggregate.
+    const bool dev_trace = dflash2 && propose_trace_level >= 2;
+    vt::Backend& trace_b = vt::GetBackend(queue_.device.type);
+    if (dev_trace) trace_b.Synchronize(queue_);
     const auto t_fwd0 = std::chrono::steady_clock::now();
+    Qwen3DFlashModel::DflashBlockDeviceOut dev_out;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
-            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
+            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
+            nullptr, nullptr, dflash2 ? &dev_out : nullptr);
+    if (dev_trace) trace_b.Synchronize(queue_);
     const auto t_fwd1 = std::chrono::steady_clock::now();
-    const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
+    // SPEC-DFLASH2 W4 (#1314): the PRODUCTION draft of a DFlash2 block, end to
+    // end. The block forward above ran the draft's grouped dynamic convolution
+    // (W2); `Dflash2SelectCandidates` runs the target head's top-K, the codebook
+    // lattice and the edge scores (W3); `Dflash2WalkPath` walks that lattice
+    // from the verified anchor and IS what produces this draft's tokens (W4).
+    // Both are the SAME functions `DflashProposeBlock` calls, so this path and
+    // the one a gate can drive are one implementation rather than two.
+    //
+    // `sample` -- the DFlash1 per-slot argmax -- must NOT run for a DFlash2
+    // block. It would succeed and propose worse tokens with no visible symptom,
+    // because the verify is lossless and the emitted tokens stay the target's;
+    // only acceptance falls. The fallback below is therefore entered on
+    // EMPTINESS, and guarded, so that deleting this branch is loud.
+    std::vector<std::vector<int32_t>> drafts;
+    auto t_sel = t_fwd1;
+    if (dflash2) {
+      // SPEC-DFLASH2 W8 (#1837): the selector and the walk run DEVICE-TO-DEVICE
+      // — sample-row gather, top-K, value scalars, projection, edge lattice,
+      // walk — and download ONLY the [P, k] drafted token ids, which is all
+      // upstream's `_generate_draft` brings back either. The host-vector
+      // entries these replaced are marshaling shells over the same cores, so
+      // the drafts are bit-identical to theirs.
+      const vllm::v1::Dflash2ProposeStateDevice selected =
+          vllm::v1::Dflash2SelectCandidatesDevice(dev_out.logits, dev_out.hidden, anchors,
+                                                  P, num_query_per_req - 1, backbone,
+                                                  config, queue_);
+      if (dev_trace) trace_b.Synchronize(queue_);
+      t_sel = std::chrono::steady_clock::now();
+      // The walk's own [P, k] download synchronizes, so `t_smp1 - t_sel` below
+      // is the walk segment with no extra seam needed.
+      drafts = vllm::v1::Dflash2WalkPathDevice(selected, queue_).draft_token_ids;
+    }
+    if (drafts.empty()) drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
+    if (dev_trace) {
+      // SPEC-DFLASH2 W9 (#1849): the draft phase, split at its seams. `pre` is
+      // the pre-phase device work (aux combine + accepted-prefix append) plus
+      // the block assembly's host bookkeeping; `fwd` the block forward (embed
+      // refresh + graph replay, or the eager paged body); `select` the device
+      // selector chain; `walk` the path walk plus the one token download.
+      std::fprintf(stderr,
+                   "[spec-phase-dev] pre=%.2fms fwd=%.2fms select=%.2fms walk=%.2fms\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
+                   std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
+                   std::chrono::duration<double, std::milli>(t_sel - t_fwd1).count(),
+                   std::chrono::duration<double, std::milli>(t_smp1 - t_sel).count());
+    }
     if (propose_trace) {
-      // Splits the draft step into the parallel backbone forward and the
+      // Splits the draft step into the pre-phase (aux combine + accepted-prefix
+      // append; W8 made it attributable), the parallel backbone forward and the
       // sampler. For DSpark the sampler is a k-iteration host loop, each
       // iteration a Markov GEMV plus a device->host download plus a host argmax
       // over the draft vocab; upstream captures the WHOLE draft step in one CUDA
-      // graph instead (dspark/speculator.py:22-24).
+      // graph instead (dspark/speculator.py:22-24). `logits` is the block
+      // forward's logits numel — device-resident for a DFlash2 draft, a host
+      // vector for DFlash1/DSpark.
+      const size_t logits_numel =
+          dflash2 ? static_cast<size_t>(dev_out.logits.Numel()) : block_logits.size();
       std::fprintf(stderr,
-                   "[spec-phase] backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   "[spec-phase] pre=%.2fms backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
                    std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
                    std::chrono::duration<double, std::milli>(t_smp1 - t_fwd1).count(),
-                   block_logits.size());
+                   logits_numel);
     }
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];

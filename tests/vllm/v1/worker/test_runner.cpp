@@ -36,6 +36,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/kv_cache_dtype.h"
+#include "vllm/v1/attention/registry.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -155,7 +156,12 @@ Qwen3_5MoeWeights MakeWeights(const HfConfig& c) {
   for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
     const uint64_t s = 1000 + static_cast<uint64_t>(l) * 5000;
     vllm::Qwen3_5MoeLayerWeights lw;
+    // #810: an EMPTY `layer_types` is what a hybrid that does not speak
+    // Qwen3.5's config dialect ships (NemotronH), and indexing it would be out
+    // of bounds. Absent => not linear attention, which is the same polarity the
+    // runner's own fallback predicate uses.
     lw.is_linear_attention =
+        !c.layer_types.empty() &&
         (c.layer_types[static_cast<size_t>(l)] == "linear_attention");
     lw.input_layernorm = MakeOwned(DType::kBF16, {H}, s + 1);
     lw.post_attention_layernorm = MakeOwned(DType::kBF16, {H}, s + 2);
@@ -183,15 +189,25 @@ Qwen3_5MoeWeights MakeWeights(const HfConfig& c) {
   return w;
 }
 
-constexpr int kBlockSize = 8;
+constexpr int kBlockSize = 16;
 constexpr int kMaxModelLen = 32;
 constexpr int kNumBlocks = 8;
 
 // A fake KVCacheConfig with the gate group structure: one full-attn group + one
 // mamba (GDN) group, sharing kNumBlocks blocks.
+//
+// #810: `conv_shape`/`ssm_shape` override the config-derived recurrent shapes.
+// EMPTY (the default) reproduces the historical helper byte for byte. They
+// exist for the same reason the dtype parameters already did: with both sides
+// derived from one `HfConfig`, `spec->shapes == expected_*_shape` is two
+// derivations of ONE config agreeing with each other, which cannot fail. A
+// caller that wants to gate "the SPEC is the allocation source of truth" has to
+// pass shapes the config cannot produce.
 KVCacheConfig MakeKvConfig(const HfConfig& c,
                            DType conv_dtype = DType::kF32,
-                           DType ssm_dtype = DType::kF32) {
+                           DType ssm_dtype = DType::kF32,
+                           std::vector<int64_t> conv_shape = {},
+                           std::vector<int64_t> ssm_shape = {}) {
   const int Hkv = static_cast<int>(c.num_key_value_heads);
   const int Dh = static_cast<int>(c.head_dim);
   const int Hv = static_cast<int>(c.linear_num_value_heads);
@@ -201,6 +217,9 @@ KVCacheConfig MakeKvConfig(const HfConfig& c,
   const int key_dim = static_cast<int>(c.linear_num_key_heads) * Dk;
   const int value_dim = Hv * Dv;
   const int conv_dim = 2 * key_dim + value_dim;
+
+  if (conv_shape.empty()) conv_shape = {conv_dim, Kw - 1};
+  if (ssm_shape.empty()) ssm_shape = {Hv, Dv, Dk};
 
   KVCacheConfig kv;
   kv.num_blocks = kNumBlocks;
@@ -212,8 +231,8 @@ KVCacheConfig MakeKvConfig(const HfConfig& c,
       std::vector<std::string>{"gdn0", "gdn1", "gdn2"},
       std::make_shared<MambaSpec>(
           kMaxModelLen,
-          std::vector<std::vector<int64_t>>{{conv_dim, Kw - 1},
-                                            {Hv, Dv, Dk}},
+          std::vector<std::vector<int64_t>>{std::move(conv_shape),
+                                            std::move(ssm_shape)},
           std::vector<DType>{conv_dtype, ssm_dtype}));
   return kv;
 }
@@ -432,6 +451,16 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(runner.num_blocks() == kNumBlocks);
   CHECK_FALSE(runner.kv_cache_backend_resident());
 
+  // M3: the runner resolves the ENGINE-level attention backend at init, per
+  // attention group. On CPU the dense priority walk (cpu.cpp) is
+  // [CPU_ATTN, FLASH_ATTN] and, since #1371 registered it, lands on CPU_ATTN —
+  // upstream's own CPU answer (cpu.py:75-87). This is the proof that selection
+  // is part of the runtime path, not just the registry test: the name below is
+  // resolved inside GPUModelRunner::initialize_kv_cache. One name per attention
+  // layer.
+  REQUIRE(runner.attn_backend_names().size() == 1);
+  CHECK(runner.attn_backend_names()[0] == "CPU_ATTN");
+
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);
   const PagedKvCache& kv = runner.attn_kv()[0];
@@ -502,16 +531,43 @@ TEST_CASE("runner: full-attn group selection ignores a third fa_draft group") {
   }
 }
 
+// #810: THE ARMED HALVES. Both subcases run the SAME assertions against the
+// same function; they differ only in whether the MambaSpec they feed it is
+// derivable from the HfConfig.
+//
+// The dtype half of this case has always been armed — `MakeKvConfig(c, kBF16,
+// kF16)` passes dtypes the config cannot produce and the runner honours them.
+// The SHAPE half was INERT for exactly the reason the shape-override
+// parameters were added: `MakeConfig()` and `MakeKvConfig(c)` derived both
+// sides from one config, so `shapes == expected_*_shape` compared two
+// derivations of one number
+// ([[gate-comparing-shared-helper-proves-consistency-not-correctness]]).
+// The second subcase feeds shapes the config CANNOT produce — the real
+// NemotronH `{6144, 3}` / `{64, 64, 128}` — which is what makes the shape
+// assertions falsifiable. Before #810 it refused at
+// `runner.cpp` "Qwen3.5 MambaSpec shapes disagree with model config".
 TEST_CASE("runner: MambaSpec is the allocation source of truth") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
-  const KVCacheConfig kv =
-      MakeKvConfig(c, DType::kBF16, DType::kF16);
+
+  KVCacheConfig kv;
+  int max_num_reqs = 8;
+  SUBCASE("shapes the config can also derive (dtype half armed)") {
+    kv = MakeKvConfig(c, DType::kBF16, DType::kF16);
+  }
+  SUBCASE("shapes the config CANNOT produce (shape half armed)") {
+    // Real NemotronH geometry (nemotron_h_registry.cpp:204-215), which
+    // MakeConfig()'s linear_* fields cannot yield under any arithmetic.
+    kv = MakeKvConfig(c, DType::kBF16, DType::kF16,
+                      /*conv_shape=*/{6144, 3}, /*ssm_shape=*/{64, 64, 128});
+    max_num_reqs = 2;  // keep the f32 SSM allocation modest in CI
+  }
+
   const auto* spec = dynamic_cast<const MambaSpec*>(
       kv.kv_cache_groups[1].kv_cache_spec.get());
   REQUIRE(spec != nullptr);
 
-  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+  GPUModelRunner runner(c, w, kv, Q(), max_num_reqs, kMaxModelLen,
                         /*max_num_batched_tokens=*/64);
   REQUIRE(runner.gdn_state().size() == 3);
   const GdnStateCache& state = runner.gdn_state()[0];
@@ -532,6 +588,229 @@ TEST_CASE("runner: MambaSpec is the allocation source of truth") {
           state.ssm_state.shape[3] *
           static_cast<int64_t>(vt::SizeOf(state.ssm_state.dtype));
   CHECK(runtime_row_bytes == spec->page_size_bytes());
+  // The slot dim is the recurrent pool, never the attention num_blocks.
+  CHECK(state.conv_state.shape[0] == runner.gdn_state_slots());
+  CHECK(state.ssm_state.shape[0] == runner.gdn_state_slots());
+}
+
+// ─── #810: THE BYTE-NEUTRALITY ARM ───────────────────────────────────────────
+//
+// `initialize_kv_cache` serves EVERY architecture — the engine builds exactly
+// one `GPUModelRunner` (`src/vllm/entrypoints/model_loader.cpp::runner_`, built
+// in the `LoadedEngine` member-init list) — so a refactor of it owes
+// a proof that it changes nothing for the models that already work. This
+// mirrors the BYTE-NEUTRALITY CONTRACT stated for the `per_layer_attn_specs`
+// seam at include/vllm/v1/kv_cache_interface.h:354-374: byte-identical
+// allocation, view, indexing and group selection to before the recurrent half
+// read its geometry off the spec.
+//
+// The expected values are LITERALS, derived at the pre-refactor base SHA. They
+// are deliberately not computed from `c` inside the test: a helper sharing the
+// inputs of the code under test reproduces exactly the self-consistency defect
+// the case above exists to remove. Only the KV element SIZE follows
+// `ResolveKvCacheDType()`, because the VT_KV_CACHE_F32 A/B lane legitimately
+// changes it and the geometry — K+V, block 16, 2 kv heads, head_dim 8 — is the
+// part being pinned.
+//
+// It reports its own N ([[the-state-was-not-the-one-you-believed]]): every
+// layer's class as a full literal vector, every state shape and dtype per
+// layer, and the total allocated bytes.
+TEST_CASE("runner: the Qwen3.5 allocation is BYTE-IDENTICAL after #810") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  REQUIRE(c.num_hidden_layers == 4);  // [LA, LA, LA, FA]
+
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+
+  using LayerKvClass = GPUModelRunner::LayerKvClass;
+  // 1. Counts, and the model's own N.
+  CHECK(runner.layer_kv_class().size() == 4);
+  CHECK(runner.attn_kv().size() == 1);
+  CHECK(runner.gdn_state().size() == 3);
+  CHECK(runner.gdn_state_slots() == 8);  // max_num_reqs, spec off
+  CHECK(runner.num_blocks() == kNumBlocks);
+
+  // 2. The layer -> group assignment for EVERY layer index, as a literal
+  //    vector. Spot-checking layer 0 cannot see a routing inversion.
+  CHECK(runner.layer_kv_class() ==
+        std::vector<LayerKvClass>{
+            LayerKvClass::kRecurrent, LayerKvClass::kRecurrent,
+            LayerKvClass::kRecurrent, LayerKvClass::kFullAttention});
+
+  // 3. Group selection — the `fa_draft` case above must stay green too.
+  CHECK(runner.full_attn_group_id() == 0);
+  CHECK(runner.gdn_group_id() == 1);
+
+  // 4. Every attention view, per layer.
+  const int64_t kv_es =
+      static_cast<int64_t>(vt::SizeOf(vllm::v1::ResolveKvCacheDType()));
+  const int64_t kFaPageBytes = 2 * 16 * 2 * 8 * kv_es;  // K+V, block, Hkv, Dh
+  CHECK(runner.fa_page_size_bytes() == kFaPageBytes);
+  for (const PagedKvCache& kv : runner.attn_kv()) {
+    CHECK(kv.num_blocks == 8);
+    CHECK(kv.block_size == 16);
+    CHECK(kv.num_kv_heads == 2);
+    CHECK(kv.head_size == 8);
+    CHECK(kv.dtype == vllm::v1::ResolveKvCacheDType());
+    CHECK(kv.data != nullptr);
+  }
+
+  // 5. Every recurrent state shape and dtype, per layer. conv_dim is
+  //    2*(2*8) + 4*8 == 64 and the conv row is conv_kernel-1 == 3.
+  for (const GdnStateCache& gs : runner.gdn_state()) {
+    CHECK(gs.conv_state.dtype == DType::kF32);
+    CHECK(gs.ssm_state.dtype == DType::kF32);
+    CHECK(std::vector<int64_t>{gs.conv_state.shape[0], gs.conv_state.shape[1],
+                               gs.conv_state.shape[2]} ==
+          std::vector<int64_t>{8, 64, 3});
+    CHECK(std::vector<int64_t>{gs.ssm_state.shape[0], gs.ssm_state.shape[1],
+                               gs.ssm_state.shape[2], gs.ssm_state.shape[3]} ==
+          std::vector<int64_t>{8, 4, 8, 8});
+    CHECK(gs.conv_state.data != nullptr);
+    CHECK(gs.ssm_state.data != nullptr);
+  }
+
+  // 6. The byte-neutrality claim itself: the whole allocation, as one number.
+  //      attention 1 layer  x 8 blocks x kFaPageBytes
+  //      recurrent 3 layers x (8 slots*64*3*4  +  8 slots*4*8*8*4)
+  int64_t total_bytes = 0;
+  for (const PagedKvCache& kv : runner.attn_kv())
+    total_bytes += kv.num_blocks * runner.fa_page_size_bytes();
+  for (const GdnStateCache& gs : runner.gdn_state())
+    total_bytes += static_cast<int64_t>(gs.conv_state.Bytes()) +
+                   static_cast<int64_t>(gs.ssm_state.Bytes());
+  CHECK(total_bytes == 1 * 8 * kFaPageBytes + 3 * (6144 + 8192));
+}
+
+// ─── #810: THE NEMOTRON-H ARM ────────────────────────────────────────────────
+//
+// The defect this row exists for, driven from a synthetic 52-layer
+// NemotronH-shaped KVCacheConfig (no checkpoint, so it runs in CI). The
+// topology is the real one — `layers_block_type` in
+// tests/vllm/models/fixtures/nemotron_h_35_lightning/config.json: 6 attention
+// blocks at {5, 12, 19, 26, 33, 42}, 23 Mamba2 blocks, 23 MoE blocks — and the
+// shapes/dtypes are what `MakeNemotronHKVCache` publishes
+// (nemotron_h_registry.cpp:204-215), asserted independently at
+// tests/vllm/models/test_nemotron_h_scaffold.cpp:620-665.
+//
+// The config half is deliberately hostile and matches the real one: NO
+// `layer_types`, and every `linear_*` field zero. That is precisely the state
+// in which the pre-#810 runner classified all 52 layers as full attention.
+namespace {
+// The real fixture's `layers_block_type`, as index sets.
+const std::vector<int64_t> kNemotronHAttnLayers{5, 12, 19, 26, 33, 42};
+const std::vector<int64_t> kNemotronHMambaLayers{0,  2,  4,  7,  9,  11, 14, 16,
+                                                 18, 21, 23, 25, 28, 30, 32, 35,
+                                                 37, 39, 41, 44, 46, 48, 50};
+
+HfConfig MakeNemotronHShapedConfig() {
+  HfConfig c = MakeConfig();
+  c.model_type = "nemotron_h";
+  c.architectures = {"NemotronHForCausalLM"};
+  c.num_hidden_layers = 52;
+  c.layer_types.clear();          // NemotronH ships `layers_block_type`
+  c.linear_num_key_heads = 0;     // ...and none of Qwen3.5's linear_* fields
+  c.linear_num_value_heads = 0;
+  c.linear_key_head_dim = 0;
+  c.linear_value_head_dim = 0;
+  c.linear_conv_kernel_dim = 0;
+  return c;
+}
+
+std::string NemotronHLayerName(int64_t i) {
+  return "backbone.layers." + std::to_string(i) + ".mixer";
+}
+
+KVCacheConfig MakeNemotronHShapedKvConfig() {
+  std::vector<std::string> attn_names;
+  for (int64_t i : kNemotronHAttnLayers) attn_names.push_back(NemotronHLayerName(i));
+  std::vector<std::string> mamba_names;
+  for (int64_t i : kNemotronHMambaLayers)
+    mamba_names.push_back(NemotronHLayerName(i));
+
+  KVCacheConfig kv;
+  kv.num_blocks = kNumBlocks;
+  kv.kv_cache_groups.emplace_back(
+      std::move(attn_names),
+      std::make_shared<FullAttentionSpec>(kBlockSize, /*num_kv_heads=*/2,
+                                          /*head_size=*/128,
+                                          vllm::v1::ResolveKvCacheDType()));
+  kv.kv_cache_groups.emplace_back(
+      std::move(mamba_names),
+      std::make_shared<MambaSpec>(
+          kBlockSize,
+          std::vector<std::vector<int64_t>>{{6144, 3}, {64, 64, 128}},
+          std::vector<DType>{DType::kBF16, DType::kF32}));
+  return kv;
+}
+}  // namespace
+
+TEST_CASE("runner: a NemotronH-shaped KV config allocates from the SPEC") {
+  const HfConfig c = MakeNemotronHShapedConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeNemotronHShapedKvConfig();
+
+  // max_num_reqs 1 keeps the 23 f32 SSM states at ~49 MiB of host memory.
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/1, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  using LayerKvClass = GPUModelRunner::LayerKvClass;
+  // 1. The full index vector, not counts alone. Before #810 this was 52
+  //    kFullAttention entries and zero recurrent buffers.
+  std::vector<LayerKvClass> expected(52, LayerKvClass::kNone);
+  for (int64_t i : kNemotronHAttnLayers)
+    expected[static_cast<size_t>(i)] = LayerKvClass::kFullAttention;
+  for (int64_t i : kNemotronHMambaLayers)
+    expected[static_cast<size_t>(i)] = LayerKvClass::kRecurrent;
+  REQUIRE(runner.layer_kv_class().size() == 52);
+  CHECK(runner.layer_kv_class() == expected);
+
+  // 2. SIX attention layers, not 52. The pre-#810 runner allocated 8.7x the
+  //    pages this model needs, because every non-linear_attention layer was an
+  //    attention layer and 23 of these blocks cache nothing at all.
+  CHECK(runner.attn_kv().size() == 6);
+  CHECK(runner.gdn_state().size() == 23);
+  CHECK(runner.full_attn_group_id() == 0);
+  CHECK(runner.gdn_group_id() == 1);
+
+  // 3. Attention geometry off the FullAttentionSpec (head_size 128, which
+  //    MakeNemotronHShapedConfig's head_dim of 8 cannot produce).
+  const int64_t kv_es =
+      static_cast<int64_t>(vt::SizeOf(vllm::v1::ResolveKvCacheDType()));
+  CHECK(runner.fa_page_size_bytes() == 2 * kBlockSize * 2 * 128 * kv_es);
+  for (const PagedKvCache& akv : runner.attn_kv()) {
+    CHECK(akv.num_kv_heads == 2);
+    CHECK(akv.head_size == 128);
+    CHECK(akv.block_size == kBlockSize);
+    CHECK(akv.data != nullptr);
+  }
+
+  // 4. Recurrent shapes and dtypes off the MambaSpec — the values no arithmetic
+  //    over this config could yield, since every linear_* field is zero.
+  for (const GdnStateCache& gs : runner.gdn_state()) {
+    CHECK(gs.conv_state.dtype == DType::kBF16);
+    CHECK(gs.ssm_state.dtype == DType::kF32);
+    CHECK(std::vector<int64_t>{gs.conv_state.shape[0], gs.conv_state.shape[1],
+                               gs.conv_state.shape[2]} ==
+          std::vector<int64_t>{1, 6144, 3});
+    CHECK(std::vector<int64_t>{gs.ssm_state.shape[0], gs.ssm_state.shape[1],
+                               gs.ssm_state.shape[2], gs.ssm_state.shape[3]} ==
+          std::vector<int64_t>{1, 64, 64, 128});
+    CHECK(gs.conv_state.data != nullptr);
+    CHECK(gs.ssm_state.data != nullptr);
+  }
+
+  // 5. Total bytes, as one number: 6 attention layers x 8 blocks x page, plus
+  //    23 recurrent layers x (1 slot x 6144x3 bf16 + 1 slot x 64x64x128 f32).
+  int64_t total_bytes = 0;
+  for (const PagedKvCache& akv : runner.attn_kv())
+    total_bytes += akv.num_blocks * runner.fa_page_size_bytes();
+  for (const GdnStateCache& gs : runner.gdn_state())
+    total_bytes += static_cast<int64_t>(gs.conv_state.Bytes()) +
+                   static_cast<int64_t>(gs.ssm_state.Bytes());
+  CHECK(total_bytes ==
+        6 * 8 * (2 * kBlockSize * 2 * 128 * kv_es) + 23 * (36864 + 2097152));
 }
 
 // ─── 2. THE ORDERING IDENTITY GATE (mandatory de-risk) ───────────────────────
@@ -1149,8 +1428,11 @@ TEST_CASE("runner: sample_tokens_async decode is token-identical to sync") {
     GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
                           kMaxModelLen, 64);
     runner.set_async_input_combine(async_output);
-    // The runner advertises async support exactly when the async path is on.
-    CHECK(runner.runner_supports_async() == async_output);
+    // SPEC-DFLASH2 W7 (#1824): runner_supports_async() is the env/backend
+    // capability predicate and no longer tracks the input-combine lever (async
+    // SCHEDULING must survive a spec engine whose combine is vetoed — I5e).
+    // The lever this case toggles is the combine itself:
+    CHECK(runner.async_input_combine() == async_output);
     std::vector<int32_t> tokens;
 
     auto sample = [&]() -> int32_t {
@@ -1248,5 +1530,54 @@ TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") 
   // (not an uncatchable OOB), which proves the runner's GDN path was skipped.
   CHECK_THROWS_WITH_AS(runner.execute_model(s1),
                        doctest::Contains("qwen3_5 dense paged forward"),
+                       std::runtime_error);
+}
+
+// ─── M3: THE BLOCK-SIZE CONTRACT AT ITS PRODUCTION CALL SITE ─────────────────
+//
+// The runner must refuse a non-multiple-of-16 block size at its production
+// call site — the same failure the server's --block-size validation and the
+// bench rounding exist to prevent at the entry points.
+//
+// WHICH guard fires, and why this case says `runtime_error` (#1608). The
+// refusal happens during backend SELECTION, before any backend is constructed:
+// no candidate declares support for block_size 8, so
+// `SelectAttentionBackendName` exhausts the platform's priority list and throws
+// `std::runtime_error` naming every rejected candidate with its reason
+// ("block_size not supported"). `get_kv_cache_shape`'s own
+// `std::invalid_argument` sits BEHIND that and is not reached from here.
+//
+// This case previously asserted that `invalid_argument`, which made it
+// host-dependent and red on every CPU build. The cause was not the assertion
+// but `RocmAttentionBackend`: it omitted upstream's
+// `get_supported_kernel_block_sizes() == MultipleOf(16)`
+// (rocm_attn.py:181-190), inheriting the base MultipleOf(1), so on ROCm alone
+// the registry ACCEPTED block_size 8 and the failure surfaced later out of
+// `get_kv_cache_shape`. Declaring it made every host agree.
+//
+// OWED, and deliberately not papered over: with the registry consistent, the
+// `CheckKvCacheShape` install inside `initialize_kv_cache` is no longer
+// reachable from here, so deleting that install again leaves this case green —
+// the #1065 Owed item this case was written for. Restoring it needs inputs that
+// pass selection and then fail the shape comparison, i.e. an MLA spec with
+// `num_kv_heads != 1` (TritonMLABackend refuses that in `get_kv_cache_shape`).
+// A CPU build cannot express it: `CpuPlatform::get_attn_backend_priority`
+// returns {CPU_ATTN, FLASH_ATTN} and registers no MLA backend, so this needs a
+// CUDA-capable host or a test-only backend registration.
+TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size") {
+  const HfConfig c = MakeDenseOnlyConfig();
+  const Qwen3_5DenseWeights w = MakeDenseOnlyWeights(c);
+
+  KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+  kv.kv_cache_groups[0].kv_cache_spec = std::make_shared<FullAttentionSpec>(
+      /*block_size=*/8, static_cast<int>(c.num_key_value_heads),
+      static_cast<int>(c.head_dim), vllm::v1::ResolveKvCacheDType());
+
+  auto make_runner = [&]() {
+    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+  };
+  CHECK_THROWS_WITH_AS(make_runner(),
+                       doctest::Contains("block_size not supported"),
                        std::runtime_error);
 }

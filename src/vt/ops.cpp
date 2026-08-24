@@ -2,6 +2,8 @@
 #include "vt/ops.h"
 
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -44,6 +46,8 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kIQ2_XXS:
     case DType::kIQ3_XXS:
     case DType::kIQ2_S:
+    case DType::kIQ1_S:
+    case DType::kIQ1_XXXS:
     case DType::kMXFP4:
       break;
   }
@@ -640,6 +644,81 @@ void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scal
   reinterpret_cast<QuantFp8StaticFn>(GetOp(OpId::kQuantFp8Static, q.device.type))(q, out_fp8, x,
                                                                                   input_scale);
 }
+void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                   int group_size) {
+  VT_CHECK(x.rank == 2 && out_fp8.rank == 2 && out_scale.rank == 2,
+           "quant_fp8_group: x/out_fp8/out_scale must be rank-2");
+  // group_size is validated BEFORE it divides anything: `K % 0` is undefined
+  // behaviour, so a zero here must refuse rather than trap.
+  VT_CHECK(group_size > 0, "quant_fp8_group: group_size must be positive");
+  const int64_t m = x.shape[0], k = x.shape[1];
+  // Mirrors upstream's assert text at
+  // vllm/model_executor/layers/quantization/utils/fp8_utils.py:596-599.
+  VT_CHECK(k % group_size == 0,
+           "quant_fp8_group: the last dimension of x must be divisible by group_size");
+  VT_CHECK(out_fp8.shape[0] == m && out_fp8.shape[1] == k,
+           "quant_fp8_group: out_fp8 must match x shape [M,K]");
+  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == k / group_size,
+           "quant_fp8_group: out_scale must be [M, K/group_size]");
+  VT_CHECK(IsFloat(x.dtype), "quant_fp8_group: float x (f32/bf16) required");
+  VT_CHECK(out_fp8.dtype == DType::kI8,
+           "quant_fp8_group: out_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  // f32, not the model dtype: upstream allocates the scale f32 (fp8_utils.py:631)
+  // and the block-scaled GEMM multiplies it into an f32 accumulator.
+  VT_CHECK(out_scale.dtype == DType::kF32, "quant_fp8_group: out_scale must be f32");
+  // Upstream asserts `x.stride(-1) == 1` (fp8_utils.py:600); a group that is not
+  // contiguous would read across rows.
+  VT_CHECK(x.IsContiguous() && out_fp8.IsContiguous() && out_scale.IsContiguous(),
+           "quant_fp8_group: contiguous tensors required");
+  VT_CHECK(x.device == q.device && out_fp8.device == q.device && out_scale.device == q.device,
+           "quant_fp8_group: device mismatch (x/out_fp8/out_scale/queue)");
+  reinterpret_cast<QuantFp8GroupFn>(GetOp(OpId::kQuantFp8Group, q.device.type))(
+      q, out_fp8, out_scale, x, group_size);
+}
+void MatmulFp8BlockScaled(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
+                          const Tensor& b_fp8, const Tensor& b_scale, int block_n,
+                          int block_k) {
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && a_scale.rank == 2 && b_fp8.rank == 2 &&
+               b_scale.rank == 2,
+           "matmul_fp8_block_scaled: out/a_fp8/a_scale/b_fp8/b_scale must be rank-2");
+  // Validated BEFORE either one divides anything: `x / 0` and `x % 0` are
+  // undefined behaviour, so a zero must refuse rather than trap.
+  VT_CHECK(block_n > 0 && block_k > 0,
+           "matmul_fp8_block_scaled: block_n and block_k must be positive");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1];
+  const int64_t n = b_fp8.shape[0];
+  // Upstream: `assert A.shape[-1] == B.shape[-1]` (quant_utils.py:111).
+  VT_CHECK(b_fp8.shape[1] == k,
+           "matmul_fp8_block_scaled: a_fp8 [M,K] and b_fp8 [N,K] must share K");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_fp8_block_scaled: out must be [M,N]");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_block_scaled: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  // f32, not the model dtype: upstream refuses any other scale dtype on this
+  // path (csrc/.../w8a8/cutlass/c3x/scaled_mm_helper.hpp:15-18) and the
+  // accumulator these multiply into is f32.
+  VT_CHECK(a_scale.dtype == DType::kF32 && b_scale.dtype == DType::kF32,
+           "matmul_fp8_block_scaled: a_scale/b_scale must be f32");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "matmul_fp8_block_scaled: out must be f32 or bf16");
+  // CEIL on every tiling, so a ragged final block is legal: upstream asserts
+  // `triton.cdiv(N, block_n) == Bs.shape[0]` and
+  // `triton.cdiv(K, block_k) == Bs.shape[1]` (fp8_utils.py:935-936), and
+  // `triton.cdiv(A.shape[-1], block_k) == As.shape[-1]` (fp8_utils.py:930).
+  const int64_t k_tiles = (k + block_k - 1) / block_k;
+  const int64_t n_tiles = (n + block_n - 1) / block_n;
+  VT_CHECK(a_scale.shape[0] == m && a_scale.shape[1] == k_tiles,
+           "matmul_fp8_block_scaled: a_scale must be [M, cdiv(K, block_k)]");
+  VT_CHECK(b_scale.shape[0] == n_tiles && b_scale.shape[1] == k_tiles,
+           "matmul_fp8_block_scaled: b_scale must be [cdiv(N, block_n), cdiv(K, block_k)]");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && a_scale.IsContiguous() &&
+               b_fp8.IsContiguous() && b_scale.IsContiguous(),
+           "matmul_fp8_block_scaled: contiguous tensors required");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && a_scale.device == q.device &&
+               b_fp8.device == q.device && b_scale.device == q.device,
+           "matmul_fp8_block_scaled: device mismatch (out/a_fp8/a_scale/b_fp8/b_scale/queue)");
+  reinterpret_cast<MatmulFp8BlockScaledFn>(GetOp(OpId::kMatmulFp8BlockScaled, q.device.type))(
+      q, out, a_fp8, a_scale, b_fp8, b_scale, block_n, block_k);
+}
 void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
                      const Tensor& weight, const RmsNormArgs& args, Tensor* residual,
                      float input_scale) {
@@ -714,7 +793,7 @@ void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& 
       q, out, a_fp8, b_fp8, alpha);
 }
 void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                       float alpha) {
+                       float alpha, bool claims_splitk1_premise) {
   // Same argument contract as MatmulFp8Cutlass (drop-in fp8 dense GEMM).
   VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
            "matmul_fp8_cublaslt: all tensors must be rank-2");
@@ -731,7 +810,52 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
   VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device,
            "matmul_fp8_cublaslt: device mismatch");
   reinterpret_cast<MatmulFp8CublasLtFn>(GetOp(OpId::kMatmulFp8CublasLt, q.device.type))(
-      q, out, a_fp8, b_fp8, alpha);
+      q, out, a_fp8, b_fp8, alpha, claims_splitk1_premise);
+}
+void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                               const Tensor& alpha_vec, bool claims_splitk1_premise) {
+  // Same operand contract as MatmulFp8CublasLt, plus the per-column alpha.
+  //
+  // The output was f32 ONLY, because the fallback arm applies the vector with
+  // vt::MulColVecF32 and that op was f32-typed -- accepting bf16 would have been
+  // a capability the fallback could not honor. PERF-FP8-ALPHA-FOLD / #417 removed
+  // that blocker (MulColVecF32 now carries a bf16 store arm), so bf16 is
+  // admitted: the GEMM emits a bf16 D and the column pass runs at bf16, halving
+  // the bytes it moves. bf16 is also what vLLM's ModelOptFp8LinearMethod emits
+  // here (out_dtype = the model dtype, modelopt.py:458).
+  //
+  // A bf16 `out` always takes the TWO-LAUNCH arm, whatever
+  // VT_FP8_ALPHA_VEC_EPILOGUE says -- see the CUDA implementation for why: at
+  // bf16 the epilogue would round ONCE and the fallback rounds TWICE, so letting
+  // the toggle choose between them would turn a performance switch into a
+  // numerics switch. The toggle stays a pure performance A/B at every dtype.
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
+           "matmul_fp8_cublaslt_alpha_vec: all tensors must be rank-2");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  VT_CHECK(k % 16 == 0 && n % 16 == 0,
+           "matmul_fp8_cublaslt_alpha_vec: K and N must be multiples of 16");
+  VT_CHECK(b_fp8.shape[1] == k,
+           "matmul_fp8_cublaslt_alpha_vec: b_fp8 must be [N, K] (K matches a_fp8)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n,
+           "matmul_fp8_cublaslt_alpha_vec: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "matmul_fp8_cublaslt_alpha_vec: out must be f32 or bf16");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_cublaslt_alpha_vec: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && b_fp8.IsContiguous(),
+           "matmul_fp8_cublaslt_alpha_vec: contiguous tensors required");
+  // cuBLASLt reads the alpha vector as one entry per OUTPUT ROW of its
+  // column-major D, which is our row-major out's COLUMN count, N.
+  VT_CHECK(alpha_vec.rank == 1 && alpha_vec.shape[0] == n,
+           "matmul_fp8_cublaslt_alpha_vec: alpha_vec must be [N] (one alpha per output column)");
+  VT_CHECK(alpha_vec.dtype == DType::kF32 && alpha_vec.IsContiguous(),
+           "matmul_fp8_cublaslt_alpha_vec: alpha_vec must be contiguous f32");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device &&
+               alpha_vec.device == q.device,
+           "matmul_fp8_cublaslt_alpha_vec: device mismatch");
+  reinterpret_cast<MatmulFp8CublasLtAlphaVecFn>(
+      GetOp(OpId::kMatmulFp8CublasLtAlphaVec, q.device.type))(q, out, a_fp8, b_fp8, alpha_vec,
+                                                             claims_splitk1_premise);
 }
 
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
@@ -876,6 +1000,15 @@ void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
   VT_CHECK(out.device == q.device && gate.device == q.device && up.device == q.device,
            "moe_silu_mul: device mismatch (out/gate/up/queue)");
   reinterpret_cast<MoeSiluMulFn>(GetOp(OpId::kMoeSiluMul, q.device.type))(q, out, gate, up);
+}
+
+void MoeRelu2(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(x.Numel() == out.Numel(), "moe_relu2: out/x must have the same element count");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "moe_relu2: float x, f32/bf16 out");
+  VT_CHECK(out.IsContiguous() && x.IsContiguous(), "moe_relu2: contiguous tensors required");
+  VT_CHECK(out.device == q.device && x.device == q.device,
+           "moe_relu2: device mismatch (out/x/queue)");
+  reinterpret_cast<MoeRelu2Fn>(GetOp(OpId::kMoeRelu2, q.device.type))(q, out, x);
 }
 
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
@@ -1948,6 +2081,213 @@ void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
       q, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, query_start_loc, args);
 }
 
+namespace {
+
+// W1 lands `tp_world_size == 1` only. An unimplemented arm is REFUSED with the
+// missing piece named, never silently mis-computed (mamba2-ssd.md §7): sharding
+// `n_groups` across ranks needs `extra_groups_for_head_shards`
+// (mamba_utils.py:187) plus `mamba_v2_sharded_weight_loader`
+// (mamba_mixer2.py:174-236), neither of which exists here.
+void CheckMamba2NoShard(int64_t tp_world_size, const char* name) {
+  VT_CHECK(tp_world_size == 1,
+           std::string(name) +
+               ": tp_world_size > 1 is NOT implemented (mamba2-ssd.md W1 lands "
+               "tp_world_size == 1); n_groups sharding needs "
+               "extra_groups_for_head_shards (mamba_utils.py:187)");
+}
+
+// A Mamba2 activation/state operand: float in, f32/bf16 out, contiguous, on the
+// queue's device. Every SSD tensor check funnels through here so a shape message
+// can never disagree with a dtype message.
+void CheckMamba2Operand(const Queue& q, const Tensor& t, const char* name, const char* what,
+                        bool is_output) {
+  VT_CHECK(is_output ? IsOutFloat(t.dtype) : IsFloat(t.dtype),
+           std::string(name) + ": " + what + (is_output ? " must be f32/bf16" : " must be float"));
+  VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+  VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " must be on the queue device");
+}
+
+}  // namespace
+
+void Mamba2ChunkScan(Queue& q, Tensor& out, Tensor& final_states, const Tensor& x,
+                     const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                     const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                     const Tensor* initial_states, const Tensor& cu_seqlens,
+                     const Tensor& cu_chunk_seqlens, const Tensor& last_chunk_indices,
+                     const Tensor& seq_idx, const Mamba2Args& args) {
+  constexpr const char* name = "mamba2_chunk_scan";
+  CheckMamba2NoShard(args.tp_world_size, name);
+  // chunk_size must be an integer power of two — `is_int_pow_2`, asserted at
+  // ssd_combined.py:48 before any stage runs.
+  VT_CHECK(args.chunk_size > 0 && (args.chunk_size & (args.chunk_size - 1)) == 0,
+           std::string(name) + ": chunk_size must be an integer power of 2 "
+                               "(ssd_combined.py:48)");
+  // dt_limit is caller-supplied and upstream's default is `(0.0, inf)`
+  // (ssd_combined.py:180). A negative `dt_min` would let `dt` go negative, which
+  // makes `dA_cumsum` NON-monotonic within a chunk and turns upstream's
+  // `min(., 0)` clamps (ssd_chunk_state.py:283-285, ssd_chunk_scan.py:339-341)
+  // from algebraic no-ops into a silent truncation of the recurrence. The
+  // companion precondition `A < 0` is checked against the tensor's contents in
+  // the kernel, where the data lives.
+  VT_CHECK(args.dt_min >= 0.0f && args.dt_max >= args.dt_min,
+           std::string(name) +
+               ": dt_limit must satisfy 0 <= dt_min <= dt_max (upstream default is "
+               "(0.0, inf), ssd_combined.py:180); a negative dt_min admits a negative "
+               "dt and breaks the dA_cumsum monotonicity the intra-chunk clamp rests on");
+  VT_CHECK(x.rank == 3 && dt.rank == 2 && A.rank == 1 && B.rank == 3 && C.rank == 3 &&
+               out.rank == 3 && final_states.rank == 4,
+           std::string(name) +
+               ": x/out [T,H,P], dt [T,H], A [H], B/C [T,G,N], final_states [S,H,P,N]");
+  const int64_t t = x.shape[0], h = x.shape[1], p = x.shape[2];
+  const int64_t g = B.shape[1], n = B.shape[2];
+  VT_CHECK(dt.shape[0] == t && dt.shape[1] == h, std::string(name) + ": dt must be [T,H]");
+  VT_CHECK(A.shape[0] == h, std::string(name) + ": A must be [H]");
+  VT_CHECK(B.shape[0] == t && C.shape[0] == t && C.shape[1] == g && C.shape[2] == n,
+           std::string(name) + ": B and C must both be [T,G,N] (ssd_combined.py:52-55)");
+  VT_CHECK(g >= 1 && h % g == 0,
+           std::string(name) + ": nheads must be divisible by ngroups (ssd_combined.py:51)");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == h && out.shape[2] == p,
+           std::string(name) + ": out must be [T,H,P]");
+  const int64_t s = final_states.shape[0];
+  VT_CHECK(final_states.shape[1] == h && final_states.shape[2] == p &&
+               final_states.shape[3] == n,
+           std::string(name) + ": final_states must be [S,H,P,N]");
+  CheckMamba2Operand(q, x, name, "x", false);
+  CheckMamba2Operand(q, dt, name, "dt", false);
+  CheckMamba2Operand(q, B, name, "B", false);
+  CheckMamba2Operand(q, C, name, "C", false);
+  CheckMamba2Operand(q, out, name, "out", true);
+  // final_states carries `state_dtype` (ssd_combined.py:46,119,176), a knob that
+  // is deliberately INDEPENDENT of the activation dtype — never derive one from
+  // the other (mamba2-ssd.md §7).
+  CheckMamba2Operand(q, final_states, name, "final_states", true);
+  VT_CHECK(A.dtype == DType::kF32 && A.IsContiguous() && A.device == q.device,
+           std::string(name) + ": A must be f32 contiguous on the queue device");
+  if (D != nullptr) {
+    VT_CHECK(D->dtype == DType::kF32 && D->IsContiguous() && D->device == q.device,
+             std::string(name) + ": D must be f32 contiguous on the queue device");
+    VT_CHECK((D->rank == 1 && D->shape[0] == h) ||
+                 (D->rank == 2 && D->shape[0] == h && D->shape[1] == p),
+             std::string(name) + ": D must be [H] or [H,P] (ssd_combined.py:56-57)");
+  }
+  if (z != nullptr) {
+    VT_CHECK(z->rank == 3 && z->shape[0] == t && z->shape[1] == h && z->shape[2] == p,
+             std::string(name) + ": z must be [T,H,P] (ssd_combined.py:54-55)");
+    CheckMamba2Operand(q, *z, name, "z", false);
+  }
+  if (dt_bias != nullptr) {
+    VT_CHECK(dt_bias->rank == 1 && dt_bias->shape[0] == h && dt_bias->dtype == DType::kF32 &&
+                 dt_bias->IsContiguous() && dt_bias->device == q.device,
+             std::string(name) + ": dt_bias must be f32 [H] contiguous on the queue device");
+  }
+  if (initial_states != nullptr) {
+    VT_CHECK(initial_states->rank == 4 && initial_states->shape[0] == s &&
+                 initial_states->shape[1] == h && initial_states->shape[2] == p &&
+                 initial_states->shape[3] == n,
+             std::string(name) +
+                 ": initial_states must be [S,H,P,N] (ssd_combined.py:78-79, :194)");
+    CheckMamba2Operand(q, *initial_states, name, "initial_states", true);
+  }
+  CheckI32Meta(q, cu_seqlens, s + 1, name, "cu_seqlens");
+  CheckI32Meta(q, last_chunk_indices, s, name, "last_chunk_indices");
+  const int64_t nchunks = cu_chunk_seqlens.rank == 1 ? cu_chunk_seqlens.shape[0] - 1 : -1;
+  VT_CHECK(nchunks >= 0, std::string(name) + ": cu_chunk_seqlens must be i32 [nchunks+1]");
+  CheckI32Meta(q, cu_chunk_seqlens, nchunks + 1, name, "cu_chunk_seqlens");
+  // seq_idx is PER CHUNK, not per token — `seq_idx.shape == (nchunks,)`,
+  // asserted at ssd_combined.py:60-61 and documented at :189.
+  CheckI32Meta(q, seq_idx, nchunks, name, "seq_idx (PER CHUNK, ssd_combined.py:60-61)");
+  reinterpret_cast<Mamba2ChunkScanFn>(GetOp(OpId::kMamba2ChunkScan, q.device.type))(
+      q, out, final_states, x, dt, A, B, C, D, z, dt_bias, initial_states, cu_seqlens,
+      cu_chunk_seqlens, last_chunk_indices, seq_idx, args);
+}
+
+void Mamba2StateUpdate(Queue& q, Tensor& out, Tensor& state, const Tensor& x,
+                       const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                       const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                       const Tensor* state_indices, const Mamba2Args& args) {
+  constexpr const char* name = "mamba2_state_update";
+  CheckMamba2NoShard(args.tp_world_size, name);
+  VT_CHECK(x.rank == 3 && dt.rank == 2 && A.rank == 1 && B.rank == 3 && C.rank == 3 &&
+               out.rank == 3 && state.rank == 4,
+           std::string(name) +
+               ": x/out [Nb,H,P], dt [Nb,H], A [H], B/C [Nb,G,N], state [S,H,P,N]");
+  const int64_t nb = x.shape[0], h = x.shape[1], p = x.shape[2];
+  const int64_t g = B.shape[1], n = B.shape[2];
+  VT_CHECK(dt.shape[0] == nb && dt.shape[1] == h,
+           std::string(name) + ": dt must be [Nb,H] (scalar per head; Mamba2 tie_hdim)");
+  VT_CHECK(A.shape[0] == h, std::string(name) + ": A must be [H]");
+  VT_CHECK(B.shape[0] == nb && C.shape[0] == nb && C.shape[1] == g && C.shape[2] == n,
+           std::string(name) + ": B and C must both be [Nb,G,N]");
+  VT_CHECK(g >= 1 && h % g == 0,
+           std::string(name) + ": nheads must be divisible by ngroups (mamba_ssm.py:583)");
+  VT_CHECK(out.shape[0] == nb && out.shape[1] == h && out.shape[2] == p,
+           std::string(name) + ": out must be [Nb,H,P]");
+  VT_CHECK(state.shape[1] == h && state.shape[2] == p && state.shape[3] == n,
+           std::string(name) + ": state must be [S,H,P,N]");
+  CheckMamba2Operand(q, x, name, "x", false);
+  CheckMamba2Operand(q, dt, name, "dt", false);
+  CheckMamba2Operand(q, B, name, "B", false);
+  CheckMamba2Operand(q, C, name, "C", false);
+  CheckMamba2Operand(q, out, name, "out", true);
+  // The SSM cache dtype is its own knob (mamba2_state_dtype, mamba_utils.py:73-81).
+  CheckMamba2Operand(q, state, name, "state", true);
+  VT_CHECK(A.dtype == DType::kF32 && A.IsContiguous() && A.device == q.device,
+           std::string(name) + ": A must be f32 contiguous on the queue device");
+  if (D != nullptr) {
+    VT_CHECK(D->rank == 1 && D->shape[0] == h && D->dtype == DType::kF32 &&
+                 D->IsContiguous() && D->device == q.device,
+             std::string(name) + ": D must be f32 [H] contiguous on the queue device");
+  }
+  if (z != nullptr) {
+    VT_CHECK(z->rank == 3 && z->shape[0] == nb && z->shape[1] == h && z->shape[2] == p,
+             std::string(name) + ": z must be [Nb,H,P]");
+    CheckMamba2Operand(q, *z, name, "z", false);
+  }
+  if (dt_bias != nullptr) {
+    VT_CHECK(dt_bias->rank == 1 && dt_bias->shape[0] == h && dt_bias->dtype == DType::kF32 &&
+                 dt_bias->IsContiguous() && dt_bias->device == q.device,
+             std::string(name) + ": dt_bias must be f32 [H] contiguous on the queue device");
+  }
+  if (state_indices == nullptr) {
+    VT_CHECK(state.shape[0] == nb,
+             std::string(name) +
+                 ": without state_indices the state is compact, one row per token");
+  } else {
+    CheckI32Meta(q, *state_indices, nb, name, "state_indices");
+  }
+  reinterpret_cast<Mamba2StateUpdateFn>(GetOp(OpId::kMamba2StateUpdate, q.device.type))(
+      q, out, state, x, dt, A, B, C, D, z, dt_bias, state_indices, args);
+}
+
+void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                       const Tensor* weight, const RmsNormGatedGroupArgs& args) {
+  constexpr const char* name = "rms_norm_gated_group";
+  CheckMamba2NoShard(args.tp_world_size, name);
+  VT_CHECK(x.rank >= 2 && x.rank <= 3, std::string(name) + ": x must be rank 2 or 3");
+  VT_CHECK(gate.rank == x.rank && out.rank == x.rank,
+           std::string(name) + ": gate and out must have x's rank");
+  for (int d = 0; d < x.rank; ++d) {
+    VT_CHECK(gate.shape[d] == x.shape[d] && out.shape[d] == x.shape[d],
+             std::string(name) + ": gate and out must have x's shape");
+  }
+  const int64_t hidden = x.shape[x.rank - 1];
+  VT_CHECK(args.n_groups >= 1 && hidden % args.n_groups == 0,
+           std::string(name) +
+               ": n_groups must divide the last dim (group_size = hidden / n_groups, "
+               "mamba_mixer2.py:80)");
+  CheckMamba2Operand(q, x, name, "x", false);
+  CheckMamba2Operand(q, gate, name, "gate", false);
+  CheckMamba2Operand(q, out, name, "out", true);
+  if (weight != nullptr) {
+    VT_CHECK(weight->rank == 1 && weight->shape[0] == hidden,
+             std::string(name) + ": weight must be [hidden]");
+    CheckMamba2Operand(q, *weight, name, "weight", false);
+  }
+  VT_CHECK(args.eps > 0.0f, std::string(name) + ": eps must be > 0");
+  reinterpret_cast<RmsNormGatedGroupFn>(GetOp(OpId::kRmsNormGatedGroup, q.device.type))(
+      q, out, x, gate, weight, args);
+}
+
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx) {
@@ -2258,7 +2598,7 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 }
 
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                const Tensor* shared) {
+                const Tensor* shared, float routed_scale) {
   VT_CHECK(expert_out.rank == 3 && weights.rank == 2 && out.rank == 2,
            "moe_combine: expert_out [T,K,H], weights [T,K], out [T,H]");
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
@@ -2279,8 +2619,8 @@ void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& w
                  shared->device == q.device,
              "moe_combine: shared must be float [T,H] contiguous on the queue device");
   }
-  reinterpret_cast<MoeCombineFn>(GetOp(OpId::kMoeCombine, q.device.type))(q, out, expert_out,
-                                                                          weights, shared);
+  reinterpret_cast<MoeCombineFn>(GetOp(OpId::kMoeCombine, q.device.type))(
+      q, out, expert_out, weights, shared, routed_scale);
 }
 
 void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
@@ -2341,6 +2681,47 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                                                         value, args);
 }
 
+// Dense non-causal CROSS attention (LTX-2.5 L2). Same validation shape as
+// vt::Attention, MINUS the token-count equality it enforces between query and
+// key/value — that equality is precisely what a cross-attention cannot satisfy.
+void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                    const Tensor& value, const Tensor* bias, const AttentionCrossArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "attention_cross: query/key/value/out rank-3 [T,H,D]");
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t s = key.shape[0], hk = key.shape[1];
+  VT_CHECK(tq > 0 && s > 0, "attention_cross: query and key token counts must be positive");
+  VT_CHECK(value.shape[0] == s, "attention_cross: key/value token counts must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention_cross: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention_cross: key/value must share the kv-head count");
+  VT_CHECK(out.shape[0] == tq && out.shape[1] == hq && out.shape[2] == d,
+           "attention_cross: out must be [Tq,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "attention_cross: Hq must be a positive multiple of Hkv (GQA broadcast)");
+  VT_CHECK(args.scale > 0.0f, "attention_cross: scale must be set (> 0), e.g. head_dim^-0.5");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
+           "attention_cross: query/key/value must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "attention_cross: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               out.IsContiguous(),
+           "attention_cross: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               out.device == q.device,
+           "attention_cross: device mismatch (query/key/value/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 2, "attention_cross: bias must be rank-2 [Tq or 1, S]");
+    VT_CHECK(bias->shape[0] == tq || bias->shape[0] == 1,
+             "attention_cross: bias rows must be Tq or 1 (key-only broadcast)");
+    VT_CHECK(bias->shape[1] == s, "attention_cross: bias columns must equal the key count");
+    VT_CHECK(bias->dtype == DType::kF32, "attention_cross: bias must be f32");
+    VT_CHECK(bias->IsContiguous(), "attention_cross: bias must be contiguous");
+    VT_CHECK(bias->device == q.device, "attention_cross: bias device mismatch");
+  }
+  reinterpret_cast<AttentionCrossFn>(GetOp(OpId::kAttentionCross, q.device.type))(
+      q, out, query, key, value, bias, args);
+}
+
 // --- Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3) --------
 // Upstream mirror: transformers 5.3.0
 // transformers/models/parakeet/modeling_parakeet.py (:357 subsampling Conv2d,
@@ -2385,6 +2766,103 @@ void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
   reinterpret_cast<Conv2dFn>(GetOp(OpId::kConv2d, q.device.type))(q, out, x, weight, bias, args);
 }
 
+// --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) --------------
+// Mirrors torch `nn.Conv3d`'s own shape contract at batch 1, so a caller that
+// passes what `CausalConv3d` passes (Lightricks/LTX-2 @ fd4ded7f2,
+// video_vae/convolution.py:292-302) is accepted verbatim. The rank-5 shapes
+// torch uses are expressed at rank 4 for the reason include/vt/ops.h states at
+// vt::Conv3d; both foldings are CHECKED here rather than assumed.
+void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv3dArgs& args) {
+  VT_CHECK(x.rank == 4 && out.rank == 4,
+           "conv3d: x/out must be rank-4 [C,T,H,W] — this op is BATCH 1, because vt::Tensor caps "
+           "rank at 4; pass one clip per call rather than folding N into a channel axis");
+  VT_CHECK(weight.rank == 4, "conv3d: weight must be rank-4 [Cout*Cin/groups,KT,KH,KW]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv3d: groups must be >= 1");
+  const int64_t cin = x.shape[0], tin = x.shape[1], hin = x.shape[2], win = x.shape[3];
+  const int64_t cout = out.shape[0];
+  const int64_t kt = weight.shape[1], kh = weight.shape[2], kw = weight.shape[3];
+  VT_CHECK(cin > 0 && tin > 0 && hin > 0 && win > 0, "conv3d: x extents must be positive");
+  VT_CHECK(cout > 0 && kt > 0 && kh > 0 && kw > 0,
+           "conv3d: out channels and kernel extents must be positive");
+  VT_CHECK(cin % g == 0 && cout % g == 0, "conv3d: groups must divide both Cin and Cout");
+  const int64_t cin_g = cin / g;
+  VT_CHECK(weight.shape[0] == cout * cin_g,
+           "conv3d: weight dim 0 must be Cout*(Cin/groups) — torch's [Cout,Cin/groups,KT,KH,KW] "
+           "with its two leading axes merged");
+  VT_CHECK(args.stride_t >= 1 && args.stride_h >= 1 && args.stride_w >= 1,
+           "conv3d: stride must be >= 1");
+  VT_CHECK(args.dilation_t >= 1 && args.dilation_h >= 1 && args.dilation_w >= 1,
+           "conv3d: dilation must be >= 1");
+  VT_CHECK(args.pad_t >= 0 && args.pad_h >= 0 && args.pad_w >= 0,
+           "conv3d: padding must be >= 0");
+  // The SPAN is separated from the division, and that is the whole of the
+  // shape contract's agreement with torch (#1007 fresh review F7).
+  //
+  // torch FLOORS `(in + 2*pad - dilation*(k-1) - 1) / stride`; C++ integer
+  // division TRUNCATES TOWARD ZERO. The two agree for a non-negative numerator
+  // and disagree for a negative one whenever stride > 1: at
+  // `tin = 2, k = 3, stride = 2, pad = 0` the numerator is -1, so torch gets
+  // `floor(-1/2) + 1 = 0` and raises "Output size is too small" while truncation
+  // gets `-1/2 + 1 = 1` and ACCEPTS an extent of 1, convolving over taps the
+  // stride skipped. Refusing on a negative span makes the two identical without
+  // a signed-division idiom, and it is the shape `Conv1dOutLength` below already
+  // uses for the same reason.
+  //
+  // UNREACHABLE FROM LTX — `CausalConv3d` materialises a pad of at least the
+  // kernel on every axis (video_vae/convolution.py:305-311), so the padded
+  // extent never falls below the kernel. It is gated because this op is offered
+  // as a SHARED SEAM and the contract at vt::Conv3d claims to mirror nn.Conv3d;
+  // tests/vt/test_ops_conv3d.cpp holds it.
+  const int64_t span_t = tin + 2 * args.pad_t - args.dilation_t * (kt - 1) - 1;
+  const int64_t span_h = hin + 2 * args.pad_h - args.dilation_h * (kh - 1) - 1;
+  const int64_t span_w = win + 2 * args.pad_w - args.dilation_w * (kw - 1) - 1;
+  VT_CHECK(span_t >= 0 && span_h >= 0 && span_w >= 0,
+           "conv3d: kernel/dilation larger than the padded input");
+  const int64_t tout = span_t / args.stride_t + 1;
+  const int64_t hout = span_h / args.stride_h + 1;
+  const int64_t wout = span_w / args.stride_w + 1;
+  VT_CHECK(tout > 0 && hout > 0 && wout > 0, "conv3d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[1] == tout && out.shape[2] == hout && out.shape[3] == wout,
+           "conv3d: out must be [Cout,Tout,Hout,Wout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "conv3d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv3d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv3d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout, "conv3d: bias must be rank-1 [Cout]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "conv3d: bias must be a contiguous float tensor on the queue device");
+  }
+  // #1007 fresh review, non-blocking suggestion. The FIRST non-CPU kConv3d
+  // dispatch in a process announces itself, once, on stderr.
+  //
+  // The CUDA arm of this op has never been compiled and has never been run —
+  // there is no `nvcc` on the authoring host and no GPU runner in CI — and no
+  // gate anywhere in this tree can catch a kernel that compiles and computes the
+  // wrong pixels. This line does not remove that risk; it converts a SILENT
+  // first execution of never-run code into an announced one, so whoever gets a
+  // GPU first sees the moment it happened beside whatever the pixels look like.
+  //
+  // Deliberately on the DEVICE-TYPE rather than on CUDA: the same argument holds
+  // for every accelerator arm this seam gains, and putting it here keeps it in
+  // code that this box compiles and `test_diffusion_device_seam` executes,
+  // rather than in a `.cu` file nothing here can build.
+  if (q.device.type != DeviceType::kCPU) {
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) {
+      std::fprintf(stderr,
+                   "[vt] first non-CPU vt::Conv3d dispatch (device type %d). This arm has never "
+                   "been run on real hardware; see issue #1452.\n",
+                   static_cast<int>(q.device.type));
+    }
+  }
+  reinterpret_cast<Conv3dFn>(GetOp(OpId::kConv3d, q.device.type))(q, out, x, weight, bias, args);
+}
+
 void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, const DepthwiseConv1dArgs& args) {
   VT_CHECK(x.rank == 3 && out.rank == 3, "depthwise_conv1d: x/out must be rank-3 [N,C,L]");
@@ -2418,6 +2896,109 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
              "depthwise_conv1d: bias must be a contiguous float tensor on the queue device");
   }
   reinterpret_cast<DepthwiseConv1dFn>(GetOp(OpId::kDepthwiseConv1d, q.device.type))(
+      q, out, x, weight, bias, args);
+}
+
+// --- BigVGAN / DAC vocoder 1-D convolutions (#672) --------------------------
+// Upstream mirror: torch `nn.Conv1d` / `nn.ConvTranspose1d` as instantiated by
+// minimax_music3_vocoder.py:42,44,55,89,98 and LTX-2.5 audio_vae/vocoder.py.
+// The validation mirrors torch's own shape contracts, so a caller that passes
+// what the Python module passes is accepted verbatim. See vt::Conv1d in
+// include/vt/ops.h for the f64-accumulator + pinned-visit-order contract.
+
+int64_t Conv1dOutLength(int64_t in_len, int64_t kernel, const Conv1dArgs& args) {
+  if (args.stride < 1 || args.dilation < 1 || args.padding < 0 || kernel < 1) return 0;
+  const int64_t effective = args.dilation * (kernel - 1) + 1;
+  const int64_t span = in_len + 2 * args.padding - effective;
+  if (span < 0) return 0;
+  return span / args.stride + 1;
+}
+
+int64_t ConvTranspose1dOutLength(int64_t in_len, int64_t kernel, const ConvTranspose1dArgs& args) {
+  if (args.stride < 1 || args.dilation < 1 || args.padding < 0 || args.output_padding < 0 ||
+      kernel < 1 || in_len < 1) {
+    return 0;
+  }
+  return (in_len - 1) * args.stride - 2 * args.padding + args.dilation * (kernel - 1) + 1 +
+         args.output_padding;
+}
+
+void Conv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv1dArgs& args) {
+  VT_CHECK(x.rank == 3 && out.rank == 3, "conv1d: x/out must be rank-3 [N,C,L]");
+  VT_CHECK(weight.rank == 3, "conv1d: weight must be rank-3 [Cout,Cin/groups,K]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv1d: groups must be >= 1");
+  const int64_t n = x.shape[0], cin = x.shape[1], lin = x.shape[2];
+  const int64_t cout = weight.shape[0], cin_g = weight.shape[1], k = weight.shape[2];
+  VT_CHECK(cin > 0 && lin > 0, "conv1d: x extents must be positive");
+  VT_CHECK(cout > 0 && k > 0, "conv1d: weight extents must be positive");
+  VT_CHECK(cin % g == 0 && cout % g == 0, "conv1d: groups must divide both Cin and Cout");
+  VT_CHECK(cin_g == cin / g, "conv1d: weight dim 1 must be Cin/groups");
+  VT_CHECK(args.stride >= 1, "conv1d: stride must be >= 1");
+  VT_CHECK(args.dilation >= 1, "conv1d: dilation must be >= 1");
+  VT_CHECK(args.padding >= 0, "conv1d: padding must be >= 0");
+  const int64_t lout = Conv1dOutLength(lin, k, args);
+  VT_CHECK(lout > 0, "conv1d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[0] == n && out.shape[1] == cout && out.shape[2] == lout,
+           "conv1d: out must be [N,Cout,Lout] for the given stride/padding/dilation");
+  // f32 ONLY, and refused by name rather than widened — see the header.
+  VT_CHECK(x.dtype == DType::kF32 && weight.dtype == DType::kF32 && out.dtype == DType::kF32,
+           "conv1d: x/weight/out must be f32 (f16/bf16 arms are not implemented; the four "
+           "vocoder1d consumers are f32 host-reference paths and no golden covers a narrow one)");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv1d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv1d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout, "conv1d: bias must be rank-1 [Cout]");
+    VT_CHECK(bias->dtype == DType::kF32 && bias->IsContiguous() && bias->device == q.device,
+             "conv1d: bias must be a contiguous f32 tensor on the queue device");
+  }
+  reinterpret_cast<Conv1dFn>(GetOp(OpId::kConv1d, q.device.type))(q, out, x, weight, bias, args);
+}
+
+void ConvTranspose1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const ConvTranspose1dArgs& args) {
+  VT_CHECK(x.rank == 3 && out.rank == 3, "conv_transpose1d: x/out must be rank-3 [N,C,L]");
+  // torch's ConvTranspose1d parameter is [Cin, Cout/groups, K] — dim 0 is the
+  // INPUT channel, the opposite of nn.Conv1d. Getting this backwards still
+  // produces finite, correctly shaped output, so it is checked here.
+  VT_CHECK(weight.rank == 3, "conv_transpose1d: weight must be rank-3 [Cin,Cout/groups,K]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv_transpose1d: groups must be >= 1");
+  const int64_t n = x.shape[0], cin = x.shape[1], lin = x.shape[2];
+  const int64_t cout_g = weight.shape[1], k = weight.shape[2];
+  VT_CHECK(cin > 0 && lin > 0, "conv_transpose1d: x extents must be positive");
+  VT_CHECK(cout_g > 0 && k > 0, "conv_transpose1d: weight extents must be positive");
+  VT_CHECK(weight.shape[0] == cin, "conv_transpose1d: weight dim 0 must be Cin");
+  VT_CHECK(cin % g == 0, "conv_transpose1d: groups must divide Cin");
+  const int64_t cout = cout_g * g;
+  VT_CHECK(args.stride >= 1, "conv_transpose1d: stride must be >= 1");
+  VT_CHECK(args.dilation >= 1, "conv_transpose1d: dilation must be >= 1");
+  VT_CHECK(args.padding >= 0, "conv_transpose1d: padding must be >= 0");
+  VT_CHECK(args.output_padding >= 0, "conv_transpose1d: output_padding must be >= 0");
+  VT_CHECK(args.output_padding < args.stride || args.output_padding < args.dilation,
+           "conv_transpose1d: output_padding must be smaller than stride or dilation (torch)");
+  const int64_t lout = ConvTranspose1dOutLength(lin, k, args);
+  VT_CHECK(lout > 0, "conv_transpose1d: padding crops the whole output away");
+  VT_CHECK(out.shape[0] == n && out.shape[1] == cout && out.shape[2] == lout,
+           "conv_transpose1d: out must be [N,Cout,Lout] for the given stride/padding/dilation");
+  VT_CHECK(x.dtype == DType::kF32 && weight.dtype == DType::kF32 && out.dtype == DType::kF32,
+           "conv_transpose1d: x/weight/out must be f32 (f16/bf16 arms are not implemented; the "
+           "four vocoder1d consumers are f32 host-reference paths and no golden covers a narrow "
+           "one)");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv_transpose1d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv_transpose1d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout,
+             "conv_transpose1d: bias must be rank-1 [Cout]");
+    VT_CHECK(bias->dtype == DType::kF32 && bias->IsContiguous() && bias->device == q.device,
+             "conv_transpose1d: bias must be a contiguous f32 tensor on the queue device");
+  }
+  reinterpret_cast<ConvTranspose1dFn>(GetOp(OpId::kConvTranspose1d, q.device.type))(
       q, out, x, weight, bias, args);
 }
 
@@ -2528,6 +3109,35 @@ void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tenso
       q, out, query, key, value, args);
 }
 
+void AttentionDenseFa2(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                       const Tensor& value, const AttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "attention-dense-fa2: query/key/value/out rank-3 [T,H,D]");
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
+           "attention-dense-fa2: query/key/value token count must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention-dense-fa2: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention-dense-fa2: key/value must share the kv-head count");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
+           "attention-dense-fa2: out must be [T,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "attention-dense-fa2: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(args.scale > 0.0f, "attention-dense-fa2: scale must be set (> 0)");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
+           "attention-dense-fa2: query/key/value must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "attention-dense-fa2: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               out.IsContiguous(),
+           "attention-dense-fa2: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               out.device == q.device,
+           "attention-dense-fa2: device mismatch (query/key/value/out/queue)");
+  reinterpret_cast<AttentionFn>(GetOp(OpId::kAttentionDenseFa2, q.device.type))(
+      q, out, query, key, value, args);
+}
+
 void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                           const Tensor& value, const DFlashBlockAttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
@@ -2612,6 +3222,153 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
       args);
 }
 
+void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                       const Tensor& base, const DFlashGroupedConvArgs& args) {
+  VT_CHECK(args.taps >= 1 && args.num_groups >= 1 && args.group_size >= 1,
+           "dflash2-grouped-conv: taps/num_groups/group_size must be >= 1");
+  VT_CHECK(args.block_size >= 1, "dflash2-grouped-conv: block_size must be >= 1 (1 + k)");
+  VT_CHECK(x.rank == 2 && out.rank == 2, "dflash2-grouped-conv: x/out must be rank-2 [T,H]");
+  VT_CHECK(coefficients.rank == 4,
+           "dflash2-grouped-conv: coefficients must be rank-4 [T,sides,taps,num_groups]");
+  VT_CHECK(base.rank == 3, "dflash2-grouped-conv: base must be rank-3 [sides,taps,H]");
+  const int64_t t = x.shape[0];
+  const int64_t h = args.num_groups * args.group_size;
+  const int64_t sides = coefficients.shape[1];
+  VT_CHECK(x.shape[1] == h,
+           "dflash2-grouped-conv: x hidden must be num_groups*group_size");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == h,
+           "dflash2-grouped-conv: out must be [T,H] matching x");
+  VT_CHECK(coefficients.shape[0] == t && coefficients.shape[2] == args.taps &&
+               coefficients.shape[3] == args.num_groups,
+           "dflash2-grouped-conv: coefficients must be [T,sides,taps,num_groups]");
+  VT_CHECK(base.shape[0] == sides && base.shape[1] == args.taps && base.shape[2] == h,
+           "dflash2-grouped-conv: base must be [sides,taps,H] with the coefficients' sides");
+  VT_CHECK(args.side >= 0 && args.side < sides,
+           "dflash2-grouped-conv: side must index the sides dimension "
+           "(0 = prepare, 1 = finish)");
+  // ONE dtype across all four. The rounding after each step is what makes the
+  // CPU reference and the CUDA kernel bit-identical, and a mixed set would make
+  // "the dtype" ambiguous rather than merely inconvenient.
+  VT_CHECK(IsFloat(x.dtype) && coefficients.dtype == x.dtype && base.dtype == x.dtype &&
+               out.dtype == x.dtype,
+           "dflash2-grouped-conv: x/coefficients/base/out must share one float dtype");
+  VT_CHECK(x.IsContiguous() && coefficients.IsContiguous() && base.IsContiguous() &&
+               out.IsContiguous(),
+           "dflash2-grouped-conv: contiguous tensors required");
+  VT_CHECK(x.device == q.device && coefficients.device == q.device &&
+               base.device == q.device && out.device == q.device,
+           "dflash2-grouped-conv: device mismatch (x/coefficients/base/out/queue)");
+  reinterpret_cast<DFlashGroupedConvFn>(GetOp(OpId::kDFlashGroupedConv, q.device.type))(
+      q, out, x, coefficients, base, args);
+}
+
+void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                          const Tensor& succ_codebook, const Tensor& candidate_ids,
+                          const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
+                          const Dflash2SelectorEdgesArgs& args) {
+  VT_CHECK(args.top_k >= 1, "dflash2-selector-edges: top_k must be >= 1");
+  VT_CHECK(pred_codebook.rank == 2 && succ_codebook.rank == 2,
+           "dflash2-selector-edges: codebooks must be rank-2 [vocab, rank]");
+  VT_CHECK(candidate_ids.rank == 3 && unary.rank == 3 && hidden.rank == 3,
+           "dflash2-selector-edges: candidate_ids/unary must be [B,L,K] and hidden [B,L,R]");
+  VT_CHECK(scores.rank == 4, "dflash2-selector-edges: scores must be rank-4 [B,L,K,K]");
+  VT_CHECK(anchors.rank == 1, "dflash2-selector-edges: anchors must be rank-1 [B]");
+  const int64_t b = candidate_ids.shape[0], l = candidate_ids.shape[1];
+  const int64_t k = args.top_k, r = pred_codebook.shape[1];
+  VT_CHECK(candidate_ids.shape[2] == k,
+           "dflash2-selector-edges: candidate_ids last dim must be top_k");
+  VT_CHECK(unary.shape[0] == b && unary.shape[1] == l && unary.shape[2] == k,
+           "dflash2-selector-edges: unary must be [B,L,K] matching candidate_ids");
+  VT_CHECK(hidden.shape[0] == b && hidden.shape[1] == l && hidden.shape[2] == r,
+           "dflash2-selector-edges: hidden must be [B,L,rank]");
+  VT_CHECK(scores.shape[0] == b && scores.shape[1] == l && scores.shape[2] == k &&
+               scores.shape[3] == k,
+           "dflash2-selector-edges: scores must be [B,L,K,K]");
+  VT_CHECK(anchors.shape[0] == b, "dflash2-selector-edges: anchors must be [B]");
+  VT_CHECK(succ_codebook.shape[0] == pred_codebook.shape[0] &&
+               succ_codebook.shape[1] == r,
+           "dflash2-selector-edges: the two codebooks must share [vocab, rank]");
+  // ONE float dtype across the codebooks and the projected hidden — upstream's
+  // params_dtype, the model dtype. `unary` and `scores` are f32 because upstream
+  // makes the candidate values f32 in compute_candidates and torch then promotes
+  // the bf16 einsum output to f32 on the add.
+  VT_CHECK(IsFloat(pred_codebook.dtype) && succ_codebook.dtype == pred_codebook.dtype &&
+               hidden.dtype == pred_codebook.dtype,
+           "dflash2-selector-edges: codebooks and hidden must share one float dtype");
+  VT_CHECK(unary.dtype == DType::kF32 && scores.dtype == DType::kF32,
+           "dflash2-selector-edges: unary and scores must be f32");
+  VT_CHECK(candidate_ids.dtype == DType::kI64 && anchors.dtype == DType::kI64,
+           "dflash2-selector-edges: candidate_ids and anchors must be i64");
+  VT_CHECK(pred_codebook.IsContiguous() && succ_codebook.IsContiguous() &&
+               candidate_ids.IsContiguous() && unary.IsContiguous() &&
+               hidden.IsContiguous() && anchors.IsContiguous() && scores.IsContiguous(),
+           "dflash2-selector-edges: contiguous tensors required");
+  VT_CHECK(pred_codebook.device == q.device && succ_codebook.device == q.device &&
+               candidate_ids.device == q.device && unary.device == q.device &&
+               hidden.device == q.device && anchors.device == q.device &&
+               scores.device == q.device,
+           "dflash2-selector-edges: device mismatch");
+  reinterpret_cast<Dflash2SelectorEdgesFn>(
+      GetOp(OpId::kDflash2SelectorEdges, q.device.type))(
+      q, scores, pred_codebook, succ_codebook, candidate_ids, unary, hidden, anchors, args);
+}
+
+void Dflash2PathWalk(Queue& q, Tensor& tokens, const Tensor& scores,
+                     const Tensor& candidate_ids, const Dflash2PathWalkArgs& args) {
+  VT_CHECK(args.top_k >= 1, "dflash2-path-walk: top_k must be >= 1");
+  VT_CHECK(scores.rank == 4, "dflash2-path-walk: scores must be rank-4 [B,L,K,K]");
+  VT_CHECK(candidate_ids.rank == 3,
+           "dflash2-path-walk: candidate_ids must be rank-3 [B,L,K]");
+  VT_CHECK(tokens.rank == 2, "dflash2-path-walk: tokens must be rank-2 [B,L]");
+  const int64_t b = candidate_ids.shape[0], l = candidate_ids.shape[1];
+  const int64_t k = args.top_k;
+  VT_CHECK(candidate_ids.shape[2] == k,
+           "dflash2-path-walk: candidate_ids last dim must be top_k");
+  // BOTH trailing axes are checked. They are the PREDECESSOR axis and the CHILD
+  // axis and they have the same extent, so checking one and inferring the other
+  // would admit a lattice indexed the wrong way round -- which reads plausible
+  // scores from the wrong rows and moves acceptance without raising.
+  VT_CHECK(scores.shape[0] == b && scores.shape[1] == l && scores.shape[2] == k &&
+               scores.shape[3] == k,
+           "dflash2-path-walk: scores must be [B,L,K,K] matching candidate_ids");
+  VT_CHECK(tokens.shape[0] == b && tokens.shape[1] == l,
+           "dflash2-path-walk: tokens must be [B,L] matching candidate_ids");
+  VT_CHECK(scores.dtype == DType::kF32, "dflash2-path-walk: scores must be f32");
+  VT_CHECK(candidate_ids.dtype == DType::kI64 && tokens.dtype == DType::kI64,
+           "dflash2-path-walk: candidate_ids and tokens must be i64");
+  VT_CHECK(scores.IsContiguous() && candidate_ids.IsContiguous() && tokens.IsContiguous(),
+           "dflash2-path-walk: contiguous tensors required");
+  VT_CHECK(scores.device == q.device && candidate_ids.device == q.device &&
+               tokens.device == q.device,
+           "dflash2-path-walk: device mismatch");
+  reinterpret_cast<Dflash2PathWalkFn>(GetOp(OpId::kDflash2PathWalk, q.device.type))(
+      q, tokens, scores, candidate_ids, args);
+}
+
+void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                       const TopKValuesIndicesArgs& args) {
+  VT_CHECK(logits.rank == 2 && values.rank == 2 && indices.rank == 2,
+           "topk-values-indices: logits/values/indices must be rank-2");
+  const int64_t rows = logits.shape[0], v = logits.shape[1];
+  const int64_t pad = args.num_org_vocab_padding;
+  VT_CHECK(pad >= 0 && pad < v, "topk-values-indices: num_org_vocab_padding must be in [0, V)");
+  VT_CHECK(args.k >= 1 && args.k <= v - pad,
+           "topk-values-indices: k must be in [1, V - num_org_vocab_padding]");
+  VT_CHECK(values.shape[0] == rows && indices.shape[0] == rows &&
+               values.shape[1] == args.k && indices.shape[1] == args.k,
+           "topk-values-indices: values/indices must be [rows, k]");
+  VT_CHECK(logits.dtype == DType::kF32 && values.dtype == DType::kF32,
+           "topk-values-indices: logits and values must be f32");
+  VT_CHECK(indices.dtype == DType::kI64, "topk-values-indices: indices must be i64");
+  VT_CHECK(logits.IsContiguous() && values.IsContiguous() && indices.IsContiguous(),
+           "topk-values-indices: contiguous tensors required");
+  VT_CHECK(logits.device == q.device && values.device == q.device &&
+               indices.device == q.device,
+           "topk-values-indices: device mismatch");
+  reinterpret_cast<TopKValuesIndicesFn>(GetOp(OpId::kTopKValuesIndices, q.device.type))(
+      q, values, indices, logits, args);
+}
+
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3,
@@ -2632,6 +3389,19 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
   // trailing rows (CUDA-graph padding) that are ignored.
   VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
            "reshape_and_cache: num_tokens (k.shape[0]) must be >= slot_mapping length");
+  // KV-FP8 W3 — the loud end of the half-sized-block hazard. A `kI8` cache page
+  // is one byte per element because the KV-cache spec was sized that way; a
+  // float store into it would write two bytes per element at offsets computed
+  // for one, which is wrong tokens rather than an out-of-bounds. Every
+  // attention block that has been routed calls `vt::ReshapeAndCacheFp8` here
+  // instead (`include/vllm/model_executor/models/kv_cache_route.h`), so reaching
+  // this line means THIS architecture's attention block has not been routed —
+  // and the message says so rather than reporting a dtype mismatch.
+  VT_CHECK(k_cache.dtype != DType::kI8 && v_cache.dtype != DType::kI8,
+           "reshape_and_cache: this cache is 1-byte fp8 storage (DType::kI8) but "
+           "this is the float (auto) store; an fp8 KV cache must be written "
+           "through vt::ReshapeAndCacheFp8. This model's attention block is not "
+           "routed for fp8 KV (KV-FP8 W3) — run it on --kv-cache-dtype auto");
   VT_CHECK(IsFloat(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
                v_cache.dtype == k.dtype,
            "reshape_and_cache: k/v/k_cache/v_cache must share one float dtype (auto cache path)");
@@ -2676,8 +3446,8 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(kind != Fp8KVCacheDataType::kAuto,
            "reshape_and_cache_fp8: kind must be an fp8 dtype (use ReshapeAndCache for auto)");
   VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
-           "reshape_and_cache_fp8: only fp8_e4m3 is implemented on CPU in W1 "
-           "(fp8_e5m2 CPU compute is a named later brick)");
+           "reshape_and_cache_fp8: only fp8_e4m3 is implemented "
+           "(fp8_e5m2 compute is a named later brick, spec W5)");
   VT_CHECK(k.rank == 3 && v.rank == 3,
            "reshape_and_cache_fp8: k/v must be rank-3 [num_tokens,num_kv_heads,head_size]");
   VT_CHECK(k_cache.rank == 4 && v_cache.rank == 4,
@@ -2718,9 +3488,11 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
            "reshape_and_cache_fp8: k_cache/v_cache page must be head-contiguous "
            "(stride[2] == head_size) — the NHD unbind-slice layout");
-  VT_CHECK(q.device.type == DeviceType::kCPU,
-           "reshape_and_cache_fp8: only the CPU fp8-KV store is implemented in W1 "
-           "(the CUDA fp8-KV store kernel is a named later brick)");
+  // NO device-class guard. W1 hard-refused every non-CPU queue here, which is
+  // what kept the CUDA arm unreachable; W2 lands that arm (cuda_cache.cu), so
+  // the op resolves through the provider table like every other op and a device
+  // with no registered fp8-KV store refuses BY NAME in GetOp
+  // (src/vt/op_provider.cpp:563-567) instead of by device class.
   VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
                v_cache.device == q.device && slot_mapping.device == q.device,
            "reshape_and_cache_fp8: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
@@ -3045,15 +3817,25 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
              "paged_attention: k_cache/v_cache must share one float dtype");
   } else {
     VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3,
-             "paged_attention: only fp8_e4m3 KV read is implemented on CPU in W1 "
-             "(fp8_e5m2 CPU read is a named later brick)");
+             "paged_attention: only the fp8_e4m3 KV read is implemented "
+             "(the fp8_e5m2 read is a named later brick, spec W5)");
     VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
              "paged_attention: fp8 KV read requires 1-byte fp8 cache (DType::kI8)");
     VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
              "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
-    VT_CHECK(q.device.type == DeviceType::kCPU,
-             "paged_attention: only the CPU fp8-KV read is implemented in W1 "
-             "(the CUDA fp8-KV paged-attention kernel is a named later brick)");
+    // WHICH BACKENDS HAVE AN fp8 READ. Unlike the fp8 STORE — a separate OpId
+    // that only the CPU and CUDA backends register, so an unimplemented backend
+    // refuses by name inside GetOp — the fp8 read rides ADDITIVE fields on
+    // PagedAttentionArgs of an op that kMETAL and kROCM already register for the
+    // float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider table can
+    // tell those two apart, so without this list an fp8 cache would reach a
+    // kernel that reads the same bytes as floats and returns silent garbage.
+    // AGENTS.md: refuse an unimplemented arm with a message that names the
+    // missing part. CPU landed in W1, CUDA in W2; Metal and ROCm are owed.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA,
+             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1) and "
+             "CUDA (KV-FP8 W2) only; this backend has no fp8 dequant on the cache read "
+             "and would read the fp8 bytes as its float dtype");
   }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.
@@ -3321,7 +4103,16 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in) {
 }
 
 void MulColVecF32(Queue& q, Tensor& x, const Tensor& col) {
-  VT_CHECK(x.dtype == DType::kF32, "mul_col_vec_f32: x must be f32");
+  // PERF-FP8-ALPHA-FOLD / #417: x may be bf16 as well as f32. The op is named
+  // for the ARITHMETIC (an f32 multiply by an f32 column vector), not for the
+  // store width -- `col` stays f32 on both arms and the multiply is f32 on both
+  // arms; only x's store rounds. Narrowing x halves the bytes this
+  // read-modify-write moves, which is its entire measured cost (it runs at 77%
+  // of the GB10's peak bandwidth on the merged FP8 GDN in_proj output). The
+  // narrowing is NOT value-neutral, so it is opt-in at the model layer
+  // (VT_GDN_FP8_IN_BF16, default OFF) and never chosen here.
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
+           "mul_col_vec_f32: x must be f32 or bf16");
   VT_CHECK(col.dtype == DType::kF32, "mul_col_vec_f32: col must be f32");
   VT_CHECK(x.rank == 2, "mul_col_vec_f32: x must be rank-2 [M,N]");
   VT_CHECK(col.rank == 1, "mul_col_vec_f32: col must be rank-1 [N]");

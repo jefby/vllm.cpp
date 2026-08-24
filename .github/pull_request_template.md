@@ -7,10 +7,11 @@
 
 ## Before starting
 
-<!-- Record what you found before implementation. "No matching issue or PR" is
-     valid; do not invent one for small governance or documentation work. -->
+<!-- Record what you found before implementation. Every change needs an open
+     issue. -->
 
 - Issue/PR search and existing claim:
+- Pull request shape selected at row claim:
 - Roadmap or matrix row, plus `scripts/ready-for-helper.py` result when applicable:
 - Exact current-code and test/evidence anchors inspected:
 
@@ -25,8 +26,7 @@
 
 - [ ] `scripts/agent-preflight.sh` passes
 - [ ] tests that cover this change (name them):
-- [ ] same-change doc obligations (`docs/STATUS.md`, `docs/BENCHMARKS.md`, and
-      `docs/FEATURES.md` if a feature/model/backend/quant surface moved)
+- [ ] public docs changed only when this PR changes their owned user-facing facts
 
 ## Speed claims
 
@@ -39,3 +39,20 @@
 
 <!-- What you did NOT do, what you could not verify, what you guessed.
      This section being empty is itself a claim. -->
+
+<!-- The repository squashes with `squash_merge_commit_message = PR_BODY`, so
+     THIS BODY becomes the landed commit message. The block below is the trailer
+     contract from AGENTS.md. Keep it last, keep the blank lines, and set
+     Assisted-by to the agent and model that did the work. CI validates this
+     body with the same checker that walks the landed commit. -->
+
+<!-- NO BARE `---` ANYWHERE IN THIS BODY. Git reads a line of `---` as the patch
+     divider, so everything below the first one leaves the commit message and
+     the trailers under it become unparseable. Write a horizontal rule as `***`
+     or `___` instead (#1563). -->
+
+FOLLOWING_AGENTS_PROTOCOL
+
+Following-Agents-Protocol: true
+AI-Assisted: true
+Assisted-by: AGENT:MODEL [TOOL]

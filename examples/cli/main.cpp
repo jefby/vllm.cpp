@@ -41,6 +41,13 @@ struct Args {
   bool stream = false;
   int repeat = 1;  // load once, complete N times (warm tok/s)
   std::string speculative_config;  // vLLM --speculative-config JSON; "" => off.
+  // --offload-config (#1135): the same JSON document `vllm-server` takes, and
+  // the same ABI field. It carries TWO halves — vLLM's mirrored `uva`/`prefetch`
+  // weight offload, and vllm.cpp's `vllm_cpp` weight-residency tier, which is
+  // what makes a checkpoint larger than host RAM loadable. `vllm-cli` had no
+  // such flag, so the only way to reach the residency tier from it was the
+  // `VT_*` environment variables. "" => NULL => the byte-identical default.
+  std::string offload_config;
   // --device (ABI v14): "auto" (default probe), "cpu", or "cuda" — the names
   // of vLLM's DeviceConfig.device this build serves. Mapped to the int the ABI
   // takes (0/1/2) in ParseArgs; an unknown name is rejected there.
@@ -48,7 +55,13 @@ struct Args {
   // --gpu-memory-utilization / --kv-cache-memory (ABI v16): KV-pool sizing.
   // gpu_memory_utilization is inert until the M3 profile run lands;
   // kv_cache_memory_bytes (> 0) sizes the block count directly.
-  double gpu_memory_utilization = 0.92;
+  //
+  // 0.0, NOT 0.92 (FIX-GPU-MEM-UTIL-INERT, #1165). 0.0 is the ABI's documented
+  // "unset" spelling (vllm.h: 0.0 => 0.92), so this stays 0.0 until the user
+  // types --gpu-memory-utilization. The engine now warns that a CHOSEN fraction
+  // sized nothing, and pre-filling 0.92 here would make every plain `vllm-cli`
+  // run look like an explicit ask and print that warning.
+  double gpu_memory_utilization = 0.0;
   long long kv_cache_memory_bytes = 0;
   // --max-num-seqs: max concurrent sequences. Exposed because it is the knob the
   // recurrent-state budget check names (issue #371): under speculative decoding
@@ -66,7 +79,7 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--seed S] [--stream] [--repeat N]\n"
       "          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]\n"
       "          [--max-num-seqs N]\n"
-      "          [--speculative-config '<json>']\n"
+      "          [--speculative-config '<json>'] [--offload-config '<json>']\n"
       "\n"
       "Runs completion(s) over the vllm.cpp C ABI (libvllm). <dir> holds\n"
       "config.json, tokenizer.json and the *.safetensors shards.\n"
@@ -115,6 +128,8 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       if (a.repeat < 1) a.repeat = 1;
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i);
+    } else if (flag == "--offload-config") {
+      a.offload_config = NextArg(argc, argv, i);
     } else if (flag == "--gpu-memory-utilization") {
       a.gpu_memory_utilization = std::atof(NextArg(argc, argv, i));
     } else if (flag == "--kv-cache-memory") {
@@ -201,12 +216,25 @@ int main(int argc, char** argv) {
   if (!args.speculative_config.empty()) {
     mp.speculative_config = args.speculative_config.c_str();
   }
+  // --offload-config (#1135): one string, both halves, parsed by the library at
+  // `vllm_engine_load` (src/capi/vllm_c.cpp) exactly as `vllm-server` parses it.
+  // This example stays a thin ABI client and adds no parsing of its own, so a
+  // malformed document, an unknown key at any level of it, or a residency
+  // document that a decision has already fixed all fail the load below with the
+  // library's own message.
+  if (!args.offload_config.empty()) {
+    mp.offload_config = args.offload_config.c_str();
+  }
   // --device: explicit device selection (ABI v14). 0 (the default) keeps the
   // accelerator-first probe; an explicitly named absent device fails the load
   // below with the library's message (never a silent fallback).
   mp.device = args.device;
   // KV-pool sizing knobs (ABI v16). Defaults leave the historical 256-block
   // behaviour; --kv-cache-memory sizes the pool from an absolute byte budget.
+  // The assignment OVERWRITES vllm_model_params_default()'s pre-filled 0.92
+  // with 0.0 unless --gpu-memory-utilization was typed, which is what keeps a
+  // plain run out of the #1165 warning. Do not guard it with `> 0.0`: that
+  // would leave the 0.92 in place and warn on every start.
   mp.gpu_memory_utilization = args.gpu_memory_utilization;
   mp.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
   if (args.max_num_seqs > 0) mp.max_num_seqs = args.max_num_seqs;
@@ -250,9 +278,16 @@ int main(int argc, char** argv) {
     // ── Blocking: load once, optionally repeat for warm tok/s. ───────────────
     for (int r = 0; r < args.repeat; ++r) {
       vllm_completion out{};
+      // TWO CLOCKS, DELIBERATELY, because they answer different questions.
+      // steady_clock measures the DURATION and cannot jump; system_clock names
+      // the INSTANT, which is the only thing an out-of-process observer can
+      // line its own samples up against. Reporting a duration from the wall
+      // clock, or an instant from the monotonic one, would each be wrong.
+      const auto w0 = std::chrono::system_clock::now();
       const auto t0 = std::chrono::steady_clock::now();
       st = vllm_complete(engine, args.prompt.c_str(), &sp, &out);
       const auto t1 = std::chrono::steady_clock::now();
+      const auto w1 = std::chrono::system_clock::now();
       const double secs =
           std::chrono::duration<double>(t1 - t0).count();
       if (st != VLLM_OK) {
@@ -273,6 +308,22 @@ int main(int argc, char** argv) {
                    r + 1, args.repeat,
                    out.finish_reason != nullptr ? out.finish_reason : "(none)",
                    out.prompt_tokens, ct, secs, tps);
+      // THE LEG'S BOUNDARIES, as Unix epoch seconds (#1671). A benchmark
+      // sampling the GPU from outside this process sees the PROCESS, and one
+      // `vllm-cli` run is a 52 GiB checkpoint read followed by a few seconds of
+      // generation: the DFlash2 speed gate's window came out 18.37% busy over
+      // 3222 samples and its clock rule refused it, correctly, because the
+      // retained window did not describe the measured work. Only this process
+      // knows when the generation was, so only this process can say. Epoch
+      // seconds rather than an ISO stamp because there is no time zone to get
+      // wrong, and printed on their own line so the timing line above keeps the
+      // format every existing reader already parses.
+      std::fprintf(stderr,
+                   "vllm-cli: run=%d/%d generate_start_unix=%.6f "
+                   "generate_end_unix=%.6f\n",
+                   r + 1, args.repeat,
+                   std::chrono::duration<double>(w0.time_since_epoch()).count(),
+                   std::chrono::duration<double>(w1.time_since_epoch()).count());
       std::fflush(stderr);
       vllm_completion_free(&out);
     }

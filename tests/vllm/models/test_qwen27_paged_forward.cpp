@@ -367,14 +367,19 @@ GDNAttentionMetadata ChunkGdnMeta(int64_t qlen, int32_t sidx, bool has_initial) 
 // Mirrors vLLM v0.25.0
 // qwen_gdn_linear_attn.py::_forward_core:1286-1298. The packed branch is
 // selected only for enabled, pure non-spec decode; every prefill/mixed/spec
-// shape remains on the standard recurrence. Local W1D2 additionally scopes the
-// first model consumer to the real dense packed-BA path and requires compatible
-// BF16 storage plus persistent device indices.
+// shape remains on the standard recurrence. Locally it additionally requires the
+// packed-BA owner, compatible BF16 activation dtypes, and persistent device
+// indices.
+//
+// W1D2's `dense_model` term is gone (GDN-MOE-BF16-OUT, #1168). The `rejects`
+// case that pinned it is replaced below by the argument for its removal rather
+// than deleted: the term is redundant behind the dtype rule, and what still
+// keeps a MoE checkpoint off this path is `has_packed_ba` (#1169), which the
+// case below now names.
 TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
   vllm::detail::GdnPackedDecodeEligibility e;
   e.runtime_enabled = true;
   e.cuda = true;
-  e.dense_model = true;
   e.has_packed_ba = true;
   e.merged_ba_enabled = true;
   e.dtype_compatible = true;
@@ -399,11 +404,16 @@ TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
     rejects(x);
   }
   {
-    auto x = e;
-    x.dense_model = false;
-    rejects(x);  // 35B/MoE is deliberately inert in W1D2.
-  }
-  {
+    // W1D2 asserted here that `dense_model = false` deselects, which was the
+    // record of f344decf4's day-one staging gate. GDN-MOE-BF16-OUT (#1168)
+    // removed that term, so the assertion is replaced by the two terms that
+    // ACTUALLY keep a MoE checkpoint off this path, neither of which is a model
+    // shape. The merged BA owner below is built only by the dense loader
+    // (qwen3_5_dense_weights.cpp:437) — that is #1169, and it is owed. The
+    // second is the dtype rule, already pinned by the `dtype_compatible` case
+    // further down: `core_out` is `outdt` and GdnPackedDecodeDTypesCompatible
+    // pins it to BF16, so an f32 recurrence output deselects on EITHER arm,
+    // which is what made the shape term redundant rather than merely unmeasured.
     auto x = e;
     x.has_packed_ba = false;
     rejects(x);
@@ -455,6 +465,342 @@ TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
     x.num_actual_tokens = 5;
     rejects(x);  // padded/non-actual rows are never consumed as live tokens.
   }
+}
+
+// PERF-27B-GDN-PACKED-REACHABLE (#365). CPU tier: these pin DECISIONS, never
+// numbers. The vendored FLA cubin the decision unlocks is CUDA-only (and only
+// linked in VLLM_CPP_TRITON builds), so nothing here proves it runs, is
+// token-exact, or is faster. What IS provable on CPU is which branch the model
+// would take, and that is the whole deliverable of this row.
+
+// The eligibility runs BEFORE ProjectGdnQkvz (it feeds ProjectGdnBA's output
+// dtype), so `mixed_qkv`'s dtype is predicted, not observed. The prediction has
+// to mirror ProjectGdnQkvz's branch order exactly: merged BF16 owner first,
+// then the native-FP8 owner, then the split BF16 owner.
+TEST_CASE("qwen27 packed GDN predicts the mixed_qkv dtype ProjectGdnQkvz emits") {
+  using vllm::detail::GdnMixedQkvDTypeInputs;
+  using vllm::detail::GdnProjectedMixedQkvDType;
+  using vt::DType;
+
+  // Merged BF16 owner (the 27B bf16 / 4B path): mixed_qkv is GdnInDType().
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            true, false, false, DType::kBF16, DType::kF32}) == DType::kBF16);
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            true, false, false, DType::kF32, DType::kF32}) == DType::kF32);
+
+  // Split BF16 owner (GGUF/synthetic): also GdnInDType().
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, false, false, DType::kBF16, DType::kF32}) == DType::kBF16);
+
+  // Native-FP8 owner (modelopt_mixed): the fp8 epilogue's dtype, NOT
+  // GdnInDType() — precisely the case the old fp8-weight term stood in for.
+  // At the f32 default the epilogue emits F32 even though GdnInDType() is BF16.
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, true, true, DType::kBF16, DType::kF32}) == DType::kF32);
+  // ...and BF16 once the fp8 GEMM is made to emit it (PERF-FP8-ALPHA-FOLD).
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, true, true, DType::kBF16, DType::kBF16}) == DType::kBF16);
+
+  // PERF-GDN-PACKED-BRIDGE. `VT_GDN_FP8_IN_BF16` narrows the MERGED fp8 arm
+  // only: `fp8_indt` reaches MergedFp8QkvzD and nothing else, while the SPLIT
+  // fp8 arm still hardcodes F32 on both of its call paths. So the prediction
+  // must know which arm runs. Getting this wrong is not symmetric — predicting
+  // BF16 on a checkpoint that takes the split path is the UNSAFE direction, in
+  // which vt::GdnPackedDecode is handed an f32 mixed_qkv with bf16 a/b/out and
+  // THROWS on its uniformity check.
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, true, false, DType::kBF16, DType::kBF16}) == DType::kF32);
+  // ...and the split arm is F32 whatever the epilogue dtype says.
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, true, false, DType::kF32, DType::kBF16}) == DType::kF32);
+
+  // Branch ORDER: a checkpoint carrying BOTH owners projects through the BF16
+  // one, so neither the FP8 epilogue dtype nor the fp8 arm flag may win.
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            true, true, true, DType::kBF16, DType::kF32}) == DType::kBF16);
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            true, true, false, DType::kBF16, DType::kBF16}) == DType::kBF16);
+}
+
+// PERF-GDN-PACKED-BRIDGE (#365). The single source for the dtype the native-FP8
+// merged GDN in_proj emits. ONE function answers it for BOTH the producer
+// (ProjectGdnQkvz's `fp8_indt`, handed to MergedFp8QkvzD) and the predictor
+// (GdnFp8MixedQkvDType, which the packed-decode eligibility reads BEFORE the
+// projection has run). They cannot drift because they are the same call.
+//
+// The three terms are PERF-FP8-ALPHA-FOLD's own, kept verbatim: the opt-in
+// toggle, `indt == BF16` (honouring VT_GDN_IN_BF16's documented rollback, since
+// that lever is the one being unblocked), and `outdt == BF16`, which keeps the
+// chain dtype-uniform.
+//
+// GDN-MOE-BF16-OUT (#1168), and #521 asked for exactly this correction. That
+// third term USED to be described here as what "confines this to the dense 27B —
+// the 35B is MoE, so GdnOutDType is f32 there and the whole arm stays inert".
+// `GdnOutDType()` no longer branches on model shape, so `outdt == BF16` is now
+// unconditional at the default and the term excludes NO checkpoint. What keeps
+// this arm inert on the 35B is the DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle, and
+// that is the only remaining bound — which is why the toggle case below is the
+// one a reader must not mistake for a shape guard.
+TEST_CASE("qwen27 fp8 merged in_proj dtype is one decision, all three terms") {
+  using vllm::detail::GdnFp8MergedMixedQkvDType;
+  using vt::DType;
+
+  // All three: BF16. This is the ONLY combination that narrows.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kBF16, DType::kBF16) ==
+        DType::kBF16);
+
+  // Toggle OFF is the shipped default and must be F32 regardless.
+  CHECK(GdnFp8MergedMixedQkvDType(false, DType::kBF16, DType::kBF16) ==
+        DType::kF32);
+
+  // Each dtype term is independently necessary.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kBF16) ==
+        DType::kF32);  // VT_GDN_IN_BF16=0 rollback.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kBF16, DType::kF32) ==
+        DType::kF32);  // the VT_GDN_OUT_BF16=0 rollback, on EITHER arm (#1168).
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kF32) ==
+        DType::kF32);
+  CHECK(GdnFp8MergedMixedQkvDType(false, DType::kF32, DType::kF32) ==
+        DType::kF32);
+}
+
+// PERF-GDN-PACKED-BRIDGE (#365). The composition end to end, as a decision:
+// does the packed arm become eligible when — and ONLY when — the fp8 merged
+// in_proj actually emits BF16? This is the assertion that was false before the
+// bridge: both toggles ON still predicted F32, so the arm stayed inert and any
+// A/B measured nothing.
+TEST_CASE("qwen27 fp8 tower reaches the packed dtype rule only when it emits BF16") {
+  using vllm::detail::GdnFp8MergedMixedQkvDType;
+  using vllm::detail::GdnMixedQkvDTypeInputs;
+  using vllm::detail::GdnPackedDecodeDTypes;
+  using vllm::detail::GdnPackedDecodeDTypesCompatible;
+  using vllm::detail::GdnProjectedMixedQkvDType;
+  using vt::DType;
+
+  // The real modelopt_mixed 27B: no bf16 qkvz owner, fp8 owner, merged arm.
+  // `ba_out`/`core_out` are BF16 at their defaults (MergedGdnBaOutputDType under
+  // packed, GdnOutDType dense) and the SSM cache is F32, native to the
+  // checkpoint's own `mamba_ssm_dtype: "float32"`.
+  auto rule_for = [](bool toggle_on) {
+    const DType mixed = GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+        false, true, true, DType::kBF16,
+        GdnFp8MergedMixedQkvDType(toggle_on, DType::kBF16, DType::kBF16)});
+    return GdnPackedDecodeDTypesCompatible(
+        GdnPackedDecodeDTypes{mixed, DType::kBF16, DType::kBF16, DType::kF32});
+  };
+
+  CHECK_FALSE(rule_for(false));  // shipped default: fp8 tower stays unpacked.
+  CHECK(rule_for(true));         // VT_GDN_FP8_IN_BF16=1: packed becomes eligible.
+
+  // The SPLIT fp8 arm never becomes eligible, toggle or not — it still emits
+  // F32, and predicting otherwise is the throw described above.
+  auto split_rule_for = [](bool toggle_on) {
+    const DType mixed = GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+        false, true, false, DType::kBF16,
+        GdnFp8MergedMixedQkvDType(toggle_on, DType::kBF16, DType::kBF16)});
+    return GdnPackedDecodeDTypesCompatible(
+        GdnPackedDecodeDTypes{mixed, DType::kBF16, DType::kBF16, DType::kF32});
+  };
+  CHECK_FALSE(split_rule_for(false));
+  CHECK_FALSE(split_rule_for(true));
+}
+
+// The rule itself: vt::GdnPackedDecode's uniformity contract over the four
+// ACTIVATION tensors, pinned to BF16, with an INDEPENDENT state dtype. No term
+// keys on how the weights are stored.
+TEST_CASE("qwen27 packed GDN dtype rule is uniformity + BF16, state independent") {
+  using vllm::detail::GdnPackedDecodeDTypes;
+  using vllm::detail::GdnPackedDecodeDTypesCompatible;
+  using vt::DType;
+
+  const GdnPackedDecodeDTypes ok{DType::kBF16, DType::kBF16, DType::kBF16,
+                                 DType::kF32};
+  CHECK(GdnPackedDecodeDTypesCompatible(ok));
+
+  // The state is independent of the activation quartet: every dtype the GDN
+  // state cache can hold is accepted (mirrors FLA, which casts it on load).
+  {
+    auto x = ok;
+    x.ssm_state = DType::kBF16;
+    CHECK(GdnPackedDecodeDTypesCompatible(x));
+  }
+  {
+    auto x = ok;
+    x.ssm_state = DType::kF16;
+    CHECK(GdnPackedDecodeDTypesCompatible(x));
+  }
+  {
+    auto x = ok;
+    x.ssm_state = DType::kI32;
+    CHECK_FALSE(GdnPackedDecodeDTypesCompatible(x));
+  }
+
+  // Each single-field activation deviation is rejected on its own.
+  {
+    auto x = ok;
+    x.mixed_qkv = DType::kF32;  // today's fp8 GDN tower.
+    CHECK_FALSE(GdnPackedDecodeDTypesCompatible(x));
+  }
+  {
+    auto x = ok;
+    x.ba_out = DType::kF32;  // VT_GDN_BA_OUT_BF16=0.
+    CHECK_FALSE(GdnPackedDecodeDTypesCompatible(x));
+  }
+  {
+    auto x = ok;
+    x.core_out = DType::kF32;  // VT_GDN_OUT_BF16=0.
+    CHECK_FALSE(GdnPackedDecodeDTypesCompatible(x));
+  }
+  // Uniform but not BF16 is still rejected: the model's packed leg is pinned to
+  // the dtype the hand kernel and the vendored cubin are exercised at.
+  CHECK_FALSE(GdnPackedDecodeDTypesCompatible(GdnPackedDecodeDTypes{
+      DType::kF32, DType::kF32, DType::kF32, DType::kF32}));
+}
+
+// VT_GDN_PACKED_DECODE_FP8_TOWER: DEFAULT OFF, house '1'-leading convention.
+TEST_CASE("qwen27 packed GDN fp8-tower toggle defaults OFF") {
+  using vllm::detail::PackedGdnDecodeFp8TowerFlagIsOn;
+
+  CHECK_FALSE(PackedGdnDecodeFp8TowerFlagIsOn(nullptr));  // unset.
+  CHECK_FALSE(PackedGdnDecodeFp8TowerFlagIsOn(""));
+  CHECK_FALSE(PackedGdnDecodeFp8TowerFlagIsOn("0"));
+  CHECK_FALSE(PackedGdnDecodeFp8TowerFlagIsOn("2"));
+  CHECK_FALSE(PackedGdnDecodeFp8TowerFlagIsOn("on"));
+  CHECK(PackedGdnDecodeFp8TowerFlagIsOn("1"));
+  CHECK(PackedGdnDecodeFp8TowerFlagIsOn("1x"));
+}
+
+// GDN-MOE-BF16-OUT (#1168), Edit 1. The GDN recurrence-output dtype is resolved
+// from the ENVIRONMENT alone, and the resolver has no model-shape input to give
+// it a second answer. `GdnOutDType()` used to take a `bool dense_model` and
+// default to it, so a reader had to visit every call site to learn what the
+// default was and a new call site could reintroduce the dense/MoE split
+// silently. vLLM has no such parameter because it has no such decision: it
+// resolves ONE model dtype and every layer inherits it
+// (qwen_gdn_linear_attn.py:870-873, :843, :459-465 @ 5559679).
+//
+// The truth table is asked of the pure helper the production resolver reads,
+// mirroring PackedGdnDecodeFp8TowerFlagIsOn: `GdnOutDType()` caches its getenv
+// in a function-local static, so one process can only ever observe one value of
+// it. `nullptr` IS the production default, and it answers bf16 with nothing in
+// the signature that could say dense or MoE. Default-ON — anything that is not
+// a leading '0' is bf16 — the polarity VT_GDN_IN_BF16 uses and the one
+// PackedGdnDecodeEnvSelected already mirrors for VT_GDN_OUT_BF16.
+//
+// What this case CANNOT say is what the model runs; that is
+// `test_qwen35_paged_forward`'s "the GDN recurrence output and z gate are bf16",
+// which enters through ModelRegistry::Forward on a MoE config.
+TEST_CASE("qwen27 GDN out dtype is bf16 by default and keys on no model shape") {
+  using vllm::detail::GdnOutBf16FlagIsOn;
+
+  CHECK(GdnOutBf16FlagIsOn(nullptr));  // unset -> bf16, on EITHER arm.
+  CHECK_FALSE(GdnOutBf16FlagIsOn("0"));
+  CHECK_FALSE(GdnOutBf16FlagIsOn("0x"));  // leading char decides, as elsewhere.
+  CHECK(GdnOutBf16FlagIsOn("1"));
+  CHECK(GdnOutBf16FlagIsOn(""));  // not a leading '0'.
+}
+
+// GDN-MOE-BF16-OUT (#1168), Edit 2. The eligibility carries NO model-shape term:
+// an eligibility whose every remaining term is true selects packed decode, and
+// nothing in it can say whether the checkpoint is dense or MoE.
+//
+// The `dense_model` term this replaces entered at f344decf4 as one of that
+// change's "real-model safety gates" and was never revisited. Neither reference
+// has an equivalent: VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE defaults True with
+// no shape term (vllm/envs.py:124 @ 5559679), and SGLang keys
+// `supports_packed_decode` on the platform alone (gdn_triton.py:43 @ f63458b5be).
+// It became REDUNDANT rather than merely unsupported once GdnOutDType stopped
+// branching on model shape: `core_out` is `outdt` and
+// GdnPackedDecodeDTypesCompatible already pins it to BF16, so the dtype rule is
+// what excludes an f32 recurrence output on either arm.
+//
+// This case deliberately never NAMES a model-shape field, so it says the same
+// thing before and after the field exists.
+TEST_CASE("qwen27 packed GDN selection carries no model-shape term") {
+  vllm::detail::GdnPackedDecodeEligibility e;
+  e.runtime_enabled = true;
+  e.cuda = true;
+  e.has_packed_ba = true;
+  e.merged_ba_enabled = true;
+  e.dtype_compatible = true;
+  e.has_state_indices = true;
+  e.num_actual_tokens = 4;
+  e.num_decodes = 4;
+  e.num_decode_tokens = 4;
+
+  CHECK(vllm::detail::ShouldUsePackedGdnDecode(e));
+}
+
+// THE ROW. The eligibility must key on the dtypes the packed op needs and NOT
+// on "the GDN weights happen to be fp8". Composing the three helpers exactly as
+// GdnBlockPaged does, an fp8 tower and a bf16 tower that produce the SAME
+// activation dtypes must reach the SAME decision.
+TEST_CASE("qwen27 packed GDN selection keys on dtypes, not on fp8 weights") {
+  using vllm::detail::GdnMixedQkvDTypeInputs;
+  using vllm::detail::GdnPackedDecodeDTypes;
+  using vllm::detail::GdnPackedDecodeDTypesCompatible;
+  using vllm::detail::GdnPackedDecodeEligibility;
+  using vllm::detail::GdnProjectedMixedQkvDType;
+  using vllm::detail::PackedGdnDecodeFp8TowerFlagIsOn;
+  using vllm::detail::ShouldUsePackedGdnDecode;
+  using vt::DType;
+
+  // The exact call-site composition (qwen3_5.cpp GdnBlockPaged): predict
+  // mixed_qkv, apply the dtype rule, then the default-OFF fp8-tower clause.
+  auto selects = [](bool fp8_tower, DType fp8_out_dtype, DType ssm_state,
+                    const char* toggle) {
+    const bool bf16_owner = !fp8_tower;
+    // PERF-GDN-PACKED-BRIDGE: an fp8 tower here means the MERGED arm, which is
+    // the one VT_GDN_FP8_IN_BF16 narrows and the only one that can reach packed.
+    const DType mixed = GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+        bf16_owner, fp8_tower, fp8_tower, DType::kBF16, fp8_out_dtype});
+    GdnPackedDecodeEligibility e;
+    e.runtime_enabled = true;
+    e.cuda = true;
+    e.has_packed_ba = true;
+    e.merged_ba_enabled = true;
+    e.dtype_compatible =
+        GdnPackedDecodeDTypesCompatible(GdnPackedDecodeDTypes{
+            mixed, DType::kBF16, DType::kBF16, ssm_state}) &&
+        (!fp8_tower || PackedGdnDecodeFp8TowerFlagIsOn(toggle));
+    e.has_state_indices = true;
+    e.num_actual_tokens = 4;
+    e.num_decodes = 4;
+    e.num_decode_tokens = 4;
+    return ShouldUsePackedGdnDecode(e);
+  };
+
+  // BF16 tower: selected, and the toggle is irrelevant to it (the fp8 clause
+  // can only ever PERMIT, never deselect).
+  CHECK(selects(false, DType::kF32, DType::kF32, nullptr));
+  CHECK(selects(false, DType::kF32, DType::kF32, "1"));
+  CHECK(selects(false, DType::kF32, DType::kBF16, nullptr));
+
+  // FP8 tower, toggle ON, and the fp8 GEMM emits BF16: SELECTED. The weights
+  // are fp8 and it no longer matters — this is the case the old
+  // `in_proj_qkv_fp8.Empty()` term excluded by construction.
+  CHECK(selects(true, DType::kBF16, DType::kF32, "1"));
+  // ...reaching the SAME decision as a bf16 tower with the same dtypes.
+  CHECK(selects(true, DType::kBF16, DType::kF32, "1") ==
+        selects(false, DType::kF32, DType::kF32, "1"));
+
+  // FP8 tower, toggle ON, but the fp8 GEMM still emits F32 (this base SHA):
+  // NOT selected — correctly, by the dtype rule rather than by construction.
+  CHECK_FALSE(selects(true, DType::kF32, DType::kF32, "1"));
+  // A bf16 tower whose mixed_qkv is f32 is rejected identically, which is what
+  // "does not key on fp8 per se" means: the SAME dtypes give the SAME answer.
+  {
+    const DType mixed_f32 = GdnProjectedMixedQkvDType(
+        GdnMixedQkvDTypeInputs{true, false, false, DType::kF32, DType::kF32});
+    CHECK(mixed_f32 == DType::kF32);
+    CHECK_FALSE(GdnPackedDecodeDTypesCompatible(GdnPackedDecodeDTypes{
+        mixed_f32, DType::kBF16, DType::kBF16, DType::kF32}));
+  }
+
+  // DEFAULT OFF: with the toggle unset the fp8 tower stays excluded even when
+  // every dtype lines up, so production selection is byte-identical to before.
+  CHECK_FALSE(selects(true, DType::kBF16, DType::kF32, nullptr));
+  CHECK_FALSE(selects(true, DType::kBF16, DType::kF32, "0"));
 }
 
 // W2 merged-qkvz dispatch: ONE in_proj_qkvz GEMM is selected only on CUDA, with

@@ -33,6 +33,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, GdnStateCache + v1 attention metadata
 #include <functional>
 
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Gdn/FullAttn weights, TensorResolver
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
@@ -60,6 +61,25 @@ struct DenseMlpWeights {
   Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
   Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
   Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
+
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise (128x128) FP8 MLP
+  // projections. This block had NO fp8 rung at all before that row, so a
+  // block-wise MLP fell through to `LoadMergedBf16RawNK` and died on
+  // "expected BF16". Loaded as separate shards and MERGED at first use (#1189
+  // M6, `gate_up_fp8_block_merged` below): block scales concatenate losslessly
+  // along N, so the merge is a device-residency step rather than a loader one.
+  Fp8BlockWeight gate_proj_fp8_block;  // [N=I, K=H]
+  Fp8BlockWeight up_proj_fp8_block;    // [N=I, K=H]
+  Fp8BlockWeight down_proj_fp8_block;  // [N=H, K=I]
+
+  // MODEL-FP8-BLOCK-MERGED (#1189 M6): vLLM's MergedColumnParallelLinear
+  // `gate_up_proj` as ONE device operand, gate rows first. Block scales
+  // concatenate losslessly along N, so this is the whole merge — no alpha
+  // vector, no shared-scale guard, no opt-in flag, which is what the per-tensor
+  // fp8 QKV merge beside it needs and this one does not. Built lazily-once by
+  // `dense_fp8_block::ResidentFp8BlockMerged`; the per-shard residents are then
+  // never built. Empty on every non-block owner.
+  Fp8BlockMergedResident gate_up_fp8_block_merged;
 
   // CUDA resident for vLLM's MergedColumnParallelLinear gate_up_proj. The
   // checkpoint stores gate/up separately; production concatenates their packed
@@ -154,6 +174,19 @@ void LoadDenseLmHead(const TensorResolver& get,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out);
 
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628). The ROUTING QUESTION `LoadDenseLmHead`
+// asks — "does this head take the packed arm?" — exported so a SECOND consumer
+// of the same head asks it rather than re-deriving it. `LoadDenseLmHead` is its
+// only other caller, so there is one predicate and not two descriptions of one.
+//
+// The second consumer is the DFlash/DSpark draft, which owns no head and runs
+// the TARGET's (`LoadDflashSharedLmHead`, qwen3_dflash.h). Its shared-head read
+// used to test the STORED DTYPE, which cannot separate a head that was
+// dequantized into something the target does not compute with from a head kept
+// packed and computed with natively.
+bool DenseLmHeadTakesNvfp4(const std::function<bool(const std::string&)>& has,
+                           const std::string& proj);
+
 // True when the checkpoint ships an EXPLICIT head under either naming
 // (`<proj>.weight`, or `<proj>.weight_packed` for compressed-tensors NVFP4);
 // false means `tie_word_embeddings`.
@@ -184,22 +217,49 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
                                     const std::string& layer_base);
 
 // Load one dense decoder layer. `layer_type` is "linear_attention" or
-// "full_attention". Prefix is "model.language_model.layers.{layer_idx}.". Routes
-// each Linear to ordinary BF16 or compressed NVFP4 based on tensor presence.
-Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
-                                               const std::string& layer_type,
-                                               int64_t layer_idx);
+// "full_attention". Prefix is "{backbone_prefix}layers.{layer_idx}.", defaulting
+// to the VL spelling every checkpoint we gate today uses, so this seam is
+// byte-identical for the 27B/35B/Coder callers; `LoadQwen3_5Dense` passes the
+// prefix it resolved ONCE from the shard index
+// (`ResolveQwen3_5BackbonePrefix`). Routes each Linear to ordinary BF16 or
+// compressed NVFP4 based on tensor presence.
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // The same load with an EXPLICIT presence probe — what `LoadQwen3_5Dense` calls
-// per layer. The resolver-only overload above answers `has` with a constant
-// `true`, which forces every routed projection down the compressed-tensors
-// spelling; a checkpoint that mixes namings (the ModelOpt `weight_scale_2` form,
-// or an FP8/BF16 projection next to an NVFP4 one) needs the real probe. Exposed
-// so the loader gate can drive a whole synthetic layer through the SAME routing
-// production takes.
+// per layer, and the cheapest one to pass when the caller HAS a name index.
+// FIX-PROBE-CANNOT-SAY-NO (#1258): the resolver-only overload above used to
+// answer `has` with a constant `true`, which forced every routed projection down
+// the compressed-tensors spelling and, after #1189 M3 taught the loader to
+// cross-check the config against the tensors, made that seam refuse every
+// checkpoint that has no block-wise FP8 scale — which is all of them but one.
+// It now derives the probe from the resolver (`dense_loaders::
+// ProbeThroughResolver`), so both overloads answer the same question truthfully
+// and differ only in cost. Exposed so the loader gate can drive a whole
+// synthetic layer through the SAME routing production takes.
+//
+// A probe handed here must be able to answer `false`: this overload refuses one
+// that cannot (`dense_loaders::CheckProbeCanAnswerNo`), because a predicate that
+// only says yes reports every optional tensor as present and the next guard to
+// ask about one blames the checkpoint.
+// MODEL-FP8-BLOCK-WEIGHT (#1189 M3): `block` carries the checkpoint's declared
+// `weight_block_size`, `activation_scheme` and `modules_to_not_convert`, read
+// ONCE by `LoadQwen3_5Dense` from the quantization config. A default-constructed
+// value means "not block-wise", which is byte-identical to the routing before
+// that row. The two seams above default to it; the production loader passes the
+// value it read, because a dtype probe alone cannot detect a config/tensor
+// DISAGREEMENT and that is where a silent wrong-scale bug lives.
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::function<bool(const std::string&)>& has,
-    const std::string& layer_type, int64_t layer_idx);
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix,
+    const Fp8BlockQuantConfig& block);
+
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::function<bool(const std::string&)>& has,
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // Full dense-model load across the given shards. Uses config.num_hidden_layers
 // and config.layer_types. Text path only — the vision tower (model.visual.*)
@@ -213,6 +273,18 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // Host-lifetime helpers for ordinary dense CUDA models. The release function
 // drops only tensors whose authoritative raw/F32 device representation exists;
 // unused fallbacks stay host-resident. The caller synchronizes first.
+// MODEL-FP8-BLOCK-LINEAR (#1189 M4), the M4/M5 seam. Throws by name when the
+// load produced a block-wise FP8 weight AND `device` has no block-scaled GEMM
+// to run it with. Inert on a device that has one, which is what M4 changed:
+// the forward reads these weights now, so the remaining gap is the kernel and
+// not the wiring. Called from `PrepareQwen3_5Dense`, i.e.
+// `ModelRegistry::Prepare`, so the refusal lands before the first forward and
+// before any graph capture. M5 (`489a9a4c0`) NARROWED this rather than deleting
+// it: the mainloop-scaled CUTLASS kernel covers `VT_CUTLASS_FP8_ARCHS` (12.0a,
+// 12.1a) only, so a CUDA arch outside that cell is still refused here by name.
+void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
+                                          vt::DeviceType device);
+
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights);
 size_t ReleaseResidentQwen3_5DenseHostWeights(Qwen3_5DenseWeights& weights);
 
@@ -405,7 +477,14 @@ class Qwen3_5DenseDecodeGraph {
                      const v1::CommonAttentionMetadata& attn_meta,
                      const v1::GDNAttentionMetadata& gdn_meta,
                      const std::vector<PagedKvCache>& attn_kv,
-                     const std::vector<GdnStateCache>& gdn_state);
+                     const std::vector<GdnStateCache>& gdn_state,
+                     // SPEC-DSPARK W8 (#442): non-null captures the DFlash/DSpark
+                     // aux hidden taps into this slot's PERSISTENT [S, H*taps]
+                     // buffer and points `aux_out->tensor` at it. The view is
+                     // valid until this slot's next replay, the same contract the
+                     // returned logits already carry. Null keeps the pure-decode
+                     // behavior byte-identical.
+                     Qwen3_5AuxTaps* aux_out = nullptr);
 
   // Diagnostics (A/B + tests): is a graph currently captured, and how many
   // replays have run since the last (re)capture.

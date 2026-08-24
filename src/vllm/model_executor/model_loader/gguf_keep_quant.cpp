@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "vllm/config/weight_residency.h"
 #include "vllm/platforms/interface.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
@@ -109,6 +110,35 @@ bool KeepF16DType(uint32_t ggml_type) { return ggml_type == 1; }
 // ggml type id 40 is the NVFP4 fork extension; see gguf_dequant.cpp case 40.
 bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 
+// Device-side keep-quant capability (review sweep on #523): the master
+// boolean `GgufQuantComputeAvailable()` only says the OP is registered; a
+// device's kernel set can be narrower than the CPU admission list, and on a
+// discrete backend with no CPU fallback tier a format the device cannot
+// execute must keep its pre-existing expand-bf16 residency -- flipping it to
+// a keep-quant block throws at FORWARD time with the whole model resident.
+// Per-device sets name what the registered kernels actually implement.
+bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
+  switch (dev) {
+    case vt::DeviceType::kROCM:
+      // src/vt/rocm/rocm_grouped_gemm.hip implements exactly these on both the
+      // grouped and non-grouped arms; Q4_0/Q2_K/Q3_K/IQ2_*/IQ3_*/MXFP4 are
+      // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
+      return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
+             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+    default:
+      // CUDA falls back to the CPU kernel for anything it lacks
+      // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
+      return true;
+  }
+}
+
+// keep-f16 needs an f16-capable MatmulBT on the running device; the ROCm
+// kernel accepts bf16/bf16 and f32/f32 only, so an F16 file weight must
+// expand there rather than be kept and refused at first forward (same review).
+bool DeviceKeepF16Supported(vt::DeviceType dev) {
+  return dev != vt::DeviceType::kROCM;
+}
+
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
@@ -141,9 +171,14 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
     const int64_t k = KeepQuantKDim(role, shape);
     vt::DType dt = vt::DType::kF32;
     // ggml_row_size's precondition: a row is a whole number of blocks. A weight
-    // whose K is ragged cannot be dotted block-wise, so it expands.
+    // whose K is ragged cannot be dotted block-wise, so it expands. The device
+    // gate (review #523): a format the RUNNING device cannot execute keeps its
+    // pre-existing expand-bf16 residency instead of flipping to a keep-quant
+    // block that throws at forward time on a card with no CPU fallback tier.
     if (k > 0 && KeepQuantDType(ggml_type, &dt) &&
-        k % vt::BlockElems(dt) == 0) {
+        k % vt::BlockElems(dt) == 0 &&
+        DeviceKeepQuantSupported(
+            dt, vllm::platforms::CurrentPlatform().device_type())) {
       return GgufResidency::kKeepQuant;
     }
   }
@@ -185,12 +220,54 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // (2.798), a real weight-residency win, NOT neutral. (2) the prefill regression
   // was borrowed-weight first-touch faults landing in the timed prefill; the
   // load-time PrefaultBorrowedSpan (port of llama.cpp's mmap prefetch) faults them
-  // off the timed path, restoring prefill to ~205 t/s = 1.16x AHEAD of pp128
-  // 176.6 (was 0.72x behind). Net: RSS parity, prefill/decode at-or-ahead,
+  // off the timed path, restoring prefill (was 0.72x behind). Net: RSS parity,
   // greedy tokens byte-identical (native-f16 compute, md5 d235db1... unchanged).
+  //
+  // THE llama.cpp DENOMINATORS ABOVE ARE SUPERSEDED, and this is the one place
+  // the contamination reaches a shipped DEFAULT rather than a document. They were
+  // measured against 237ad9b96, our own local-only fork, 65 of this project's
+  // performance commits past upstream tag b9827, six of them in ggml/src/ggml-cpu/
+  // (fused gated_delta_net and a discriminated ssm_conv, both DEFAULT-ON, neither
+  // of which stock upstream carries at that point). The CPU floor arm ran a qwen35
+  // model whose CPU graph reaches exactly those ops. The oracle is now stock
+  // b10451, and the re-take is owed under #1003.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY, both from the #1003 sweep:
+  //
+  // (a) THE PREFILL FIGURES HERE WERE UNSOURCED. This comment read "~205 t/s =
+  //     1.16x AHEAD of pp128 176.6". NO recorded run produces either operand:
+  //     `git grep -F 176.6` finds it in four other files, none of them a
+  //     llama.cpp prefill number: a MoE microbenchmark mean in MICROSECONDS
+  //     (benchmark-record.md), a 176.69 in an ours-vs-vLLM ledger row
+  //     (parity-ledger.md), two LTX golden floats, and #1003's own index row.
+  //     Do not grep the regex `176.6`: the `.` matches any character and buries
+  //     these in ~360 hits. No arm of ours recorded 205 t/s. The owning record
+  //     (gguf-keep-quant-loader.md:595, benchmark-record.md:10722) says 204 t/s
+  //     against pp128 173.2 = 1.18x. The numbers are NOT reconciled here, because
+  //     picking one would assert an attribution nobody measured; #1003 owes a
+  //     single re-measured pair. Do not quote any of these ratios.
+  //
+  // (b) THIS DEFAULT IS NOT INDEPENDENT OF THAT FLOOR. An earlier pass claimed it
+  //     was, on the grounds that the L7 acceptance is a same-binary OURS-vs-OURS
+  //     A/B. That reads one row of a three-row table. The A/B trades ~10% of
+  //     prefill (224 -> 204 t/s, TTFT 571 -> 625 ms) and ~1.4% of decode for
+  //     1.05 GiB of peak RSS, and the recorded reason the PREFILL loss is
+  //     acceptable is stated in llama.cpp's own terms: "comfortably above the
+  //     competitor floor" (gguf-keep-quant-loader.md:595). That floor is the
+  //     contaminated pp128 173.2. b10451 is 624 commits past b9827 and carries
+  //     upstream's own fused_gdn, so the direction is NOT established: if a
+  //     re-taken stock pp128 lands above 204 t/s, that clause fails and this
+  //     default's only recorded justification for its prefill regression is gone.
+  //     The RSS leg would still stand alone and may well suffice. Keep-f16 stays
+  //     DEFAULT ON here because this is a record pass that measured nothing;
+  //     revisiting it is QUANT-GGUF-KEEPQ-LOADER's decision and needs the re-take
+  //     first. See .agents/specs/oracle-llamacpp-repin-stock.md, row 12.
+  //
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
-  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk;
+  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk &&
+               DeviceKeepF16Supported(
+                   vllm::platforms::CurrentPlatform().device_type());
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
   // build keeps expanding, which is correct but unquantized), with
@@ -205,7 +282,13 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.
-  p.mmap_residency = EnvOnOr("VT_GGUF_MMAP", p.keep_quant) && !p.cpu_ref;
+  // ENG-RESIDENCY-CONFIG (#1110): `VT_GGUF_MMAP` is now `--offload-config`'s
+  // `vllm_cpp.mmap.enabled` as well, and ResolveGgufMmap holds the precedence —
+  // env var > config > this availability default. It is the SOLE reader of the
+  // variable, and it applies the same whole-value polarity `EnvOnOr` did, so an
+  // environment-only run resolves byte-for-byte as before. `VT_CPU_REF` still wins
+  // over both: the oracle switch is not a residency preference.
+  p.mmap_residency = ResolveGgufMmap(p.keep_quant) && !p.cpu_ref;
   p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", p.expand_nk) && p.expand_nk;
   // GDN split-projection orientation. Rides expand_nk (so VT_CPU_REF=1
   // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow
@@ -241,6 +324,12 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                       tensor.ggml_type, tensor.shape);
   if (audit) audit(tensor.name, role, r);
   return r;
+}
+
+GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
+                        GgufTensorRole role) {
+  return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
+                         policy.cpu_ref, role, tensor.ggml_type, tensor.shape);
 }
 
 }  // namespace vllm

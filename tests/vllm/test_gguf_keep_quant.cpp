@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "gguf_builder.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -59,8 +60,8 @@ using vllm::RouteGgufTensor;
 namespace {
 
 // ggml type ids (ggml/include/ggml.h:390-432).
-constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ3_K = 11,
-                   kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kQ8_K = 15,
+constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ2_K = 10,
+                   kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kQ8_K = 15,
                    kIQ2_S = 22, kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
@@ -232,6 +233,40 @@ TEST_CASE("keep-quant expert split is lossless per expert") {
   }
 }
 
+TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #523)") {
+  // Registering kMatmulBTQuant flips keep-quant loader-wide via the boolean
+  // GgufQuantComputeAvailable(), but a device's kernel set can be narrower
+  // than the CPU admission list. On ROCm exactly {Q8_0, Q4_K, Q5_K, Q6_K} are
+  // implemented; with no CPU fallback tier on a discrete card, an unsupported
+  // format that flipped to keep-quant would throw at FORWARD time with the
+  // model fully resident. The loader must keep the pre-existing expand_bf16
+  // residency for those formats instead.
+  const vt::DeviceType dev =
+      vllm::platforms::CurrentPlatform().device_type();
+  if (dev != vt::DeviceType::kROCM) {
+    MESSAGE("non-ROCm host (the device set is full there); the device-gated "
+            "arms are asserted on gfx1100");
+    return;
+  }
+  const std::vector<int64_t> shape = {4, 256};  // [out, in]: K = shape[1] = 256 elems, whole blocks
+  const auto route = [&](uint32_t ty) {
+    return RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/true,
+                           /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                           GgufTensorRole::kMatmulWeight, ty, shape);
+  };
+  // The supported set keeps quant residency (ggml type ids per the constants
+  // at the top of this file).
+  CHECK(route(kQ4_0) == GgufResidency::kExpandBf16);  // unsupported -> expand
+  CHECK(route(kQ8_0) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ4_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ5_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ6_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);  // owed, not silently kept
+  // keep-f16 must be OFF on ROCm: MatmulBTKernelRocm accepts bf16/f32 only.
+  const GgufLoadPolicy pol = GgufLoadPolicy::FromEnv();
+  CHECK(!pol.keep_f16);
+}
+
 TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
   const int64_t n = 2, k = 64;
   const size_t nbytes = BlockBytesFor(kQ8_0, n * k);
@@ -277,6 +312,105 @@ TEST_CASE("KeepQuantDType covers the executable encodings") {
   }
 }
 
+namespace {
+
+// One row of a checkpoint census: an encoding, how many tensor records carry
+// it, and whether the loader is expected to keep it in blocks or expand it.
+// `keep_quant == false` is a real entry, not an omission: F32 is 838 of the
+// 1702 records in both target checkpoints, it is served by the expansion path,
+// and leaving it out is what let an incomplete list call itself total.
+struct CensusRow {
+  uint32_t ggml_type;
+  const char* name;
+  int tensors;
+  bool keep_quant;
+};
+
+// `split.tensors.count` from the shard headers, the same number on both
+// checkpoints. The list below must add up to exactly this.
+constexpr int kQwen38DeclaredTensors = 1702;
+
+// unsloth/Qwen3.8-2.4T-A95B-GGUF @ 567d3e6ac2, quant UD-IQ1_S, all 12 shards.
+constexpr CensusRow kUdIq1sCensus[] = {
+    {19, "iq1_s", 276, true},  // 96.92 % of params
+    {13, "q5_k", 420, true},   {10, "q2_k", 3, true},
+    {14, "q6_k", 162, true},   {12, "q4_k", 2, true},
+    {8, "q8_0", 1, true},      {0, "f32", 838, false},
+};
+
+// The same census over UD-Q1_0, all 10 shards. Identical apart from the expert
+// encoding: ggml 66 where UD-IQ1_S has ggml 19.
+constexpr CensusRow kUdQ10Census[] = {
+    {66, "iq1_xxxs", 276, true},  // 96.92 % of params
+    {13, "q5_k", 420, true},      {10, "q2_k", 3, true},
+    {14, "q6_k", 162, true},      {12, "q4_k", 2, true},
+    {8, "q8_0", 1, true},         {0, "f32", 838, false},
+};
+
+template <size_t N>
+void CheckCheckpointCensus(const CensusRow (&census)[N], const char* quant) {
+  CAPTURE(std::string(quant));
+  vt::DType dt = vt::DType::kF32;
+  int counted = 0;
+  for (const CensusRow& p : census) {
+    CAPTURE(p.name);
+    CAPTURE(p.ggml_type);
+    CAPTURE(p.tensors);
+    counted += p.tensors;
+    // Assert the ROUTING both ways. A row expected to keep its blocks must
+    // have a dot kernel, and a row expected to expand must NOT silently be
+    // reclassified as keep-quant by a later change.
+    if (p.keep_quant) {
+      CHECK(KeepQuantDType(p.ggml_type, &dt));
+      CHECK(vt::cpu::HasQuantDotKernel(dt));
+    } else {
+      CHECK_FALSE(KeepQuantDType(p.ggml_type, &dt));
+    }
+  }
+  // The list accounts for every declared record, so "this checkpoint needs
+  // nothing else" is a measurement rather than a claim.
+  CAPTURE(counted);
+  CHECK(counted == kQwen38DeclaredTensors);
+}
+
+}  // namespace
+
+TEST_CASE("every encoding in the Qwen3.8-2.4T UD-IQ1_S checkpoint decodes") {
+  // Census of unsloth/Qwen3.8-2.4T-A95B-GGUF @ 567d3e6ac2, quant UD-IQ1_S,
+  // taken by parsing the tensor header of all 12 shards: 1702 tensor records
+  // against the 1702 declared in `split.tensors.count`, so this list is TOTAL
+  // rather than sampled. See the target-checkpoint census section of
+  // .agents/specs/expert-streaming.md.
+  //
+  // This is the row's real precondition: ENG-EXPERT-STREAM streams routed
+  // expert slices off NVMe, and a slice it can address but cannot DECODE moves
+  // bytes for nothing. IQ1_S alone is 96.92 % of the parameters (the
+  // ffn_{down,gate,up}_exps of all 92 non-MTP layers), so an unsupported
+  // encoding here is a refusal to run the model, never a slow path.
+  //
+  // The list has to SUM to the declared record count, and this case asserts
+  // that it does. An earlier revision claimed total coverage while enumerating
+  // six of the seven encodings: F32 was left out and the counts summed to 864,
+  // not 1702. A census that cannot say how many records it accounted for has
+  // not reported a census, and a list that is short by 838 tensors while
+  // calling itself TOTAL is the more misleading of the two states.
+  CheckCheckpointCensus(kUdIq1sCensus, "UD-IQ1_S");
+}
+
+TEST_CASE("every encoding in the Qwen3.8-2.4T UD-Q1_0 checkpoint decodes") {
+  // Same census method and the same revision as the UD-IQ1_S case above, over
+  // all 10 shards: 1702 tensor records against the 1702 declared. UD-Q1_0 is
+  // structurally IDENTICAL to UD-IQ1_S apart from the expert encoding, which is
+  // ggml 66 (IQ1_XXXS, 1.1875 bpw) instead of ggml 19 (IQ1_S, 1.5625 bpw). The
+  // other six encodings and their tensor counts match exactly.
+  //
+  // Type 66 is defined by NO upstream llama.cpp. It comes from the pinned fork
+  // oracle `llama-cpp-unsloth` (.agents/oracles/llama-cpp-unsloth.md), which is
+  // admitted for this encoding family alone and is `gateable = no` until #933
+  // measures it.
+  CheckCheckpointCensus(kUdQ10Census, "UD-Q1_0");
+}
+
 TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // The expectation is written out LONGHAND here rather than derived from the
   // implementation, so this is a real cross-check and not a tautology.
@@ -305,9 +439,19 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // --- the independent expectation ---
         // IQ2_S (256-elem, Q8_K-act) and MXFP4 (32-elem, Q8_0-act) are keep-quant
         // capable as of the UD-IQ2_M vehicle, so they route like the others.
-        const bool block_capable =
+        // The DEVICE axis (review #523): the running device's kernel set can be
+        // narrower than the loader's CPU-derived list — ROCm implements exactly
+        // {Q8_0, Q4_K, Q5_K, Q6_K}; the rest keep expand_bf16 there.
+        const bool cpu_capable =
             type == kQ4_0 || type == kQ8_0 || type == kQ3_K || type == kQ4_K ||
             type == kQ5_K || type == kQ6_K || type == kIQ2_S || type == kMXFP4;
+        const bool rocm =
+            vllm::platforms::CurrentPlatform().device_type() ==
+            vt::DeviceType::kROCM;
+        const bool device_capable =
+            !rocm || type == kQ8_0 || type == kQ4_K || type == kQ5_K ||
+            type == kQ6_K;
+        const bool block_capable = cpu_capable && device_capable;
         const int64_t blk =
             (type == kQ4_0 || type == kQ8_0 || type == kMXFP4) ? 32 : 256;
         bool expect_keep = false;
@@ -340,9 +484,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
     }
   }
   // Both outcomes are actually exercised (a table that never keeps anything
-  // would pass every assertion above vacuously).
-  CHECK(kept == 16);          // 8 block-capable encodings x 2 keep-capable roles
-  CHECK(expanded == 13 * 36 - 16);  // 13 types x (6 roles x 6 shapes) - kept
+  // would pass every assertion above vacuously). The kept count is
+  // device-dependent (review #523): 8 block-capable encodings x 2 keep-capable
+  // roles where the device covers the CPU list; 4 x 2 on ROCm.
+  const bool rocm_host =
+      vllm::platforms::CurrentPlatform().device_type() == vt::DeviceType::kROCM;
+  CHECK(kept == (rocm_host ? 8 : 16));
+  CHECK(expanded == 13 * 36 - (rocm_host ? 8 : 16));
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
@@ -366,6 +514,14 @@ TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
 TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   ::unsetenv("VT_CPU_REF");
   ::unsetenv("VT_GGUF_KEEP_QUANT");
+  // keep_f16 additionally requires an f16-capable MatmulBT on the running
+  // device (review #523): the ROCm kernel accepts bf16/f32 only, so keep_f16
+  // is OFF on ROCm regardless of expand_nk.
+  const bool f16_device_ok =
+      vllm::platforms::CurrentPlatform().device_type() != vt::DeviceType::kROCM;
+  const auto keep_f16_expected = [&](const GgufLoadPolicy& q) {
+    return q.expand_nk && f16_device_ok;
+  };
   {
     // PRODUCTION DEFAULT SINCE CIQ G4: keep-quant follows the running device's
     // ability to EXECUTE the quantized GEMM. The expectation is derived from
@@ -378,9 +534,22 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable());
     // L7 (2026-07-23): keep-f16 is now DEFAULT ON wherever expand_nk holds — the
     // repack-source release + load-time prefault removed L6's two objections
-    // (RSS-neutral, prefill regression), so it measures 1.01x llama.cpp RSS with
-    // prefill/decode at-or-ahead and byte-identical tokens.
-    CHECK(p.keep_f16 == vllm::GgufQuantComputeAvailable());
+    // (RSS-neutral, prefill regression), so it buys 1.05 GiB of peak RSS with
+    // byte-identical tokens. Its llama.cpp denominators are SUPERSEDED (fork
+    // 237ad9b96, re-take owed under #1003, see gguf_keep_quant.cpp).
+    //
+    // This CHECK pins the DEFAULT, not the trade behind it, and separating the
+    // two matters here. An earlier pass recorded the default as independent of
+    // the contaminated floor, because the L7 acceptance is a same-binary
+    // ours-versus-ours A/B. That reads one row of a three-row table: prefill
+    // (~10%, 224 -> 204 t/s) and decode (~1.4%) BOTH regress to buy that RSS, and
+    // the recorded reason the prefill loss is acceptable is "comfortably above
+    // the competitor floor", which IS the contaminated pp128. If #1003's re-take
+    // puts stock above 204 t/s, that justification is gone and the default
+    // becomes a live question for QUANT-GGUF-KEEPQ-LOADER. Should that happen,
+    // THIS assertion is one of the things that has to change, so it is flagged
+    // here rather than discovered when it goes red.
+    CHECK(p.keep_f16 == (vllm::GgufQuantComputeAvailable() && f16_device_ok));
     CHECK_FALSE(p.cpu_ref);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
@@ -390,7 +559,7 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   // NB compare to expand_nk, NOT GgufQuantComputeAvailable(): with keep-quant
   // env-forced, expand_nk holds even on a CUDA build where the quant GEMM is
   // unregistered (GgufQuantComputeAvailable() is false there).
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
   // The opt-out must work after the default flip.
   ::setenv("VT_GGUF_KEEP_F16", "0", 1);
   CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);
@@ -407,11 +576,11 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   // it is inert with keep-quant off (nothing to keep) or under VT_CPU_REF.
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   ::setenv("VT_GGUF_KEEP_F16", "1", 1);
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
   for (const char* on : {"1", "true", "on"}) {
     ::setenv("VT_GGUF_KEEP_F16", on, 1);
     CAPTURE(on);
-    CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+    CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
   }
   ::unsetenv("VT_GGUF_KEEP_F16");
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
@@ -1698,6 +1867,16 @@ TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") 
   // The prefault (VT_GGUF_PREFAULT) only READS the borrowed pages to fault them
   // in at load, off the timed prefill path. It must change no byte and must leave
   // the weight borrowed in place. A/B the two env settings on the SAME file.
+  //
+  // ENG-RESIDENCY-CONFIG (#1110) MADE THIS CASE MEAN SOMETHING. Two problems, both
+  // measured. The site cached its answer in a function-local static, so the second
+  // `setenv` below could not affect anything and both arms ran identically — the
+  // A/B was vacuous. And byte-transparency holds whether the prefault runs or not,
+  // so with the site mutated to never consult its resolver at all this whole suite
+  // stayed green (39/39), as did test_gguf_qwen36_loader (6/6) and
+  // test_gguf_expert_span (11/11). The static is gone and the span counter below is
+  // the observable: it is the only thing that separates "prefaulted" from
+  // "skipped", because the operation reads pages and writes nothing.
   const DenseDims d;
   const TempFile f(BuildDenseF16Gguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
@@ -1708,16 +1887,39 @@ TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") 
   mmap.mmap_residency = true;
 
   ::setenv("VT_GGUF_PREFAULT", "0", 1);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights woff =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  const uint64_t spans_off = vllm::GgufPrefaultedSpanCount();
+
   ::setenv("VT_GGUF_PREFAULT", "1", 1);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights won =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  const uint64_t spans_on = vllm::GgufPrefaultedSpanCount();
   ::unsetenv("VT_GGUF_PREFAULT");
 
   CHECK(won.lm_head.bytes.borrowed());        // still an in-place borrow
   CHECK(won.lm_head.bytes.data() == oh.data);
   CHECK(won.lm_head.bytes == woff.lm_head.bytes);  // byte-identical to no-prefault
+
+  // THE ARMS ACTUALLY DIFFER. Without these two the case asserts only that the
+  // prefault is harmless, which is equally true of a prefault that never ran.
+  CHECK(spans_off == 0);
+  CHECK(spans_on > 0);
+
+  // And the CONFIG reaches the same site: `vllm_cpp.mmap.prefault` turns it off
+  // with no environment variable in play, which is the whole point of #1110.
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm::WeightResidencyConfig cfg;
+  cfg.prefault = false;
+  vllm::SetWeightResidencyConfig(cfg);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
+  const vllm::Qwen3_5DenseWeights wcfg =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  CHECK(vllm::GgufPrefaultedSpanCount() == 0);
+  CHECK(wcfg.lm_head.bytes == woff.lm_head.bytes);  // still byte-identical
+  vllm::ResetWeightResidencyConfigForTesting();
 }
 
 TEST_CASE("a borrowed F16 weight OUTLIVES the GgufFile and the file") {

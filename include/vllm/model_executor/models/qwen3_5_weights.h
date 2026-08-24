@@ -20,15 +20,18 @@
 // toggles retain the split residents.
 #pragma once
 
+#include <cstddef>  // size_t, for kDeviceAliasAlignment
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/owned_bytes.h"
+#include "vllm/model_executor/models/qwen3_vl_vision.h"  // MoE vision tower (#891)
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
@@ -82,6 +85,30 @@ struct OwnedTensor {
   // absent. Mutable because ReleaseHost is logically const, like lazy residency.
   mutable bool host_released = false;
 
+  // ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). The expert-stream lane has
+  // claimed this tower: its slices are served from HOST slot storage, and the
+  // tower itself must therefore NEVER be staged into device memory.
+  //
+  // Why a flag and not a name test. `ResidentWeight` is handed an OwnedTensor
+  // and has no idea what the loader called it, and the refusal has to fire in
+  // `ResidentWeight` because that is where the 1.1875 GiB `d.b.Alloc` is. A
+  // process-global set of streamed tower ids would answer the same question at
+  // the cost of a lookup in the decode path of every weight; one bool on the
+  // tensor answers it for free.
+  //
+  // Set by `KqExpertSlice` the first time the lane serves this tower, and read
+  // by `ResidentWeight`'s staging branch, which throws by name. That refusal is
+  // a TRIPWIRE, not a path with a production caller: with the lane on, the
+  // grouped-MoE route that would stage a tower is already disabled
+  // (`Qwen35GroupedMoeEnabled`), and W0c's own fallback reads the tower's host
+  // bytes in place. It exists because the failure it guards is issue #1123 —
+  // 48 towers staged, death partway through layer 16 of 93 — and that failure
+  // is silent until the allocator runs out.
+  //
+  // Mutable for the same reason `d_dev` is: claiming a tower for the lane is
+  // logically const, like lazy residency.
+  mutable bool expert_streamed = false;
+
   // ENG-LOAD-DIRECT-UPLOAD (issue #150). Non-null when `bytes` BORROWS a
   // read-only safetensors mmap taken verbatim from the checkpoint instead of
   // being copied into an owned buffer, and records the exact source range so
@@ -91,6 +118,51 @@ struct OwnedTensor {
   // tied-expansion borrow must not be (see AdoptDeviceBytesAsHost).
   mutable const void* mmap_src = nullptr;
   mutable size_t mmap_src_bytes = 0;
+  // Where those borrowed bytes physically live, for a consumer that wants to
+  // READ them rather than fault them in: the owning shard's descriptor and the
+  // byte offset of this weight within that shard. Set only on the mmap-borrow
+  // path; -1 means "no descriptor, read through the mapping".
+  //
+  // Expert streaming is the consumer. Filling a slot by memcpy from the mapping
+  // traps every 4 KiB page on the way, which is the whole reason W4 moved no
+  // faster than the mmap path it replaced; a pread lands the slice in one call.
+  mutable int mmap_fd = -1;
+  mutable size_t mmap_file_offset = 0;
+
+  // A process-unique identity for the BUFFER this tensor currently points at,
+  // for a cache that outlives the model.
+  //
+  // READ THAT LITERALLY: the identity is keyed on `bytes.data()`, so it is an
+  // identity for the address, not for the contents. Replacing a buffer's bytes
+  // IN PLACE — same address, different weights — keeps the old uid, and the
+  // cache would then serve the old entries for the new contents. Nothing does
+  // that today: a tower's `bytes` is assigned once when the model loads and is
+  // only ever replaced wholesale, which moves the address. This comment says
+  // where the guarantee stops rather than rounding it up, because #1066 was
+  // caused by a comment on this exact field that rounded it up (it claimed a
+  // base pointer was a stable identity, which is true for one model's life and
+  // false for the cache's). `test_qwen36_weights` pins both halves.
+  //
+  // The expert slot cache is a process-lifetime singleton keyed by (tower,
+  // expert), and it used to derive the tower half from the buffer's ADDRESS.
+  // That is stable for one model's life, which is what its comment claimed, but
+  // the cache is not scoped to one model's life: free a model, load another, and
+  // the allocator hands a new tower an address the old one used. Every entry the
+  // cache still holds for that address is then served to a DIFFERENT model's
+  // expert, silently, as a hit that moves no bytes. Measured on two synthetic
+  // models in one process: 21 distinct addresses for 24 towers, and 20 of 222
+  // slices returned another tower's bytes.
+  //
+  // A counter cannot collide because it never goes backwards, and re-stamping
+  // when `bytes` moves keeps a COPY of a tensor from inheriting the original's
+  // identity along with a different buffer. Assigned lazily, so a weight that is
+  // never streamed never pays for one.
+  mutable uint64_t tower_uid = 0;
+  mutable const uint8_t* tower_uid_for = nullptr;
+
+  // `tower_uid`, assigned on first use and re-assigned if `bytes` has moved.
+  // Never returns 0, so a caller can treat 0 as "no identity".
+  uint64_t TowerUid() const;
 
   bool Empty() const { return bytes.empty() && !host_released; }
   bool HasHostBytes() const { return !bytes.empty(); }
@@ -148,6 +220,231 @@ struct OwnedTensor {
 // `VT_ADOPT_DEVICE_BYTES=0` is the same-binary A/B back to the two-copy
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
+
+// The alignment a HOST pointer must meet before a device kernel may be handed it
+// in place of the `Backend::Alloc` pointer it would otherwise have received.
+//
+// 256, because that is cuBLASLt's documented
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` DEFAULT, which this tree never
+// sets, and it dominates every explicit pointer gate in the tree. Measured, not
+// assumed: `grep -rn MIN_ALIGNMENT src/vt/` finds nothing, so the 256 default
+// applies to every cuBLASLt matmul this tree issues.
+//
+// THE POINTER GATES, ENUMERATED. Two earlier revisions of this paragraph said
+// there was exactly one, in `cuda_matmul_nvfp4.cu`, asking for 16. That was
+// wrong both times. `grep -rn 'reinterpret_cast<uintptr_t>' src/vt/cuda/` plus
+// `grep -rn PointerAligned src/vt/` finds at least seven, across four files:
+//
+//   | site | asks | operand |
+//   |---|---|---|
+//   | `cuda_nvfp4_sm12x.cu:401` `PointerAligned(gate_up, 32)`   | **32** | activation |
+//   | `cuda_nvfp4_sm12x.cu:401` `PointerAligned(packed, 8)`     | 8  | weight |
+//   | `cuda_matmul_nvfp4.cu:204` `(prow) & 0xf`                 | 16 | weight row |
+//   | `cuda_matmul_nvfp4.cu:1757,1778` `(p) & 0xF`              | 16 | scratch |
+//   | `cuda_matmul_nvfp4.cu:1841` `(out) & 0x7`                 | 8  | output |
+//   | `cuda_laguna.cu:67,70` `LagFastNormAligned{16,8}`         | 16 | weight/act |
+//   | `cuda_ops.cu:370,395` `aligned16(w.data)`                 | 16 | NORM WEIGHT |
+//
+// The strictest is 32, and `cuda_ops.cu` is the one that binds a WEIGHT pointer
+// on the ordinary decode path rather than a packed-arm buffer. The `% 32` and
+// `% 64` tests near `cuda_matmul_nvfp4.cu` still read as alignment gates and
+// still are not: they check a DIMENSION (`d`, `dv`), not an address.
+//
+// The conclusion is unchanged and is now correct at the widest of them: 256
+// dominates 32 as comfortably as it dominated 16. It is also what `cudaMalloc`
+// returns in practice, though CUDA guarantees only "suitably aligned" and
+// current devices return more — so "indistinguishable from a `cudaMalloc`
+// pointer" is the intuition, and "at least what every consumer is promised" is
+// the claim.
+//
+// WHAT ALIGNMENT DOES AND DOES NOT BUY. It makes the substitution CORRECT: no
+// kernel can fault or mis-vectorise on this pointer that would not have on the
+// other. It does not make the two pointers indistinguishable in every respect,
+// and two in-tree facts say so. `src/vllm/model_executor/models/laguna.cpp`
+// records a MEASURED GB10 penalty for reading system-allocated memory from the
+// GPU rather than a `cudaMalloc` allocation, worst on a long-K low-parallelism
+// GEMV — a consumer telling them apart by BANDWIDTH, which is why
+// `VT_QWEN35_ALIAS_HOST_WEIGHTS` exists below. And the Vulkan and Metal backends
+// resolve a tensor pointer against their own allocation tables and throw if it
+// is outside them, telling them apart by IDENTITY; harmless only because neither
+// overrides `host_memory_is_device_addressable()`, so this argument is scoped to
+// backends that take raw pointers. Deriving a smaller number would mean
+// enumerating every kernel that ever binds a weight and being right about all of
+// them, and the enumeration does not close: the widest thing any of them
+// dereferences is a 16-byte `cp.async` granule
+// (`src/vt/cuda/cuda_matmul_nvfp4.cu`, whose shape gate assumes an aligned base
+// rather than checking it), while cuBLASLt is PROMISED 256 —
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` defaults to 256 and this tree
+// never sets it (`src/vt/cuda/cuda_matmul.cu`). Matching the allocator instead
+// of the consumers makes the whole question go away, and it costs one memcpy
+// that REPLACES the host->device copy it removes.
+//
+// CAN THE SUBSTITUTION MOVE A LOGIT? MEASURED, AND THE ANSWER IS NO.
+// An earlier revision of this comment worried that "the heuristic may pick an
+// algorithm on the strength of a promise a 16-aligned pointer breaks", and a
+// fresh review was right that the worry was recorded here and never measured.
+// It is measured now, on `thor:gpu0` (NVIDIA Thor `sm_110`, driver 13020,
+// cuBLASLt 130101), which answers this file's own predicate TRUE
+// (`cudaDevAttrPageableMemoryAccess = 1`, `cudaDevAttrIntegrated = 1`) and is
+// therefore a member of the population this branch serves. Six shapes off the
+// target checkpoint (`embedding_length = 8192`; M = 1, 5 and 32) crossed with
+// BOTH formulations this tree issues — the row-major NN `MatmulKernelCuda`,
+// where the weight is operand B, and the column-major TN `MatmulBTKernelCuda`,
+// where it is operand A — for 12 measurements, `PROBE_FAILURES=0`:
+//
+//   * The heuristic CANNOT see a pointer. `cublasLtMatmulAlgoGetHeuristic` takes
+//     (handle, desc, four layouts, preference) and no operands, so alignment
+//     reaches it only through the preference. 12/12 identical on a repeated
+//     call, 12/12 identical with the 256 promise stated EXPLICITLY, and 12/12
+//     identical when the promise is weakened to 16 — the selection does not move
+//     on alignment at all. Five DIFFERENT algo configurations appear across the
+//     six shapes (tiles 393/537/573/576, workspaces 0 to 5,242,896), so the
+//     instrument does discriminate; it simply does not discriminate on this.
+//   * The OUTPUT is bit-exact. Running `cublasLtMatmul` with the same algo over
+//     the same bytes, the weight operand once from `cudaMalloc` and once from a
+//     256-aligned host block, gives byte-identical results: 12/12 with zero
+//     differing elements, every status `SUCCESS`.
+//
+// So a 256-aligned host pointer cannot change a logit.
+//
+// AND THE SAME PROBE RAN ON THE GB10 ITSELF — the silicon the token gate ran on,
+// so this is no longer a Thor result read across to another part. `rc` job
+// `7c7a05e9-be87-48f4-94ae-1bbe0340f063` on `dgx:gpu0`, 2026-08-19 17:47 UTC,
+// `NVIDIA GB10 sm_121`, driver 580.173.02, cuBLASLt 130101, the predicate
+// re-derived in the job's own output (`pageableMemoryAccess=1 integrated=1`).
+// Same six shapes, same two formulations, 12 measurements, `PROBE_EXIT=0`,
+// `PROBE_FAILURES=0`: repeated heuristic call identical 12/12, the promise
+// weakened to 16 moving nothing 12/12, and `cublasLtMatmul` output bit-exact
+// 12/12 (`differing=0`). At least five distinct algo configurations appear
+// across the twelve and they DIFFER from Thor's, so the heuristic was
+// re-resolved rather than replayed.
+//
+// WHAT THAT ESTABLISHES, AND WHAT IT DOES NOT. It EXCLUDES this branch as the
+// cause of the row's CUDA-versus-CPU token divergence, measured on the target
+// silicon. It does not IDENTIFY the cause, and no reader of this block may take
+// it as if it did: excluding one cause is not identifying another. An earlier
+// revision of this comment named the two arms' GEMM arithmetic as the cause,
+// which the row's own spec forbids asserting — that is the STANDING HYPOTHESIS,
+// together with a greedy path whose top-2 margin at the divergent step —
+// step 9 — is 0.022802 logits, about 0.1 % of the winning logit, and it is
+// NOT MEASURED. This comment used to name 0.264709 logits here. That is
+// step 7's margin, and step 7 is a step both arms AGREE on: the divergence
+// point was transcribed wrong in `.agents/benchmark-record.md`'s W0f entry,
+// which drops token id `7172` twice (#1783). Naming the first tensor whose
+// values differ between the arms at that step, and the operation that
+// produced it, is carried under `## Owed` in
+// `.agents/specs/expert-stream-device-slots.md`.
+//
+// One more thing the probe does not license. The 16-aligned arm also came back
+// bit-exact at these shapes, which is NOT a reason to lower this constant: the
+// enumeration above still does not close, and a promise kept by luck at twelve
+// shapes is not a promise. The literal below is pinned by a case in
+// `tests/vllm/model_executor/test_resident_weight_host_addressable.cpp`, so
+// lowering it reds a gate instead of passing every one of them silently.
+inline constexpr size_t kDeviceAliasAlignment = 256;
+
+// Make `w.bytes` safe to hand to a device kernel directly, and say whether it
+// worked. On return `true`, `w.bytes.data()` is non-null and aligned to
+// `kDeviceAliasAlignment`. On `false` the caller must fall back to staging, and
+// nothing has changed.
+//
+// THREE CASES, and the middle one is the point (ENG-EXPERT-STREAM-DEVICE W0f,
+// issue #1299).
+//
+//   * ALREADY ALIGNED — true, and nothing is copied. A GGUF mmap borrow lands
+//     here whenever its tensor offset happens to be a multiple of 256; GGUF's
+//     `general.alignment` guarantees only 32, so this is luck rather than a
+//     contract, and the fallback below is what makes that acceptable.
+//   * OWNED AND MISALIGNED — the bytes are moved into a `kDeviceAliasAlignment`
+//     allocation and `w.bytes` is re-pointed at it, keeping the new block alive
+//     the way `AdoptDeviceBytesAsHost` keeps the device block alive. A plain
+//     `std::vector<uint8_t>` from glibc is 16-byte aligned and no more (a large
+//     block is an mmap chunk, so it lands at page+16), which is exactly what the
+//     GDN V-head reorder's ~44.6 GiB of bf16-expanded `attn_qkv` / `ssm_out`
+//     arrive as. Without this they could never be aliased and W0f would move no
+//     bytes at all.
+//   * BORROWED AND MISALIGNED — false. A borrow owns no anonymous pages: it is a
+//     clean, file-backed GGUF mapping or a tied pair's single shared expansion.
+//     Copying it would CREATE the anonymous residency this change exists to
+//     remove, and would break the tie. Staging is the right answer for it.
+//
+// Logically const, like the lazy device residency beside it: only where the
+// bytes live changes, never what they are.
+// The outcomes, so a caller and a log can say WHICH one happened.
+enum class HostAliasOutcome {
+  kAliasedInPlace,    // already aligned; nothing allocated and nothing copied
+  kRehomed,           // an OWNED misaligned buffer moved into an aligned block
+  kDeclinedBorrow,    // a misaligned BORROW; the caller must stage
+  kDeclinedEmpty,     // no host bytes at all
+  kDeclinedDisabled,  // VT_QWEN35_ALIAS_HOST_WEIGHTS=0
+};
+
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
+                                  HostAliasOutcome* outcome = nullptr);
+
+// Bytes seen by `MakeHostBytesDeviceAliasable`, split by outcome, since process
+// start.
+//
+// WHY A COUNTER AND NOT AN INFERENCE FROM RSS. W0f's first device attempt was
+// read only through `free -m`, and what it showed — about 47 GB appearing in
+// 30 seconds at the first forward — is equally consistent with "the branch
+// declined and staged as before", with "the branch re-homed and the old pages
+// did not come back", and with "something else allocated". Those three call for
+// three different changes, and no amount of staring at an RSS curve chooses
+// between them. This says how many bytes took each outcome. It is printed
+// PERIODICALLY rather than at exit, because the process it measures is one the
+// memory guard kills before any exit handler runs.
+//
+// PER CALL, NOT PER WEIGHT, AND THE DIFFERENCE IS THE WHOLE READING. There is no
+// memo on the alias branch: `ResidentWeight` re-enters it for every weight on
+// every forward step, so a weight aliased 32 times is counted 32 times. These are
+// therefore BYTES SEEN — traffic — and they become a residency statement only
+// when read at a stated point. The recorded 60.793 GiB is one such reading: the
+// first-forward totals at call 1361, where re-homing plateaus and every dense
+// weight has been seen exactly once. Quoted without that qualifier the same
+// number is a traffic count, and after two decode steps the counter has passed
+// 200 GiB on a checkpoint whose resident dense half is 60.8.
+struct HostAliasStats {
+  uint64_t aliased_in_place_bytes = 0;
+  uint64_t rehomed_bytes = 0;
+  uint64_t declined_borrow_bytes = 0;
+  uint64_t declined_other_bytes = 0;
+  uint64_t calls = 0;
+};
+HostAliasStats HostAliasSnapshot();
+
+// The same-binary A/B back to the staging behaviour, per the house convention
+// for a default-on residency change that `VT_ADOPT_DEVICE_BYTES` and
+// `VT_MOE_HOST_FREE` already follow. `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` makes
+// every call decline, so one build can measure both arms — which matters more
+// here than usual, because `src/vllm/model_executor/models/laguna.cpp` records
+// a MEASURED GB10 penalty for reading system-allocated memory from the GPU
+// rather than a `cudaMalloc` allocation, worst on a long-K low-parallelism
+// GEMV. This branch installs exactly that retag by default, and without a knob
+// W0e could not tell a decode regression from the workload.
+bool HostWeightAliasEnabled();
+
+// May the host mirror of `w` be released, because a DEVICE copy exists to be
+// authoritative in its place?
+//
+// THE INVARIANT A USE-AFTER-FREE TAUGHT US (issue #1299). `MoeBlockBf16Cuda`
+// captures `ResidentWeight(...).data` for every expert into a device-resident
+// pointer table, uploads the table once, and then releases the host mirrors. It
+// justified that with "once the device copy exists it is authoritative and
+// nothing reads the host bytes again", which was true while `ResidentWeight`
+// had two behaviours. It has three: on a host-addressable platform it ALIASES,
+// so the captured pointers ARE `w.bytes.data()` and releasing them frees memory
+// the resident table still points at, for the model's lifetime and from inside
+// captured graphs. A fresh review demonstrated it with a scratch case that takes
+// SIGSEGV.
+//
+// The question is therefore not "did we upload" but "is there something else to
+// read", and `d_dev` already answers it: null on exactly the arm that aliases,
+// non-null on every arm that staged. Named rather than inlined so the release
+// sites state the invariant they depend on, and so a gate can mutate it.
+inline bool HostMirrorIsRedundant(const OwnedTensor& w) {
+  return w.d_dev != nullptr;
+}
 
 // Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
 // #237).
@@ -282,6 +579,90 @@ struct Fp8Weight {
   mutable std::shared_ptr<void> d_packed;
 };
 
+// Block-wise (fine-grained) FP8 weight — MODEL-FP8-BLOCK-WEIGHT, #1189 M3, spec
+// `.agents/specs/model-fp8-block-weight.md`. One fp8-e4m3fn scale per
+// `block_n` x `block_k` tile of the weight, the layout `Qwen/Qwen3.8-27B-FP8`
+// ships and vLLM registers as `weight_scale_inv`
+// (`vllm/model_executor/layers/quantization/fp8.py:378-379,511` @ `555967922`).
+//
+// A SIBLING of `Fp8Weight` above, deliberately, not an extension of it. That
+// struct is three host floats whose whole point is the `alpha = input_scale *
+// weight_scale` folded once at load; a block scheme has NO `input_scale` at all
+// (the activation scheme is `dynamic`, and the target checkpoint ships zero such
+// tensors) and its weight scale is a 2-D tensor, so there is no value `alpha`
+// could take. Adding an optional tensor to `Fp8Weight` would make every existing
+// reader of `alpha` — the cutlass and cuBLASLt fp8 wrappers, the merged-QKV alpha
+// vector, `PrepareGdnFp8Resident` — carry a silent which-arm branch, and the one
+// that forgets it returns a plausible number instead of an error. A distinct type
+// makes the wrong call site fail to COMPILE. The shape mirrors `Nvfp4Weight`
+// above: an OwnedTensor scale beside the packed values plus lazy device handles.
+//
+// `scale` is f32 and that is the MIRROR rather than a widening
+// (`.agents/porting.md` §"Mirror the memory format"). Upstream allocates the
+// parameter `torch.float32` (`utils/fp8_utils.py:1276,1283-1296`; `scale_dtype`
+// is None unless `is_scale_e8m0`, which `Fp8Config` does not define) and loads
+// the checkpoint tensor into it with `self.data.copy_()`
+// (`vllm/model_executor/parameter.py:97`), a CONVERTING copy. A `BF16` tensor on
+// disk is therefore widened to f32 once, at load, losslessly. `LoadFp8BlockRaw`
+// switches on the on-disk dtype explicitly and has no default branch, because
+// #1181 landed a guard for a reader that memcpy'd four bytes whatever the dtype
+// was.
+//
+// `block_n`/`block_k` are carried ON the weight rather than looked up from the
+// config at use time: the consumer needs them per GEMM, and a weight that knows
+// its own geometry cannot be paired with the wrong one.
+//
+// CONSUMED BY THE DENSE FORWARD since #1189 milestone M4 (`281b4bc76`), which
+// landed `Fp8BlockLinearMethod` and the wiring it names. All ten projections
+// in `qwen3_5.cpp` are read, through THREE entry points rather than one.
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them: `o_proj`,
+// `down_proj`, the three GDN projections, and q/k/v whenever the split path
+// runs. M6 (`836c13c35`) added the other two: `MatmulFp8BlockMergedD` reads
+// q/k/v as one operand when the consumer accepts row-strided views, and
+// `Fp8BlockGateUpSwiGLUD` is the ONLY reader of `gate_proj_fp8_block` and
+// `up_proj_fp8_block`. `PrepareQwen3_5Dense` no longer refuses a populated
+// weight -- it refuses a DEVICE with no block-scaled GEMM, which after M5
+// (`489a9a4c0`) means a CUDA arch outside `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a).
+//
+// The CUDA kernel has still NEVER EXECUTED on hardware and there is no token
+// gate. That debt is real and is recorded in
+// `.agents/specs/vt-matmul-fp8-block-cuda.md`; nothing here narrows it.
+struct Fp8BlockWeight {
+  OwnedTensor packed;  // i8  [N, K]  one fp8-e4m3fn byte per element, verbatim
+  OwnedTensor scale;   // f32 [cdiv(N, block_n), cdiv(K, block_k)]
+  int64_t n = 0;       // out_features
+  int64_t k = 0;       // in_features
+  int64_t block_n = 0;
+  int64_t block_k = 0;
+  bool Empty() const { return packed.Empty(); }
+
+  // Lazily-populated device-resident copies (CUDA forward only; null on host or
+  // before first use). Declared here so M4/M5 upload through the same seam every
+  // other quantized weight uses; owed and unpopulated at this merge commit.
+  mutable std::shared_ptr<void> d_packed;
+  mutable std::shared_ptr<void> d_scale;
+};
+
+// The N-concatenated device operand of a MERGED block-wise FP8 group —
+// MODEL-FP8-BLOCK-MERGED (#1189 milestone M6, spec
+// `.agents/specs/model-fp8-block-merged.md`).
+//
+// vLLM loads `gate_proj`/`up_proj` into ONE MergedColumnParallelLinear and
+// `q`/`k`/`v` into ONE QKVParallelLinear, so one GEMM runs where this tree ran
+// two and three. Unlike the per-tensor fp8 case beside it, no alpha vector is
+// needed: a block scale is indexed by `n / block_n`, so the shard scale grids
+// row-concatenate exactly when each shard's rows begin on a block boundary,
+// which is upstream's own merged-partition rule (`fp8_utils.py:1229-1244`).
+//
+// Built lazily-once by `dense_fp8_block::ResidentFp8BlockMerged`, exactly like
+// `Fp8BlockWeight::d_packed`. The per-shard residents are then never built, so
+// the merged arm costs no duplicate device bytes. Empty on every non-block
+// owner.
+struct Fp8BlockMergedResident {
+  mutable std::shared_ptr<void> d_packed;  // i8  [sum N_i, K]
+  mutable std::shared_ptr<void> d_scale;   // f32 [sum cdiv(N_i,bn), cdiv(K,bk)]
+};
+
 // Gated-DeltaNet (linear_attention) layer weights. Projections in Matmul-B
 // layout [in, out]; conv1d [conv_dim, K]; a_log/dt_bias f32 [Hv]; norm bf16.
 struct GdnLayerWeights {
@@ -289,10 +670,11 @@ struct GdnLayerWeights {
   OwnedTensor in_proj_z;      // bf16 [H, value_dim] (FP8 dequant + T)
   OwnedTensor in_proj_b;      // bf16 [H, Hv]        (bf16 + T)
   OwnedTensor in_proj_a;      // bf16 [H, Hv]        (bf16 + T)
-  // Qwen3.6-27B production owner for vLLM's MergedColumnParallelLinear
-  // `in_proj_ba`: raw torch Linear orientation [2*Hv,H], rows [b,a], nk=true.
-  // The real dense loader populates this and leaves in_proj_b/a empty. The
-  // split rollback slices this owner; 35B/GGUF/synthetic paths retain the
+  // The production owner for vLLM's MergedColumnParallelLinear `in_proj_ba`:
+  // raw torch Linear orientation [2*Hv,H], rows [b,a], nk=true. Both
+  // safetensors loaders populate this and leave in_proj_b/a empty (dense since
+  // KERNEL-GDN-PACKED-DECODE W1, MoE since GDN-MOE-PACKED-BA, #1169). The split
+  // rollback slices this owner. The GGUF (#1793) and synthetic paths retain the
   // legacy fields above and leave this empty.
   OwnedTensor in_proj_ba;
   // Qwen3.6-27B production owner for vLLM's MergedColumnParallelLinear
@@ -309,6 +691,14 @@ struct GdnLayerWeights {
   OwnedTensor dt_bias;        // f32  [Hv]
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
+
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise FP8 GDN projections. The
+  // target checkpoint lists the GDN small tensors under
+  // `modules_to_not_convert`, so these stay empty for it; the rung exists
+  // because the SITE probes `F8_E4M3` and a block-wise weight is one.
+  Fp8BlockWeight in_proj_qkv_fp8_block;
+  Fp8BlockWeight in_proj_z_fp8_block;
+  Fp8BlockWeight out_proj_fp8_block;
 
   // 27B W4A4 fp4-resident variant of out_proj (compressed-tensors NVFP4, notes
   // §3.6). When populated (real 27B CUDA load) the forward calls vt::MatmulNvfp4
@@ -384,6 +774,18 @@ struct FullAttnLayerWeights {
   Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight o_proj_fp8;  // [N=H,       K=Hq*Dh]
 
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): the block-wise (128x128) FP8 variants,
+  // populated by the `weight_scale_inv` rung in `qwen3_5_dense_weights.cpp`
+  // BEFORE the per-tensor rung, because a block-wise weight is also `F8_E4M3`
+  // (#1166). The bf16, fp4 and per-tensor fp8 slots are left EMPTY when these
+  // are populated, and vice versa. M4 (#1189, `281b4bc76`) landed the linear
+  // method and the forward that reads them, so `PrepareQwen3_5Dense` refuses an
+  // unrunnable DEVICE rather than a populated weight.
+  Fp8BlockWeight q_proj_fp8_block;  // [N=2*Hq*Dh, K=H]
+  Fp8BlockWeight k_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
+  Fp8BlockWeight v_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
+  Fp8BlockWeight o_proj_fp8_block;  // [N=H,       K=Hq*Dh]
+
   // CUDA resident for the FP8 (W8A8) analog of QKVParallelLinear (VT_FP8_MERGED
   // _QKV, opt-in). The checkpoint owns logical Q/K/V shards separately with a
   // shared per-tensor input_scale but per-projection weight_scale; production
@@ -395,6 +797,14 @@ struct FullAttnLayerWeights {
   // The split fp8 weights above remain available for VT_FP8_MERGED_QKV=0.
   mutable std::shared_ptr<void> d_qkv_fp8_packed;  // i8 [Nq+Nk+Nv, K] raw e4m3fn
   mutable std::shared_ptr<void> d_qkv_fp8_alpha;   // f32 [Nq+Nk+Nv] per-column
+
+  // MODEL-FP8-BLOCK-MERGED (#1189 M6): the BLOCK-wise analog of the resident
+  // above, and a much smaller one. Block scales concatenate losslessly along N,
+  // so there is no alpha vector and no shared-input_scale guard; the merged
+  // operand is the three shards' bytes and scale grids end to end. Default ON
+  // wherever the site exposes packed q/k/v views, because there is nothing to
+  // trade off. Empty on every non-block owner.
+  Fp8BlockMergedResident qkv_fp8_block_merged;
 };
 
 // Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.
@@ -488,6 +898,52 @@ struct Qwen3_5MoeWeights {
 // Resolves a tensor name to its StTensor (across shards). Throws if absent.
 using TensorResolver = std::function<const StTensor&(const std::string&)>;
 
+// --- Backbone weight namespace (MODEL-TEXT-qwen3-5-*-for-causal-lm) -----------
+//
+// A Qwen3.5-family checkpoint publishes its text backbone under ONE of two
+// spellings. The multimodal wrappers we already gate (Qwen3.6-27B / 35B-A3B /
+// Coder) nest it under `model.language_model.`; the TEXT-ONLY arms
+// (`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM`, e.g.
+// `Qwen/Qwen3.8-2.4T-A95B`) publish it flat under `model.`. The BACKBONE names
+// are otherwise identical — same `mlp.shared_expert_gate.weight`, same
+// top-level `lm_head`.
+//
+// THE PREFIX IS NOT THE ONLY THING BETWEEN THIS LOADER AND A PUBLISHED
+// CHECKPOINT, and an earlier revision of this comment wrongly implied it was.
+// The published Qwen3.5-family MoE repos ship 3-D STACKED routed experts
+// (`...mlp.experts.gate_up_proj` / `.down_proj`) and carry no quantization
+// scales at all, while `LoadQwen3_5Moe` reads ONLY per-expert NVFP4. That arm
+// is OWED and is refused by name (`CheckMoeExpertLayoutSupported`,
+// `qwen3_5_weights.cpp`). The DENSE loader is different: it routes BF16 vs FP8
+// vs NVFP4 per projection by tensor presence, so it may genuinely read a flat
+// bf16 checkpoint. Resolving the namespace is what THIS seam does; it is not a
+// support claim for either published checkpoint.
+//
+// Upstream normalizes the two with ONE mapper —
+//   WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})
+//   (vllm/model_executor/models/qwen3_5.py:296-300 @ `ad5d29db7`, PR #50210,
+//    which is AHEAD OF our `555967922` parity pin and recorded as such) —
+// so `model.` is canonical and the VL spelling is its accepted alias.
+inline constexpr std::string_view kQwen3_5VlBackbonePrefix =
+    "model.language_model.";
+inline constexpr std::string_view kQwen3_5TextBackbonePrefix = "model.";
+
+// Decides which of the two the checkpoint uses, ONCE, from the shard index, so
+// every subsequent lookup in a load uses one namespace. Deliberately NOT a
+// per-lookup fallback: a fallback would let a checkpoint bind half its tensors
+// from one namespace and half from the other and still appear to load.
+//
+// Only BACKBONE spellings vote — `<prefix>embed_tokens.weight`,
+// `<prefix>norm.weight` and `<prefix>layers.`. `model.visual.*` (the
+// vision-inclusive 27B/35B towers) and the top-level `lm_head.*` / `mtp.*`
+// therefore cast no vote, which is what keeps a vision checkpoint from looking
+// like a flat text one.
+//
+// Throws std::runtime_error when BOTH namespaces carry backbone tensors (a
+// mixed index is refused, never half-loaded) and when NEITHER does.
+std::string ResolveQwen3_5BackbonePrefix(
+    const std::vector<std::string>& tensor_names);
+
 // --- ENG-LOAD-DIRECT-UPLOAD (issue #150) -------------------------------------
 //
 // THE DEFECT THIS CLOSES. Loading a checkpoint copies the weights TWICE: the
@@ -529,14 +985,215 @@ namespace detail {
 void SetLoadDirectUploadOverrideForTesting(std::optional<bool> value);
 }  // namespace detail
 
+// How a checkpoint spells its ROUTED experts (issue #740). Resolved ONCE per
+// checkpoint from the shard index and threaded, exactly as the backbone
+// namespace is: a per-lookup fallback would let one checkpoint bind half its
+// experts from each layout and still appear to load.
+//
+//  kPerExpertNvfp4  `<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight` U8 +
+//                   `.weight_scale` F8_E4M3 + `.weight_scale_2` -- what an
+//                   NVFP4 requant (nvidia/Qwen3.6-35B-A3B-NVFP4) ships and what
+//                   every gated row reads today. Populates `expert_*_fp4`.
+//  kStackedBf16     `<layer>.mlp.experts.{gate_up_proj,down_proj}`, ONE 3-D bf16
+//                   tensor per projection holding every expert -- what the
+//                   PUBLISHED repos (Qwen/Qwen3.8-2.4T-A95B,
+//                   Qwen/Qwen3.6-35B-A3B) ship. Populates the bf16 `expert_*`.
+enum class MoeExpertLayout { kPerExpertNvfp4, kStackedBf16 };
+
+// Decides which of the two a checkpoint uses, ONCE, from its shard index —
+// the routed-expert sibling of `ResolveQwen3_5BackbonePrefix`, and public for
+// the same reason: a caller that wants to know what a published index implies
+// must ask the same question the loader asks, not a paraphrase of it.
+//
+// Only names under `<backbone_prefix>layers.` vote. The top-level `mtp.` draft
+// head carries the STACKED spelling even in `nvidia/Qwen3.6-35B-A3B-NVFP4`,
+// whose model is per-expert NVFP4, so a scan that counted every `.mlp.experts.`
+// name would flip that checkpoint's whole model onto the wrong arm.
+//
+// Throws when BOTH spellings appear under the backbone (a mixed index is
+// refused, never half-bound). An index with NEITHER resolves to the per-expert
+// arm — the status quo — and the load then fails at its first missing tensor.
+MoeExpertLayout ResolveQwen3_5MoeExpertLayout(
+    const std::vector<std::string>& tensor_names,
+    const std::string& backbone_prefix);
+
+// --- Everything that is NOT a routed expert (issue #864) ---------------------
+//
+// #740 gave the MoE loader the published repos' routed experts. It did not make
+// a published repo LOAD: `Qwen/Qwen3.6-35B-A3B` and `Qwen/Qwen3.8-2.4T-A95B`
+// carry ZERO `weight_scale` / `input_scale` / `scale_inv` tensors anywhere, and
+// the loader additionally hard-required per-tensor FP8 for the GDN and
+// attention towers and NVFP4 for the shared expert and `lm_head`. Those four
+// components are what this enum and struct route by tensor PRESENCE.
+//
+// `DenseNativeEnabled()` does NOT cover this and is deliberately not widened:
+// it switches fp8-RESIDENT against fp8-DEQUANT and BOTH of its branches assume
+// an fp8 input, so it is a build/env A/B lever with recorded evidence attached,
+// not a layout probe.
+enum class MoeProjDtype {
+  kBf16,   // `<proj>.weight` BF16, no scales -- what a published repo ships
+  kFp8,    // `<proj>.weight` F8_E4M3 + `.weight_scale` (+ `.input_scale`)
+  kNvfp4,  // ModelOpt `<proj>.weight` U8 + `.weight_scale` F8 + `.weight_scale_2`
+};
+
+const char* MoeProjDtypeName(MoeProjDtype dtype);
+
+// The safetensors dtype string of `name` ("BF16", "F8_E4M3", "U8", ...), or an
+// EMPTY string when the checkpoint index has no such tensor.
+//
+// One callback rather than the dense loader's `TensorResolver` + `TensorExists`
+// pair, because presence is `!dtype_of(name).empty()` and the dense ladder needs
+// exactly those two questions -- so a caller that has only an INDEX (a manifest,
+// a plan audit) can answer both without materializing an `StTensor`.
+using TensorDtypeProbe = std::function<std::string(const std::string&)>;
+
+// THE DENSE ARM'S LADDER, AND IT MUST STAY THE DENSE ARM'S LADDER.
+// `qwen3_5_dense_weights.cpp`'s `load_projection` (:475-484) asks, in order:
+//   1. `IsNvfp4Projection`  = `has(<proj>.weight_packed) || has(<proj>.weight_scale_2)`
+//      -- compressed-tensors spells the packed weight `weight_packed`; ModelOpt
+//      spells the global scale `weight_scale_2`. Probing only one missed
+//      `nvidia/Qwen3.6-27B-NVFP4` entirely (:342-356).
+//   2. `get(<proj>.weight).dtype == "F8_E4M3"` -- the `modelopt_mixed` tower.
+//   3. otherwise BF16.
+// This is that ladder and nothing else. If the two ever disagree about one
+// projection, a checkpoint could route differently through two loaders in the
+// same build, so `test_qwen3_8_text_only` binds them by loading the SAME
+// synthetic projection through the dense loader and comparing which slot it
+// filled.
+MoeProjDtype ClassifyQwen3_5Projection(const TensorDtypeProbe& dtype_of,
+                                       const std::string& proj);
+
+// True iff the checkpoint carries this projection at all, under either spelling
+// (mirror of `DenseCheckpointHasLmHead`: a compressed-tensors projection's only
+// weight tensor is `<proj>.weight_packed`).
+bool Qwen3_5ProjectionPresent(const TensorDtypeProbe& dtype_of,
+                              const std::string& proj);
+
+// The four non-routed-expert components, each resolved ONCE per checkpoint and
+// THREADED -- the same discipline `ResolveQwen3_5BackbonePrefix` and
+// `ResolveQwen3_5MoeExpertLayout` follow, and for the same reason: a per-lookup
+// probe would let one checkpoint bind some layers quantized and some bf16 and
+// still appear to load.
+//
+// The defaults are the STATUS QUO before #864 -- per-tensor FP8 towers, NVFP4
+// shared expert and head -- so every existing caller of the defaulted seams
+// below is unchanged by construction.
+//
+// WHY FOUR INDEPENDENT DECISIONS AND NOT ONE. A checkpoint that is quantized in
+// one component and bf16 in another is ordinary upstream, not a defect:
+// `nvidia/Qwen3.6-27B-NVFP4` is `modelopt_mixed` (FP8 attention tower next to
+// NVFP4 MLP and a BF16 GDN in-projection) and the dense arm reads it by asking
+// per projection. Collapsing the four into one decision would refuse that shape
+// and diverge from the ladder above, which is the one thing the spec's stop
+// condition forbids. What IS refused is a component that disagrees with ITSELF
+// -- see `ResolveQwen3_5MoeTowerDtypes`.
+struct Qwen3_5MoeTowerDtypes {
+  MoeProjDtype gdn = MoeProjDtype::kFp8;     // linear_attn in_proj_qkv/z, out_proj
+  MoeProjDtype attn = MoeProjDtype::kFp8;    // self_attn q/k/v/o_proj
+  MoeProjDtype shared_expert = MoeProjDtype::kNvfp4;  // mlp.shared_expert.*
+  MoeProjDtype lm_head = MoeProjDtype::kNvfp4;
+};
+
+// Resolves all four from the checkpoint index, walking EVERY layer of
+// `layer_types` (GDN projections on `linear_attention` layers, attention
+// projections on `full_attention` ones, the shared expert on both) plus the
+// top-level `lm_head`.
+//
+// Throws when one component disagrees with itself -- layer 0's `q_proj` BF16
+// against layer 4's F8_E4M3, or `gate_proj` BF16 against `down_proj` NVFP4 --
+// naming both projections and both dtypes. That is the "half from each" failure
+// the once-per-checkpoint discipline exists to prevent, and unlike a missing
+// tensor it would otherwise produce wrong logits rather than an error.
+//
+// A component with no projections present at all keeps its default, so an index
+// that simply lacks a tensor still fails at the reader with `tensor not found`.
+Qwen3_5MoeTowerDtypes ResolveQwen3_5MoeTowerDtypes(
+    const TensorDtypeProbe& dtype_of, const std::string& backbone_prefix,
+    const std::vector<std::string>& layer_types);
+
+// --- The load PLAN (issue #740, .agents/specs/moe-bf16-stacked-experts.md) ---
+//
+// WHAT PROBLEM THIS SOLVES. `Qwen/Qwen3.8-2.4T-A95B` is ~4.8 TB over 213 shards.
+// Nothing here can hold it, so "the reader works at 35B" is the only byte-level
+// evidence available — and on its own it does not show that the 2.4T's OWN
+// names, shapes and dtypes resolve, nor that the per-expert offset arithmetic
+// survives its dimensions (one layer's `gate_up_proj` is 34,359,738,368 bytes,
+// which overflows int32 by four orders of magnitude).
+//
+// So: walk the whole load for a config WITHOUT allocating or reading a single
+// weight byte, and report every tensor it would fetch. Checked against the
+// published `model.safetensors.index.json`, that answers "would it load on
+// hardware that can hold it?" for exactly the part that can be answered without
+// the hardware.
+//
+// WHAT IT DELIBERATELY DOES NOT CLAIM: a generated token, throughput, memory
+// headroom, or that any allocation path survives at that scale.
+//
+// THE PLAN IS ONLY WORTH ANYTHING IF IT IS A PROJECTION OF THE LOADER RATHER
+// THAN A SECOND MODEL OF IT. `PlanQwen3_5MoeLoad` therefore mirrors
+// `LoadQwen3_5Moe` helper for helper, including the `DenseNativeEnabled()`
+// decision that adds `.input_scale` to every FP8 projection, and the test suite
+// binds the two: it builds a synthetic checkpoint from the plan ALONE, requires
+// the production loader to read it, and then removes each planned tensor in turn
+// and requires the load to fail naming exactly that tensor. A plan entry the
+// loader does not want, or a tensor it wants that the plan omits, fails there.
+struct PlannedTensor {
+  std::string name;
+  // The safetensors dtype string the load hard-requires (`LoadBf16Direct` wants
+  // BF16, `LoadFp8Raw` F8_E4M3, `LoadNvfp4Raw` U8 + F8_E4M3 + F32, ...).
+  std::string dtype;
+  // The shape the CONFIG implies. EMPTY when neither the loader nor the config
+  // determines it: the attention projections' output width depends on
+  // `attn_output_gate`, which `HfConfig` does not carry, so this planner states
+  // no shape for them rather than a plausible one that is wrong on every real
+  // checkpoint (the 2.4T's `q_proj` is [32768, 8192], twice heads*head_dim).
+  std::vector<int64_t> shape;
+  // True when the LOADER ITSELF checks this shape against config, rather than
+  // reading it off the header. Only the 3-D stacked routed experts do — which is
+  // exactly the arithmetic this row added, so it is the one shape whose
+  // agreement with the published index is a statement about the reader and not
+  // about this planner.
+  bool shape_enforced = false;
+};
+
+// Every tensor `LoadQwen3_5Moe` would fetch for `config`, in load order, without
+// touching a weight byte. `backbone_prefix` and `layout` are what
+// `ResolveQwen3_5BackbonePrefix` / `ResolveQwen3_5MoeExpertLayout` resolved from
+// the index. Does NOT include `mtp.*`: `LoadQwen3_5MTP` loads that optional
+// draft head separately, and only when speculative decoding is enabled.
+//
+// Identical for the eager and DEFERRED (`load_layer_experts`) residency paths —
+// deferring changes WHEN the routed experts are read, never WHICH.
+//
+// `tower` is what `ResolveQwen3_5MoeTowerDtypes` resolved for the four
+// non-routed-expert components; it changes the REQUEST SET (an FP8 projection
+// asks for two or three tensors where a BF16 one asks for a single `.weight`),
+// so a plan built with the wrong one is not a projection of the loader.
+std::vector<PlannedTensor> PlanQwen3_5MoeLoad(
+    const HfConfig& config, const std::string& backbone_prefix,
+    MoeExpertLayout layout, Qwen3_5MoeTowerDtypes tower = {});
+
 // Load one decoder layer's weights from real tensors. `layer_type` is
 // "linear_attention" or "full_attention"; `num_experts` drives the expert loop.
 // Exercised on real data by the Task 3 unit test (both layer types live in
-// shard 1). Prefix is "model.language_model.layers.{layer_idx}.".
-Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
-                                           const std::string& layer_type,
-                                           int64_t layer_idx,
-                                           int64_t num_experts);
+// shard 1). Prefix is "{backbone_prefix}layers.{layer_idx}.", and the default
+// is the VL spelling every checkpoint we gate today uses, so this seam is
+// byte-identical for the 27B/35B/Coder callers. `LoadQwen3_5Moe` passes the
+// prefix it resolved once from the shard index.
+//
+// `layout` likewise defaults to the arm every gated caller uses, so this seam
+// stays byte-identical for them. `hidden` is read ONLY by the stacked arm, which
+// needs it to resolve the 3-D tensors' orientation the way upstream does; it is
+// unused (and may be 0) for the per-expert arm.
+//
+// `tower` likewise defaults to the arm every gated caller reads (FP8 towers,
+// NVFP4 shared expert), so this seam stays byte-identical for them.
+Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    int64_t num_experts,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix),
+    MoeExpertLayout layout = MoeExpertLayout::kPerExpertNvfp4,
+    int64_t hidden = 0, Qwen3_5MoeTowerDtypes tower = {});
 
 // Full-model load: resolves every param across the given shards (name -> shard
 // looked up from each file's own header), dequantizes/transposes, and returns
@@ -554,5 +1211,51 @@ Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
 Qwen3_5MoeWeights LoadQwen3_5Moe(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config,
     std::shared_ptr<const std::vector<SafetensorsFile>> shards_owner = nullptr);
+
+// ── The MoE arm's VISION TOWER (issue #891, .agents/specs/moe-vision-tower.md) ─
+//
+// `LoadQwen3_5Moe` above reads the TEXT backbone only. `Qwen/Qwen3.6-35B-A3B`
+// ships 333 `model.visual.*` tensors alongside it, and until this seam existed
+// they were simply not read — the load succeeded and produced a text-only model,
+// which is the silent-drop failure class this project keeps rediscovering.
+//
+// Upstream composes the SAME tower on both arms: `Qwen3_5MoeForConditionalGener
+// ation` and `Qwen3_5ForConditionalGeneration` each hold a `Qwen3_VisionTransfor
+// mer` (pinned vLLM `qwen3_5.py`), so this is the SHARED
+// `LoadQwen3VLVisionWeights` reader (`qwen3_vl.h`) the dense 27B arm already
+// gates at image 32/32 + video 32/32 — deliberately NOT a second tower.
+
+// The tower geometry for a Qwen3.6 conditional-generation checkpoint. Mirrors
+// the checkpoint's `config.json::vision_config`; `Qwen/Qwen3.6-35B-A3B` and
+// `Qwen/Qwen3.6-27B` publish the SAME tower (depth 27, hidden 1152, heads 16,
+// intermediate 4304, patch 16, temporal patch 2, spatial merge 2, 2304 position
+// embeddings, EMPTY `deepstack_visual_indexes`) and differ only in
+// `out_hidden_size`, which is the text backbone's hidden size (2048 on the 35B
+// MoE, 5120 on the 27B dense) because the merger writes straight into the text
+// residual stream. That one field is therefore taken from `config.hidden_size`
+// rather than hardcoded. `HfConfig` does not parse `vision_config` (the dense
+// arm's gate hardcodes the same numbers in-test).
+//
+// NO DeepStack: `deepstack_visual_indexes: []` compiles that path out for this
+// family upstream (`qwen3_vl.py:1709-1716`), so the tower output is exactly
+// [N, out_hidden_size].
+multimodal::Qwen3VLVisionConfig Qwen3_5MoeVisionConfig(const HfConfig& config);
+
+// Load the MoE arm's vision tower from the SAME shards the text backbone came
+// from, through the shared `LoadQwen3VLVisionWeights`.
+//
+// REFUSES BY NAME when the checkpoint carries no `model.visual.*` tensor at all:
+// a Qwen3.5-family `*ForConditionalGeneration` checkpoint without a tower cannot
+// answer an image or video prompt, and returning an empty tower would let it
+// answer from text alone and still emit plausible tokens. AGENTS.md: an arm that
+// is not implemented "is refused with a message naming the missing piece ...
+// never left to be discovered later". `nvidia/Qwen3.6-35B-A3B-NVFP4` is exactly
+// such a checkpoint (`vision_config` declared, `visual.*` weights absent).
+multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
+// True iff any shard carries a `model.visual.` tensor. Exposed so a caller can
+// route to the text-only path deliberately instead of discovering the refusal.
+bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 
 }  // namespace vllm

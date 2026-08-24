@@ -1371,6 +1371,65 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Scheduler.update_draft_token_ids_in_output (#1824): trims to the "
+    "scheduled count, pads a short row with -1, and skips unknown requests") {
+  // Ported from scheduler.py:2072-2107 @ 555967922 (SPEC-DFLASH2 W7). The
+  // async draft-in-output path rewrites the drafts INSIDE a SchedulerOutput
+  // (the scheduler-side request state holds only placeholders under async
+  // scheduling); the grammar validate_tokens arm stays deferred exactly as in
+  // the sync update_draft_token_ids above (no per-request validate seam yet).
+  auto scheduler = CreateSpecScheduler(/*num_speculative_tokens=*/3);
+  auto requests = CreateRequests(1, /*num_tokens=*/4);
+  const std::string req_id = requests[0]->request_id;
+  (void)AddRequest(*scheduler, std::move(requests[0]));
+
+  auto out = scheduler->schedule();  // prefill
+  FeedModelOutput(*scheduler, out, {{0}});
+  DraftTokenIds drafts;
+  drafts.req_ids = {req_id};
+  drafts.draft_token_ids = {{1, 2, 3}};
+  scheduler->update_draft_token_ids(drafts);
+
+  out = scheduler->schedule();  // schedules the 3 drafts
+  REQUIRE(out.scheduled_spec_decode_tokens.count(req_id) == 1);
+  REQUIRE(out.scheduled_spec_decode_tokens.at(req_id).size() == 3);
+
+  // (a) The worker returned MORE drafts than were scheduled (chunked-prefill
+  // trim, scheduler.py:2091-2094): trimmed to the scheduled count.
+  DraftTokenIds more;
+  more.req_ids = {req_id};
+  more.draft_token_ids = {{7, 8, 9, 10, 11}};
+  scheduler->update_draft_token_ids_in_output(more, out);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id) ==
+        std::vector<int32_t>{7, 8, 9});
+  CHECK(out.num_invalid_spec_tokens.empty());
+
+  // (b) FEWER drafts than scheduled: padded to the scheduled count with -1
+  // and the invalid tail recorded (scheduler.py:2099-2103).
+  DraftTokenIds fewer;
+  fewer.req_ids = {req_id};
+  fewer.draft_token_ids = {{7}};
+  scheduler->update_draft_token_ids_in_output(fewer, out);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id) ==
+        std::vector<int32_t>{7, -1, -1});
+  REQUIRE(out.num_invalid_spec_tokens.count(req_id) == 1);
+  CHECK(out.num_invalid_spec_tokens.at(req_id) == 2);
+
+  // (c) An unknown request id is skipped (scheduler.py:2082-2085), and a known
+  // request with NO scheduled spec entry is skipped too (:2087-2089).
+  DraftTokenIds ghost;
+  ghost.req_ids = {"ghost", req_id};
+  ghost.draft_token_ids = {{1, 2, 3}, {4, 5, 6}};
+  CHECK_NOTHROW(scheduler->update_draft_token_ids_in_output(ghost, out));
+  CHECK(out.scheduled_spec_decode_tokens.count("ghost") == 0);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id) ==
+        std::vector<int32_t>{4, 5, 6});
+  // Each call REPLACES num_invalid_spec_tokens (upstream builds a fresh dict
+  // and assigns it, scheduler.py:2075,2107) — (b)'s entry does not survive (c).
+  CHECK(out.num_invalid_spec_tokens.empty());
+}
+
+TEST_CASE(
     "Scheduler: no speculator -> spec-decode paths inert (default-off)") {
   // Default-off proof: a scheduler built WITHOUT a SpeculativeConfig never sees a
   // draft (the runner never produces one), so spec_token_ids stays empty on every
@@ -1392,4 +1451,110 @@ TEST_CASE(
   out = scheduler->schedule();  // decode: exactly 1 token, no spec
   CHECK(out.num_scheduled_tokens.at(req_id) == 1);
   CHECK(out.scheduled_spec_decode_tokens.empty());
+}
+
+// ---------------------------------------------------------------------------
+// The per-step token budget is what SPLITS a concurrent prefill wave (#669).
+//
+// This pins the c4 x 1024-token shape that the TTFT budget sweep runs, at two
+// values of --max-num-batched-tokens, because the sweep produced a
+// budget-INVARIANT wall time on our arm and the natural reading of that is "the
+// budget never reaches the scheduler". It does. What the sweep measured is that
+// 1 x 4096 and 2 x 2048 are the same total prefill work, not that the split
+// failed to happen -- and this test is the thing that keeps that distinction
+// falsifiable, since no timing gate can tell the two apart.
+//
+// Both arms mirror upstream's waiting loop exactly:
+//   budget init                scheduler.cpp:465   <- scheduler.py:447
+//   `token_budget > 0` guard   scheduler.cpp:642   <- scheduler.py:671
+//   num_new = tokens - computed scheduler.cpp:688  <- scheduler.py:825
+//   min(num_new, token_budget) scheduler.cpp:697   <- scheduler.py:859-860
+//   token_budget -= num_new    scheduler.cpp:742   <- scheduler.py:1018-1019
+// (upstream anchors @ 5559679229bc961848b121ccdeaa8fa5d79bec98.)
+//
+// Note which line ENDS the 2048 step: the loop guard, not the chunking clamp.
+// Two 1024-token prompts take the budget to exactly 0, so the third request is
+// never even peeked and there is NO partial third chunk -- upstream stops at the
+// same place for the same reason (scheduler.py:671).
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: the token budget splits a 4x1024 prefill wave") {
+  const int kPrompt = 1024;
+
+  SUBCASE("budget 8192 admits the whole wave in ONE 4096-token step") {
+    auto scheduler = CreateScheduler(/*max_num_seqs=*/256,
+                                     /*max_num_batched_tokens=*/8192,
+                                     /*enable_chunked_prefill=*/true,
+                                     /*num_blocks=*/100000, /*block_size=*/16,
+                                     /*max_model_len=*/8192);
+    auto requests = CreateRequests(/*num_requests=*/4, kPrompt,
+                                   {"a", "b", "c", "d"});
+    for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+    auto out = scheduler->schedule();
+
+    CHECK(out.total_num_scheduled_tokens == 4 * kPrompt);  // 4096 in one step.
+    CHECK(out.num_scheduled_tokens.size() == 4);
+    for (const char* id : {"a", "b", "c", "d"}) {
+      CHECK(out.num_scheduled_tokens.at(id) == kPrompt);  // nobody is chunked.
+    }
+    CHECK(out.scheduled_new_reqs.size() == 4);
+    CHECK(scheduler->waiting->empty());
+  }
+
+  SUBCASE("budget 2048 splits the SAME wave into two 2048-token steps") {
+    auto scheduler = CreateScheduler(/*max_num_seqs=*/256,
+                                     /*max_num_batched_tokens=*/2048,
+                                     /*enable_chunked_prefill=*/true,
+                                     /*num_blocks=*/100000, /*block_size=*/16,
+                                     /*max_model_len=*/8192);
+    auto requests = CreateRequests(/*num_requests=*/4, kPrompt,
+                                   {"a", "b", "c", "d"});
+    for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+    // Step 0: "a" and "b" fill the budget exactly; "c"/"d" stay WAITING.
+    auto out0 = scheduler->schedule();
+    CHECK(out0.total_num_scheduled_tokens == 2048);
+    CHECK(out0.num_scheduled_tokens.size() == 2);
+    CHECK(out0.num_scheduled_tokens.at("a") == kPrompt);
+    CHECK(out0.num_scheduled_tokens.at("b") == kPrompt);
+    // The loop guard stopped it, so there is no partial third chunk.
+    CHECK(out0.num_scheduled_tokens.count("c") == 0);
+    CHECK(out0.num_scheduled_tokens.count("d") == 0);
+    CHECK(scheduler->waiting->size() == 2);
+
+    // "a" and "b" completed prefill, so each samples its first token and moves
+    // into decode.
+    scheduler->update_from_output(
+        out0, MakeRunnerOutput({{"a", {7}}, {"b", {7}}}));
+
+    // Step 1: the RUNNING loop is served first (scheduler.cpp:478 <-
+    // scheduler.py:473), so a/b's two decode tokens come off the budget before
+    // the waiting loop runs. "c" then takes a full chunk and "d" gets only what
+    // is left -- 2048 - 2 - 1024 = 1022. THIS is the clamp at scheduler.cpp:697
+    // (<- scheduler.py:859-860) firing: a genuine mid-prompt split, which the
+    // 8192 arm never performs. Pinning the exact 1022 is the point: an
+    // off-by-one in the budget arithmetic changes it, and no timing gate can.
+    auto out1 = scheduler->schedule();
+    CHECK(out1.num_scheduled_tokens.at("a") == 1);  // decode
+    CHECK(out1.num_scheduled_tokens.at("b") == 1);  // decode
+    CHECK(out1.num_scheduled_tokens.at("c") == kPrompt);
+    CHECK(out1.num_scheduled_tokens.at("d") == 1022);  // chunked remainder
+    CHECK(out1.total_num_scheduled_tokens == 2048);    // budget filled exactly
+    CHECK(scheduler->waiting->empty());
+    // "d" is mid-prompt, so it samples nothing this step.
+    Request* d = nullptr;
+    for (Request* r : scheduler->running) {
+      if (r->request_id == "d") d = r;
+    }
+    REQUIRE(d != nullptr);
+    CHECK(d->is_prefill_chunk);
+
+    scheduler->update_from_output(
+        out1, MakeRunnerOutput({{"a", {7}}, {"b", {7}}, {"c", {7}}, {"d", {}}}));
+
+    // Step 2: "d" finishes its prompt with the 2-token tail it was left.
+    auto out2 = scheduler->schedule();
+    CHECK(out2.num_scheduled_tokens.at("d") == 2);
+    CHECK(out2.total_num_scheduled_tokens == 5);  // a,b,c decode + d's tail
+  }
 }

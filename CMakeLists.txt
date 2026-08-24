@@ -9,7 +9,28 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(InSourceGuard)
 vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
-project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
+project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)
+
+set(VLLM_CPP_BUILD_VERSION "${PROJECT_VERSION}" CACHE STRING
+  "Exact version identity reported by this build")
+if(VLLM_CPP_BUILD_VERSION STREQUAL "")
+  message(FATAL_ERROR "VLLM_CPP_BUILD_VERSION must not be empty")
+endif()
+
+# Native Windows release ABI: the core and every consumer use the static
+# MSVC/UCRT runtime (/MT in Release, /MTd in Debug), so the installed server
+# does not depend on a developer-machine CRT deployment.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC)
+  # Keep PE debug directories reproducible and free of runner/build paths.
+  add_link_options("/PDBALTPATH:%_PDB%")
+  # Windows headers otherwise replace qualified std::min/std::max calls with
+  # legacy macros. The project intentionally uses the portable ISO CRT entry
+  # points across platforms, and tokenizer tables require a UTF-8 execution
+  # character set. These are platform contracts; /W4 /WX remains unchanged.
+  add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +49,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Pinning contract=off gives every TU (kernels AND tests) the exact numerics of
 # the plain x86-64 Release build on every platform. CUDA device code is NOT
 # affected (nvcc flags are separate; GPU parity tests compare GPU-vs-GPU).
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/fp:strict>)
+else()
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+endif()
 
 option(VLLM_CPP_BUILD_TESTS "Build tests" ON)
 option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
@@ -41,6 +66,27 @@ option(VLLM_CPP_SERVER "Build the OpenAI HTTP server (needs third_party/httplib/
 option(VLLM_CPP_LITERAL_STATIC
   "Link the CPU-only server as a literal static executable (experimental musl release lane only)"
   OFF)
+# ENG-HF-MODEL-DOWNLOAD W5 (#1280): fetching a HuggingFace repository named by
+# `--model` needs transport layer security, because `huggingface.co` speaks
+# nothing else. The shape mirrors llama.cpp at stock tag `b10451`
+# (`vendor/cpp-httplib/CMakeLists.txt:38-154`), which retired libcurl and now
+# transports over the same cpp-httplib this tree already vendors: one option for
+# the feature, one for OpenSSL, one for a statically fetched BoringSSL. It also
+# follows the VLLM_CPP_SERVER idiom directly above -- a missing dependency
+# DOWNGRADES the feature with a WARNING rather than failing the configure, so a
+# host with no OpenSSL development files still builds a working engine.
+option(VLLM_CPP_HF_DOWNLOAD
+  "Fetch a HuggingFace repository named by --model (resolves OFF with no TLS)" ON)
+option(VLLM_CPP_OPENSSL
+  "Use the system OpenSSL for HTTPS in the HuggingFace client" ON)
+option(VLLM_CPP_BUILD_BORINGSSL
+  "Fetch and statically link BoringSSL for HTTPS (for the literal-static lane)" OFF)
+# The value the USER asked for, captured before any resolution can downgrade it.
+# `tests/CMakeLists.txt` arms its transport-layer-security expectation from this
+# one, so a build where the feature silently resolved OFF fails a test instead
+# of quietly running the no-TLS arm of every case and reporting SUCCESS.
+set(VLLM_CPP_HF_DOWNLOAD_REQUESTED ${VLLM_CPP_HF_DOWNLOAD})
+
 if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib/httplib.h")
   message(WARNING "VLLM_CPP_SERVER=ON but third_party/httplib/httplib.h is missing; "
     "disabling the server target. Vendor cpp-httplib to enable it.")
@@ -669,21 +715,51 @@ include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
+# THE COMPILED-ARCH MANIFEST (issue #1357, umbrella #1332 M2) starts EMPTY, and
+# empty means "FlashAttention-2 was not compiled". It is filled in exactly one
+# place: beside the vt_cuda_set_source_gencode call that emits FA2's -gencode
+# options, so the manifest cannot claim an architecture nvcc was not asked to
+# emit SASS for. Nothing fills it in a non-CUDA build, in a build with
+# -DVLLM_CPP_FLASH_ATTN=OFF, in a build without CUTLASS headers, or in a build
+# whose requested architectures do not intersect the feature table's fa2 row --
+# and "not compiled" is the correct answer in every one of those cases.
+#
+# The header is rendered at the END of this file, after that assignment has had
+# its chance to run. Derived, never hand-written: a parallel architecture list is
+# CUDA_SUPPORTED_ARCHS, and a list that goes stale is precisely the defect.
+set(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "")
+
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
   src/vllm/lora/layers.cpp
+  src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
+  src/vllm/config/offload.cpp
+  src/vllm/config/weight_residency.cpp
+  src/vllm/model_executor/weight_offloader.cpp
+  src/vllm/model_executor/weight_offload_policy.cpp
+  src/vllm/model_executor/expert_slot_cache.cpp
+  src/vllm/model_executor/model_loader/gguf_expert_span.cpp
+  src/vllm/model_executor/expert_streamer.cpp
+  src/vllm/model_executor/device_expert_slot_store.cpp
+  src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the HuggingFace cache layout. Pure file
+  # system, no transport, so it builds in every lane. The DFlash draft path
+  # in model_loader.cpp reaches it and is not behind VLLM_CPP_SERVER.
+  src/vllm/transformers_utils/hf_cache.cpp
+  src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
   src/vllm/model_executor/model_loader/gguf_keep_quant.cpp
+  src/vllm/model_executor/model_loader/gguf_device_fit.cpp
   src/vllm/model_executor/model_loader/nvfp4_dequant.cpp
   src/vllm/model_executor/model_loader/awq_gptq_dequant.cpp
   src/vllm/model_executor/model_loader/mxfp4_dequant.cpp
@@ -700,6 +776,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
   src/vllm/model_executor/models/qwen3_dflash.cpp
+  src/vllm/model_executor/models/qwen3_dflash2.cpp
   src/vllm/model_executor/models/qwen3_dspark.cpp
   src/vllm/model_executor/models/qwen3_dspark_weights.cpp
   src/vllm/model_executor/models/qwen3_dflash_gguf.cpp
@@ -718,8 +795,11 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_mhc.cpp
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
+  src/vllm/model_executor/models/dots3_note.cpp
+  src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
+  src/vllm/model_executor/models/interfaces.cpp
   src/vllm/model_executor/models/laguna_ops.cpp
   src/vllm/model_executor/models/laguna_device.cpp
   src/vllm/model_executor/models/laguna_shared_fp4.cpp
@@ -740,6 +820,43 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_nvfp4.cpp
   src/vllm/model_executor/models/minimax_h3_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
+  src/vllm/model_executor/models/vocoder1d.cpp
+  src/vllm/model_executor/models/minimax_music3_loader.cpp
+  src/vllm/model_executor/models/minimax_music3_quant.cpp
+  src/vllm/model_executor/models/minimax_music3_ar.cpp
+  src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_device.cpp
+  src/vllm/model_executor/models/minimax_music3_depth_device.cpp
+  src/vllm/model_executor/models/minimax_music3_llm.cpp
+  src/vllm/model_executor/models/minimax_music3_speech.cpp
+  src/vllm/model_executor/models/gpt2.cpp
+  src/vllm/multimodal/speech_engine.cpp
+  src/vllm/model_executor/models/indextts2.cpp
+  src/vllm/model_executor/models/campplus.cpp
+  src/vllm/model_executor/models/emovec.cpp
+  src/vllm/model_executor/models/w2vbert.cpp
+  src/vllm/model_executor/models/w2v_fbank.cpp
+  src/vllm/model_executor/models/fvq.cpp
+  src/vllm/model_executor/models/codec_encoder.cpp
+  src/vllm/model_executor/models/wavenet.cpp
+  src/vllm/model_executor/models/dit_tail.cpp
+  src/vllm/model_executor/models/dit_skip.cpp
+  src/vllm/model_executor/models/dit_front.cpp
+  src/vllm/model_executor/models/dit_stack.cpp
+  src/vllm/model_executor/models/bigvgan.cpp
+  src/vllm/model_executor/models/bigvgan_loader.cpp
+  src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_conditioning.cpp
+  src/vllm/model_executor/models/indextts2_render.cpp
+  src/vllm/model_executor/models/indextts2_talker_loader.cpp
+  src/vllm/model_executor/models/vocos.cpp
+  src/vllm/model_executor/models/lenreg.cpp
+  src/vllm/model_executor/models/cfm.cpp
+  src/vllm/model_executor/models/adaln.cpp
+  src/vllm/model_executor/models/dit.cpp
+  src/vllm/model_executor/models/talker.cpp
+  src/vllm/model_executor/models/tiktoken_bpe.cpp
+  src/vllm/model_executor/models/indextts2_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
   src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp
@@ -754,13 +871,104 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_encoder_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
   src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp
+  # LTX-2.5 (row MODEL-DIFFUSION-LTX25, .agents/specs/ltx-2-5.md phase L2).
+  src/vllm/model_executor/models/ltx2.cpp
+  src/vllm/model_executor/models/ltx2_dit.cpp
+  # LTX-2.5 (row MODEL-DIFFUSION-LTX25, phase L8): the DEVICE-RESIDENT forward and
+  # the (kLtx2, device) resolver. The resolver is its own TU so the vt::GetOp cast
+  # links in CPU-only builds, exactly as minimax_h3_device_resolve.cpp is.
+  src/vllm/model_executor/models/ltx2_device_resolve.cpp
+  src/vllm/model_executor/models/ltx2_device.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L4): the Conv video VAE, the audio
+  # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
+  src/vllm/model_executor/models/ltx2_audio_vae.cpp
+  src/vllm/model_executor/models/ltx2_video_vae.cpp
+  # LTX-2.5 (ROW LTX25-TILED-DECODE, issue #644): the tiling algebra and the
+  # STREAMING tiled decode. Own translation units so the untiled decode above
+  # stays the gated reference and the tiled path cannot drift from it by sharing
+  # an internal helper only one of them exercises.
+  src/vllm/model_executor/models/ltx2_tiling.cpp
+  src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L3): the Gemma-4 multi-layer feature
+  # aggregation, the two caption projections and the embedded asset pack. An
+  # additive file mirroring ltx_core's own structure.
+  src/vllm/model_executor/models/ltx2_text_encoder.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L5): the flow-matching pipeline,
+  # the latent spatial upsampler, the duration head and the embeddings
+  # connector. Additive files mirroring ltx_core's own structure.
+  src/vllm/model_executor/models/ltx2_pipeline.cpp
+  # LTX-2.5 (ROW LTX25-RES2S-LOOP, issue #921): the res_2s second-order sampler.
+  # Its own TU because upstream partitions it that way — a STEPPER advances one
+  # substep and lives in ltx-core/components/diffusion_steps.py, which
+  # ltx2_pipeline.cpp mirrors, while a SAMPLER decides how many substeps there
+  # are and what is evaluated between them and lives in
+  # ltx-pipelines/utils/samplers.py. Two upstream packages, two files here.
+  src/vllm/model_executor/models/ltx2_samplers.cpp
+  src/vllm/model_executor/models/ltx2_upsampler.cpp
+  # LTX-2.5 (ROW LTX25-DFR-PIPELINE, issue #986): the DFR canvas layout — the
+  # keyframe segment grid, the temporal tile ranges and the latent stitch. Its
+  # own TU because it holds no weights and runs no kernel: it is pure index
+  # arithmetic whose every failure mode returns a correctly shaped, finite,
+  # plausible latent, so it is gated by exact index vectors rather than by a
+  # numeric band, which is a different kind of test from the rest of L5.
+  src/vllm/model_executor/models/ltx2_dfr.cpp
+  src/vllm/model_executor/models/ltx2_duration_head.cpp
+  src/vllm/model_executor/models/ltx2_connector.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L11): the conditioning items that
+  # place the VAE ENCODERS' output into the denoise state.
+  src/vllm/model_executor/models/ltx2_conditioning.cpp
+  # LTX-2.5 (ROW LTX25-IMAGE-COND, issue #644): the video VAE ENCODER's LOAD
+  # path — key filter and config parser, which existed nowhere before — and the
+  # pixel front-end an image conditioning arrives through. Separate TUs rather
+  # than additions to ltx2_loader.cpp, which two concurrent rows of the same
+  # campaign need to edit.
+  src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_audio_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_audio_input.cpp
+  src/vllm/model_executor/models/ltx2_image_preprocess.cpp
+  # LTX-2.5 RETAKE (row LTX25-RETAKE, #924): the temporal region mask, the
+  # truncate-or-pad conform, and the frame-directory source. Its own TU for the
+  # same reason the two above are: ltx2_video.cpp is a concurrent-edit lock.
+  src/vllm/model_executor/models/ltx2_retake.cpp
+  # LTX-2.5 (ROW LTX25-T2A-ONE-STAGE, issue #1005): text-to-audio — the
+  # audio-only pipeline and its guided denoiser. Its own TU for the same reason
+  # the two above are, plus one this row adds: it is the only LTX pipeline that
+  # runs the DiT with `video = nullptr`, and keeping that call in one file is
+  # what makes "does anything else pass a video stream" a readable question.
+  src/vllm/model_executor/models/ltx2_t2a.cpp
+  # LTX-2.5 (ROW LTX25-GUIDED-VIDEO, issue #1092): `_guided_denoise` — the pass
+  # assembly four unported pipelines are each blocked on, and the piece the
+  # VIDEO denoise loop never had. Its own TU because upstream has its own file
+  # (ltx-pipelines utils/denoisers.py) and because ltx2_pipeline.cpp, where the
+  # guiders live, is a concurrent-edit lock.
+  src/vllm/model_executor/models/ltx2_denoisers.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
+  # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
+  # load-time device staging GB10's ATS penalty makes the default.
+  src/vllm/model_executor/models/ltx2_loader.cpp
+  # LTX-2.5 (ROW LTX25-IC-LORA, issue #923): reading an IC-LoRA adapter and its
+  # `__metadata__`, and the bf16 delta the loader fuses into every arm. Its own
+  # TU for the same reason as the two above.
+  src/vllm/model_executor/models/ltx2_lora.cpp
   src/vllm/entrypoints/openai/video_api.cpp
+  src/vllm/entrypoints/openai/speech_api.cpp
+  src/vllm/entrypoints/openai/speech_api_synthesize.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
   src/vllm/model_executor/models/kimi_linear_forward.cpp
   src/vllm/model_executor/models/kimi_linear.cpp
   src/vllm/model_executor/models/kimi_linear_device.cpp
+  # MODEL-NEMOTRON-H W3 (#517): the additive NemotronH structural bring-up —
+  # config descent, the on-disk name map, the registry entry and the het-KV
+  # topology. No forward: nemotron_h.cpp is W4.
+  src/vllm/model_executor/models/nemotron_h.cpp
+  # A2-R (#810): the DEVICE arm — the residual stream, the 52 norms, the
+  # embedding lookup and the 6 GQA attention blocks. Mamba/MoE/lm_head stay
+  # host; see the file header for why the line falls where it does.
+  src/vllm/model_executor/models/nemotron_h_device.cpp
+  src/vllm/model_executor/models/nemotron_h_registry.cpp
+  src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp
   src/vllm/model_executor/models/glm4.cpp
@@ -814,8 +1022,12 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/phi_weights.cpp
   src/vllm/model_executor/models/phi.cpp
   src/vllm/model_executor/models/model_registry.cpp
+  src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp
   src/vllm/plugins/plugins.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
+  # LOAD-GGUF-MMPROJ (#821): the llama.cpp `clip` mmproj reader that fills the
+  # SAME Qwen3VLVisionWeights from a SECOND GGUF file beside the language one.
+  src/vllm/model_executor/models/clip_mmproj_gguf.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
@@ -824,6 +1036,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
+  # Per-modality input-count limits and the refusal they carry
+  # (ENG-MM-INPUT-PIPELINE L1, #607).
+  src/vllm/multimodal/processing/context.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
@@ -852,6 +1067,19 @@ add_library(vllm STATIC
   # server's private /v1/videos twin. Builds artifacts + the ffmpeg argv and
   # SPAWNS NOTHING (the ratified process boundary).
   src/vllm/multimodal/minimax_h3_video.cpp
+  # The GENERALIZED video seam (vllm::multimodal::VideoEngine) + its
+  # checkpoint-detected family registry — LTX-2.5 L1, .agents/specs/ltx-2-5.md
+  # §5. Knows about no family; each family self-registers from its own TU.
+  src/vllm/multimodal/video_engine.cpp
+  # LTX-2.5 behind that seam — the SECOND family, and the driving loop that
+  # composes the L2-L6 bricks into frames + a waveform (phase L7). Additive:
+  # one file plus one REGISTER_VLLM_VIDEO_FAMILY line, which is the property
+  # the seam exists to have.
+  # W0 of LTX25-DEVICE-RESIDENCY (#1010): where a render spends its wall, and
+  # how many bytes it held while it did. Family-neutral, driven by the LTX-2.5
+  # driver today.
+  src/vllm/multimodal/render_phase_log.cpp
+  src/vllm/multimodal/ltx2_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
@@ -868,8 +1096,10 @@ add_library(vllm STATIC
   src/vllm/v1/spec_decode/ngram_proposer.cpp
   src/vllm/v1/spec_decode/draft_model_proposer.cpp
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
+  src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_decode_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
+  src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
@@ -908,15 +1138,20 @@ add_library(vllm STATIC
   src/vllm/v1/core/sched/async_scheduler.cpp
   src/vllm/v1/core/sched/utils.cpp
   src/vllm/v1/worker/gpu/block_table.cpp
+  src/vllm/v1/worker/gpu/cudagraph_dispatch.cpp
   src/vllm/v1/worker/gpu/input_batch.cpp
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
   src/vllm/v1/worker/gpu/async_output.cpp
   src/vllm/v1/worker/gpu/runner.cpp
+  src/vllm/platform/process.cpp
+  src/vllm/platform/console_shutdown.cpp
   src/vllm/platforms/platform.cpp
+  src/vllm/platforms/cuda_arch_manifest.cpp
   src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/registry.cpp
   src/vllm/v1/attention/backends/utils.cpp
+  src/vllm/v1/attention/backends/cpu_attn.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
@@ -998,6 +1233,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/reasoning_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/step3.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/olmo3.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/parser_engine_adapter.cpp
   src/vllm/entrypoints/openai/tool_parsers/xlam.cpp
   src/vllm/entrypoints/openai/tool_parsers/phi4_mini.cpp
   src/vllm/entrypoints/openai/tool_parsers/internlm.cpp
@@ -1021,6 +1257,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
   src/vllm/entrypoints/openai/tool_parsers/muse_glimmer.cpp
+  src/vllm/entrypoints/openai/tool_parsers/parser_engine_adapter.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.cpp
   src/vllm/parser/engine/incremental_lexer.cpp
   src/vllm/parser/engine/token_id_scanner.cpp
@@ -1029,12 +1266,15 @@ add_library(vllm STATIC
   src/vllm/parser/engine/registry.cpp
   src/vllm/parser/engine/parser_engine.cpp
   src/vllm/parser/kimi_k2.cpp
+  src/vllm/parser/qwen3.cpp
   src/vllm/parser/glm47_moe.cpp
   src/vllm/parser/gemma4.cpp
   src/vllm/parser/inkling.cpp
   src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
+  src/vt/breakable_graph.cpp
+  src/vt/persistent_step_input.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/op_provider.cpp
@@ -1042,11 +1282,11 @@ add_library(vllm STATIC
   src/vt/ops.cpp
   src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
-  src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
+  src/vt/cpu/cpu_ltx2.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
@@ -1065,6 +1305,12 @@ add_library(vllm STATIC
   # translation units, reached through vllm's INTERFACE --whole-archive option.
   src/vt/cpu/cpu_conv2d.cpp
   src/vt/cpu/cpu_conv1d_depthwise.cpp
+  # BigVGAN / DAC vocoder 1-D convolutions (#672). Self-registering, reached the
+  # same --whole-archive way as the conformer kernels above.
+  src/vt/cpu/cpu_conv1d_general.cpp
+  # General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) — the primitive
+  # the LTX-2.5 video VAE decode had on no device. Self-registering.
+  src/vt/cpu/cpu_conv3d.cpp
   src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
@@ -1077,7 +1323,7 @@ add_library(vllm::vllm ALIAS vllm)
 # extension enabled so <arm_neon.h> exposes `vmmlaq_s32` and defines
 # `__ARM_FEATURE_MATMUL_INT8`. The project sets no global -march, so build ONLY
 # this translation unit with armv8.2-a+i8mm (surgical, exactly like the x86
-# tier's per-function `target("f16c")`): every other TU stays on the default
+# tier's dedicated F16C translation unit): every other TU stays on the default
 # baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
 # binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
 # KERNEL-GEMM-CPU-ELEM-X86WIDE W1: the AVX2 elementwise tier needs the ISA
@@ -1093,14 +1339,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   # x86-only TUs: <immintrin.h> does not exist on aarch64, so they are ADDED
   # here rather than in the unconditional source list.
   target_sources(vllm PRIVATE
+    src/vt/cpu/cpu_matmul_elem_f16c.cpp
     src/vt/cpu/cpu_matmul_elem_avx2.cpp
     src/vt/cpu/cpu_matmul_elem_avx512.cpp)
   set_source_files_properties(
+    src/vt/cpu/cpu_matmul_elem_f16c.cpp PROPERTIES
+    COMPILE_OPTIONS
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mf16c>")
+  set_source_files_properties(
     src/vt/cpu/cpu_matmul_elem_avx2.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx2;-mf16c>")
+    COMPILE_OPTIONS
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX2>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mavx2;-mf16c>")
   set_source_files_properties(
     src/vt/cpu/cpu_matmul_elem_avx512.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
+    COMPILE_OPTIONS
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX512>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   # The portable Q8 DotProd C++ tier is valid on Linux and Darwin. Compile only
@@ -1140,7 +1393,9 @@ endif()
 # (.agents/specs/backend-fanout-metal-vulkan-xpu.md § Our baseline). ld64 has no
 # `--whole-archive`; the equivalent is `-force_load <archive>`. This unblocks the
 # CPU backend on macOS as well as any future Metal backend.
-if(APPLE)
+if(MSVC)
+  target_link_options(vllm INTERFACE "/WHOLEARCHIVE:$<TARGET_FILE:vllm>")
+elseif(APPLE)
   target_link_options(vllm INTERFACE "LINKER:-force_load,$<TARGET_FILE:vllm>")
 elseif(UNIX)
   target_link_options(vllm INTERFACE "LINKER:--whole-archive,$<TARGET_FILE:vllm>,--no-whole-archive")
@@ -1193,6 +1448,9 @@ target_compile_definitions(blake3_vendored PRIVATE
 target_include_directories(blake3_vendored PUBLIC third_party/blake3)
 set_target_properties(blake3_vendored PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(vllm PUBLIC blake3_vendored)
+if(WIN32)
+  target_link_libraries(vllm PUBLIC ws2_32)
+endif()
 # --- Metal backend (BACKEND-METAL-MLX W0 skeleton) --------------------------
 # Purely ADDITIVE, exactly like the CUDA block below: a `target_sources` list, a
 # PUBLIC compile definition tests can gate on, and two framework links. No
@@ -1234,6 +1492,69 @@ if(VLLM_CPP_METAL)
     message(STATUS "MLX GEMM provider enabled: ${MLX_LIBRARY}")
   endif()
 endif()
+# --- MLX provider BIT-ROT GUARD (GATE-METAL-MLX-COMPILE, issue #1765) --------
+# `src/vt/metal/metal_mlx_provider.mm` was built by exactly one job when this
+# guard landed: `mlx_arm64` in .github/workflows/release.yml, which triggers on
+# a `v*` tag or a manual dispatch -- never on a pull request and never on a push
+# to `main`. `.github/workflows/ci.yml` had no Apple runner to fall back on. So
+# the only build of this file happened AFTER a change landed, and a break presented
+# as a blocked release instead of as a red check. Issue #1584 is the case that
+# proved it: its edit to `MlxFallback` landed unbuilt and unrun.
+#
+# The file can be compiled here, and it is the only Metal TU that can: it
+# carries ZERO Objective-C constructs. Its two `#import`s are Apple frameworks
+# it names nothing from, because `metal_buffers.h` and `metal_context.h` hand it
+# every Metal handle as a `void*` on purpose (metal_context.h:22). What it
+# actually depends on is the `vt::OpProvider` seam, which is portable C++ -- and
+# that is precisely what #1584 changed under it.
+#
+# Never linked, exactly like `vllm_rocm_platform_syntax_check` above: the object
+# is built and discarded, so the provider's static registrar cannot run and
+# every other build stays byte-identical. This is a syntax/type gate on OUR
+# seam. It is NOT a build of the MLX provider -- the stubs under
+# src/vt/metal/stubs are written from this file's call sites and so can never
+# disagree with them, which leaves the MLX API to the jobs that build against
+# the real wheel: `mlx_arm64` at release time, and `macos-metal-mlx` in ci.yml
+# on every push to `main` and every 4-hourly baseline since 2026-08-23 (wave 2
+# of this row). src/vt/metal/stubs/README.md states that limit; do not read a
+# green here as "the MLX provider builds". This target remains the only Metal
+# signal a PULL REQUEST gets, which is why it stays.
+#
+# Two guards, both load-bearing:
+#   * NOT VLLM_CPP_MLX -- on a real MLX build the file belongs to `vllm` as
+#     OBJCXX, and the LANGUAGE property below is DIRECTORY-scoped, so setting it
+#     there would rewrite how the shipping build compiles it. Off that build,
+#     the file is in no other target and the property reaches nothing else.
+#   * NOT MSVC -- in MSVC `#import` means "import a type library", so cl.exe
+#     hard-errors on those two lines. The windows-2022 jobs must not inherit a
+#     red from a bit-rot guard.
+if(NOT VLLM_CPP_MLX AND NOT MSVC)
+  # CMake maps `.mm` to OBJCXX, which would need enable_language(OBJCXX) and an
+  # ObjC++ compiler no Linux runner has. LANGUAGE CXX makes it emit `-x c++`.
+  set_source_files_properties(src/vt/metal/metal_mlx_provider.mm
+    PROPERTIES LANGUAGE CXX)
+  add_library(vllm_metal_mlx_provider_syntax_check OBJECT
+    src/vt/metal/metal_mlx_provider.mm)
+  # The vt:: seam is REAL here -- that is the entire point. Only the foreign
+  # dependencies are stubbed, and they are SYSTEM so their own diagnostics stay
+  # out of this TU's -Werror while the provider's code stays subject to it.
+  target_include_directories(vllm_metal_mlx_provider_syntax_check PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/vt/metal)
+  target_include_directories(vllm_metal_mlx_provider_syntax_check SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/vt/metal/stubs ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_metal_mlx_provider_syntax_check PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_metal_mlx_provider_syntax_check)
+  # g++ rejects ObjC's `#import` in C++ mode as
+  # `error: #import is a deprecated GCC extension [-Werror=deprecated]`.
+  # MEASURED to be narrow rather than assumed: with -Wno-deprecated in force, a
+  # call to a [[deprecated]] function still fails as -Werror=deprecated-
+  # declarations, so this gives up no diagnostic this TU could otherwise draw.
+  # Rewriting the two `#import`s to `#include` was rejected -- editing a
+  # production file whose real compiler is not on this host, to suit a gate,
+  # is the wrong direction.
+  target_compile_options(vllm_metal_mlx_provider_syntax_check PRIVATE -Wno-deprecated)
+endif()
 # --- Vulkan backend (BACKEND-VULKAN W0 skeleton) -----------------------------
 # Purely ADDITIVE, exactly like the Metal block above: a `target_sources` list, a
 # PUBLIC compile definition tests can gate on, and `${CMAKE_DL_LIBS}` for dlopen.
@@ -1260,6 +1581,11 @@ if(VLLM_CPP_VULKAN)
     # ONE TU's compile time instead of every TU that includes the table.
     src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
+endif()
+if(NOT WIN32)
+  # The persistent cache is also exercised by CPU-only NVFP4 emulation. Its
+  # current file-lock implementation is POSIX-only; Windows CUDA is out of W15.
+  target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)
 endif()
 # --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
 # Mostly ADDITIVE like the Metal/Vulkan/ROCm blocks above: a source list, a
@@ -1325,12 +1651,15 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gemma4_expert_geglu.hip
     src/vt/rocm/rocm_fp8_channel_gemv.hip
     src/vt/rocm/rocm_moe_router.hip
+    src/vt/rocm/rocm_moe_chain.hip
+    src/vt/rocm/rocm_grouped_gemm.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
     src/vt/rocm/rocm_gdn_conv.hip
     src/vt/rocm/rocm_gdn_postconv.hip
     src/vt/rocm/rocm_gdn_scan.hip
     src/vt/rocm/rocm_gdn_fused.hip
+    src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
@@ -1345,12 +1674,15 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gemma4_expert_geglu.hip
       src/vt/rocm/rocm_fp8_channel_gemv.hip
       src/vt/rocm/rocm_moe_router.hip
+      src/vt/rocm/rocm_moe_chain.hip
+      src/vt/rocm/rocm_grouped_gemm.hip
       src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_gdn_state.hip
       src/vt/rocm/rocm_gdn_conv.hip
       src/vt/rocm/rocm_gdn_postconv.hip
       src/vt/rocm/rocm_gdn_scan.hip
       src/vt/rocm/rocm_gdn_fused.hip
+      src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
@@ -1422,6 +1754,12 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_quant_dot.cu
+    # UNCONDITIONAL ON PURPOSE (issue #960). The static per-tensor fp8 activation
+    # quant has no cutlass dependency; it lived in the cutlass-fp8 TU below and so
+    # went unregistered for kCUDA on every arch outside VT_CUTLASS_FP8_ARCHS,
+    # where the resolver then ran the portable CPU tier over device pointers and
+    # segfaulted. scripts/check-cuda-op-arch-gate.py fails if it leaves this list.
+    src/vt/cuda/cuda_quant_fp8.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu
@@ -1436,7 +1774,15 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
     src/vt/cuda/cuda_laguna.cu
-    src/vt/cuda/cuda_minimax_h3.cu)
+    src/vt/cuda/cuda_minimax_h3.cu
+    src/vt/cuda/cuda_ltx2.cu
+    # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
+    # convolution in the tree on any device.
+    src/vt/cuda/cuda_conv1d_general.cu
+    # General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) — the device arm
+    # the LTX-2.5 video VAE decode never had.
+    src/vt/cuda/cuda_conv3d.cu
+    src/vt/cuda/cuda_attention_cross.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
@@ -1500,9 +1846,18 @@ if(VLLM_CPP_CUDA)
     # different upstream arch set from the NVFP4 block-scaled collective (vLLM
     # keeps them as separate SCALED_MM_ARCHS / FP4_SM120_ARCHS intersections), so
     # it is resolved separately here rather than riding on the NVFP4 gate.
+    # cuda_matmul_fp8_block_cutlass.cu (#1189 M5) rides the SAME cell: it is the
+    # BLOCK-scaled (fine-grained 128x128) sibling of the per-tensor GEMM above,
+    # built from the same ArchTag=Sm120 family -- upstream keeps both in
+    # csrc/.../w8a8/cutlass/c3x behind one SCALED_MM_ARCHS intersection. It is a
+    # separate TU rather than a second kernel in the same file because the two
+    # share no template (dense layout tags vs cute::tuple<Layout, LayoutSF>), so
+    # one file would only serialise two heavy cutlass compiles.
     set(_FP8_CUTLASS_SOURCES)
     if(VT_CUTLASS_FP8_ARCHS)
-      set(_FP8_CUTLASS_SOURCES src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
+      set(_FP8_CUTLASS_SOURCES
+        src/vt/cuda/cuda_matmul_fp8_cutlass.cu
+        src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu)
     endif()
     target_sources(vllm PRIVATE
       ${_NVFP4_CUTLASS_SOURCES}
@@ -1952,7 +2307,27 @@ if(VLLM_CPP_CUDA)
       # symmetric instantiation of the SAME generic template — no template edit,
       # hence the d128/d256 kernels the 27B/35B/dense paths call are unchanged.
       src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu
-      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu)
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu
+      # d64 bf16 NON-SPLIT (multimodal-speed §17): the Whisper AUDIO ENCODER
+      # self-attention. Two firsts, both deliberate — head_dim 64 (Whisper-large-v3
+      # is d_model 1280 / 20 heads) and the plain batch `run_mha_fwd_` entry rather
+      # than the split-KV dispatch, because the encoder is dense and non-paged where
+      # every prior caller attends over a paged KV cache. vLLM reaches the same FA-2
+      # forward here (whisper.py WhisperEncoderAttention:255 -> forward:298-317 ->
+      # flash_attn_varlen_func, causal=False). Non-causal only: no causal hd-64
+      # caller exists.
+      src/vt/cuda/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
+      # d128 bf16 NON-SPLIT (#1551): the LTX-2.5 DiT self-attention, 32 heads x
+      # head_dim 128 over 2352 video tokens. Same one-line ask as the hd-64 file
+      # above for a different head dim; the hd-128 SPLIT-KV instantiation two
+      # entries up already compiles these kernel traits and `mma.sync` bodies, so
+      # this adds an entry point rather than a kernel. Non-causal only: LTX's DiT
+      # self-attention is bidirectional and no causal non-split hd-128 caller
+      # exists. Unlike the flash-tiled scalar op, the vendored launcher raises its
+      # own dynamic shared-memory cap (flash_fwd_launch_template.h:85-88), so the
+      # 48 KiB default cap that bounds AttentionDenseFlash (#1544) does not bound
+      # this path.
+      src/vt/cuda/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu)
     target_sources(vllm PRIVATE
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
@@ -2046,6 +2421,11 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     vt_cuda_set_source_gencode("${VT_FA2_ARCHS}" ${_VT_FA2_SOURCES})
+    # THE MANIFEST, taken from the SAME argument that just became nvcc's
+    # -gencode options for these exact sources (issue #1357). Reaching this line
+    # is what "FA2 is compiled" means, and the architectures are the ones the
+    # compiler was handed -- not a second list that has to be kept honest.
+    string(REPLACE ";" "," VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "${VT_FA2_ARCHS}")
     list(APPEND _VT_CUDA_FEATURE_SOURCES ${_VT_FA2_SOURCES})
   endif()
 
@@ -2070,11 +2450,272 @@ if(VLLM_CPP_SERVER)
   # construction) lives in the library so examples/server can be a thin client of
   # the C ABI's vllm_server_main (v17). It shares api_server.cpp's httplib gate.
   target_sources(vllm PRIVATE src/vllm/entrypoints/openai/server_main.cpp)
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the hub protocol speaks HTTP through the same
+  # vendored cpp-httplib header api_server.cpp uses, so it shares that gate. The
+  # cache half above stays unconditional because it opens no socket.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/hf_hub.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W3/W4 (#1280): the byte transport and the `--model`
+  # grammar. Both speak HTTP through the same vendored header, so both share
+  # api_server.cpp's gate. The resolver is what `server_main.cpp` calls, so a
+  # build without the server has no `--model` flag to resolve either.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/downloader.cpp)
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/model_resolver.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W5 (#1280): the one-definition-rule instrument. It
+  # holds the SERVER half's reading (api_server.cpp) beside the FETCHER half's
+  # (hf_hub.cpp) and it deliberately includes no httplib header of its own, so
+  # it cannot contribute a third opinion. server_main.cpp refuses to start on a
+  # disagreement.
+  target_sources(vllm PRIVATE src/vllm/http_transport_abi.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
+
+  # ── ENG-HF-MODEL-DOWNLOAD W5 (#1280): transport layer security ─────────────
+  # `huggingface.co` speaks https and nothing else, so without this block the
+  # `--model org/repo` grammar that W4 landed can only reach an `http` mirror.
+  #
+  # THE DEFINE GOES ON THE TARGET, PUBLIC, AND NEVER PER SOURCE FILE.
+  # `CPPHTTPLIB_OPENSSL_SUPPORT` is a whole-header switch: it changes the layout
+  # of `httplib::Result` and `httplib::ClientConnection`
+  # (third_party/httplib/httplib.h:2045-2100). This tree includes that one
+  # header from the OpenAI server, from the hub client, from the byte
+  # downloader and from several test binaries, and they all link together. A
+  # per-file define would LINK CLEANLY and then corrupt every response object
+  # crossing the seam, with no diagnostic anywhere. PUBLIC so every consumer of
+  # `vllm` -- tests and examples included -- inherits the same answer.
+  # `src/vllm/http_transport_abi.cpp` and
+  # `tests/vllm/transformers_utils/test_tls_transport.cpp` measure that it held.
+  #
+  # llama.cpp made the same choice at `vendor/cpp-httplib/CMakeLists.txt:184
+  # @ b10451`, `target_compile_definitions(${TARGET} PUBLIC ...)`.
+  if(VLLM_CPP_HF_DOWNLOAD)
+    set(_vllm_tls_source "")
+    if(VLLM_CPP_BUILD_BORINGSSL)
+      # The literal-static lane: a fully static libssl/libcrypto that leaves no
+      # entry in `readelf -dW`, which `scripts/validate-release-archive.py`
+      # refuses on that artifact. Mirrors llama.cpp `LLAMA_BUILD_BORINGSSL`
+      # (`vendor/cpp-httplib/CMakeLists.txt:40-82 @ b10451`), including the
+      # BUILD_SHARED_LIBS/BUILD_TESTING save-and-restore and the pinned tag.
+      # It fetches from the network at CONFIGURE time, which is why it is OFF by
+      # default and why nothing in the default lane depends on it.
+      set(OPENSSL_NO_ASM ON CACHE BOOL "Disable OpenSSL ASM when building BoringSSL")
+      set(FIPS OFF CACHE BOOL "Enable FIPS (BoringSSL)")
+      set(BORINGSSL_GIT "https://boringssl.googlesource.com/boringssl"
+        CACHE STRING "BoringSSL git repository")
+      set(BORINGSSL_VERSION "0.20260813.0" CACHE STRING "BoringSSL version")
+      message(STATUS "Fetching BoringSSL ${BORINGSSL_VERSION}")
+      include(FetchContent)
+      FetchContent_Declare(boringssl
+        GIT_REPOSITORY ${BORINGSSL_GIT}
+        GIT_TAG        ${BORINGSSL_VERSION}
+        EXCLUDE_FROM_ALL)
+      set(_vllm_saved_shared ${BUILD_SHARED_LIBS})
+      set(_vllm_saved_testing ${BUILD_TESTING})
+      set(BUILD_SHARED_LIBS OFF)
+      set(BUILD_TESTING OFF)
+      FetchContent_MakeAvailable(boringssl)
+      set(BUILD_SHARED_LIBS ${_vllm_saved_shared})
+      set(BUILD_TESTING ${_vllm_saved_testing})
+      # Vendored code is not on this project's -Werror path.
+      foreach(_boringssl_target ssl crypto)
+        if(TARGET ${_boringssl_target})
+          target_compile_options(${_boringssl_target} PRIVATE
+            $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
+        endif()
+      endforeach()
+      target_link_libraries(vllm PUBLIC ssl crypto)
+      set(_vllm_tls_source "BoringSSL ${BORINGSSL_VERSION} (static, fetched)")
+    elseif(VLLM_CPP_OPENSSL)
+      find_package(OpenSSL)
+      if(OpenSSL_FOUND)
+        # The version gate is llama.cpp's, verbatim in intent
+        # (`vendor/cpp-httplib/CMakeLists.txt:126-146 @ b10451`): OpenSSL 3.0 or
+        # later, or 1.1.1g or later for BoringSSL and LibreSSL. It is not
+        # invented here, and it is not a `VERSION_GREATER_EQUAL` on
+        # `OPENSSL_VERSION` either, because the version STRING does not say
+        # which of the three implementations answered `find_package`. The
+        # vendored header raises the same `#error` at
+        # `third_party/httplib/httplib.h:411-418`, so a build that skipped this
+        # check would fail later and less legibly.
+        include(CheckCSourceCompiles)
+        set(_vllm_saved_required_includes ${CMAKE_REQUIRED_INCLUDES})
+        set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+        check_c_source_compiles("
+        #include <openssl/opensslv.h>
+        #if defined(OPENSSL_IS_BORINGSSL) || defined(LIBRESSL_VERSION_NUMBER)
+        #    if OPENSSL_VERSION_NUMBER < 0x1010107f
+        #        error bad version
+        #    endif
+        #else
+        #    if OPENSSL_VERSION_NUMBER < 0x30000000L
+        #        error bad version
+        #    endif
+        #endif
+        int main() { return 0; }
+        " VLLM_CPP_OPENSSL_VERSION_SUPPORTED)
+        set(CMAKE_REQUIRED_INCLUDES ${_vllm_saved_required_includes})
+        if(VLLM_CPP_OPENSSL_VERSION_SUPPORTED)
+          target_link_libraries(vllm PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+          set(_vllm_tls_source "OpenSSL ${OPENSSL_VERSION} (system, dynamic)")
+        else()
+          message(WARNING
+            "VLLM_CPP_OPENSSL=ON but the OpenSSL at ${OPENSSL_INCLUDE_DIR} is "
+            "older than 3.0 (or older than 1.1.1g for BoringSSL/LibreSSL); "
+            "HTTPS support is disabled.")
+        endif()
+      else()
+        message(WARNING
+          "VLLM_CPP_OPENSSL=ON but OpenSSL was not found; HTTPS support is "
+          "disabled. Install the OpenSSL development files, or configure with "
+          "-DVLLM_CPP_BUILD_BORINGSSL=ON.")
+      endif()
+    endif()
+
+    if(_vllm_tls_source STREQUAL "")
+      # The DOWNGRADE, in the VLLM_CPP_SERVER idiom above: a WARNING and an
+      # option that resolves OFF, never a failed configure. The binary still
+      # builds and still serves a local checkpoint; a repository identifier
+      # against an `https` endpoint is refused by
+      # `HfRefuseHttpsWithoutTls` with a message naming these three options.
+      message(WARNING
+        "VLLM_CPP_HF_DOWNLOAD=ON but no transport layer security is available, "
+        "so --model org/repo can only reach an http:// endpoint. Install the "
+        "OpenSSL development files (VLLM_CPP_OPENSSL=ON, the default) or "
+        "configure with -DVLLM_CPP_BUILD_BORINGSSL=ON.")
+      set(VLLM_CPP_HF_DOWNLOAD OFF)
+    else()
+      target_compile_definitions(vllm PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
+      if(APPLE)
+        # cpp-httplib reads the macOS keychain for root certificates whenever a
+        # TLS backend is enabled on an Apple clang build
+        # (third_party/httplib/httplib.h:344-353), which pulls in these two
+        # frameworks. Mirrors llama.cpp `vendor/cpp-httplib/CMakeLists.txt:186-190`.
+        find_library(CORE_FOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        find_library(SECURITY_FRAMEWORK Security REQUIRED)
+        target_link_libraries(vllm PUBLIC
+          ${CORE_FOUNDATION_FRAMEWORK} ${SECURITY_FRAMEWORK})
+      endif()
+      if(WIN32 AND NOT MSVC)
+        target_link_libraries(vllm PUBLIC crypt32)
+      endif()
+      message(STATUS "HuggingFace download: HTTPS through ${_vllm_tls_source}")
+    endif()
+  else()
+    message(STATUS
+      "HuggingFace download: HTTPS disabled (VLLM_CPP_HF_DOWNLOAD=OFF); "
+      "--model org/repo is refused against an https:// endpoint")
+  endif()
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party
   # is already a SYSTEM include on the vllm target).
 endif()
+
+# ── BIT-ROT GUARD: the MiniMax-Music3 depth-stage A/B driver (#672, #1246) ────
+# `tools/bench/music3_depth_stage_ab.cpp` is the sole artifact behind spec §16.6's
+# 3.50x and its `f0cfeed6eee4f55d` fingerprint. Its own header argues, correctly,
+# that CI must never RUN it: it allocates 2.5 GB of weights, spends seconds per
+# round, and is a TWO-BUILD A/B that one target could not express anyway. None of
+# that is a reason for it to be UNCOMPILABLE — it reaches internal headers and
+# `LinearNoBias`, so the next signature change would rot the one file a reader
+# has to compile to reproduce the measurement, silently.
+#
+# So both arms are compiled and NOTHING is linked or registered as a test. An
+# OBJECT library builds the TU and discards it; `main` is never linked, so no
+# weight is ever allocated and the build stays byte-identical to what it was.
+# Two targets rather than one because the arms are `#if defined(MUSIC3_AFTER)`
+# alternatives and a single configuration would leave the other half unchecked.
+foreach(_music3_ab_arm before after)
+  add_library(vllm_music3_depth_stage_ab_${_music3_ab_arm} OBJECT
+    tools/bench/music3_depth_stage_ab.cpp)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_music3_depth_stage_ab_${_music3_ab_arm})
+endforeach()
+target_compile_definitions(vllm_music3_depth_stage_ab_after PRIVATE MUSIC3_AFTER)
+
+# ── The MiniMax-Music3 vocoder decode-window A/B driver (#672, #1334) ─────────
+# `tools/bench/music3_vocoder_conv_ab.cpp` is the artifact behind spec §18's
+# numbers, and it is registered as no test, so nothing in `ctest` runs it.
+#
+# WHY THIS ONE IS AN EXECUTABLE WHERE ITS SIBLING 20 LINES ABOVE IS AN OBJECT
+# LIBRARY. That divergence was a review finding (2026-08-19) and it is argued
+# here rather than left to be noticed twice. The depth driver's two arms are
+# `#if defined(MUSIC3_AFTER)` branches of ONE file, so compiling it is the whole
+# rot guard and linking `main` would only add an entry point nobody calls; an
+# OBJECT library is strictly cheaper and it says so.
+#
+# This driver's arms are two SOURCE TREES, the shape spec §18.8 requires and that
+# §16.6a was voided for not having, and the recorded recipe is a SHIPPED SCRIPT:
+# `scripts/music3-vocoder-conv-ab.sh` configures two clones, runs
+# `ninja ... vllm_music3_vocoder_conv_ab` in each, `sha256sum`s the two results
+# and REFUSES to time anything when they hash the same, then executes them with
+# `--lengths=` / `--repeats=`. Every one of those steps needs a linked binary.
+# An OBJECT library would guard the compile and break the reproduction, which
+# inverts the point: the rot this target exists to prevent is a §18 nobody can
+# re-run.
+#
+# What it costs, stated rather than hoped: one ~21 MB executable in a build tree,
+# no test registration, and no `install(TARGETS ...)` entry — see the install
+# list below, which names `vllm` and `vllm_shared` only — so it does not ship and
+# no packaged artifact changes. `main` is linked and never runs in CI; the
+# allocation the depth driver's comment worries about happens on invocation, not
+# at load.
+add_executable(vllm_music3_vocoder_conv_ab tools/bench/music3_vocoder_conv_ab.cpp)
+target_link_libraries(vllm_music3_vocoder_conv_ab PRIVATE vllm)
+target_include_directories(vllm_music3_vocoder_conv_ab PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
+
+# ── The `vt::Conv1d` decomposition probe (#672, #1334) ───────────────────────
+# `tools/bench/conv1d_scaling_probe.cpp` is the instrument behind the scaling
+# curve and the residency ablation in `.agents/specs/vt-conv1d-time-block.md`.
+# It is registered as no test and CI runs it never, for the reason its sibling
+# above gives: it allocates hundreds of megabytes and spends tens of seconds per
+# sweep. The build COMPILES it so that the one file a reader has to compile to
+# re-derive "what limits the vocoder's parallel scaling" cannot rot behind a
+# `vt::Conv1d` or `ParallelForRows` signature change -- which is the failure the
+# sibling target's comment records for three earlier harnesses that lived in
+# prose only.
+add_executable(vllm_conv1d_scaling_probe tools/bench/conv1d_scaling_probe.cpp)
+target_link_libraries(vllm_conv1d_scaling_probe PRIVATE vllm)
+target_include_directories(vllm_conv1d_scaling_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_conv1d_scaling_probe SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_conv1d_scaling_probe PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_conv1d_scaling_probe)
+
+# ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
+# `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
+# `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier
+# harnesses for that row lived in prose only, so no reader could re-derive one
+# figure and three rounds of certified constants each failed to reproduce.
+#
+# CI COMPILES IT AND RUNS NOTHING, and that is not an oversight. The row's own
+# ruling is that a growth assertion over these figures is NOT viable on a shared
+# runner, so there is nothing here for CI to decide; and one leg on the O(n^2)
+# code costs tens of seconds of one core, which no test tier should spend. What
+# CI does buy is that the file cannot rot behind a `Tokenizer::Encode` or
+# `FromHfJson` signature change while still being the only artifact a reader can
+# reproduce the row's numbers from — the #1246 failure, where the sole named
+# harness for a measurement was compiled by nothing.
+#
+# An OBJECT library, like `vllm_music3_depth_stage_ab_*` above and unlike
+# `vllm_music3_vocoder_conv_ab`: the recorded run recipe in the file's own header
+# compiles the four tokenizer translation units directly with `g++` rather than
+# linking `libvllm.a`, so a linked target here would guard nothing the compile
+# does not and would only add an entry point nobody calls.
+add_library(vllm_bpe_encode_cost OBJECT tools/bench/bpe_encode_cost.cpp)
+target_include_directories(vllm_bpe_encode_cost PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_bpe_encode_cost SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_bpe_encode_cost PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_bpe_encode_cost)
 
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and
@@ -2098,6 +2739,7 @@ add_library(vllm_shared SHARED "${_vllm_shared_stub}")
 add_library(vllm::shared ALIAS vllm_shared)
 set_target_properties(vllm_shared PROPERTIES
   OUTPUT_NAME vllm
+  ARCHIVE_OUTPUT_NAME vllm_shared
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
   CXX_VISIBILITY_PRESET hidden
@@ -2110,7 +2752,11 @@ target_include_directories(vllm_shared PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 # Force-link the whole `vllm` archive (the C ABI + engine + the CPU-backend
 # static registrar) and inherit its PUBLIC deps (CUDA::cudart, Threads, ...).
-target_link_libraries(vllm_shared PRIVATE vllm)
+# On Windows the packaged shared target also needs the vendored BLAKE3 archive
+# explicitly on its own link line; relying on the static archive's usage
+# requirements is not sufficient once the C ABI DLL is assembled via
+# /WHOLEARCHIVE.
+target_link_libraries(vllm_shared PRIVATE vllm blake3_vendored)
 # Export only the C ABI: `vllm_*` stays global, everything else is localized.
 # UNLIKE the force-link guard above, `UNIX AND NOT APPLE` is CORRECT here: a
 # linker version script is a GNU-ld/ELF feature with no ld64 spelling (ld64 uses
@@ -2140,6 +2786,33 @@ if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
     "$<TARGET_PROPERTY:vllm,INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
   target_compile_definitions(vllm_sanitize_test_shared INTERFACE
     "$<TARGET_PROPERTY:vllm,INTERFACE_COMPILE_DEFINITIONS>")
+  # ...and the LINK interface, forwarded by the same rule as the three lines
+  # above. Those forward what a consumer needs to COMPILE against `vllm`. This
+  # one forwards what it needs to LINK, and its absence is issue #1531: the
+  # `CPPHTTPLIB_OPENSSL_SUPPORT` that arrives through the line above makes every
+  # test including the vendored httplib header emit OpenSSL references, while
+  # the only libssl anywhere near the link line was a DT_NEEDED entry of THIS
+  # shared image. GNU ld refuses to resolve through one -- "DSO missing from
+  # command line" -- so eight targets failed to link and both sanitizer lanes
+  # reported `fail` without running a case, on every branch based after
+  # a50c57d69.
+  #
+  # Forward the PROPERTY rather than naming OpenSSL: the answer then lives in
+  # exactly one place, and the next PUBLIC LINK LIBRARY `vllm` acquires cannot be
+  # forgotten here. A per-target `target_link_libraries(test_x OpenSSL::SSL)`
+  # would repair the eight and leave the ninth to be discovered by a red lane.
+  #
+  # These four forwards are not the complete set, and saying so is the point of
+  # the paragraph above. `INTERFACE_COMPILE_OPTIONS`, `INTERFACE_COMPILE_FEATURES`
+  # and `INTERFACE_LINK_DIRECTORIES` are still unforwarded. All three are EMPTY on
+  # `vllm` today, so nothing is broken; the first one that gains a value owes a
+  # fifth line here, and will fail exactly as silently as this one did.
+  #
+  # It must stay INTERFACE with the property genex, and must never become
+  # `PUBLIC vllm`: `vllm` carries the `--whole-archive` INTERFACE link OPTION
+  # set above, and not propagating that is the entire reason this target exists.
+  target_link_libraries(vllm_sanitize_test_shared INTERFACE
+    "$<TARGET_PROPERTY:vllm,INTERFACE_LINK_LIBRARIES>")
 endif()
 
 # make install => a consumable libvllm.so + libvllm.a + vllm.h (llama.cpp-style).
@@ -2157,3 +2830,25 @@ endif()
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
+endif()
+
+# Render the compiled-arch manifest (issue #1357). Last, so it observes whatever
+# the FA2 gencode site above did or did not set. Generated per build into the
+# build tree, so it is not a shared file any pull request has to edit.
+configure_file(include/vllm/platforms/cuda_compiled_archs.h.in
+  include/vllm/platforms/cuda_compiled_archs.h @ONLY)
+message(STATUS
+  "CUDA FA2 compiled-arch manifest: [${VLLM_CPP_CUDA_FA2_COMPILED_ARCHS}]")

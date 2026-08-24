@@ -44,7 +44,8 @@ bool IsNamedToolChoice(const ChatCompletionRequest& request) {
 
 std::string DefaultChatPromptFallback(
     const std::vector<ChatMessage>& messages, bool add_generation_prompt,
-    const std::vector<ChatCompletionToolsParam>& /*tools*/) {
+    const std::vector<ChatCompletionToolsParam>& /*tools*/,
+    const nlohmann::ordered_json& /*chat_template_kwargs*/) {
   // T0 SEAM (M3.2 swaps in the real chat-template renderer). A simple
   // "<role>: <content>\n" join + an "assistant:" generation prompt. This is NOT
   // a model chat template — it exists only so the chat path is end-to-end
@@ -225,28 +226,12 @@ namespace {
 // subset parser_engine.py reads: include_reasoning, tool_choice, tools, and the
 // history tool-call count). chat_completion/serving.py passes the request object
 // straight to parse_delta / parse; we model only the fields the assembly path
-// consumes. history_tool_call_cnt is derived only for kimi_k2's id_type (base
-// count_history_tool_calls == 0 for a fresh request), matching
-// abstract_parser.py:_initialize_history_tool_call_cnt.
+// consumes. The body now lives next to ParserRequest itself
+// (parser_engine.h ParserRequestFromChatCompletion) so the tool_parsers
+// ParserEngineToolAdapter projects the request the SAME way this path does.
 vllm::parser::engine::ParserRequest ToParserRequest(
     const ChatCompletionRequest& request) {
-  vllm::parser::engine::ParserRequest pr;
-  pr.include_reasoning = request.include_reasoning;
-  pr.tool_choice = request.tool_choice.has_value() ? request.tool_choice->mode
-                                                    : std::string("auto");
-  if (request.tools.has_value()) {
-    for (const ChatCompletionToolsParam& t : *request.tools) {
-      vllm::parser::engine::ParserTool pt;
-      pt.name = t.function.name;
-      // Carry the function's JSON-Schema parameters so the assembly can coerce
-      // argument values to their declared types (parser_engine.py _fix_arg_types /
-      // find_tool_properties). Absent parameters => no schema (identity path).
-      pt.parameters = t.function.parameters;
-      pr.tools.push_back(std::move(pt));
-    }
-  }
-  pr.history_tool_call_cnt = 0;
-  return pr;
+  return vllm::parser::engine::ParserRequestFromChatCompletion(request);
 }
 
 }  // namespace
@@ -630,8 +615,13 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::vector<ChatCompletionToolsParam> tools =
       ToolsEnabled(request) ? *request.tools
                             : std::vector<ChatCompletionToolsParam>{};
+  // #1681: the request's chat_template_kwargs reach the renderer here, which is
+  // the only place they can. Upstream builds them in
+  // ChatCompletionRequest.build_chat_params (chat_completion/protocol.py:545-556)
+  // and hands them to the renderer the same way.
   const std::string prompt =
-      prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
+      prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools,
+                 request.chat_template_kwargs);
 
   const int max_tok_log =
       request.max_completion_tokens.has_value()
@@ -1040,6 +1030,11 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     response.choices.push_back(std::move(choice));
     num_generated_tokens += static_cast<int>(output.token_ids.size());
   }
+
+  // prompt_logprobs (chat_completion/serving.py:1070): TOP-LEVEL on the chat
+  // response, not per choice — one rendered prompt is shared by every choice.
+  response.prompt_logprobs = final_res.prompt_logprobs;
+  ClampPromptLogprobs(response.prompt_logprobs);
 
   const int num_prompt_tokens =
       static_cast<int>(final_res.prompt_token_ids.size());

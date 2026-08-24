@@ -57,6 +57,20 @@ class RocmPlatform final : public Platform {
   // whether it may treat host and device memory as one.
   bool is_integrated_gpu() const override { return backend().UnifiedMemory(); }
 
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). Answered from the two device
+  // attributes `ProbeDevice` already reads, through the HIP-free probe rather
+  // than through `UnifiedMemory()`: that one is widened by the managed-alloc
+  // branch, which makes the BACKEND's allocations migratable and says nothing
+  // about whether a kernel may follow a plain host pointer. So this is NARROWER
+  // than `is_integrated_gpu()` above, in the one direction that matters.
+  //
+  // Device 0, matching this leg's other single-device answers. NEVER RUN — no
+  // ROCm hardware is reachable from this project — which is why it reads the
+  // probe rather than hardcoding an answer for a board nobody here can check.
+  bool host_memory_is_device_addressable() const override {
+    return vt::rocm::HostMemoryIsDeviceAddressable(0);
+  }
+
   // --- W0 placeholders. Each is the BASE class answer, stated explicitly here
   // --- with what would change it, so nobody has to guess whether the omission
   // --- was considered.
@@ -64,9 +78,13 @@ class RocmPlatform final : public Platform {
   // supports_fp8() stays false: gfx942/gfx950 have hardware fp8 and rocm.py lists
   //   "fp8" in supported_quantization (rocm.py:457-467), but we have no ROCm fp8
   //   kernel, and this predicate gates a fused path that would then not exist.
-  // support_static_graph_mode() stays false: hipGraph is the mapping and is not
-  //   implemented. Capture that bakes a wrong address is a silent correctness
-  //   bug, so this flips only alongside a real capture implementation.
+  // support_static_graph_mode() stays false: the vt::Backend hipGraph capture
+  //   seam is implemented as of BACKEND-ROCM W1 (rocm_backend.hip; see
+  //   .agents/specs/rocm-decode-graph.md) and the address-baking concern that
+  //   used to justify leaving this false is now an assertion, not a worry —
+  //   the mutate-src-then-replay test step fails if replay ever returns a
+  //   snapshot. This flag still stays false because flipping it to engage a
+  //   real model's decode-graph path is W2, not W1.
   // needs_weight_staging() stays false: this is the memory-model POLICY that
   //   selects the device-resident forward over the host-resident reference path.
   //   HIP's programming model does stage (hipMalloc hands back a distinct
@@ -87,25 +105,30 @@ class RocmPlatform final : public Platform {
   // discrete board actually loads weights, with the measurement in the record.
   ResidencyPolicy residency_policy() const override { return {}; }
 
-  // Attention-backend priority. There is NO ROCm attention kernel in this
-  // skeleton — kPagedAttention is not registered for kROCM — so returning a name
-  // would be a claim we cannot honour. The EMPTY list is the honest and
-  // mechanically correct answer: SelectAttentionBackendName walks the list and
-  // takes the first REGISTERED name (include/vllm/v1/attention/registry.h:59-78),
-  // so an empty list makes selection throw loudly instead of handing back a
-  // backend whose kernels do not exist. Same choice, same reasoning, as the
-  // Vulkan leg.
-  //
-  // WHAT GOES HERE AT M3, read off upstream rather than invented: rocm.py:407
-  // _get_backend_priorities returns [ROCM_ATTN, (ROCM_AITER_FA if AITER MHA),
-  // (ROCM_AITER_UNIFIED_ATTN if AITER), TRITON_ATTN, TURBOQUANT] for the
-  // non-MLA case. AITER is gfx9-only in practice (rocm.py:661-665 gates the FA
-  // path on on_gfx9()), so on the RDNA3 boards of issue #41 the reachable entries
-  // are ROCM_ATTN and TRITON_ATTN.
+  // Attention-backend priority — M3 (issue #41). Mirrors rocm.py:407-441
+  // `_get_backend_priorities` at pin 555967922. The dense branch is
+  // [ROCM_ATTN, (ROCM_AITER_FA if `rocm_aiter_ops.is_mha_enabled()`, :434),
+  // (ROCM_AITER_UNIFIED_ATTN if `is_aiter_found_and_supported()`, :436),
+  // TRITON_ATTN, TURBOQUANT] — mirrored VERBATIM below. Upstream appends
+  // ROCM_ATTN only `if not use_kv_connector` (:432-433); our registration uses
+  // the shared symmetric NHD layout (see the KV-LAYOUT DEVIATION record in
+  // backend.h), which is immune to the asymmetric-view concern that guard
+  // protects, so the guard does not apply here — recorded, not implied.
+  // SelectAttentionBackendName skips unregistered names, so the AITER entries
+  // and TRITON_ATTN/TURBOQUANT are placeholders that cost nothing and need no
+  // gfx9 reasoning: a dense request resolves to the first REGISTERED name,
+  // ROCM_ATTN. MLA mirrors rocm.py:414-419 ([TRITON_MLA] when AITER MLA is
+  // off); TRITON_MLA is unregistered for kROCM (registered for CUDA only), so
+  // a use_mla=true request throws loudly rather than silently falling back to
+  // a dense backend — the honest answer until a ROCm MLA kernel lands.
+  // use_sparse mirrors rocm.py:410 ([ROCM_AITER_MLA_SPARSE], AITER-only) and
+  // is likewise unregistered.
   std::vector<std::string> get_attn_backend_priority(
       const AttnSelectorConfig& cfg) const override {
-    (void)cfg;
-    return {};
+    if (cfg.use_sparse) return {"ROCM_AITER_MLA_SPARSE"};
+    if (cfg.use_mla) return {"TRITON_MLA"};
+    return {"ROCM_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN",
+            "TRITON_ATTN", "TURBOQUANT"};
   }
 };
 

@@ -33,6 +33,7 @@ cmake -S . -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DVLLM_CPP_BUILD_TESTS=ON \
+  -DVLLM_CPP_BUILD_VERSION="$VERSION" \
   -DVLLM_CPP_BUILD_EXAMPLES=ON \
   -DVLLM_CPP_SERVER=ON \
   -DVLLM_CPP_CUDA="$cuda" \
@@ -94,7 +95,8 @@ python3 scripts/package-server.py \
   --build-dir "$build_dir" \
   --stage-dir "$stage_dir" \
   --metadata-dir "$metadata_dir" \
-  --archive "$archive"
+  --archive "$archive" \
+  --archive-format tar.gz
 if [[ "$backend" == cuda ]]; then
   cuda_stub_validation_dir=$(mktemp -d)
   cleanup_cuda_stub_validation_dir() {
@@ -106,6 +108,7 @@ if [[ "$backend" == cuda ]]; then
 fi
 python3 scripts/validate-release-archive.py \
   --archive "$archive" \
+  --archive-format tar.gz \
   --checksum "$archive.sha256" \
   --provenance "$archive.provenance.json" \
   --repo-root . \

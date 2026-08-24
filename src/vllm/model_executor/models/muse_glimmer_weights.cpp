@@ -50,6 +50,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 
 namespace vllm {
 namespace {
@@ -59,6 +60,13 @@ const nlohmann::json* Field(const nlohmann::json& doc, const char* key) {
   const auto it = doc.find(key);
   if (it == doc.end() || it->is_null()) return nullptr;
   return &(*it);
+}
+// PRESENT, including an explicit `null`. Two upstream fields are `X | None`
+// (configs/muse_glimmer.py:56, :58) where None is a real state DIFFERENT from
+// absent: absent takes the architecture's default, an explicit `null` turns the
+// mechanism off. `Field` collapses the two, so those fields ask this instead.
+bool HasKey(const nlohmann::json& doc, const char* key) {
+  return doc.is_object() && doc.find(key) != doc.end();
 }
 const nlohmann::json* Object(const nlohmann::json& doc, const char* key) {
   const nlohmann::json* f = Field(doc, key);
@@ -155,20 +163,23 @@ nlohmann::json HoistFlatText(const nlohmann::json& raw) {
       "normalize_tok_embeddings", "post_norm_eps", "no_rope_layers"};
   nlohmann::json text = nlohmann::json::object();
   for (const char* k : kKeys) {
-    const nlohmann::json* f = Field(raw, k);
-    if (f != nullptr) text[k] = *f;
+    // Carry an explicit `null` THROUGH rather than dropping the key: for the two
+    // `X | None` fields a dropped null would be re-defaulted on the other side,
+    // so a flat config could not express "no window" / "no soft-cap" at all.
+    if (HasKey(raw, k)) text[k] = raw[k];
   }
   // Renames (configs/muse_glimmer.py:207-210).
   if (const nlohmann::json* f = Field(raw, "hidden_act");
       f != nullptr && !text.contains("hidden_activation"))
     text["hidden_activation"] = *f;
-  if (const nlohmann::json* f = Field(raw, "output_soft_cap_temp");
-      f != nullptr && !text.contains("final_logit_softcapping"))
-    text["final_logit_softcapping"] = *f;
+  // `final_logit_softcapping` is nullable, so these two carry a null through for
+  // the same reason the loop above does.
+  if (HasKey(raw, "output_soft_cap_temp") && !text.contains("final_logit_softcapping"))
+    text["final_logit_softcapping"] = raw["output_soft_cap_temp"];
   if (const nlohmann::json* f = Field(raw, "hidden_activation"); f != nullptr)
     text["hidden_activation"] = *f;
-  if (const nlohmann::json* f = Field(raw, "final_logit_softcapping"); f != nullptr)
-    text["final_logit_softcapping"] = *f;
+  if (HasKey(raw, "final_logit_softcapping"))
+    text["final_logit_softcapping"] = raw["final_logit_softcapping"];
   return text;
 }
 
@@ -234,13 +245,21 @@ double ResolveMuseGlimmerQueryPreScale(double qk_scale_factor,
   // muse_glimmer.py:472-517. An explicit `scale_query_by` is ALREADY the final
   // factor and wins outright.
   if (has_explicit_scale) return explicit_scale_query_by;
-  if (!has_qk_scale_factor) return 1.0;
+  // ABSENT is not "no scaling" (#412). `qk_scale_factor` is a class default in
+  // both references (configs/muse_glimmer.py:62; SGLang srt/configs/muse_glimmer.py:98),
+  // so a checkpoint that omits it — the released DFlash drafter does — still runs
+  // the architecture's scale. The identity here leaves `use_qk_norm` on with no
+  // pre-scale: coherent output, collapsed acceptance, nothing to see in a log.
+  // It goes through the SAME magnitude disambiguation below because what is
+  // defaulted is the NATIVE (unfolded) value, exactly as upstream stores it.
+  const double qk =
+      has_qk_scale_factor ? qk_scale_factor : kMuseGlimmerDefaultQkScaleFactor;
   const double sqrt_hd = std::sqrt(static_cast<double>(head_dim));
   // Native raw (~43.784 at head_dim 128) is ~sqrt(head_dim)x larger than the
   // modular pre-folded value (~3.87). Disambiguate by magnitude against
   // sqrt(head_dim): at/above it the value is native and must be divided.
-  if (qk_scale_factor >= sqrt_hd) return qk_scale_factor / sqrt_hd;
-  return qk_scale_factor;
+  if (qk >= sqrt_hd) return qk / sqrt_hd;
+  return qk;
 }
 
 MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
@@ -269,17 +288,40 @@ MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
       RawInt(text, "num_key_value_heads", t.num_attention_heads);
   t.head_dim = RawInt(text, "head_dim", 0);
   t.max_position_embeddings = RawInt(text, "max_position_embeddings", 0);
-  t.sliding_window = RawInt(text, "sliding_window", 0);
+  // `sliding_window` is `int | None` upstream (configs/muse_glimmer.py:56) with a
+  // 2048 DEFAULT, and 0 here means no window at all — so absent must take 2048
+  // and only an explicit `null` disables the window. Defaulting to 0 turned every
+  // RoPE layer into global attention (#412).
+  t.sliding_window = HasKey(text, "sliding_window")
+                         ? RawInt(text, "sliding_window", 0)
+                         : kMuseGlimmerDefaultSlidingWindow;
   t.tie_word_embeddings = RawBool(text, "tie_word_embeddings", false);
-  t.rms_norm_eps = static_cast<float>(RawDouble(text, "rms_norm_eps", 1e-6));
-  // The post-norms use their OWN, typically smaller eps; falling back to
-  // rms_norm_eps when absent mirrors upstream's default (:106).
+  t.rms_norm_eps = static_cast<float>(
+      RawDouble(text, "rms_norm_eps",
+                static_cast<double>(kMuseGlimmerDefaultRmsNormEps)));
+  // The post-norms use their OWN, SMALLER eps, and its default is 1e-8 — NOT
+  // `rms_norm_eps` (configs/muse_glimmer.py:67; SGLang srt/configs/muse_glimmer.py:91).
+  // The released GGUF carries no post-norm key at all, so the old fallback ran
+  // both sandwich post-norms at 1e-5, a thousand times too large (#412).
   t.post_norm_eps = static_cast<float>(
-      RawDouble(text, "post_norm_eps", static_cast<double>(t.rms_norm_eps)));
+      RawDouble(text, "post_norm_eps",
+                static_cast<double>(kMuseGlimmerDefaultPostNormEps)));
   t.hidden_activation = RawString(text, "hidden_activation", "silu");
-  t.normalize_tok_embeddings = RawBool(text, "normalize_tok_embeddings", false);
-  t.output_multiplier = RawDouble(text, "output_multiplier", 1.0);
-  t.final_logit_softcapping = RawDouble(text, "final_logit_softcapping", 0.0);
+  // ABSENT means TRUE, the same tri-state as use_qk_norm / use_attn_output_gate
+  // above (configs/muse_glimmer.py:66). The released config omits the key, so the
+  // default is the only value that ships; defaulting it false made
+  // `perception_emb_norm` a silent no-op on the vision path (#405).
+  t.normalize_tok_embeddings = RawBoolDefaultTrue(text, "normalize_tok_embeddings");
+  t.output_multiplier =
+      RawDouble(text, "output_multiplier", kMuseGlimmerDefaultOutputMultiplier);
+  // `float | None` with a 20.0 default (configs/muse_glimmer.py:58; SGLang's
+  // `output_soft_cap_temp`, srt/configs/muse_glimmer.py:102). 0 is our "no cap"
+  // sentinel, so — as with the window — absent takes 20.0 and only an explicit
+  // `null` removes the cap.
+  t.final_logit_softcapping =
+      HasKey(text, "final_logit_softcapping")
+          ? RawDouble(text, "final_logit_softcapping", 0.0)
+          : kMuseGlimmerDefaultFinalLogitSoftcapping;
 
   // RoPE theta: an explicit `rope_parameters` dict wins, else a bare
   // `rope_theta`, else upstream's 500000 default (configs/muse_glimmer.py:91-98).
@@ -699,7 +741,8 @@ MuseGlimmerVisionTower LoadVisionTower(const TensorResolver& get,
 }  // namespace
 
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
-    const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    const MultiModalConfig* mm_config) {
   MuseGlimmerWeights w;
   w.params = ParseMuseGlimmerParams(config);
   const std::vector<std::string> expected = EnumerateMuseGlimmerTensors(w.params);
@@ -747,7 +790,22 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
   // — a capability behind an opt-in flag is a capability nobody reaches. A
   // text-only Muse Glimmer checkpoint (no `vision_config`) leaves `vision.loaded`
   // false and the mm forward refuses BY NAME rather than reading empty vectors.
-  if (w.params.vision.present) w.vision = LoadVisionTower(get, w.params);
+  //
+  // #607 L3, the TOWER SKIP: with every modality the encoder serves at limit 0,
+  // its tensors are never read. `w.params.vision` above already parsed the whole
+  // geometry off `vision_config`, which is upstream's construct-then-do-not-
+  // initialise exactly (interfaces.py:288-293 over `torch.device("meta")`); only
+  // the storage is skipped. The perception encoder covers image AND video
+  // (muse_glimmer_registry.cpp:37-39), which is the modality set `_mark_tower_
+  // model` would be called with, so BOTH must be 0 — `--limit-mm-per-prompt
+  // '{"image":0}'` alone keeps the tower.
+  if (w.params.vision.present) {
+    if (SkipTowerForModalities(mm_config, {"image", "video"})) {
+      w.vision_skipped = true;
+    } else {
+      w.vision = LoadVisionTower(get, w.params);
+    }
+  }
   return w;
 }
 

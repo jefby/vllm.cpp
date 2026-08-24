@@ -28,6 +28,37 @@ type before believing a surprising green.
 Tests that starve under `ctest -j` are re-run serially before being called a
 regression.
 
+## Is `main` green? — the baseline lane
+
+Before spending a build cycle proving a red check is not yours, ask:
+
+```sh
+scripts/main-baseline.py            # last fully green SHA, and what is failing now
+scripts/main-baseline.py --json
+```
+
+It reads the `schedule`/`workflow_dispatch` runs of `.github/workflows/ci.yml` —
+the only lane whose long jobs are not cancelled by the next push — and derives
+the verdict at read time. Nothing is stored, so there is no file to conflict on
+and no file that can be stale relative to the runs.
+
+Three things to know before you trust or dismiss a red check.
+
+- **A `push` run on `main` proves almost nothing.** Its expensive jobs share a
+  ref-keyed concurrency group, so the next push cancels them. Of 40 consecutive
+  runs measured for [#274](https://github.com/mudler/vllm.cpp/issues/274), 26
+  were `cancelled` and exactly one completed.
+- **A run's own conclusion is not the verdict.** `sanitize-cpu` is
+  `continue-on-error`, so a run reports `success` with the sanitizers red — run
+  `31448896841` at `5812b8b6` is exactly that. The tool reads per-job
+  conclusions and so should you.
+- **Staleness is visible, not silent.** Every line carries the run's date. If the
+  newest baseline is old, say so; never read an absent run as a pass, and never
+  read `REMOTE_UNVERIFIED` as one either.
+
+To pin a baseline on a SHA you care about right now, rather than waiting for the
+4-hourly cron: `gh workflow run ci.yml --ref main`.
+
 ## Reviewing
 
 Review happens only after the implementation's own gates pass, and only on an
@@ -41,11 +72,52 @@ a *scratch copy* and prove the focused test fails. Mutate, don't just read — a
 test that passes with the guard deleted was testing nothing. Restore the tree
 byte-for-byte after every mutation, and never mutate the reviewed worktree.
 
+**Reachability mutation:** delete the production call site too, not only the
+guards, and rerun the focused gate. A gate that stays green without it is
+measuring a class rather than a capability, and that is a finding.
+[`reachability.md`](reachability.md) has the method and the exceptions.
+
 Report `PASS` only after both passes on the same head. Every finding carries
 severity, the violated requirement, a reproduction, and the expected behavior.
 
 Do not take another agent's report at face value; the operator reruns the gate
 regardless of how confident the report sounded.
+
+## Make the instrument say what it is measuring, in its own output, in words
+
+A criterion committed in advance protects against a threshold moved after the
+fact. **It does not protect against an instrument pointed at the wrong thing.**
+That failure returns a confident, structurally valid, correctly formatted answer
+to a question nobody verified it was asking, and no threshold downstream can
+catch it, because every number downstream is arithmetically correct.
+
+Four instances from this tree, and the shape is what makes the next one
+recognisable:
+
+- A pixel A/B passed its comparison tool `--a naive --b flash --control
+  flash-ctl` while the tool compared the control against arm A. `flash-ctl` is a
+  repeat of FLASH, so the "run-to-run noise floor" was a second copy of the
+  treatment comparison. It would have read the same size as the delta it was
+  meant to calibrate, and the design's null verdict — "indistinguishable from
+  run-to-run nondeterminism" — would have been published whatever the kernel
+  did (`.agents/specs/ltx25-dit-attn-flash.md` §10.6).
+- A governor reported `1.00 s`, `69.1 s`, `162 s` and `396.9 s` for one
+  quantity. Four well-formed answers, at most one about the thing asked for.
+- An append-only checker read the WORKING TREE instead of the commits and
+  returned `rc=0` three times over a violation that was there.
+- A `static_assert` compared a literal against itself and read `256 == 256`,
+  staying green when the constant it existed to pin changed.
+
+**Every one of those would have been caught in seconds by an instrument that
+narrated its own comparison.** The governor never printed which estimator
+produced its number. The append-only checker never printed whether it had read
+commits or the working tree. The `static_assert` never printed which constant it
+had captured. So the repair is the same each time, and it is cheap: have the
+tool state, in its own output and in words, WHAT it compared against WHAT — and
+where a caller chooses that, make the choice an argument with a name rather than
+a convention the caller can invert silently. A reader who cannot see the wiring
+in the report cannot audit it, and a reviewer reading the source instead is
+reviewing the intent rather than the run.
 
 ## Evidence
 

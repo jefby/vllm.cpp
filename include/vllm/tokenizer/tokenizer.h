@@ -4,6 +4,7 @@
 // merge-ranked BPE -> vocab ids. Anything unsupported throws loudly.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -47,6 +48,18 @@ class Tokenizer {
   // not byte-level BPE with a recognized Split pre-tokenizer regex (no silent
   // wrong tokenization).
   static Tokenizer FromHfJson(const std::string& tokenizer_json_path);
+  // The same parse, from bytes already in hand. `source` appears in error
+  // messages exactly where the path would.
+  //
+  // Exists because a tokenizer does not always arrive as a FILE. LTX-2.5's text
+  // encoder ships its tokenizer AS A TENSOR — `tokenizer_json` U8 [32169626]
+  // inside the one safetensors file, alongside `hf_asset__*` sidecars
+  // (gemma_assets.py:34-36) — so a loader that assumes a sibling
+  // `tokenizer.json` cannot read that checkpoint at all. Spilling 32 MB to a
+  // temporary file just to read it back would put the temp directory on a model
+  // path and leave a 32 MB file behind on every failure.
+  static Tokenizer FromHfJsonBytes(std::string_view tokenizer_json,
+                                   const std::string& source);
   // Loads a GGUF byte-level BPE vocab (tokenizer.ggml.* kvs). Throws
   // std::runtime_error unless tokenizer.ggml.model == "gpt2" and
   // tokenizer.ggml.pre is a recognized pre-tokenizer name.
@@ -83,6 +96,15 @@ class Tokenizer {
   // True when `id` is an added token carrying the special flag. Drives the
   // detokenizer's skip_special_tokens; encoding is unaffected.
   bool IsSpecial(int32_t id) const;
+
+  // The longest STORED token text in bytes, over every assigned id. An UPPER
+  // BOUND on how many input bytes one token can account for, because the token
+  // texts of an encode concatenate back to the input and the stored form is
+  // never shorter than the decoded one (see FinalizeTables). A request boundary
+  // uses it to reject, WITHOUT tokenizing, a prompt that cannot possibly fit in
+  // max_model_len tokens: a prompt of B bytes costs at least
+  // B / MaxTokenBytes() tokens.
+  size_t MaxTokenBytes() const { return max_token_bytes_; }
 
   // Number of id slots (max id + 1); ids in [0, VocabSize) may still be
   // unassigned for vocabs with holes.
@@ -138,6 +160,7 @@ class Tokenizer {
   MergeRanks merge_ranks_;
   std::vector<SpecialToken> added_tokens_;
   std::vector<std::string> token_text_;  // id -> stored text ("" = unassigned)
+  size_t max_token_bytes_ = 0;           // longest token_text_ entry, in bytes
   // id -> 0 plain vocab, 1 added, 2 added+special. Nonzero decodes literally.
   std::vector<uint8_t> is_added_;
   Family family_ = Family::kByteLevel;

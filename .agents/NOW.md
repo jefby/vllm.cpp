@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-11 -->
+<!-- now-updated: 2026-08-17 -->
 
 Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
@@ -52,8 +52,9 @@ ENFORCE `agent-start.py` → claim → preflight. Review FAIL loops to a fresh
 implementer until PASS. Queue: 10 rows; backfill 79, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
 SM060/061/070 below vLLM's floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL
-unported work; **all 362 archs have rows**; llama.cpp's 11 extra devices IN
-SCOPE (`ROAD-V1-D6`).
+unported work; **every arch in the pinned registry has a row** (the count lives in
+[model-matrix.md](model-matrix.md), not here — #622); llama.cpp's 11 extra
+devices IN SCOPE (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 
@@ -64,8 +65,10 @@ SCOPE (`ROAD-V1-D6`).
 - Mirror vLLM; never ask how a feature should behave.
 - `nsys` BOTH sides, SAME tool, before any perf claim; cross-tool comparisons
   never establish invocation parity; whole-run sums mix prefill.
-- GPU: park `local-ai-worker`, flock `$HOME/gpu.lock`, single-load
-  steady-state, never reload per rep, named tmux.
+- GPU: claim a lease with `rc run` or `rc hold`. Never `ssh` to a box, because
+  that makes the fleet report it free while you are on it. The flock now lives
+  INSIDE the lease ([environment](environment.md)). Single-load steady-state,
+  never reload per rep, named tmux.
 - Never weaken a checker to pass; repair the record.
 - Work happens in its own worktree on a task branch; the shared checkout stays
   clean on `main`, never a work surface. Land via `row/*` PR or authorized

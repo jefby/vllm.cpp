@@ -43,9 +43,10 @@ class Backend {
 
   // Drains any deferred submission WITHOUT a Queue in hand. Needed because the
   // portable CPU reference tier (op_provider.cpp) runs a HOST kernel directly
-  // over device memory on a unified-memory backend, and must not observe bytes
-  // a batched-but-uncommitted GPU submission has not written yet. Default no-op
-  // suits every backend that submits eagerly; Metal overrides it (M3c-1).
+  // over device memory on a backend that reports DeviceMemoryIsHostAddressable(),
+  // and must not observe bytes a batched-but-uncommitted GPU submission has not
+  // written yet. Default no-op suits every backend that submits eagerly; Metal
+  // overrides it (M3c-1).
   virtual void FlushPending() {}
 
   // True when host and device share one memory space (CPU, GB10, Apple).
@@ -74,6 +75,26 @@ class Backend {
   // Default false: a backend must OPT IN, because being wrong here hands a
   // device pointer to a host memcpy and segfaults.
   virtual bool DeviceMemoryIsHostAddressable() const { return false; }
+
+  // Optional device free/total VRAM probe (bytes). Default false = unknown.
+  // ROCm overrides it with hipMemGetInfo (src/vt/rocm/rocm_backend.hip) so model
+  // code can size LRU caches without including vendor headers (device-leakage).
+  //
+  // CUDA does NOT override it. This comment claimed "ROCm/CUDA" until #1123
+  // measured what that costs: `Gemma4MoE`'s device-expert LRU is the seam's only
+  // consumer, its `FreeBytes` returns false on an absent probe and `MakeRoom`
+  // then refuses the device upload (both in gemma4_moe.cpp), so on EVERY CUDA
+  // device that cache admits nothing and falls back to host H2D, silently.
+  // Adding the override therefore WAKES a landed residency policy and needs its own
+  // measurement; that is issue #1126, and this line says what is true until then.
+  //
+  // The load-time GGUF fit refusal deliberately does not read this seam: it is a
+  // live free/total probe, and a load-time budget must not be a function of
+  // contention. It carries its own `total` on
+  // `vllm::platforms::ResidencyPolicy::device_memory_total_bytes` instead.
+  virtual bool DeviceMemoryInfo(size_t* /*free_bytes*/, size_t* /*total_bytes*/) const {
+    return false;
+  }
 
   // --- Device compute capability (BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4) ---
   // The architecture the backend is actually running on, as the familiar
@@ -229,7 +250,8 @@ Backend& GetBackend(DeviceType type);
 // registered. `GetBackend` throws for the unregistered case, which forces every
 // "is this device present?" caller into a try/catch; this is the answer without
 // one. Used by the portable reference tier (op_provider.cpp) to read a device's
-// UnifiedMemory() property without assuming the device exists in this build.
+// DeviceMemoryIsHostAddressable() property without assuming the device exists in
+// this build.
 Backend* TryGetBackend(DeviceType type);
 // Threading contract: all registration must complete before main() runs
 // (backends register via static initializers). After that, GetBackend is

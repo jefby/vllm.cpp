@@ -629,6 +629,51 @@ TEST_CASE("paged_attention validates shapes/args") {
         vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, bad),
         std::runtime_error);
   }
+  // #1390 / #1394: A BLOCK TABLE THAT CANNOT ADDRESS `seq_lens` IS AN
+  // OUT-OF-BOUNDS READ, not a wrong number, and the refusal that stops it had
+  // no test of its own. `tbt` is one column at block_size 2, so it addresses
+  // positions 0..1; seq_len 3 makes the kernel read `block_table[0, 1]`, one
+  // int32 past the row, and multiply that byte pattern by the cache's block
+  // stride. Measured at `5f68e60df`: that read returned 0 when the crashing
+  // case ran alone and 1021459670 when one earlier case in its file had run
+  // first, so the same source faulted at 0x533fbc625590 in the natural suite
+  // order and looked correct in isolation.
+  //
+  // WHERE THE BOUND LIVES, AND WHERE THIS CASE ENTERS IT. The refusal is in the
+  // CPU kernel, `src/vt/cpu/cpu_paged_attn.cpp`, beside the read it protects,
+  // and it holds for the CPU backend ONLY. This case is written against
+  // `vt::PagedAttention` because that is the call a caller writes and the one
+  // entry point all six registered backends share -- NOT because the bound is
+  // enforced there for all six. It is not: the same unbounded index sits in 19
+  // device sites, and #1406 records why the seam cannot hold one bound for them
+  // today.
+  {
+    Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
+    std::vector<int32_t> sl_over = {3};  // needs 2 columns, the table has 1
+    Tensor tsl_over = I32(sl_over, {1});
+    CHECK_THROWS_AS(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_over, tqsl,
+                                       PagedAttentionArgs{1.0f, true}),
+                    std::runtime_error);
+    // And a batch that FITS still runs: seq_len 2 == 1 column x block_size 2.
+    // Without this line the case above is satisfied by a refusal that refuses
+    // everything.
+    std::vector<int32_t> sl_fit = {2};
+    Tensor tsl_fit = I32(sl_fit, {1});
+    CHECK_NOTHROW(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_fit, tqsl,
+                                     PagedAttentionArgs{1.0f, true}));
+  }
+  // A PADDED ROW IS NOT A CALLER MISTAKE. Request 1 carries no query tokens, so
+  // no kernel reads its `seq_lens` entry and its over-long context addresses
+  // nothing. A bound that read every row would reject a batch that runs
+  // correctly today, which is #1394's second measurement and the reason its
+  // refusal skips a row the token loop never visits.
+  {
+    Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
+    std::vector<int32_t> bt2 = {0, 0}, sl2 = {1, 99}, qsl2 = {0, 1, 1};
+    Tensor tbt2 = I32(bt2, {2, 1}), tsl2 = I32(sl2, {2}), tqsl2 = I32(qsl2, {3});
+    CHECK_NOTHROW(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt2, tsl2, tqsl2,
+                                     PagedAttentionArgs{1.0f, true}));
+  }
 }
 
 // ===========================================================================
@@ -1196,8 +1241,18 @@ TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at 
   // kBlockN=128 for d128: covers up to ceil(140/128)*128 = 256 keys = 16 pages;
   // size the block table to that so no column is read past its row (memcheck).
   const int64_t max_blocks = 16, num_blocks = 64;
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     const int64_t Hq = ratio.first, Hk = ratio.second, page = Hk * D;
     CAPTURE(Hq);
     auto qf = RandF32(static_cast<size_t>(num_tokens * Hq * D),
@@ -1569,8 +1624,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode matches composed referen
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 decode parity (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {1, 2, 4, 8}) {
       for (const int base_len : {5, 21, 1024}) {  // short => num_splits==1; long => split
         CAPTURE(ratio.first);
@@ -1615,8 +1680,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode GQA group-swap matches c
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 group-swap parity (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {1, 2, 4, 8}) {
       for (const int base_len : {5, 21, 1024}) {  // short => num_splits==1; long => split
         CAPTURE(ratio.first);
@@ -1645,8 +1720,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode swap near-ties the plain
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 swap-vs-plain near-tie (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {2, 8}) {
       for (const int base_len : {21, 1024}) {
         CAPTURE(ratio.first);
@@ -1691,8 +1776,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode num_splits cap engages a
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 num_splits-cap check (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {1, 2, 4}) {
       CAPTURE(ratio.first);
       CAPTURE(batch);

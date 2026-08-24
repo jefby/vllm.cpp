@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -510,15 +511,15 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
       }
     std::vector<float> ref_comb = combined;
     {
-      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-      Queue cq = cpu.CreateQueue();
-      const Device cd{DeviceType::kCPU, 0};
-      std::vector<float> ck = knew, cv = vnew, cslots_f;
-      std::vector<int64_t> cslots = slots;
-      Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
-      Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      vt::Backend& fcpu = vt::GetBackend(DeviceType::kCPU);
+      Queue fq = fcpu.CreateQueue();
+      const Device fd{DeviceType::kCPU, 0};
+      std::vector<float> fk = knew, fv = vnew, fslots_f;
+      std::vector<int64_t> fslots = slots;
+      Tensor tk = Tensor::Contiguous(fk.data(), DType::kF32, fd, {kTokens, kHk, kD});
+      Tensor tv = Tensor::Contiguous(fv.data(), DType::kF32, fd, {kTokens, kHk, kD});
       Tensor tcomb =
-          Tensor::Contiguous(ref_comb.data(), DType::kF32, cd, {kBlocks * 2 * within});
+          Tensor::Contiguous(ref_comb.data(), DType::kF32, fd, {kBlocks * 2 * within});
       auto slice = [&](int which) {
         Tensor t = tcomb;
         t.data = static_cast<char*>(t.data) +
@@ -534,10 +535,10 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
         t.stride[3] = 1;
         return t;
       };
-      Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+      Tensor tsm = Tensor::Contiguous(fslots.data(), DType::kI64, fd, {kTokens});
       Tensor tkc = slice(0), tvc = slice(1);
-      vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
-      cpu.DestroyQueue(cq);
+      vt::ReshapeAndCache(fq, tk, tv, tkc, tvc, tsm);
+      fcpu.DestroyQueue(fq);
     }
 
     for (DeviceType dt : RegisteredDevices()) {
@@ -1001,7 +1002,7 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 
   for (int tier : {0, 1}) {
     CAPTURE(tier);
-    setenv("VT_FUSED_TIER", tier == 0 ? "0" : "1", 1);
+    vllm_test::SetEnv("VT_FUSED_TIER", tier == 0 ? "0" : "1");
     // ASSERT the tier actually took effect rather than trusting the log: doctest
     // CAPTURE is lazily stringified, so a mis-set environment would silently
     // run the same path twice and still look like two-tier coverage.
@@ -1045,9 +1046,9 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
   }
 
   if (had_prev) {
-    setenv("VT_FUSED_TIER", saved.c_str(), 1);
+    vllm_test::SetEnv("VT_FUSED_TIER", saved);
   } else {
-    unsetenv("VT_FUSED_TIER");
+    vllm_test::UnsetEnv("VT_FUSED_TIER");
   }
 }
 
@@ -1126,6 +1127,99 @@ std::vector<uint16_t> Bf16Bits(const std::vector<float>& src) {
   vt::CastBf16(cq, tout, tin);
   cpu.DestroyQueue(cq);
   return out;
+}
+
+TEST_CASE("paged attention at Qwen3 geometry (bf16, GQA 2, head_dim 128) matches the CPU oracle") {
+  // #488 / ROCM-DECODE-ATTN-D128: bf16 decode at head_dim==128 (Qwen3/Llama-
+  // class GQA) fell all the way to the generic PagedAttnOnline on ROCm --
+  // every "fast" decode kernel was gated to d==256/512 only. Mirrors the
+  // Metal "Qwen3 geometry" test's shape (nblocks/bsz/hq/hkv/dh, mixed
+  // prefill+decode across 2 requests) so a bf16, GQA=2, d=128 case exists
+  // for every registered device, not just Metal.
+  constexpr int64_t kNBlocks = 24, kBsz = 16, kHq = 16, kHkv = 8, kDh = 128;
+  constexpr int64_t kNumReqs = 2;
+  const std::vector<int32_t> qsl{0, 40, 45};   // req0: 40 new (prefill); req1: 5 new
+  const std::vector<int32_t> slens{40, 71};    // req1 carries 66 context tokens
+  const int64_t t_total = qsl.back();
+  constexpr int64_t kMaxBlocks = 6;
+  std::vector<int32_t> btab(static_cast<size_t>(kNumReqs * kMaxBlocks));
+  for (int64_t r = 0; r < kNumReqs; ++r) {
+    for (int64_t c = 0; c < kMaxBlocks; ++c) {
+      btab[static_cast<size_t>(r * kMaxBlocks + c)] = static_cast<int32_t>(r * kMaxBlocks + c);
+    }
+  }
+
+  const size_t cache_elems = static_cast<size_t>(kNBlocks * kBsz * kHkv * kDh);
+  const std::vector<float> qf = RandomVec(static_cast<size_t>(t_total * kHq * kDh), 811, -1.5f, 1.5f);
+  const std::vector<float> kf = RandomVec(cache_elems, 812, -1.5f, 1.5f);
+  const std::vector<float> vf = RandomVec(cache_elems, 813, -1.5f, 1.5f);
+  const std::vector<uint16_t> qb = Bf16Bits(qf), kb = Bf16Bits(kf), vb = Bf16Bits(vf);
+
+  vt::PagedAttentionArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(kDh));
+  args.causal = true;
+  args.query_start_loc_host = qsl.data();
+  args.max_seq_len = 71;
+
+  std::vector<uint16_t> ref(qb.size(), 0);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<uint16_t> cq_v = qb, ckc = kb, cvc = vb;
+    std::vector<int32_t> cbt = btab, csl = slens, cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(cq_v.data(), DType::kBF16, cd, {t_total, kHq, kDh});
+    Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kBF16, cd, {kNBlocks, kBsz, kHkv, kDh});
+    Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kBF16, cd, {kNBlocks, kBsz, kHkv, kDh});
+    Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {kNumReqs, kMaxBlocks});
+    Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {kNumReqs});
+    Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {kNumReqs + 1});
+    Tensor to = Tensor::Contiguous(ref.data(), DType::kBF16, cd, {t_total, kHq, kDh});
+    vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    cpu.DestroyQueue(cq);
+  }
+  std::vector<float> reff(ref.size());
+  for (size_t i = 0; i < ref.size(); ++i) reff[i] = vt::BF16ToF32(ref[i]);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    DevBufBytes dq(dev, q, qb.size() * 2), dkc(dev, q, kb.size() * 2), dvc(dev, q, vb.size() * 2),
+        dout(dev, q, qb.size() * 2);
+    dq.Upload(qb.data());
+    dkc.Upload(kb.data());
+    dvc.Upload(vb.data());
+    DevBufI32 dbt(dev, q, btab.size()), dsl(dev, q, slens.size()), dqsl(dev, q, qsl.size());
+    dbt.Upload(btab);
+    dsl.Upload(slens);
+    dqsl.Upload(qsl);
+    dev.Synchronize(q);
+
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kBF16, d, {t_total, kHq, kDh});
+    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kBF16, d, {kNBlocks, kBsz, kHkv, kDh});
+    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kBF16, d, {kNBlocks, kBsz, kHkv, kDh});
+    Tensor tbt = Tensor::Contiguous(dbt.ptr(), DType::kI32, d, {kNumReqs, kMaxBlocks});
+    Tensor tsl = Tensor::Contiguous(dsl.ptr(), DType::kI32, d, {kNumReqs});
+    Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), DType::kI32, d, {kNumReqs + 1});
+    Tensor to = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {t_total, kHq, kDh});
+
+    vt::ResetOpProviderStats(vt::OpId::kPagedAttention, dt);
+    vt::PagedAttention(q, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    dev.Synchronize(q);
+    CHECK(vt::GetOpProviderStats(vt::OpId::kPagedAttention, dt).declines == 0);
+
+    std::vector<uint16_t> got(qb.size());
+    dout.Download(got.data());
+    std::vector<float> gotf(got.size());
+    for (size_t i = 0; i < got.size(); ++i) gotf[i] = vt::BF16ToF32(got[i]);
+    CHECK(Nmse(reff, gotf) <= kNmseTol);
+
+    dev.DestroyQueue(q);
+  }
 }
 
 // Rank-3 padded-row view [T, H, D] over a [T, row_stride] f32 buffer — the
@@ -1791,6 +1885,67 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
     }
   }
 
+  // The in-context production mix (issue #41 M4 W2): the 0.8B bf16 model feeds
+  // the preamble a BF16 projection output but wants F32 q/k/gate out (the f32
+  // attention path — FA-2 is off on ROCm). The ROCm dispatcher once keyed on
+  // the SOURCE dtype and mis-launched all-bf16, writing bf16 bits through the
+  // f32 out pointers; this arm pins the (bf16 src -> f32 out) combo at the real
+  // 0.8B dims so the bug class cannot return silently.
+  {
+    const int64_t HQr = 8, HKVr = 2, DHr = 256, ROTr = 64;
+    const std::vector<float> qg = RandomVec(static_cast<size_t>(T * HQr * 2 * DHr), 991, -0.5f, 0.5f);
+    const std::vector<float> kfv = RandomVec(static_cast<size_t>(T * HKVr * DHr), 992, -0.5f, 0.5f);
+    const std::vector<float> qnr = RandomVec(static_cast<size_t>(DHr), 993, 0.2f, 1.0f);
+    const std::vector<float> knr = RandomVec(static_cast<size_t>(DHr), 994, 0.2f, 1.0f);
+    const std::vector<float> csr = RandomVec(static_cast<size_t>(T * ROTr), 995, -1.0f, 1.0f);
+    const std::vector<uint16_t> qg_bf = Bf16Bits(qg), kf_bf = Bf16Bits(kfv);
+    vt::RmsNormArgs na3; na3.eps = 1e-6f; na3.gemma = true;
+    vt::RopeArgs ra3; ra3.rotary_dim = static_cast<int>(ROTr);
+    // CPU reference: bf16 in (exact upcast inside the op) -> f32 out.
+    std::vector<float> rq(static_cast<size_t>(T * HQr * DHr));
+    std::vector<float> rk(static_cast<size_t>(T * HKVr * DHr));
+    std::vector<float> rg(static_cast<size_t>(T * HQr * DHr));
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<uint16_t> a = qg_bf, b = kf_bf; std::vector<float> e = qnr, f = knr, g = csr;
+      Tensor tqg = Tensor::Contiguous(a.data(), DType::kBF16, cd, {T, HQr * 2 * DHr});
+      Tensor tkf = Tensor::Contiguous(b.data(), DType::kBF16, cd, {T, HKVr * DHr});
+      Tensor tqn = T1(e.data(), cd, DHr), tkn = T1(f.data(), cd, DHr);
+      Tensor tcs = T2(g.data(), cd, T, ROTr);
+      Tensor tqo = Tensor::Contiguous(rq.data(), DType::kF32, cd, {T, HQr, DHr});
+      Tensor tko = Tensor::Contiguous(rk.data(), DType::kF32, cd, {T, HKVr, DHr});
+      Tensor tgo = Tensor::Contiguous(rg.data(), DType::kF32, cd, {T, HQr, DHr});
+      vt::AttnQkNormRopeGate(cq, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na3, ra3);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBufBytes dqg(dev, q, qg_bf.size() * 2), dkf(dev, q, kf_bf.size() * 2);
+      DevBuf dqn(dev, q, DHr), dkn(dev, q, DHr), dcs(dev, q, csr.size());
+      DevBuf dqo(dev, q, rq.size()), dko(dev, q, rk.size()), dgo(dev, q, rg.size());
+      dqg.Upload(qg_bf.data()); dkf.Upload(kf_bf.data());
+      dqn.Upload(qnr); dkn.Upload(knr); dcs.Upload(csr);
+      Tensor tqg = Tensor::Contiguous(dqg.ptr(), DType::kBF16, d, {T, HQr * 2 * DHr});
+      Tensor tkf = Tensor::Contiguous(dkf.ptr(), DType::kBF16, d, {T, HKVr * DHr});
+      Tensor tqn = T1(dqn.ptr(), d, DHr), tkn = T1(dkn.ptr(), d, DHr);
+      Tensor tcs = T2(dcs.ptr(), d, T, ROTr);
+      Tensor tqo = Tensor::Contiguous(dqo.ptr(), DType::kF32, d, {T, HQr, DHr});
+      Tensor tko = Tensor::Contiguous(dko.ptr(), DType::kF32, d, {T, HKVr, DHr});
+      Tensor tgo = Tensor::Contiguous(dgo.ptr(), DType::kF32, d, {T, HQr, DHr});
+      vt::AttnQkNormRopeGate(q, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na3, ra3);
+      CHECK(Nmse(rq, dqo.Download()) <= kNmseTol);
+      CHECK(Nmse(rk, dko.Download()) <= kNmseTol);
+      CHECK(Nmse(rg, dgo.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+
   const int64_t HQ = 3, HKV = 2, DH = 32, ROT = 16;
   const int64_t qg_outer = HQ * 2 * DH + 7, kf_outer = HKV * DH + 5;
   const std::vector<float> qgate = RandomVec(static_cast<size_t>(T * qg_outer), 881, -0.5f, 0.5f);
@@ -1976,6 +2131,513 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
         dev.DestroyQueue(q);
       }
     }
+  }
+}
+
+TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
+  // Port of upstream's tests/kernels/quantization/test_rocm_skinny_gemms.py
+  // ::test_rocm_wvsplitk_kernel @ pin 55596792 (review sweep on #506: the first
+  // version of this case had aggregate-NMSE tolerance that ten completely
+  // wrong elements would still pass, every K a multiple of the 512 stride so
+  // the K-tail path never ran, and no guard-boundary shapes at all).
+  //
+  // Preserved from upstream: the NKM factor list (the applicable subset — see
+  // below), the xavier on/off scaling, and the ELEMENTWISE tolerance
+  // atol = eps_bf16 * sqrt(K), rtol = 1e-2 (torch.testing.assert_close
+  // semantics). Deferred with reason: fp16 (our port is bf16-only), bias
+  // (the vt::MatmulBT seam has no bias operand), padded strides (our dispatch
+  // requires contiguous rows — a documented precondition), and the fp8/rc
+  // kernel variants (not ported). The (n,k,m) upstream triple = (tokens, K,
+  // features) here.
+  struct Shape { int64_t tok, k, feat; const char* why; };
+  const Shape shapes[] = {
+      // the upstream sweep (token counts 1-4 = our template arms)
+      {1, 32, 16, "upstream"}, {1, 64, 64, "upstream"}, {2, 256, 256, "upstream"},
+      {3, 1024, 1024, "upstream"}, {4, 4096, 4096, "upstream"},
+      // K-tail: K % 512 != 0 exercises the `if (k_ >= K) break` remainder path
+      {4, 4096 + 16, 4096, "k-tail"}, {1, 9216, 512, "upstream"},
+      // guard boundaries (must stay CORRECT via the BLAS fallback)
+      {2, 256, 8, "features<=8 declines (upstream m>8)"},
+      {2, 256, 254, "even below bound: takes skinny"},
+      {2, 256, 255, "odd features decline (YTILE=2 OOB class)"},
+      {2, 254, 256, "K%8!=0 declines"},
+  };
+  const double kEpsBf16 = 0.0078125;  // 2^-8
+  for (const Shape& sh : shapes) {
+    for (bool xnorm : {false, true}) {
+      CAPTURE(sh.why);
+      CAPTURE(sh.tok);
+      CAPTURE(sh.k);
+      CAPTURE(sh.feat);
+      CAPTURE(xnorm);
+      const int64_t M = sh.tok, N = sh.feat, K = sh.k;
+      const size_t an = static_cast<size_t>(M) * K, bn = static_cast<size_t>(N) * K;
+      const double xavier = xnorm ? std::sqrt(2.0 / static_cast<double>(K)) : 1.0;
+      std::vector<float> a = RandomVec(an, 991, -1.0f, 1.0f);
+      std::vector<float> b = RandomVec(bn, 992, -1.0f, 1.0f);
+      for (float& x : a) x = static_cast<float>(x * xavier);
+      for (float& x : b) x = static_cast<float>(x * xavier);
+      const std::vector<uint16_t> a_bf = Bf16Bits(a), b_bf = Bf16Bits(b);
+
+      std::vector<uint16_t> ref(static_cast<size_t>(M) * N, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint16_t> ca = a_bf, cb = b_bf;
+        Tensor ta = Tensor::Contiguous(ca.data(), DType::kBF16, cd, {M, K});
+        Tensor tb = Tensor::Contiguous(cb.data(), DType::kBF16, cd, {N, K});
+        Tensor to = Tensor::Contiguous(ref.data(), DType::kBF16, cd, {M, N});
+        vt::MatmulBT(cq, to, ta, tb);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMatmulBT, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        // Sentinel-padded output: the dispatch must never write past M*N
+        // elements (the odd-features OOB class from the review).
+        const size_t out_elems = static_cast<size_t>(M) * N;
+        const size_t guard_elems = 128;
+        DevBufBytes da(dev, q, an * 2), db(dev, q, bn * 2),
+            dout(dev, q, (out_elems + guard_elems) * 2);
+        std::vector<uint16_t> fill(out_elems + guard_elems, 0xDEAD);
+        dout.Upload(fill.data());
+        da.Upload(a_bf.data());
+        db.Upload(b_bf.data());
+        Tensor ta = Tensor::Contiguous(da.ptr(), DType::kBF16, d, {M, K});
+        Tensor tb = Tensor::Contiguous(db.ptr(), DType::kBF16, d, {N, K});
+        Tensor to = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+        vt::MatmulBT(q, to, ta, tb);
+        std::vector<uint16_t> got(out_elems + guard_elems);
+        dout.Download(got.data());
+        // Elementwise tolerance (upstream assert_close), never aggregate NMSE.
+        const double atol = kEpsBf16 * std::sqrt(static_cast<double>(K));
+        for (size_t i = 0; i < out_elems; ++i) {
+          uint32_t ug = static_cast<uint32_t>(got[i]) << 16, ur = static_cast<uint32_t>(ref[i]) << 16;
+          float gf, rf;
+          std::memcpy(&gf, &ug, 4);
+          std::memcpy(&rf, &ur, 4);
+          CHECK(std::fabs(gf - rf) <= atol + 1e-2 * std::fabs(rf));
+        }
+        // The guard band must be untouched by ANY path (skinny or BLAS).
+        for (size_t i = out_elems; i < out_elems + guard_elems; ++i)
+          CHECK(got[i] == 0xDEAD);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU oracle") {
+  // kMatmulBTQuant (op 74) on ROCm vs the CPU keep-quant reference. The
+  // non-grouped arm carries PR #523's headline mechanism and had NO coverage
+  // (review sweep 2026-08-13); the ROCm dispatcher's src-vs-out dtype mix-up
+  // in the fused preamble (the 0.8B divergence, row/ROCM-GDN-08B-FIX) is
+  // exactly the class an untested-but-registered op hides. REQUIRE (not skip)
+  // on ROCm so a dropped RegisterOp can never pass silently.
+  constexpr int64_t M = 3, N = 8, K = 512;
+  struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  const Fmt fmts[] = {
+    {vt::DType::kQ8_0, 34, 0, -1, "q8_0"},
+    {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+    {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+    {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+  };
+  const bool rocm_present = OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM);
+  const bool any_rocm = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (any_rocm) {
+    REQUIRE_MESSAGE(rocm_present,
+                    "kMatmulBTQuant must be registered on ROCm (the keep-quant "
+                    "loader flips on it) — a missing registration is a failure, "
+                    "never a skip");
+  }
+  for (const Fmt& f : fmts) {
+    CAPTURE(f.name);
+    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t blocks_per_row = K / elems_per_block;
+    const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(N) * row_bytes;
+    std::mt19937 rng(779);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < N; ++r)
+      for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) { uint16_t h = vt::F32ToF16(v); std::memcpy(blk + off, &h, 2); };
+        if (f.d_off >= 0) put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+    const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+    const std::vector<float> act = RandomVec(an, 780, -0.5f, 0.5f);
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      Tensor tout = T2(ref.data(), cd, M, N);
+      Tensor tact = T2(ca.data(), cd, M, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+      vt::MatmulBTQuant(cq, tout, tact, twt);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf da(dev, q, an);
+      DevBufBytes dwt(dev, q, wn);
+      DevBuf dout(dev, q, on);
+      da.Upload(act);
+      dwt.Upload(wt.data());
+      Tensor tact = T2(da.ptr(), d, M, K);
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
+  // kMatmulBTQuantGrouped on ROCm vs the CPU keep-quant reference
+  // (cpu_quant_gemm.cpp:305). Valid random blocks (valid f16 deltas, random
+  // quants) at a real expert-MLP shape. Integer cores are bit-exact ports;
+  // the f16/f32 scale sum reassociates across lanes, so NMSE <= 5e-4.
+  constexpr int64_t P = 3, N = 8, K = 512;         // K%256==0 (K-quant superblocks)
+  constexpr int64_t E = 4;                          // experts
+  const std::vector<int32_t> eids = {2, 0, 3};      // routed experts (non-sorted)
+
+  struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  // offsets from ggml-common.h (restated in cpu_quant_blocks.h)
+  const Fmt fmts[] = {
+    {vt::DType::kQ8_0, 34, 0, -1, "q8_0"},   // {d; qs[32]}        K blocks of 32
+    {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},   // {d,dmin,sc,qs}     superblocks of 256
+    {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},// {ql,qh,scales,d}   superblocks of 256
+    {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},   // {d,dmin,sc,qh,qs}  superblocks of 256
+  };
+
+  // REQUIRE-proven registration on ROCm (never a silent skip — review sweep
+  // on #523: an OpAvailable-guarded case passes green with the registration
+  // deleted).
+  const bool any_rocm = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (any_rocm) {
+    REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuantGrouped, DeviceType::kROCM),
+                    "kMatmulBTQuantGrouped must be registered on ROCm — a missing "
+                    "registration is a failure, never a skip");
+  }
+  for (const Fmt& f : fmts) {
+    CAPTURE(f.name);
+    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t blocks_per_row = K / elems_per_block;
+    const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(E) * N * row_bytes;
+    // Build valid random blocks: random quant bytes, small positive f16 deltas.
+    std::mt19937 rng(777);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < E * N; ++r)
+      for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) { uint16_t h = vt::F32ToF16(v); std::memcpy(blk + off, &h, 2); };
+        if (f.d_off >= 0) put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+    const size_t an = static_cast<size_t>(P) * K, on = static_cast<size_t>(P) * N;
+    const std::vector<float> act = RandomVec(an, 778, -0.5f, 0.5f);
+
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      std::vector<int32_t> ce = eids;
+      Tensor tout = T2(ref.data(), cd, P, N);
+      Tensor tact = T2(ca.data(), cd, P, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {E * N, K});
+      Tensor te = TI32(ce.data(), cd, P);
+      vt::MatmulBTQuantGrouped(cq, tout, tact, twt, te);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMatmulBTQuantGrouped, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf da(dev, q, an);
+      DevBufBytes dwt(dev, q, wn);
+      DevBufI32 de(dev, q, P);
+      DevBuf dout(dev, q, on);
+      da.Upload(act);
+      dwt.Upload(wt.data());
+      de.Upload(eids);
+      Tensor tact = T2(da.ptr(), d, P, K);
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {E * N, K});
+      Tensor te = TI32(de.ptr(), d, P);
+      Tensor tout = T2(dout.ptr(), d, P, N);
+      vt::MatmulBTQuantGrouped(q, tout, tact, twt, te);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
+  // The "paged attention" case above hand-builds a contiguous KV cache; the
+  // real model path writes it with ReshapeAndCache and reads it back. This
+  // case is that composition, at real model dims (Dh=256, Hq=8, Hkv=2,
+  // block_size 16), a shuffled block table, and a non-sequential slot mapping
+  // — the layout a stride/scatter bug would live in and the contiguous case
+  // cannot see.
+  constexpr int64_t T = 20, Hq = 8, Hkv = 2, Dh = 256, BS = 16;
+  constexpr int64_t kBlocks = 4;                 // 4 blocks x 16 slots = 64 >= 20
+  const size_t qn = static_cast<size_t>(T) * Hq * Dh;
+  const size_t kvn = static_cast<size_t>(T) * Hkv * Dh;
+  const size_t cachen = static_cast<size_t>(kBlocks) * BS * Hkv * Dh;
+  const std::vector<float> q = RandomVec(qn, 711);
+  const std::vector<float> k = RandomVec(kvn, 712);
+  const std::vector<float> v = RandomVec(kvn, 713);
+  // The slot mapping must DERIVE from the logical position through the
+  // (shuffled) block table — exactly what the engine produces — otherwise the
+  // attention read of logical position p lands on a slot nothing wrote and
+  // both backends compare zeros (review on #497: the first version's
+  // (i*7+3)%64 scatter was disjoint from the block table, so the composition
+  // exercised mostly-unwritten cache).
+  std::vector<int32_t> block_table = {3, 1, 2, 0};  // shuffled physical blocks
+  std::vector<int64_t> slots(T);
+  for (int64_t i = 0; i < T; ++i)
+    slots[i] = static_cast<int64_t>(block_table[static_cast<size_t>(i / BS)]) * BS + (i % BS);
+  std::vector<int32_t> seq_lens = {T};
+  std::vector<int32_t> qsl = {0, T};
+  vt::PagedAttentionArgs pa;
+  pa.scale = 1.0f / std::sqrt(static_cast<float>(Dh));
+  pa.causal = true;
+
+  std::vector<float> ref_out(static_cast<size_t>(T) * Hq * Dh, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> q_host = q, ck = k, cv = v;
+    std::vector<float> ckc(cachen, 0.0f), cvc(cachen, 0.0f);
+    std::vector<int64_t> cslots = slots;
+    std::vector<int32_t> cbt = block_table, csl = seq_lens, cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(q_host.data(), DType::kF32, cd, {T, Hq, Dh});  // contiguous (op contract)
+    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {T, Hkv, Dh});
+    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {T, Hkv, Dh});
+    Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
+    Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
+    Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {T});
+    vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
+    Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
+    Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
+    Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
+    Tensor to = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, Hq, Dh});
+    vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kPagedAttention, dt) || !OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q_ = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q_, qn), dk(dev, q_, kvn), dv(dev, q_, kvn),
+        dkc(dev, q_, cachen), dvc(dev, q_, cachen), dout(dev, q_, static_cast<size_t>(T) * Hq * Dh);
+    DevBufBytes dsm(dev, q_, T * 8), dbt(dev, q_, kBlocks * 4), dsl_(dev, q_, 4), dqsl(dev, q_, 8);
+    dq.Upload(q); dk.Upload(k); dv.Upload(v);
+    dkc.Upload(std::vector<float>(cachen, 0.0f)); dvc.Upload(std::vector<float>(cachen, 0.0f));
+    dsm.Upload(slots.data()); dbt.Upload(block_table.data());
+    dsl_.Upload(seq_lens.data()); dqsl.Upload(qsl.data());
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, Hq, Dh});  // contiguous (op contract)
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, Hkv, Dh});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, Hkv, Dh});
+    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
+    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
+    Tensor tsm = Tensor::Contiguous(dsm.ptr(), DType::kI64, d, {T});
+    vt::ReshapeAndCache(q_, tk, tv, tkc, tvc, tsm);
+    Tensor tbt = Tensor::Contiguous(dbt.ptr(), DType::kI32, d, {1, kBlocks});
+    Tensor tsl = Tensor::Contiguous(dsl_.ptr(), DType::kI32, d, {1});
+    Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), DType::kI32, d, {2});
+    Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, Hq, Dh});
+    vt::PagedAttention(q_, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+
+    // Anti-vacuity guard (review on #497): a WRONG physical mapping must NOT
+    // reproduce the reference — if the composition were vacuous (reads never
+    // hitting writes), a corrupted table would compare equal. Blocks 0 and 2
+    // both carry real tokens under the true table, so swapping them must
+    // change the output.
+    // Swap the mapping of the first two LOGICAL blocks — both hold real
+    // tokens (0-15 and 16-19), so the read path changes. (The first version
+    // of this guard swapped two blocks OUTSIDE the logical range and was
+    // itself vacuous — the guard proved the guard.)
+    std::vector<int32_t> bad_table = {1, 3, 2, 0};
+    DevBufBytes dbt_bad(dev, q_, kBlocks * 4);
+    dbt_bad.Upload(bad_table.data());
+    DevBuf dout2(dev, q_, static_cast<size_t>(T) * Hq * Dh);
+    Tensor tbt2 = Tensor::Contiguous(dbt_bad.ptr(), DType::kI32, d, {1, kBlocks});
+    Tensor to2 = Tensor::Contiguous(dout2.ptr(), DType::kF32, d, {T, Hq, Dh});
+    vt::PagedAttention(q_, to2, tq, tkc, tvc, tbt2, tsl, tqsl, pa);
+    const std::vector<float> bad_out = dout2.Download();
+    bool any_diff = false;
+    for (size_t i = 0; i < ref_out.size(); ++i)
+      if (std::fabs(bad_out[i] - ref_out[i]) > 1e-3f) { any_diff = true; break; }
+    CHECK_MESSAGE(any_diff,
+                  "a corrupted block table must change the attention output — "
+                  "otherwise the composition test is vacuous");
+    dev.DestroyQueue(q_);
+  }
+}
+
+
+// Scalar bf16 RNE round-trip helpers for host-side oracles (the MoE combine
+// gate reference rounds the shared term through bf16 exactly like the kernel).
+static uint16_t F32ToBf16Rne(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return static_cast<uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+static float Bf16ToF32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+TEST_CASE("MoE combine/gate ops match the CPU oracle") {
+  constexpr int64_t T = 5, H = 64, K = 3;
+  const size_t en = static_cast<size_t>(T) * K * H, on = static_cast<size_t>(T) * H;
+  const std::vector<float> eo = RandomVec(en, 911);
+  const std::vector<float> w = RandomVec(static_cast<size_t>(T) * K, 912, 0.0f, 1.0f);
+  const std::vector<float> sd = RandomVec(on, 913);
+  const std::vector<uint16_t> eo_bf = Bf16Bits(eo), sd_bf = Bf16Bits(sd);
+  // SharedExpertGate (sigmoid*mul), MoeCombine (weighted expert sum +/-
+  // shared), MoeCombineGate (combine + folded shared gate). f32 and bf16 arms,
+  // PLUS the production dtype mix the model actually runs (review sweep on
+  // #509): expert_out bf16 (qwen3_5.cpp DBuf ddown), shared bf16, out bf16.
+  // MoeCombine/MoeCombineGate are thread-per-element with a single store
+  // rounding and NO cross-lane reduction (cuda_moe.cu:465-468), so both arms
+  // are asserted BIT-EXACT — the NMSE aggregate would tolerate a few wrong
+  // elements, which is exactly how a 2x OOB read hides.
+  const std::vector<float> gl = RandomVec(static_cast<size_t>(T), 914);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    // CPU oracle for all three, f32.
+    std::vector<uint16_t> ref_sg_b(on, 0);
+  std::vector<float> ref_c(on), ref_cg(on);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> csd = sd, cgl = gl, ceo = eo, cw = w;
+      Tensor tout = Tensor::Contiguous(ref_sg_b.data(), DType::kBF16, cd, {T, H});
+      Tensor tsd = T2(csd.data(), cd, T, H);
+      Tensor tgl = T1(cgl.data(), cd, T);
+      if (OpAvailable(vt::OpId::kSharedExpertGate, DeviceType::kCPU))
+        vt::SharedExpertGate(cq, tout, tsd, tgl);
+      Tensor teo = Tensor::Contiguous(ceo.data(), DType::kF32, cd, {T, K, H});
+      Tensor tw = T2(cw.data(), cd, T, K);
+      Tensor to2 = T2(ref_c.data(), cd, T, H);
+      if (OpAvailable(vt::OpId::kMoeCombine, DeviceType::kCPU))
+        vt::MoeCombine(cq, to2, teo, tw, &tsd, 1.0f);
+      cpu.DestroyQueue(cq);
+      // MoeCombineGate has no CPU op registration; the oracle is the composite
+      // computed on host: MoeCombine (no shared) + bf16-round(sigmoid(gl)*sd).
+      for (int64_t r = 0; r < T; ++r) {
+        const float g = 1.0f / (1.0f + std::exp(-gl[static_cast<size_t>(r)]));
+        for (int64_t c2 = 0; c2 < H; ++c2) {
+          float acc = 0.0f;
+          for (int64_t j = 0; j < K; ++j)
+            acc += w[static_cast<size_t>(r * K + j)] * eo[static_cast<size_t>((r * K + j) * H + c2)];
+          const float sv = g * sd[static_cast<size_t>(r * H + c2)];
+          const uint16_t svb = F32ToBf16Rne(sv);
+          acc += Bf16ToF32(svb);
+          ref_cg[static_cast<size_t>(r * H + c2)] = acc;
+        }
+      }
+    }
+    // device
+    DevBuf deo(dev, q, en), dw(dev, q, T * K), dsd(dev, q, on), dgl(dev, q, T), dout(dev, q, on);
+    DevBufBytes doutb(dev, q, on * 2);
+    deo.Upload(eo); dw.Upload(w); dsd.Upload(sd); dgl.Upload(gl);
+    Tensor teo = Tensor::Contiguous(deo.ptr(), DType::kF32, d, {T, K, H});
+    Tensor tw = T2(dw.ptr(), d, T, K);
+    Tensor tsd = T2(dsd.ptr(), d, T, H);
+    Tensor tgl = T1(dgl.ptr(), d, T);
+    Tensor tout = T2(dout.ptr(), d, T, H);
+    if (OpAvailable(vt::OpId::kSharedExpertGate, dt)) {
+      Tensor toutb = Tensor::Contiguous(doutb.ptr(), DType::kBF16, d, {T, H});
+      vt::SharedExpertGate(q, toutb, tsd, tgl);
+      std::vector<uint16_t> gotb(on);
+      doutb.Download(gotb.data());
+      CHECK(gotb == ref_sg_b);  // both sides store bf16: bit-exact
+    }
+    if (OpAvailable(vt::OpId::kMoeCombine, dt)) {
+      vt::MoeCombine(q, tout, teo, tw, &tsd, 1.0f);
+      // Thread-per-element, single store rounding, no cross-lane reduction:
+      // bit-exact is the achievable and asserted bar (review sweep on #509).
+      CHECK(dout.Download() == ref_c);
+    }
+    if (OpAvailable(vt::OpId::kMoeCombineGate, dt)) {
+      vt::MoeCombineGate(q, tout, teo, tw, tsd, tgl);
+      CHECK(Nmse(ref_cg, dout.Download()) <= kNmseTol);
+    }
+
+    // The production bf16 arm: expert_out bf16 + shared bf16 + out bf16
+    // (qwen3_5.cpp:5463 ddown / :5326 shared). The CPU oracle runs the same
+    // ops on the same bf16 tensors; both sides thread-per-element with the
+    // same sequential K order, so the assertion is BIT-EXACT.
+    DevBufBytes deo_bf(dev, q, en * 2), dsd_bf(dev, q, on * 2), dout_bf(dev, q, on * 2);
+    deo_bf.Upload(eo_bf.data());
+    dsd_bf.Upload(sd_bf.data());
+    Tensor teo_b = Tensor::Contiguous(deo_bf.ptr(), DType::kBF16, d, {T, K, H});
+    Tensor tsd_b = Tensor::Contiguous(dsd_bf.ptr(), DType::kBF16, d, {T, H});
+    Tensor tout_b = Tensor::Contiguous(dout_bf.ptr(), DType::kBF16, d, {T, H});
+    if (OpAvailable(vt::OpId::kMoeCombine, dt) &&
+        OpAvailable(vt::OpId::kMoeCombine, DeviceType::kCPU)) {
+      // CPU reference on bf16 tensors.
+      std::vector<uint16_t> ref_b(on, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint16_t> ceo = eo_bf, csd = sd_bf;
+        std::vector<float> cw = w;
+        Tensor r = Tensor::Contiguous(ref_b.data(), DType::kBF16, cd, {T, H});
+        Tensor teo_c = Tensor::Contiguous(ceo.data(), DType::kBF16, cd, {T, K, H});
+        Tensor tw_c = T2(cw.data(), cd, T, K);
+        Tensor tsd_c = Tensor::Contiguous(csd.data(), DType::kBF16, cd, {T, H});
+        vt::MoeCombine(cq, r, teo_c, tw_c, &tsd_c, 0.7f);
+        cpu.DestroyQueue(cq);
+      }
+      vt::MoeCombine(q, tout_b, teo_b, tw, &tsd_b, 0.7f);
+      std::vector<uint16_t> got_b(on);
+      dout_bf.Download(got_b.data());
+      CHECK(got_b == ref_b);
+    }
+    dev.DestroyQueue(q);
   }
 }
 

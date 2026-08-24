@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import os
 import re
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -96,6 +98,7 @@ class PathClassification(unittest.TestCase):
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
             "release/release-matrix.json": "configuration",
+            "release/release-version.json": "configuration",
             "release/container-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
             # The container lane images. `docker/Dockerfile.arm64` already
@@ -107,10 +110,42 @@ class PathClassification(unittest.TestCase):
             "docker/Dockerfile.arm64": "configuration",
             "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
+            # Same failure as the Dockerfile entries above, one row later.
+            # #840 moved the intake table out of roadmap_v1.md into its own
+            # append-only file and never classified it, and classify_path FAILS
+            # CLOSED -- so pr-size aborted on every pull request that appends an
+            # index row, which under that same policy is nearly all of them
+            # (#856). It is a project record for the same reason roadmap_v1.md
+            # is: it IS the table roadmap_v1.md used to hold.
+            ".agents/roadmap_v1.md": "project_record",
+            ".agents/issue-index.md": "project_record",
+            ".agents/style/commits.md": "procedure",
+            ".agents/style/prose.md": "procedure",
+            ".claude/skills/writing-commits-and-prs/SKILL.md": "procedure",
+            ".claude/skills/writing-technical-english/SKILL.md": "procedure",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), path_class)
+
+    def test_release_version_classification_is_exact_and_fail_closed(self) -> None:
+        """Only the authoritative immutable declaration earns this class.
+
+        A directory-level ``release/`` rule would silently classify future
+        mutable release state. Near-miss names therefore remain unknown.
+        """
+        self.assertEqual(
+            checker.classify_path("release/release-version.json"),
+            "configuration",
+        )
+        for path in (
+            "release/version.json",
+            "release/release-version.local.json",
+            "release/channel.json",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
 
     def test_generated_class_does_not_swallow_its_own_sources(self) -> None:
         # The generator and the GLSL it compiles are the REVIEWABLE surface and
@@ -319,27 +354,92 @@ class BudgetEnforcement(unittest.TestCase):
         self.assertEqual(checker.change_errors([huge]), [])
 
     def test_retiring_the_budget_did_not_retire_the_other_contracts(self) -> None:
-        """The three rules that share this checker must still bite.
+        """The rules that share this checker must still bite.
 
-        Dropping a size gate is not licence to drop classification, the binary
-        guard, or checker-evidence with it, which is exactly the kind of thing
-        that goes unnoticed when a constant is deleted.
+        Dropping a size gate is not licence to drop classification or
+        checker-evidence with it, which is exactly the kind of thing that goes
+        unnoticed when a constant is deleted.
         """
         unknown = checker.ChangedPath("no/such/surface.txt", 1, 0)
         self.assertTrue(checker.change_errors([unknown]))
-        # Asserted on the ERROR, not its wording: this is a regression guard
-        # that must hold on both sides of the retirement, so it must not be
-        # coupled to a message string that the retirement itself reworded.
-        binary = checker.ChangedPath("assets/logo.png", None, None)
-        self.assertTrue(checker.change_errors([binary]))
         lone_checker = self.change("scripts/check-pr-size.py", 10)
         self.assertTrue(
             any("mutation evidence" in e for e in checker.change_errors([lone_checker]))
         )
 
-    def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
-        errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
-        self.assertTrue(any("binary" in error for error in errors), errors)
+    def test_every_secondary_oracle_file_classifies(self) -> None:
+        """One file per oracle must classify (GATE-PR-SIZE-BINARY follow-on, #668).
+
+        RED before the fix on EVERY tracked file under .agents/oracles/: the
+        secondary-oracle registry landed with no pattern in the checker, so a
+        required check refused any PR that recorded a pin -- which is the one
+        thing the registry exists to make cheap. Asserted on the whole tracked
+        set rather than a sample, so a ninth oracle added without a class is
+        caught here and not in someone's PR.
+        """
+        tracked = subprocess.run(
+            ["git", "ls-files", ".agents/oracles/"],
+            capture_output=True, text=True, check=True, cwd=checker.ROOT,
+        ).stdout.split()
+        self.assertTrue(tracked, "expected tracked .agents/oracles/ files")
+        for path in tracked:
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "procedure")
+
+    def test_oracles_is_a_pattern_not_a_blanket_directory_exemption(self) -> None:
+        """The class is earned by shape, not by living under .agents/oracles/.
+
+        AGENTS.md forbids hiding mutable files behind a blanket directory
+        exemption, so a non-.md file or a nested path there must still fail
+        closed rather than inherit `procedure`.
+        """
+        for path in (
+            ".agents/oracles/pin.txt",
+            ".agents/oracles/vllm.json",
+            ".agents/oracles/nested/dir.md",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
+    def test_a_classified_binary_is_accepted(self) -> None:
+        """A binary at a classified path is not an error (GATE-PR-SIZE-BINARY, #615).
+
+        RED before the retirement: `change_errors` short-circuited on every
+        `lines is None` path, so a captured parity golden could not reach main
+        at all and #431 was unmergeable by construction. The classifier was
+        always built to give binaries a class -- the `SITE_ASSET` comment says
+        so in as many words -- and the guard refused them anyway.
+        """
+        for path in (
+            "tests/parity/goldens/qwen3_greedy_0_6b/our_ids.npy",
+            "tests/parity/goldens/qwen35_greedy_0_8b/neartie_gap_mnats.npy",
+            "tests/parity/goldens/qwen3_greedy_0_6b/p0_prompt.i32",
+            "website/static/fonts/sora-700.woff2",
+        ):
+            with self.subTest(path=path):
+                # Asserted through classify_path rather than a hardcoded class
+                # so this stays true if a golden is later reclassified.
+                checker.classify_path(path)
+                binary = checker.ChangedPath(path, None, None)
+                self.assertEqual(checker.change_errors([binary]), [])
+
+    def test_an_unclassified_binary_is_still_refused(self) -> None:
+        """Retiring the guard must not turn an unclassified path into a free one.
+
+        This is the rail that keeps the retirement scoped: the protection was
+        never "binaries are unreviewable", it was "every path earns a class".
+        Green on both sides of the change -- classification runs first -- so it
+        is a regression pin, not the evidence for the retirement.
+        """
+        errors = checker.change_errors([checker.ChangedPath("no/such/surface.png", None, None)])
+        self.assertTrue(errors)
+        # The message must name the real defect. "Not reviewable as text" told
+        # the author to fix something about the file; an unclassified path is
+        # something they can actually act on.
+        self.assertFalse(
+            any("not reviewable as text" in error for error in errors), errors
+        )
 
     def test_checker_change_requires_its_recognized_mutation_test(self) -> None:
         changed = [
@@ -375,6 +475,12 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
             "scripts/check-triton-aot-multiarch.py",
+            # PR #446 created the native Windows portability checker after the
+            # range base, so its own suite must reject a closed disabled form.
+            "scripts/check-windows-portability.py",
+            # The release-state truth checker was created in the same range and
+            # owes the identical closed bootstrap proof.
+            "scripts/check-windows-release-state.py",
             # 2026-08-10: the docs-site content guard (#224). A checker created
             # in the same PR has no BASE version to mutate, so it registers the
             # disabled form its own tests must reject.
@@ -384,6 +490,31 @@ class BudgetEnforcement(unittest.TestCase):
             # every case rather than quietly passing a reduced one.
             "scripts/check-container-matrix.py",
             "scripts/check-container-workflow.py",
+            # 2026-08-16: the CUDA arch-gate registration guard (#960). Its suite
+            # reaches into the checker's parser, so the disabled stub cannot load.
+            "scripts/check-cuda-op-arch-gate.py",
+            # 2026-08-18: the symbol-anchor freshness gate (#1143, #1139). Created
+            # in the same range, so it has no BASE version to mutate. The disabled
+            # stub exits 0 and prints nothing, which fails 20 of its 21 cases --
+            # including the clean-tree case, which asserts a checked count at or
+            # above the recorded floor and so cannot be satisfied by silence.
+            "scripts/check-symbol-anchors.py",
+            # 2026-08-20: the conflict-marker gate (#1417). Created in the same
+            # range, so it has no BASE version to mutate. The disabled stub
+            # exits 0 and prints nothing, which fails 16 of its 21 cases --
+            # measured. The five that survive assert only that an ordinary
+            # document exits 0, or read no checker at all, so silence satisfies
+            # them; every case that reads an exit code of 1 or an examined count
+            # goes red.
+            "scripts/check-conflict-markers.py",
+            # 2026-08-21: the attention-rung gate (#1544). Created in the same
+            # range, so it has no BASE version to mutate. Its suite loads the
+            # checker as a module at import time and every case then calls into
+            # it, so the disabled stub -- which defines none of scan_file,
+            # has_marker, drift_sites, stale_allowlist_entries or main -- takes
+            # all 31 cases red on AttributeError. Measured, not asserted: the
+            # suite has no case that passes without touching the checker.
+            "scripts/check-attention-rung-consistency.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():
@@ -440,6 +571,110 @@ class BudgetEnforcement(unittest.TestCase):
                     )
                 )
 
+    def test_evidence_tools_do_not_leak_the_ambient_path(self) -> None:
+        """CMake and Ninja are private copies, not ambient PATH leakage."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ambient = root / "ambient"
+            ambient.mkdir()
+            empty_system_path = root / "empty-system-path"
+            empty_system_path.mkdir()
+            for name in ("cmake", "ninja", "ambient-secret"):
+                executable = ambient / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            with mock.patch.dict(
+                os.environ, {"PATH": str(ambient)}, clear=True
+            ), mock.patch.object(
+                checker.os, "defpath", str(empty_system_path)
+            ):
+                tools = checker._prepare_evidence_tools(
+                    root, "tests.scripts.test_check_windows_portability"
+                )
+                env = checker._sanitized_env(root, tools)
+                entries = env["PATH"].split(os.pathsep)
+                self.assertNotIn(str(ambient), entries)
+                for name in ("cmake", "ninja"):
+                    with self.subTest(name=name):
+                        self.assertEqual(
+                            shutil.which(name, path=env["PATH"]),
+                            str(tools / name),
+                        )
+                self.assertIsNone(
+                    shutil.which("ambient-secret", path=env["PATH"])
+                )
+
+    def test_portability_evidence_fails_closed_for_each_missing_tool(self) -> None:
+        module = "tests.scripts.test_check_windows_portability"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for missing in ("cmake", "ninja"):
+                with self.subTest(missing=missing):
+                    container = root / f"container-{missing}"
+                    container.mkdir()
+                    available = root / f"available-{missing}"
+                    available.mkdir()
+                    for name in ({"cmake", "ninja"} - {missing}):
+                        executable = available / name
+                        executable.write_text(
+                            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+                        )
+                        executable.chmod(0o755)
+                    with mock.patch.dict(
+                        os.environ, {"PATH": str(available)}, clear=True
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            rf"semantic evidence requires executable {missing}",
+                        ):
+                            checker._prepare_evidence_tools(container, module)
+
+    def test_private_cmake_retains_its_installed_module_tree(self) -> None:
+        module = "tests.scripts.test_check_windows_portability"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installation = root / "installation"
+            binaries = installation / "bin"
+            modules = installation / "share/cmake/Modules"
+            binaries.mkdir(parents=True)
+            modules.mkdir(parents=True)
+            cmake = binaries / "cmake"
+            cmake.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parent.parent\n"
+                "if not (root / 'share/cmake/Modules').is_dir():\n"
+                "    print('Could not find CMAKE_ROOT', file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "print('Build files have been written')\n",
+                encoding="utf-8",
+            )
+            cmake.chmod(0o755)
+            ninja = binaries / "ninja"
+            ninja.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            ninja.chmod(0o755)
+            empty_system_path = root / "empty-system-path"
+            empty_system_path.mkdir()
+            with mock.patch.dict(
+                os.environ, {"PATH": str(binaries)}, clear=True
+            ), mock.patch.object(
+                checker.os, "defpath", str(empty_system_path)
+            ):
+                tools = checker._prepare_evidence_tools(root, module)
+                result = subprocess.run(
+                    [str(tools / "cmake")],
+                    env=checker._sanitized_env(root, tools),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn("Build files have been written", result.stdout)
+
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
             [
@@ -488,6 +723,58 @@ class BudgetEnforcement(unittest.TestCase):
             )
             self.assertFalse(any("{" in change.path or "=>" in change.path for change in changes))
 
+    def test_changed_paths_uses_the_merge_base_when_the_base_branch_moved(self) -> None:
+        """A PR diff is merge_base..head, not base_tip..head (#773).
+
+        RED before GATE-FORK-ANCESTRY: CI passes `pull_request.base.sha`, the
+        TIP of the base branch, which stops being an ancestor of head the moment
+        main advances -- so `changed_paths` raised and classification never ran
+        on any fork PR. Worse than strict: two-dot diffing a moved main renders
+        MAIN's own commits as reversions inside the contributor's diff, so paths
+        they never touched get classified and charged to them. This asserts both
+        halves: the PR's path is present, main's is absent.
+        """
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            repo = Path(directory)
+            run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            run("config", "user.name", "Test")
+            run("config", "user.email", "test@example.com")
+            (repo / "src").mkdir()
+            (repo / "src" / "root.cpp").write_text("root\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "root")
+            root = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            # The contributor's branch, cut from root.
+            run("checkout", "-q", "-b", "pr", root)
+            (repo / "src" / "from_pr.cpp").write_text("pr\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "pr work")
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            # main moves on afterwards -- the ordinary case, not an edge case.
+            run("checkout", "-q", "-B", "main", root)
+            (repo / "src" / "from_main.cpp").write_text("main\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "mainline work")
+            moved_main = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            self.assertNotEqual(moved_main, root)
+
+            paths = {c.path for c in checker.changed_paths(moved_main, head, repo=repo)}
+            self.assertIn("src/from_pr.cpp", paths)
+            self.assertNotIn(
+                "src/from_main.cpp",
+                paths,
+                "main's own commit must not appear in the contributor's diff",
+            )
+
     def test_missing_and_nonancestor_objects_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
             repo = Path(directory)
@@ -508,7 +795,12 @@ class BudgetEnforcement(unittest.TestCase):
             side = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             with self.assertRaises(ValueError):
                 checker.changed_paths("missing", side, repo=repo)
-            with self.assertRaisesRegex(ValueError, "ancestor"):
+            # Still RAISES -- the fail-closed half of the old non-ancestor rule
+            # is deliberately preserved (#773). `side` here is an ORPHAN branch,
+            # so there is no merge base and therefore no range to compute. Only
+            # the message changed: what used to be reported as "not an ancestor"
+            # is now named for what it actually is.
+            with self.assertRaisesRegex(ValueError, "no merge base"):
                 checker.changed_paths(base, side, repo=repo)
 
     def test_production_pr_classifier_covers_every_governed_path_class(self) -> None:

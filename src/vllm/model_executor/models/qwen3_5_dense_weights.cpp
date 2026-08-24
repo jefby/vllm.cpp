@@ -14,10 +14,15 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
+#include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 
@@ -28,18 +33,13 @@ namespace vllm {
 using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
 using dense_loaders::MakeOwned;
+// The per-tensor scale read (#1181). The local copy this replaces checked
+// neither the element count nor the dtype.
+using dense_loaders::ReadF32Scalar;
 
 namespace {
 
 using TensorExists = std::function<bool(const std::string&)>;
-
-float ReadF32Scalar(const StTensor& t) {
-  VT_CHECK(t.data != nullptr && t.nbytes >= sizeof(float),
-           "qwen3_5 dense: scalar tensor too small for f32");
-  float v = 0.0F;
-  std::memcpy(&v, t.data, sizeof(float));
-  return v;
-}
 
 // The GDN in-projections stay RAW in the on-disk torch Linear [out, in]
 // orientation (nk=true, via LoadMergedBf16RawNK), consumed by vt::MatmulBT —
@@ -114,8 +114,10 @@ OwnedTensor LoadToF32(const TensorResolver& get, const std::string& name) {
              "qwen3_5 dense: byte-size mismatch for " + name);
     std::memcpy(dst, t.data, t.nbytes);
   } else {
-    const auto* src = reinterpret_cast<const uint16_t*>(t.data);
-    for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+    // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+    for (int64_t i = 0; i < n; ++i) {
+      dst[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(t.data + i * 2));
+    }
   }
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
@@ -131,8 +133,30 @@ bool DirectDeviceLoadEligible(vt::Queue* queue) {
   const char* direct = std::getenv("VT_DIRECT_DEVICE_LOAD");
   if (direct != nullptr && direct[0] == '0') return false;
   const auto& platform = platforms::GetPlatform(queue->device.type);
-  return !platform.is_unified_memory() &&
-         platform.residency_policy().release_host_weights_after_upload;
+  // LOAD-MODELOPT-NVFP4-BORROW (issue #1647). This used to also require
+  // `!platform.is_unified_memory()`, which is TRUE on GB10, so
+  // `StageAndReleaseLoadedDense` -- the only caller of
+  // `ReleaseResidentQwen3_5DenseHostWeights` -- never ran on the one device in
+  // this fleet whose host and device memory come out of the same 119 GiB.
+  //
+  // TWO PREDICATES DISAGREED ABOUT ONE DEVICE, and the staging one is right.
+  // `needs_weight_staging()` is asked at the top of this function and is
+  // unconditionally true on CUDA; `src/vllm/platforms/cuda.cpp` says why in its
+  // own words -- the CUDA path binds distinct device-resident buffers
+  // "regardless of GB10 being physically unified". `interface.h` says the same
+  // from the other side: `is_unified_memory()` "answers the OPPOSITE question",
+  // because a `cudaMalloc` pointer there is still not host-dereferenceable.
+  // `ResidentNvfp4` settles it by construction: it allocates and copies with no
+  // aliasing branch, so on GB10 there really are two buffers.
+  //
+  // THIS DOES NOT ARM THE ALIASING USE-AFTER-FREE the release site's comment
+  // records. That site asks the invariant `HostMirrorIsRedundant(tensor)` --
+  // `d_dev != nullptr` -- rather than the `d_dev || d_dev_f32` proxy, and
+  // `ResidentWeight`'s alias branch leaves `d_dev` null, so an aliased weight is
+  // never released. Its own conclusion is that the disjunct is redundant on the
+  // staging arm; what changes here is that the invariant now does the work
+  // instead of an accident of platform naming.
+  return platform.residency_policy().release_host_weights_after_upload;
 }
 
 void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
@@ -174,7 +198,7 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3",
            "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
-  const float wgs_disk = ReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs_disk = ReadF32Scalar(get, proj + ".weight_global_scale");
   VT_CHECK(wgs_disk != 0.0F,
            "qwen3_5 dense: zero weight_global_scale (divisor) for " + proj);
 
@@ -187,7 +211,7 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   // (used DIRECTLY), and alpha folds both reciprocated globals for the fp4xfp4
   // GEMM: alpha = (1/input_divisor)·(1/weight_divisor). input_global_scale is a
   // per-tensor F32 scalar present on every 27B quantized Linear (§3.2).
-  const float igs_disk = ReadF32Scalar(get(proj + ".input_global_scale"));
+  const float igs_disk = ReadF32Scalar(get, proj + ".input_global_scale");
   VT_CHECK(igs_disk != 0.0F,
            "qwen3_5 dense: zero input_global_scale (divisor) for " + proj);
   r.input_global_scale_inv = igs_disk;   // on-disk divisor, used directly
@@ -299,14 +323,14 @@ OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get, const TensorExists& ha
     // spells it `weight_global_scale` and stores the reciprocal.
     float disk_divisor = 0.0F;
     if (has(name + "_scale_2")) {
-      const float ws2 = ReadF32Scalar(get(name + "_scale_2"));
+      const float ws2 = ReadF32Scalar(get, name + "_scale_2");
       VT_CHECK(ws2 != 0.0F, "qwen3_5 dense: zero " + name + "_scale_2");
       disk_divisor = 1.0F / ws2;  // ModelOpt scale -> CT divisor convention
     } else {
       VT_CHECK(has(name + "_global_scale"),
                "qwen3_5 dense: NVFP4 " + name + " requires " + name +
                    "_scale_2 (ModelOpt) or " + name + "_global_scale (CT)");
-      disk_divisor = ReadF32Scalar(get(name + "_global_scale"));
+      disk_divisor = ReadF32Scalar(get, name + "_global_scale");
       VT_CHECK(disk_divisor != 0.0F,
                "qwen3_5 dense: zero " + name + "_global_scale (divisor)");
     }
@@ -371,7 +395,7 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3",
            "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
-  const float ws2 = ReadF32Scalar(get(proj + ".weight_scale_2"));
+  const float ws2 = ReadF32Scalar(get, proj + ".weight_scale_2");
   VT_CHECK(ws2 != 0.0F, "qwen3_5 dense: zero weight_scale_2 for " + proj);
 
   Nvfp4Weight r;
@@ -387,27 +411,130 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   // fp4-activation GEMM; leaving alpha at 0 keeps the weight-only dispatcher.
   const bool w4a4_opt_in = ModelOptW4A4OptIn();
   if (w4a4_opt_in && has(proj + ".input_scale")) {
-    const float is = ReadF32Scalar(get(proj + ".input_scale"));
+    const float is = ReadF32Scalar(get, proj + ".input_scale");
     if (is != 0.0F) {
       r.input_global_scale_inv = is;
       r.alpha = r.scale2 * (1.0F / is);
     }
   }
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150), widened to the ModelOpt SPELLING by
+  // LOAD-MODELOPT-NVFP4-BORROW (issue #1647). Both payloads are verbatim, byte
+  // for byte identical to what `LoadCtNvfp4Raw` borrows twenty lines up: the
+  // same E2M1 nibbles and the same fp8-e4m3 group-16 scale, differing only in
+  // the tensor NAMES and in a scalar global-scale convention. Nothing about the
+  // ranges made this arm ineligible; it was simply never given the attempt.
+  //
+  // WHAT IT COST. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` declares
+  // `quant_method: "modelopt"`, so all 193 of its NVFP4 modules take this
+  // branch. Copying put ~21 GiB into ANONYMOUS heap where upstream holds
+  // reclaimable page cache (`weight_utils.py:969-974,1247` at the pin
+  // `5559679229bc961848b121ccdeaa8fa5d79bec98` streams a file-backed mmap into a
+  // device parameter allocated before any file is opened,
+  // `base_loader.py:52-58`). The expensive half is downstream:
+  // `AdoptDeviceBytesAsHost` is gated on
+  // `w.mmap_src != nullptr && w.bytes.borrowed()`, so `ResidentNvfp4`'s
+  // post-upload adoption -- which releases the consumed source pages and, on a
+  // host-addressable device, re-points `bytes` at the device allocation -- was a
+  // SILENT NO-OP for every weight loaded here. On GB10, where a device
+  // allocation IS host RAM, that is a packed host copy plus a packed device copy
+  // out of one 119 GiB pool, and the box reboots.
+  //
+  // The fallback below is unchanged and still runs whenever the borrow declines,
+  // which `BorrowStTensorBytes` does for a synthetic tensor, a size that does not
+  // line up, or `VT_LOAD_DIRECT_UPLOAD=0`. The lever can only cost residency,
+  // never correctness.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
+// MODEL-FP8-BLOCK-WEIGHT (#1189 M3), spec
+// `.agents/specs/model-fp8-block-weight.md`. Does this projection take the
+// block-wise (fine-grained 128x128) FP8 arm?
+//
+// READ THE CONFIG AND THE TENSORS, AND REFUSE WHEN THEY DISAGREE. A dtype probe
+// alone answers "which arm" and can never answer "do these two sources agree",
+// and the disagreement is where a silent wrong-scale bug lives: #1166 measured a
+// `[96, 40]` block grid passing a per-tensor scale reader's byte floor and being
+// applied to the whole `[N, K]` weight, stopped only by the tensor NAME. The
+// checkpoint's `modules_to_not_convert` is the other half -- 882 entries on
+// `Qwen/Qwen3.8-27B-FP8` @`017b9c7a`, 636 of them outside the vision tower --
+// which a probe reproduces only by accident (#1614; the "~400" this line
+// carried was wrong by more than 2.2x however the list is sliced).
+//
+// Six combinations, four of them refused by name; the table is in the spec.
+bool IsFp8BlockProjection(const TensorExists& has, const std::string& proj,
+                          const std::string& weight_dtype,
+                          const Fp8BlockQuantConfig& block) {
+  const bool has_scale_inv = has(proj + ".weight_scale_inv");
+  const bool excluded = block.ExcludesModule(proj);
+
+  if (!block.block_quant) {
+    VT_CHECK(!has_scale_inv,
+             "qwen3_5 dense: '" + proj +
+                 ".weight_scale_inv' is present, which is the block-wise "
+                 "(fine-grained) FP8 scale, but the checkpoint's "
+                 "quantization_config declares no weight_block_size. The "
+                 "tensors and the config disagree and there is no block "
+                 "geometry to read the scale with; refusing rather than "
+                 "guessing 128x128");
+    return false;
+  }
+
+  if (excluded) {
+    VT_CHECK(!has_scale_inv,
+             "qwen3_5 dense: '" + proj +
+                 "' is listed in quantization_config.modules_to_not_convert, "
+                 "so it must be unquantized, yet it ships '" + proj +
+                 ".weight_scale_inv'. The tensors and the config disagree; "
+                 "refusing rather than picking one of them");
+    return false;
+  }
+
+  if (weight_dtype == "F8_E4M3") {
+    VT_CHECK(has_scale_inv,
+             "qwen3_5 dense: the checkpoint declares "
+             "quantization_config.weight_block_size and '" +
+                 proj +
+                 ".weight' is F8_E4M3, but '" + proj +
+                 ".weight_scale_inv' is missing. Block-wise (fine-grained) FP8 "
+                 "stores its scale under that name and only that name "
+                 "(vllm fp8.py:378-379,511), so this projection cannot be "
+                 "dequantized. Either the module belongs in "
+                 "modules_to_not_convert or the shard is incomplete");
+  }
+  if (!has_scale_inv) return false;
+
+  // An `input_scale` cannot coexist with a dynamic activation scheme: upstream
+  // registers one only when `act_q_static` (`fp8.py:381-384`), which block quant
+  // asserts against outright (`fp8.py:367`). `Qwen/Qwen3.8-27B-FP8` ships zero.
+  VT_CHECK(!has(proj + ".input_scale"),
+           "qwen3_5 dense: '" + proj +
+               ".input_scale' is present beside a block-wise (fine-grained) "
+               "FP8 weight whose quantization_config declares "
+               "activation_scheme \"dynamic\". A dynamic scheme quantizes "
+               "activations at run time and has no static input scale; the "
+               "tensors and the config disagree");
+  return true;
+}
+
 GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
-                             const std::string& base) {
+                             const std::string& base,
+                             const Fp8BlockQuantConfig& block) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
@@ -423,7 +550,15 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   // decode and starves the KV pool. `ProjectGdnQkvz` already carries the
   // separate-fp8 arm the 35B runs and selects it when the merged owner is empty.
   const StTensor& qkv_probe = get(la + "in_proj_qkv.weight");
-  if (qkv_probe.dtype == "F8_E4M3") {
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): the block-wise rung goes BEFORE the
+  // per-tensor one at every site that probes `F8_E4M3`, because a block-wise
+  // weight IS `F8_E4M3` and fell into the per-tensor arm (#1166).
+  if (IsFp8BlockProjection(has, la + "in_proj_qkv", qkv_probe.dtype, block)) {
+    g.in_proj_qkv_fp8_block = dense_loaders::LoadFp8BlockRaw(
+        get, la + "in_proj_qkv", block.block_n, block.block_k);
+    g.in_proj_z_fp8_block = dense_loaders::LoadFp8BlockRaw(
+        get, la + "in_proj_z", block.block_n, block.block_k);
+  } else if (qkv_probe.dtype == "F8_E4M3") {
     g.in_proj_qkv_fp8 = LoadFp8RawShared(get, la + "in_proj_qkv");
     g.in_proj_z_fp8 = LoadFp8RawShared(get, la + "in_proj_z");
   } else {
@@ -436,6 +571,10 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   // torch-Linear BF16 [N,K].
   if (IsNvfp4Projection(has, la + "out_proj")) {
     g.out_proj_fp4 = LoadNvfp4AnyNaming(get, has, la + "out_proj");
+  } else if (IsFp8BlockProjection(has, la + "out_proj",
+                                  get(la + "out_proj.weight").dtype, block)) {
+    g.out_proj_fp8_block = dense_loaders::LoadFp8BlockRaw(
+        get, la + "out_proj", block.block_n, block.block_k);
   } else if (get(la + "out_proj.weight").dtype == "F8_E4M3") {
     // Same rule as the in_proj shards above, and for the same measured reason:
     // the bf16 arm dequantizes this tower and then runs it as a cuBLAS `gemvx`,
@@ -459,7 +598,8 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
 
 FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
                                    const TensorExists& has,
-                                   const std::string& base) {
+                                   const std::string& base,
+                                   const Fp8BlockQuantConfig& block) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
   // Three forms, not two. `modelopt_mixed` checkpoints quantize this tower to
@@ -469,20 +609,35 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
   // 1.562 GiB of FP8 became 3.12 GiB of BF16 re-read every decode step and
   // executed as cuBLAS `gemvx`. The `*_fp8` slots and their `MatmulFp8Cutlass*`
   // consumers already exist and are what the 35B runs.
+  // FOUR forms. MODEL-FP8-BLOCK-WEIGHT (#1189 M3) inserts the block-wise rung
+  // BEFORE the per-tensor one, because a block-wise weight is also `F8_E4M3`
+  // and therefore entered the per-tensor arm, which then asked for a
+  // `weight_scale` the checkpoint spells `weight_scale_inv` (#1166).
   const auto load_projection = [&](const std::string& name, Nvfp4Weight& fp4,
-                                   Fp8Weight& fp8, OwnedTensor& plain) {
+                                   Fp8BlockWeight& fp8_block, Fp8Weight& fp8,
+                                   OwnedTensor& plain) {
     if (IsNvfp4Projection(has, name)) {
       fp4 = LoadNvfp4AnyNaming(get, has, name);
-    } else if (get(name + ".weight").dtype == "F8_E4M3") {
+      return;
+    }
+    const std::string dtype = get(name + ".weight").dtype;
+    if (IsFp8BlockProjection(has, name, dtype, block)) {
+      fp8_block = dense_loaders::LoadFp8BlockRaw(get, name, block.block_n,
+                                                 block.block_k);
+    } else if (dtype == "F8_E4M3") {
       fp8 = LoadFp8RawShared(get, name);
     } else {
       plain = LoadBf16RawNK(get, name + ".weight");
     }
   };
-  load_projection(sa + "q_proj", a.q_proj_fp4, a.q_proj_fp8, a.q_proj);
-  load_projection(sa + "k_proj", a.k_proj_fp4, a.k_proj_fp8, a.k_proj);
-  load_projection(sa + "v_proj", a.v_proj_fp4, a.v_proj_fp8, a.v_proj);
-  load_projection(sa + "o_proj", a.o_proj_fp4, a.o_proj_fp8, a.o_proj);
+  load_projection(sa + "q_proj", a.q_proj_fp4, a.q_proj_fp8_block, a.q_proj_fp8,
+                  a.q_proj);
+  load_projection(sa + "k_proj", a.k_proj_fp4, a.k_proj_fp8_block, a.k_proj_fp8,
+                  a.k_proj);
+  load_projection(sa + "v_proj", a.v_proj_fp4, a.v_proj_fp8_block, a.v_proj_fp8,
+                  a.v_proj);
+  load_projection(sa + "o_proj", a.o_proj_fp4, a.o_proj_fp8_block, a.o_proj_fp8,
+                  a.o_proj);
   a.q_norm = LoadModelBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadModelBf16Direct(get, sa + "k_norm.weight");
   return a;
@@ -490,13 +645,27 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
 
 // Dense SwiGLU MLP: gate/up/down all W4A4-quantized -> fp4-resident (§5 6a).
 DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
-                             const std::string& base) {
+                             const std::string& base,
+                             const Fp8BlockQuantConfig& block) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights m;
   if (IsNvfp4Projection(has, mlp + "gate_proj")) {
     m.gate_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "gate_proj");
     m.up_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "up_proj");
     m.down_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "down_proj");
+  } else if (IsFp8BlockProjection(has, mlp + "gate_proj",
+                                  get(mlp + "gate_proj.weight").dtype, block)) {
+    // MODEL-FP8-BLOCK-WEIGHT (#1189 M3). This block had NO fp8 rung at all, so
+    // a block-wise MLP fell through to `LoadMergedBf16RawNK` and died on
+    // "expected BF16". Loaded UNMERGED: block scales concatenate losslessly
+    // along N, so merging gate+up is simpler here than in the per-tensor case
+    // and #1189 M6 owns it rather than this row guessing at the layout.
+    m.gate_proj_fp8_block = dense_loaders::LoadFp8BlockRaw(
+        get, mlp + "gate_proj", block.block_n, block.block_k);
+    m.up_proj_fp8_block = dense_loaders::LoadFp8BlockRaw(
+        get, mlp + "up_proj", block.block_n, block.block_k);
+    m.down_proj_fp8_block = dense_loaders::LoadFp8BlockRaw(
+        get, mlp + "down_proj", block.block_n, block.block_k);
   } else {
     m.gate_up_proj = dense_loaders::LoadMergedBf16RawNK(
         get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
@@ -512,6 +681,10 @@ bool DenseLmHeadFp4Enabled() {
   return v == nullptr || v[0] != '0';
 }
 
+bool DenseLmHeadTakesNvfp4(const TensorExists& has, const std::string& proj) {
+  return DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj);
+}
+
 void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out) {
@@ -521,7 +694,7 @@ void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
   // LoadNvfp4AnyNaming every other NVFP4 projection takes, so the ModelOpt vs
   // compressed-tensors global-scale convention is handled in exactly one place.
   // vLLM's mixed scheme likewise resolves a quantized head (modelopt.py:2491-2496).
-  if (DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj)) {
+  if (DenseLmHeadTakesNvfp4(has, proj)) {
     fp4_out = LoadNvfp4AnyNaming(get, has, proj);
     // The head is W4A16, whatever the naming. `LoadNvfp4AnyNaming` decides
     // activation-quant per SPELLING — the ModelOpt arm ignores `input_scale`
@@ -562,9 +735,26 @@ OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
 
 GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
                                     const std::string& layer_base) {
-  // Public focused-loader seam historically describes the 27B checkpoint.
-  const TensorExists has = [](const std::string&) { return true; };
-  return LoadGdnDense(get, has, layer_base);
+  // Public focused-loader seam historically describes the 27B checkpoint, which
+  // is NVFP4 and declares no `weight_block_size`, so the default-constructed
+  // block config here is the truthful one and the routing is unchanged.
+  //
+  // `has` ASKS THE RESOLVER (#1256). It used to answer `true` for every name,
+  // which was harmless while the only caller of `has` was a dtype probe that
+  // went on to `get` the tensor anyway and would throw on a name that was not
+  // there. M3's config/tensor cross-check made it harmful: it asks
+  // `has(proj + ".weight_scale_inv")` WITHOUT then fetching it, so a stub that
+  // says yes to everything reports a block-wise scale on a checkpoint that has
+  // none, and `IsFp8BlockProjection` refuses the disagreement it just invented.
+  // `TensorResolver` throws on a missing tensor, so probing it is the honest
+  // answer and the only one available at this seam.
+  //
+  // FIX-PROBE-CANNOT-SAY-NO (#1258): the `try`/`catch` this used to spell out
+  // now lives ONCE in `dense_loaders`, because the sibling seam below needs the
+  // identical probe and two copies of a subtle thing is the next defect.
+  const TensorExists has = dense_loaders::ProbeThroughResolver(get);
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5DenseGdn");
+  return LoadGdnDense(get, has, layer_base, Fp8BlockQuantConfig{});
 }
 
 bool IsQwen27QuantizedLinear(const std::string& name) {
@@ -605,7 +795,7 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
   const StTensor& wscale = get(proj + ".weight_scale");
   VT_CHECK(wscale.dtype == "F8_E4M3",
            "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
-  const float wgs_disk = ReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs_disk = ReadF32Scalar(get, proj + ".weight_global_scale");
 
   // Dequant to f32 [out, in] (the divisor is reciprocated inside), then round to
   // bf16 while transposing to Matmul-B layout [in, out].
@@ -624,12 +814,16 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
   return o;
 }
 
-Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
-                                               const TensorExists& has,
-                                               const std::string& layer_type,
-                                               int64_t layer_idx) {
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const TensorExists& has,
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix, const Fp8BlockQuantConfig& block) {
+  // FIX-PROBE-CANNOT-SAY-NO (#1258): every dense-layer path funnels through this
+  // overload, so one check here covers the production loader, both resolver-only
+  // seams, and whatever probe a caller supplies next.
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5DenseLayer");
   const std::string base =
-      "model.language_model.layers." + std::to_string(layer_idx) + ".";
+      backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5DenseLayerWeights layer;
   layer.input_layernorm =
       LoadModelBf16Direct(get, base + "input_layernorm.weight");
@@ -637,32 +831,59 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
       LoadModelBf16Direct(get, base + "post_attention_layernorm.weight");
   if (layer_type == "linear_attention") {
     layer.is_linear_attention = true;
-    layer.gdn = LoadGdnDense(get, has, base);
+    layer.gdn = LoadGdnDense(get, has, base, block);
   } else if (layer_type == "full_attention") {
     layer.is_linear_attention = false;
-    layer.attn = LoadAttnDense(get, has, base);
+    layer.attn = LoadAttnDense(get, has, base, block);
   } else {
     VT_CHECK(false, "qwen3_5 dense: unknown layer_type " + layer_type);
   }
-  layer.mlp = LoadDenseMlp(get, has, base);
+  layer.mlp = LoadDenseMlp(get, has, base, block);
   return layer;
 }
 
-Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
-                                               const std::string& layer_type,
-                                               int64_t layer_idx) {
-  // The public resolver-only seam is used by the compressed-tensors parity
-  // fixture, where every routed projection is NVFP4.
-  const TensorExists has = [](const std::string&) { return true; };
-  return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx);
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const TensorExists& has,
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix) {
+  return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx, backbone_prefix,
+                               Fp8BlockQuantConfig{});
+}
+
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix) {
+  // FIX-PROBE-CANNOT-SAY-NO (#1258). This was the SECOND always-true stub named
+  // by #1256; #1257 fixed only the sibling above. It was not latent: the
+  // `qwen36_gdn_layer_27b` isolated-layer golden replays through THIS overload
+  // (`tests/parity/test_op_parity.cpp`) with `layer_type == "linear_attention"`,
+  // which routes to `LoadGdnDense`, whose first act is the
+  // `IsFp8BlockProjection` cross-check a constant `true` lies to. That leg is
+  // SKIPped without the pinned 27B snapshot, which is why no CPU lane saw it.
+  //
+  // The compressed-tensors parity fixture this seam was written for really does
+  // carry `weight_packed` on every routed projection, so a truthful probe leaves
+  // its routing where it was and merely stops inventing the tensors it lacks.
+  const TensorExists has = dense_loaders::ProbeThroughResolver(get);
+  return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx,
+                               backbone_prefix);
 }
 
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config,
                                      vt::Queue* load_queue) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
-  for (const SafetensorsFile& shard : shards)
-    for (const std::string& name : shard.Names()) where[name] = &shard;
+  std::vector<std::string> all_names;
+  for (const SafetensorsFile& shard : shards) {
+    for (const std::string& name : shard.Names()) {
+      where[name] = &shard;
+      all_names.push_back(name);
+    }
+  }
+  // ONE namespace decision for the whole checkpoint (qwen3_5_weights.h): the
+  // VL-nested spelling for the wrappers we gate, the flat `model.` spelling for
+  // a text-only arm, and a refusal for a mixed index.
+  const std::string backbone = ResolveQwen3_5BackbonePrefix(all_names);
   const TensorResolver get =
       [&where](const std::string& name) -> const StTensor& {
     auto it = where.find(name);
@@ -672,17 +893,87 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   const TensorExists has = [&where](const std::string& name) {
     return where.find(name) != where.end();
   };
+  // FIX-PROBE-CANNOT-SAY-NO (#1258). Truthful by construction today; checked
+  // anyway, because the guard's value is that it does not depend on how the
+  // probe was built — a name index filled from the wrong shard list fails here
+  // too.
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5Dense");
 
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
                    config.num_hidden_layers,
            "qwen3_5 dense: layer_types size must equal num_hidden_layers");
 
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): ONE read of the quantization config for
+  // the whole checkpoint, validated here rather than per projection. It carries
+  // the block geometry the rung needs and the `modules_to_not_convert` list the
+  // rung cross-checks against, which a per-tensor dtype probe cannot supply.
+  // Default-constructed (`block_quant == false`) on every non-block checkpoint,
+  // which leaves the routing below byte-identical to before this row.
+  const Fp8BlockQuantConfig block = ReadFp8BlockQuantConfig(config);
+
+  // QUANT-QWEN38-27B-NVFP4-ARM (#821). The SECOND whole-checkpoint read of the
+  // quantization config, for the compressed-tensors spelling this file's
+  // per-projection dtype probe cannot resolve.
+  //
+  // `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d...` declares
+  // `format: "mixed-precision"`: layers 0-55's MLP is NVFP4 W4A4 and layers
+  // 56-63's MLP is FP8 W8A8, under the SAME module names. Which arm a
+  // projection takes is a REGEX OVER LAYER INDICES in `config_groups`, so no
+  // dtype probe can recover it — and its FP8 group ships a PER-OUTPUT-CHANNEL
+  // BF16 `weight_scale` with DYNAMIC per-token activations, which this file's
+  // `LoadFp8Raw` rung cannot represent. Before this call the loader entered the
+  // per-tensor arm anyway and died on `tensor not found:
+  // ...in_proj_qkv.input_scale`, a sentence about a checkpoint that is
+  // complete: the artifact ships ZERO `*.input_scale` because its activation
+  // scheme is dynamic, exactly as its config says.
+  //
+  // Empty on every checkpoint that is not compressed-tensors, and on every
+  // compressed-tensors checkpoint whose groups this build can execute, so every
+  // arm that loaded before this row still loads byte-identically.
+  const std::string ct_refusal =
+      layers::compressed_tensors::RefusalForHfConfigRaw(config.raw, all_names);
+  VT_CHECK(ct_refusal.empty(), "qwen3_5 dense: " + ct_refusal);
+
+  // QUANT-QWEN38-27B-NVFP4-ARM W5 (#821, campaign #1574). The THIRD
+  // whole-checkpoint read, for the OTHER `mixed-precision` spelling: ModelOpt's.
+  //
+  // Two 27B artifacts in this family declare `quant_method: "modelopt"`,
+  // `quant_algo: "MIXED_PRECISION"` and a `quantized_layers` map of exact
+  // module names — `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160`, which this tree has
+  // loaded and measured since #466, and `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`
+  // @ `36f717a2`. Both split 401 Linears into 208 per-tensor STATIC FP8 and 193
+  // W4A16_NVFP4 group_size 16. Neither is compressed-tensors, so the read above
+  // stops at `quant_method` and answers "" for both, and until this call
+  // NOTHING in this tree read either config: every routing decision for them
+  // was made by probing which tensor NAMES are present.
+  //
+  // That probe cannot be wrong about the bytes and it can be wrong about the
+  // CHECKPOINT, in both directions. A module the producer declared FP8 that
+  // ships an NVFP4 spelling takes the NVFP4 arm; a module declared unquantized
+  // that ships scales takes a quantized arm. Both load, both produce plausible
+  // numbers, and both match tokens while moving the wrong bytes — the one
+  // defect class `AGENTS.md` §"Inherit vLLM defaults" says a token gate cannot
+  // see. So the declaration is CROSS-CHECKED against the shipped spelling and a
+  // disagreement is refused by name.
+  //
+  // This CHECKS the probe rather than replacing it: no checkpoint whose config
+  // and tensors agree takes a different arm than it did before this line, and
+  // every non-ModelOpt checkpoint answers "" without reading anything. Routing
+  // by the declared algorithm instead of by the probe is a larger change that
+  // would move a gate model's arm; it is listed under `## Owed` in
+  // `.agents/specs/qwen38-27b-quant-arms.md` and tracked by its own issue.
+  const nlohmann::json* quant =
+      layers::compressed_tensors::QuantizationConfigOf(config.raw);
+  if (quant != nullptr) {
+    const std::string modelopt_refusal =
+        layers::modelopt::RefusalForQuantizationConfig(*quant, all_names);
+    VT_CHECK(modelopt_refusal.empty(), "qwen3_5 dense: " + modelopt_refusal);
+  }
+
   Qwen3_5DenseWeights w;
-  w.embed_tokens =
-      LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
-  w.final_norm =
-      LoadModelBf16Direct(get, "model.language_model.norm.weight");
+  w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
+  w.final_norm = LoadModelBf16Direct(get, backbone + "norm.weight");
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
   // the embedding table and omit lm_head.weight.
   if (DenseCheckpointHasLmHead(has, "lm_head")) {
@@ -695,13 +986,59 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   bool direct_device = DirectDeviceLoadEligible(load_queue);
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
-        get, has, config.layer_types[static_cast<size_t>(l)], l));
+        get, has, config.layer_types[static_cast<size_t>(l)], l, backbone,
+        block));
     if (direct_device) {
       direct_device = IsPlainBf16Qwen3_5Dense(w);
       if (direct_device) StageAndReleaseLoadedDense(w, *load_queue);
     }
   }
   return w;
+}
+
+// MODEL-FP8-BLOCK-LINEAR (#1189 M4), the M4/M5 seam, narrowing the M3/M4 one.
+//
+// M3 refused every LOADED block weight, because the dense forward knew only
+// fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
+// through to an EMPTY bf16 tensor. The forward reads all ten projections now,
+// through THREE entry points rather than one:
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them,
+// `MatmulFp8BlockMergedD` reads q/k/v as one operand, and
+// `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj` and `up_proj`. So
+// what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
+// mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
+// this now fires for a CUDA arch outside that cell. It stays inert on CPU,
+// where `vt::MatmulFp8BlockScaled` is registered as a correctness reference.
+// This runs from `PrepareQwen3_5Dense`, i.e.
+// `ModelRegistry::Prepare`, which every runner calls unconditionally before the
+// first forward and before any graph capture
+// (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a
+// capture rather than inside the first GEMM. M5 NARROWED this rather than
+// deleting it: an arch outside the CUTLASS cell must still be refused by name.
+void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
+                                          vt::DeviceType device) {
+  if (dense_fp8_block::BlockFp8Runnable(device)) return;
+  for (size_t l = 0; l < weights.layers.size(); ++l) {
+    const Qwen3_5DenseLayerWeights& layer = weights.layers[l];
+    const std::string base = "model.layers." + std::to_string(l) + ".";
+    const auto check = [&base, device](const Fp8BlockWeight& w,
+                                       const std::string& suffix) {
+      if (!w.Empty()) RefuseUnrunnableFp8BlockWeight(base + suffix, device);
+    };
+    if (layer.is_linear_attention) {
+      check(layer.gdn.in_proj_qkv_fp8_block, "linear_attn.in_proj_qkv");
+      check(layer.gdn.in_proj_z_fp8_block, "linear_attn.in_proj_z");
+      check(layer.gdn.out_proj_fp8_block, "linear_attn.out_proj");
+    } else {
+      check(layer.attn.q_proj_fp8_block, "self_attn.q_proj");
+      check(layer.attn.k_proj_fp8_block, "self_attn.k_proj");
+      check(layer.attn.v_proj_fp8_block, "self_attn.v_proj");
+      check(layer.attn.o_proj_fp8_block, "self_attn.o_proj");
+    }
+    check(layer.mlp.gate_proj_fp8_block, "mlp.gate_proj");
+    check(layer.mlp.up_proj_fp8_block, "mlp.up_proj");
+    check(layer.mlp.down_proj_fp8_block, "mlp.down_proj");
+  }
 }
 
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
@@ -713,14 +1050,29 @@ bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
         !layer.mlp.down_proj_fp4.Empty()) {
       return false;
     }
+    // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): a block-wise FP8 projection is not
+    // plain bf16 either, and the direct-device staging path only knows how to
+    // stage OwnedTensors.
+    if (!layer.mlp.gate_proj_fp8_block.Empty() ||
+        !layer.mlp.up_proj_fp8_block.Empty() ||
+        !layer.mlp.down_proj_fp8_block.Empty()) {
+      return false;
+    }
     if (layer.is_linear_attention) {
       if (!layer.gdn.out_proj_fp4.Empty() ||
           !layer.gdn.in_proj_qkv_fp8.Empty() ||
           !layer.gdn.in_proj_z_fp8.Empty() ||
-          !layer.gdn.out_proj_fp8.Empty()) {
+          !layer.gdn.out_proj_fp8.Empty() ||
+          !layer.gdn.in_proj_qkv_fp8_block.Empty() ||
+          !layer.gdn.in_proj_z_fp8_block.Empty() ||
+          !layer.gdn.out_proj_fp8_block.Empty()) {
         return false;
       }
-    } else if (!layer.attn.q_proj_fp4.Empty() ||
+    } else if (!layer.attn.q_proj_fp8_block.Empty() ||
+               !layer.attn.k_proj_fp8_block.Empty() ||
+               !layer.attn.v_proj_fp8_block.Empty() ||
+               !layer.attn.o_proj_fp8_block.Empty() ||
+               !layer.attn.q_proj_fp4.Empty() ||
                !layer.attn.k_proj_fp4.Empty() ||
                !layer.attn.v_proj_fp4.Empty() ||
                !layer.attn.o_proj_fp4.Empty() ||
@@ -738,7 +1090,36 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     Qwen3_5DenseWeights& weights) {
   size_t released = 0;
   const auto release = [&released](OwnedTensor& tensor) {
-    if (tensor.HasHostBytes() && (tensor.d_dev || tensor.d_dev_f32)) {
+    // `HostMirrorIsRedundant`, NOT `d_dev || d_dev_f32` (the second instance of
+    // the use-after-free W0f introduced; #1299).
+    //
+    // `d_dev_f32` is a bf16->f32 UPCAST into a separate device allocation. It is
+    // not a copy of these bytes and it can never stand in for them, so it never
+    // made a host mirror redundant — it only looked like it did while every
+    // weight that had one also had a `d_dev`. On the aliasing arm that stopped
+    // being true: `PrepareBf16Resident` passes exactly four weights to BOTH
+    // `raw()` and `f32()` — `gdn.conv1d_weight`, `gdn.norm_weight`,
+    // `attn.q_norm`, `attn.k_norm` — and there `raw()` ALIASES (leaving `d_dev`
+    // null) while `f32()` allocates (setting `d_dev_f32`). The disjunction then
+    // passes and frees the very bytes the aliased raw tensor points at.
+    //
+    // NOTHING REACHES THAT COMBINATION, AND SINCE #1647 THE INVARIANT IS THE
+    // ONLY REASON. This paragraph used to name a second one:
+    // `DirectDeviceLoadEligible` also required `!platform.is_unified_memory()`,
+    // and on CUDA `is_unified_memory()` and `host_memory_is_device_addressable()`
+    // are the SAME `pageable && integrated` conjunction, computed independently
+    // in `src/vt/cuda/cuda_backend.cu` and `src/vllm/platforms/cuda.cpp`. That
+    // equality was an accident — no rule states it, no document records it and
+    // no gate holds it — and the sentence written here said so and concluded
+    // that asking the invariant instead of a proxy costs nothing. #1647 removed
+    // the accident, because `is_unified_memory()` was switching the whole
+    // stage-and-release lane off on the one device that needs it. What is left
+    // is the invariant itself, doing the work it was already doing: on the
+    // aliasing arm `ResidentWeight` leaves `d_dev` null, so `HostMirrorIsRedundant`
+    // answers false and an aliased weight is never released. The `d_dev_f32`
+    // disjunct stays deleted, and it stays redundant on the staging arm, where
+    // every weight with a `d_dev_f32` has a `d_dev` too.
+    if (tensor.HasHostBytes() && HostMirrorIsRedundant(tensor)) {
       released += tensor.bytes.size();
       tensor.ReleaseHost();
     }

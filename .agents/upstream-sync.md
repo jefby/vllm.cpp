@@ -12,6 +12,59 @@ zero real golden drift (27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder
 byte-stable) and unblocked DFlash (vllm#40898), Gemma-4 (`transformers.gemma4`),
 and OLMo-3 (nested rope); a `vllm-oracle-v0.25.0-stage` rollback is preserved.
 
+**The pin, as a running oracle reports itself.** The paragraph above names the
+release; the block below carries the exact strings a runtime identity check can
+compare, measured 2026-08-12 from `~/venvs/vllm-oracle-next` on dgx. They are not
+derivable from the release number — the oracle reports
+`0.23.1rc1.dev1511+g555967922`, not `0.26.0.dev0`, and its distribution metadata
+adds a `.precompiled` suffix its runtime string lacks. `tools/bench/` reads this
+block rather than duplicating it (#520); the duplicate drifted once, and the
+harness spent 17 days *refusing* the oracle this record required. Advance it only
+as part of a sync cycle, from a measured oracle, never by transcribing a version
+number.
+
+```parity-pin
+vllm_commit = 5559679229bc961848b121ccdeaa8fa5d79bec98
+vllm_runtime_version = 0.23.1rc1.dev1511+g555967922
+vllm_distribution_version = 0.23.1rc1.dev1511+g555967922.precompiled
+flashinfer_version = 0.6.15.post1
+```
+
+**`vllm_runtime_version` must carry a `+g<sha>` segment naming `vllm_commit`.**
+That is a permanent constraint of this design, not a property of today's values:
+`assert_oracle_commit` extracts the segment and requires it to prefix
+`vllm_commit`. A released-wheel shape (`0.26.0`, no local version segment) is
+therefore unusable — set the block to one and the harness refuses every oracle
+including the pin itself; measured 2026-08-12, 34 of the 233 `tests/tools` cases
+go red. Fail-closed and CI-caught rather than silent, but it means a pin advance
+is taken from a source build's measured `vllm.__version__`, never transcribed
+from a release number. If a future pin is genuinely a released wheel, give the
+commit its own asserted field first; do not delete the assertion to make the
+block parse.
+
+**One measured source build does NOT match the full `vllm_runtime_version`
+string, and the discrepancy is OPEN.** A build of this pin inside an `rc` lease
+on `dgx:gpu0`, 2026-08-18, reports `vllm.__version__ = 0.1.dev1+g555967922`
+against the `0.23.1rc1.dev1511+g555967922` recorded above
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+[`specs/oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md)). The binding
+constraint holds, because the `+g<sha>` segment names `vllm_commit`. The cause of
+the prefix difference is the shallow fetch that build used: `setuptools_scm`
+cannot count the commits since the last tag and falls back to a default. A gate
+that compares the FULL string needs either a deeper fetch or an explicit
+pretend-version carrying that reason. Do NOT edit the block above to match a
+build. The block records the pin, and a shallow clone is a property of one job.
+
+**vLLM-Omni's pin does NOT live here.** It is a separate repository, and under
+AGENTS.md §"When vLLM has no implementation" every oracle carries its own file:
+[`.agents/oracles/vllm-omni.md`](oracles/vllm-omni.md), whose `oracle-pin` block
+is the one place its revision is recorded. Do not add a second pin block to this
+file; one file per oracle, read by glob, is what keeps a pin from becoming a
+surface every change has to write. What belongs HERE is only the part that is
+about the relationship between the two, which the oracle file cannot state on its
+own: see the omni rules under §Rules, and
+[specs/upstream-omni-pin.md](specs/upstream-omni-pin.md) (#633) for why they hold.
+
 **Prior cycle (2026-07-12):** audited target v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
 `e24d1b24..702f481` delta was classified (94 `INVENTORY`, 51 `IGNORE`, no
@@ -38,6 +91,10 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
   against. Gaps vs it are normal and tracked in the inventory, not hidden.
 - **Parity pin (post-MVP)** — one repo-wide vLLM commit. "We have feature X"
   always means "X as of the pin". Never compare against a moving target.
+- **Omni parity pin** — the same idea for `vllm-project/vllm-omni`, recorded in
+  [`.agents/oracles/vllm-omni.md`](oracles/vllm-omni.md), not here. It is a
+  second pin rather than a second value of this one: it names the vLLM commit
+  *it* ran against, which need not be ours.
 - **Per-file pins** — every ported file's header records the upstream path +
   the upstream commit it matches. Normally equal to the parity pin; a file may
   be temporarily ahead (hot-fix port) but never behind without a ledger note.
@@ -86,6 +143,14 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
 ## Rules
 
 - Ledger and inventory updates are part of the cycle, not optional follow-ups.
+- An omni-gated number is labeled with BOTH commits and is never cited in a
+  vLLM-side parity claim, a binding grid, or a `docs/BENCHMARKS.md` row owned by
+  a core-pinned row.
+- Advancing the omni pin does not re-open the vLLM-side binding grids PROVIDED
+  the omni oracle is installed in its own virtualenv and touches neither
+  `${VLLM_SOURCE}` nor the environment the core pin measures itself from. If that
+  isolation does not hold, the advance is a core sync cycle and is re-validated
+  as one — the dependency tree under the denominator moved.
 - Never mix a sync cycle with feature work in the same commit.
 - If an upstream change conflicts with a recorded deviation (inventory §9),
   the deviation doc gets updated in the same cycle — deviations must always

@@ -224,6 +224,38 @@ bool MaybeInstallReferenceTier(OpId op, DeviceType device) {
   return true;
 }
 
+// Why the portable CPU reference tier did not answer for (op, device). Called
+// only on the refusal path, so it may take the slow, readable route. The clauses
+// name the tier's preconditions in the order MaybeInstallReferenceTier and
+// ReferenceTierEligible test them; the last one asks OpRegistered on the CPU
+// slot rather than repeating that function's Choose call, which is the same
+// question for the CPU device, where no reference provider ever exists.
+std::string ReferenceTierRefusalReason(OpId op, DeviceType device) {
+  if (device == DeviceType::kCPU) {
+    return "the portable CPU reference tier is the SOURCE of that kernel, not a "
+           "fallback for it";
+  }
+  Backend* b = TryGetBackend(device);
+  if (b == nullptr) {
+    return "no backend is registered for that device in this build, so the "
+           "portable CPU reference tier has nothing to install onto";
+  }
+  if (!b->DeviceMemoryIsHostAddressable()) {
+    return std::string("the portable CPU reference tier is NOT eligible: this "
+                       "backend does not report its device memory "
+                       "host-addressable, so a host kernel may not dereference "
+                       "what it allocated (unified memory is ") +
+           (b->UnifiedMemory() ? "true" : "false") +
+           ", which is a DIFFERENT property). Build a native kernel for this op "
+           "or run it on the CPU device";
+  }
+  if (!OpRegistered(op, DeviceType::kCPU)) {
+    return "the portable CPU reference tier is eligible but has no CPU kernel "
+           "for this op to install";
+  }
+  return "the portable CPU reference tier declined it";
+}
+
 void Announce(OpId op, DeviceType device, Slot& slot, const OpProvider* chosen,
               const ProviderCaps& caps) {
   if (!AnnounceEnabled()) return;
@@ -235,6 +267,278 @@ void Announce(OpId op, DeviceType device, Slot& slot, const OpProvider* chosen,
                chosen != nullptr ? chosen->name : "<none>",
                chosen != nullptr ? chosen->priority : 0, slot.count, caps.compute_major,
                caps.compute_minor, caps.valid ? "valid" : "unprobed");
+}
+
+// The canonical spelling of an op, for user-facing messages. Mirrors
+// DeviceTypeName (include/vt/device.h): a data list, not a device-specific
+// branch. The switch is deliberately EXHAUSTIVE and carries no `default` — with
+// -Wall -Werror, appending an OpId without naming it fails the build, which is
+// what keeps this from drifting behind the enum.
+const char* OpNameImpl(OpId op) {
+  switch (op) {
+    case OpId::kMatmul:
+      return "Matmul";
+    case OpId::kRmsNorm:
+      return "RmsNorm";
+    case OpId::kSiluAndMul:
+      return "SiluAndMul";
+    case OpId::kRopeNeox:
+      return "RopeNeox";
+    case OpId::kEmbedding:
+      return "Embedding";
+    case OpId::kCausalConv1dFwd:
+      return "CausalConv1dFwd";
+    case OpId::kCausalConv1dUpdate:
+      return "CausalConv1dUpdate";
+    case OpId::kCausalConv1dSpecUpdate:
+      return "CausalConv1dSpecUpdate";
+    case OpId::kL2Norm:
+      return "L2Norm";
+    case OpId::kRmsNormGated:
+      return "RmsNormGated";
+    case OpId::kGdnPrefill:
+      return "GdnPrefill";
+    case OpId::kGdnDecode:
+      return "GdnDecode";
+    case OpId::kGdnSpecDecode:
+      return "GdnSpecDecode";
+    case OpId::kGdnPackedDecode:
+      return "GdnPackedDecode";
+    case OpId::kKdaGatedDeltaRule:
+      return "KdaGatedDeltaRule";
+    case OpId::kKdaChunkPrefill:
+      return "KdaChunkPrefill";
+    case OpId::kMoeRouterTopK:
+      return "MoeRouterTopK";
+    case OpId::kMoeCombine:
+      return "MoeCombine";
+    case OpId::kAttention:
+      return "Attention";
+    case OpId::kAttentionCross:
+      return "AttentionCross";
+    case OpId::kAttentionDenseFast:
+      return "AttentionDenseFast";
+    case OpId::kAttentionDenseFlash:
+      return "AttentionDenseFlash";
+    case OpId::kDFlashBlockAttention:
+      return "DFlashBlockAttention";
+    case OpId::kDFlashPagedBlockAttention:
+      return "DFlashPagedBlockAttention";
+    case OpId::kDFlashGroupedConv:
+      return "DFlashGroupedConv";
+    case OpId::kDflash2SelectorEdges:
+      return "Dflash2SelectorEdges";
+    case OpId::kDflash2PathWalk:
+      return "Dflash2PathWalk";
+    case OpId::kTopKValuesIndices:
+      return "TopKValuesIndices";
+    case OpId::kReshapeAndCache:
+      return "ReshapeAndCache";
+    case OpId::kConcatAndCacheMla:
+      return "ConcatAndCacheMla";
+    case OpId::kMlaDecodeAttention:
+      return "MlaDecodeAttention";
+    case OpId::kMlaPrefillAttention:
+      return "MlaPrefillAttention";
+    case OpId::kGatherMlaCache:
+      return "GatherMlaCache";
+    case OpId::kMergeAttnStates:
+      return "MergeAttnStates";
+    case OpId::kPagedAttention:
+      return "PagedAttention";
+    case OpId::kApplyTemperature:
+      return "ApplyTemperature";
+    case OpId::kGreedyArgmax:
+      return "GreedyArgmax";
+    case OpId::kApplyTopKTopP:
+      return "ApplyTopKTopP";
+    case OpId::kComputeProbs:
+      return "ComputeProbs";
+    case OpId::kComputeLogprobs:
+      return "ComputeLogprobs";
+    case OpId::kRandomSample:
+      return "RandomSample";
+    case OpId::kApplyPenalties:
+      return "ApplyPenalties";
+    case OpId::kApplyMinP:
+      return "ApplyMinP";
+    case OpId::kApplyLogitBias:
+      return "ApplyLogitBias";
+    case OpId::kApplyTokenMask:
+      return "ApplyTokenMask";
+    case OpId::kApplyAllowedTokenIds:
+      return "ApplyAllowedTokenIds";
+    case OpId::kMatmulNvfp4:
+      return "MatmulNvfp4";
+    case OpId::kScaledFp4Quant:
+      return "ScaledFp4Quant";
+    case OpId::kSiluMulFp4Quant:
+      return "SiluMulFp4Quant";
+    case OpId::kSiluAndMulFp4Quant:
+      return "SiluAndMulFp4Quant";
+    case OpId::kSigmoidGateFp4Quant:
+      return "SigmoidGateFp4Quant";
+    case OpId::kMatmulNvfp4Fp4:
+      return "MatmulNvfp4Fp4";
+    case OpId::kMatmulNvfp4Cutlass:
+      return "MatmulNvfp4Cutlass";
+    case OpId::kMatmulFp8Cutlass:
+      return "MatmulFp8Cutlass";
+    case OpId::kMatmulFp8CublasLt:
+      return "MatmulFp8CublasLt";
+    case OpId::kQuantFp8Static:
+      return "QuantFp8Static";
+    case OpId::kSwizzleBlockscale:
+      return "SwizzleBlockscale";
+    case OpId::kMoeGroupedGemmNvfp4:
+      return "MoeGroupedGemmNvfp4";
+    case OpId::kMoeSiluMul:
+      return "MoeSiluMul";
+    case OpId::kMoeRelu2:
+      return "MoeRelu2";
+    case OpId::kCastBf16:
+      return "CastBf16";
+    case OpId::kCastF32:
+      return "CastF32";
+    case OpId::kMulColVecF32:
+      return "MulColVecF32";
+    case OpId::kAttnGateSplit:
+      return "AttnGateSplit";
+    case OpId::kSigmoidGateBf16:
+      return "SigmoidGateBf16";
+    case OpId::kGdnGBeta:
+      return "GdnGBeta";
+    case OpId::kGdnConvSplit:
+      return "GdnConvSplit";
+    case OpId::kQkvSplit:
+      return "QkvSplit";
+    case OpId::kSharedExpertGate:
+      return "SharedExpertGate";
+    case OpId::kMoeCombineGate:
+      return "MoeCombineGate";
+    case OpId::kMoeGroupedGemmNvfp4Marlin:
+      return "MoeGroupedGemmNvfp4Marlin";
+    case OpId::kGdnPostConv:
+      return "GdnPostConv";
+    case OpId::kRopeCosSinCache:
+      return "RopeCosSinCache";
+    case OpId::kAttnQkNormRopeGate:
+      return "AttnQkNormRopeGate";
+    case OpId::kAttnQkNormRope:
+      return "AttnQkNormRope";
+    case OpId::kFusedChain:
+      return "FusedChain";
+    case OpId::kRmsNormQuantFp8:
+      return "RmsNormQuantFp8";
+    case OpId::kRmsNormGatedQuantFp8:
+      return "RmsNormGatedQuantFp8";
+    case OpId::kMatmulBT:
+      return "MatmulBT";
+    case OpId::kMatmulBTQuant:
+      return "MatmulBTQuant";
+    case OpId::kMatmulBTQuantGrouped:
+      return "MatmulBTQuantGrouped";
+    case OpId::kDropinProbe:
+      return "DropinProbe";
+    case OpId::kRopeFromCache:
+      return "RopeFromCache";
+    case OpId::kGdnStateGather:
+      return "GdnStateGather";
+    case OpId::kGdnStateScatter:
+      return "GdnStateScatter";
+    case OpId::kIndexSelect:
+      return "IndexSelect";
+    case OpId::kIndexCopy:
+      return "IndexCopy";
+    case OpId::kMoeGroupedGemmBf16:
+      return "MoeGroupedGemmBf16";
+    case OpId::kLayerNorm:
+      return "LayerNorm";
+    case OpId::kRelu:
+      return "Relu";
+    case OpId::kGeluTanh:
+      return "GeluTanh";
+    case OpId::kGeluErf:
+      return "GeluErf";
+    case OpId::kAdd:
+      return "Add";
+    case OpId::kBatchedMatmul:
+      return "BatchedMatmul";
+    case OpId::kConcatMlaNopeRope:
+      return "ConcatMlaNopeRope";
+    case OpId::kGeluAndMul:
+      return "GeluAndMul";
+    case OpId::kMulScalar:
+      return "MulScalar";
+    case OpId::kSoftCap:
+      return "SoftCap";
+    case OpId::kGreedyRejectionSample:
+      return "GreedyRejectionSample";
+    case OpId::kAllReduce:
+      return "AllReduce";
+    case OpId::kAllGather:
+      return "AllGather";
+    case OpId::kSend:
+      return "Send";
+    case OpId::kRecv:
+      return "Recv";
+    case OpId::kDeepseekV4Mhc:
+      return "DeepseekV4Mhc";
+    case OpId::kDeepseekV4Dsa:
+      return "DeepseekV4Dsa";
+    case OpId::kDeepseekV4Compressor:
+      return "DeepseekV4Compressor";
+    case OpId::kDeepseekV4Moe:
+      return "DeepseekV4Moe";
+    case OpId::kReshapeAndCacheFp8:
+      return "ReshapeAndCacheFp8";
+    case OpId::kMoeGateUpSwiGLUGrouped:
+      return "MoeGateUpSwiGLUGrouped";
+    case OpId::kFusedNormRope:
+      return "FusedNormRope";
+    case OpId::kMoeGroupedGemmBf16GateUpSilu:
+      return "MoeGroupedGemmBf16GateUpSilu";
+    case OpId::kLaguna:
+      return "Laguna";
+    case OpId::kMarlinDenseGemm:
+      return "MarlinDenseGemm";
+    case OpId::kMiniMaxH3:
+      return "MiniMaxH3";
+    // Absorbed from origin/main, named in enum order. This exhaustive switch IS
+    // the drift guard (0541cbeaa), and it carries no `default`, so merging main
+    // is precisely when it is supposed to fire.
+    case OpId::kAttentionDenseFa2:
+      return "AttentionDenseFa2";
+    case OpId::kMatmulFp8CublasLtAlphaVec:
+      return "MatmulFp8CublasLtAlphaVec";
+    case OpId::kMamba2ChunkScan:
+      return "Mamba2ChunkScan";
+    case OpId::kMamba2StateUpdate:
+      return "Mamba2StateUpdate";
+    case OpId::kRmsNormGatedGroup:
+      return "RmsNormGatedGroup";
+    case OpId::kLtx2:
+      return "Ltx2";
+    case OpId::kConv2d:
+      return "Conv2d";
+    case OpId::kDepthwiseConv1d:
+      return "DepthwiseConv1d";
+    case OpId::kConv1d:
+      return "Conv1d";
+    case OpId::kConvTranspose1d:
+      return "ConvTranspose1d";
+    case OpId::kAttentionRelPos:
+      return "AttentionRelPos";
+    case OpId::kQuantFp8Group:
+      return "QuantFp8Group";
+    case OpId::kMatmulFp8BlockScaled:
+      return "MatmulFp8BlockScaled";
+    case OpId::kConv3d:
+      return "Conv3d";
+    case OpId::kCount:
+      break;
+  }
+  return "unknown";
 }
 
 void* Resolve(OpId op, DeviceType device, Slot& slot) {
@@ -251,9 +555,16 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
   if (chosen == nullptr) {
     slot.fallbacks.fetch_add(1, std::memory_order_relaxed);
     slot.resolved_none.store(true, std::memory_order_relaxed);
-    VT_CHECK(false, std::string("no kernel for op ") +
-                        std::to_string(static_cast<int>(op)) + " on device type " +
-                        std::to_string(static_cast<int>(device)));
+    // Refuse BY NAME. The integers stay for grep-ability, but a reader must not
+    // have to count enumerators in include/vt/ops.h to learn what was refused —
+    // nor open this file to learn that a portable fallback exists and was
+    // withheld. The trailing clause says which of the tier's preconditions the
+    // device failed, which is the sentence #844 asked for.
+    VT_CHECK(false, std::string("no kernel for op ") + OpNameImpl(op) + " (id " +
+                        std::to_string(static_cast<int>(op)) + ") on device " +
+                        DeviceTypeName(device) + " (type " +
+                        std::to_string(static_cast<int>(device)) + "), and " +
+                        ReferenceTierRefusalReason(op, device));
     return nullptr;
   }
   // Reference-tier accounting: count it, and warn LOUDLY exactly once per
@@ -262,10 +573,18 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
     slot.ref_selected.store(true, std::memory_order_relaxed);
     RefTierHits().fetch_add(1, std::memory_order_relaxed);
     if (!slot.ref_announced.exchange(true, std::memory_order_relaxed)) {
+      // NOT "correct but slow". Those three words asserted a property instead of
+      // naming it, and #844 / docs/USAGE.md both quote them as what misled a
+      // reader past a SIGSEGV. What makes this dispatch valid is one checkable
+      // fact — the backend reports its device memory host-addressable — so the
+      // line states that fact and lets the reader verify it.
       std::fprintf(stderr,
-                   "[vt reference-tier] op=%d device=%d has NO native kernel; "
-                   "running the PORTABLE CPU fallback (correct but slow)\n",
-                   static_cast<int>(op), static_cast<int>(device));
+                   "[vt reference-tier] op=%s device=%s has NO native kernel; "
+                   "running the PORTABLE CPU host kernel, which this backend "
+                   "permits because it reports its device memory "
+                   "host-addressable. It is SLOW: this run is not a performance "
+                   "measurement\n",
+                   OpNameImpl(op), DeviceTypeName(device));
     }
   }
   slot.last_selected.store(chosen->name, std::memory_order_relaxed);
@@ -341,6 +660,8 @@ void RegisterOp(OpId op, DeviceType device, void* fn) {
   RegisterOpProvider(op, device, p);
 }
 
+const char* OpName(OpId op) { return OpNameImpl(op); }
+
 void* GetOp(OpId op, DeviceType device) {
   Slot& slot = At(op, device);
   void* fn = slot.selected.load(std::memory_order_relaxed);
@@ -360,7 +681,13 @@ void* GetOp(OpId op, DeviceType device) {
   return fn;
 }
 
-void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) {
+namespace {
+
+// The one body behind both spellings of a fallback resolution. `count` is the
+// ONLY difference: the resolution order, the reference-tier install, the drain
+// and every throw are shared, so the two spellings can never answer differently
+// ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)).
+void* ResolveFallback(OpId op, DeviceType device, const char* declining_provider, bool count) {
   VT_CHECK(declining_provider != nullptr, "op provider fallback requires a provider name");
   Slot& slot = At(op, device);
   const OpProvider* floor = nullptr;
@@ -385,7 +712,9 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
   if (next == nullptr && MaybeInstallReferenceTier(op, device)) {
     next = Choose(slot, caps, floor);
   }
-  slot.declines.fetch_add(1, std::memory_order_relaxed);
+  // BEFORE the check below and not after: a decline that finds nothing underneath
+  // it is still a decline, and tests/vt/test_op_provider.cpp asserts that count.
+  if (count) slot.declines.fetch_add(1, std::memory_order_relaxed);
   VT_CHECK(next != nullptr,
            std::string("provider '") + declining_provider + "' declined op " +
                std::to_string(static_cast<int>(op)) + " on device type " +
@@ -401,6 +730,16 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
     if (b != nullptr) b->FlushPending();
   }
   return next->fn;
+}
+
+}  // namespace
+
+void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) {
+  return ResolveFallback(op, device, declining_provider, /*count=*/true);
+}
+
+void* GetOpFallbackUncounted(OpId op, DeviceType device, const char* declining_provider) {
+  return ResolveFallback(op, device, declining_provider, /*count=*/false);
 }
 
 void NoteOpDecline(OpId op, DeviceType device) {
@@ -516,13 +855,34 @@ bool ReferenceTierEligible(DeviceType device) {
   // The CPU is the SOURCE of the reference kernels, never a fallback target
   // (falling back to itself is a no-op at best and self-reference at worst).
   if (device == DeviceType::kCPU) return false;
-  // THE SAFETY GATE. A CPU kernel dereferences host pointers, which is correct
-  // ONLY where host and device memory alias. Gate on the unified-memory property
-  // of the ACTUAL registered backend, not on DeviceType: a discrete GPU (CUDA or
-  // Vulkan) answers false and never receives a CPU fallback. A device with no
-  // backend in this build is trivially ineligible.
+  // THE SAFETY GATE. A CPU kernel dereferences pointers that came out of
+  // `Backend::Alloc`, so the question is whether the HOST MAY DEREFERENCE THEM
+  // — `DeviceMemoryIsHostAddressable()` — and not whether the two address spaces
+  // happen to sit on the same physical RAM. Gate on the property of the ACTUAL
+  // registered backend, not on DeviceType. A device with no backend in this
+  // build is trivially ineligible.
+  //
+  // THIS USED TO ASK `UnifiedMemory()`, AND THAT COST TWO CRASHES (#844, #1435).
+  // The two properties are not the same, and include/vt/backend.h says so beside
+  // the narrow one: CUDA on GB10 reports unified memory because host and device
+  // address the same physical RAM, yet a plain `cudaMalloc` pointer is still not
+  // host-dereferenceable. `CudaBackend::Alloc` calls exactly that, so every CUDA
+  // op without a native kernel installed the CPU host kernel over device
+  // pointers and the process took SIGSEGV — `vt::QuantFp8Static` on sm_110
+  // (#960) and `vt::MatmulFp8BlockScaled` on a CUTLASS-less build (#1435).
+  //
+  // Metal (StorageModeShared) and ROCm (managed or pageable-access integrated
+  // allocations) answer the narrow predicate with the value they already report
+  // for unified memory, so neither changes. VULKAN WIDENS, and safely: it
+  // answers the narrow predicate `true` unconditionally, while its
+  // `UnifiedMemory()` is false when no HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL
+  // memory type exists. On such a device the tier was WITHHELD before and is
+  // installed now. That is sound rather than lucky — `VulkanContext` falls back
+  // to the host flags alone and then VT_CHECKs that a host-visible, host-coherent
+  // type was found, so every allocation it hands out is host memory the GPU also
+  // reads. A backend added later gets the safe default, which is `false`.
   Backend* b = TryGetBackend(device);
-  return b != nullptr && b->UnifiedMemory();
+  return b != nullptr && b->DeviceMemoryIsHostAddressable();
 }
 
 int RegisterReferenceTier(DeviceType target) {

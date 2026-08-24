@@ -14,8 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,9 +27,12 @@
 #include "vllm/model_executor/models/dense_attn_block.h"   // AttnBlock, BuildStepInputs, ResidentWeight
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"       // Qwen3VLMergeMultimodal (modality-agnostic merge)
+#include "vllm/model_executor/models/voxtral_loader_internal.h"  // the two mmap-reading loader steps (#772)
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W3: the shared capture seam
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
+#include "vt/unaligned.h"  // LoadUnaligned — mmap'd payloads have no alignment guarantee
 
 namespace vllm {
 namespace {
@@ -44,16 +49,6 @@ using vt::DType;
 using vt::Queue;
 using vt::Tensor;
 using v1::CommonAttentionMetadata;
-
-// --- bf16 StTensor -> host f32 vector (encoder + adapter weights). --------------
-std::vector<float> StBf16ToF32(const StTensor& t) {
-  VT_CHECK(t.dtype == "BF16", "voxtral: expected BF16 tensor");
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
-  const size_t n = t.nbytes / sizeof(uint16_t);
-  std::vector<float> out(n);
-  for (size_t i = 0; i < n; ++i) out[i] = vt::BF16ToF32(src[i]);
-  return out;
-}
 
 std::vector<float> Bf16BitsToF32(const uint16_t* p, int64_t n) {
   std::vector<float> o(static_cast<size_t>(n));
@@ -274,10 +269,7 @@ ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t voca
   fl.rows = rows;
   fl.vocab = vocab;
   fl.device_tensor = dlogits.t();
-  const size_t alloc = dlogits.alloc_bytes();
-  void* p = dlogits.Release();
-  fl.device_storage =
-      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  fl.device_storage = dlogits.ReleaseShared();
   (void)d;
   return fl;
 }
@@ -304,58 +296,33 @@ void LoadEncoderWeights(const TensorResolver& get, const std::vector<float>& emb
                         const multimodal::WhisperAudioEncoderConfig& cfg,
                         multimodal::WhisperAudioEncoderWeights& w) {
   const std::string E = "mm_whisper_embeddings.whisper_encoder.";
-  w.conv1_w = StBf16ToF32(get(E + "conv_layers.0.weight"));
-  w.conv1_b = StBf16ToF32(get(E + "conv_layers.0.bias"));
-  w.conv2_w = StBf16ToF32(get(E + "conv_layers.1.weight"));
-  w.conv2_b = StBf16ToF32(get(E + "conv_layers.1.bias"));
+  w.conv1_w = VoxtralStBf16ToF32(get(E + "conv_layers.0.weight"));
+  w.conv1_b = VoxtralStBf16ToF32(get(E + "conv_layers.0.bias"));
+  w.conv2_w = VoxtralStBf16ToF32(get(E + "conv_layers.1.weight"));
+  w.conv2_b = VoxtralStBf16ToF32(get(E + "conv_layers.1.bias"));
   w.embed_positions_w = embed_positions;
-  w.final_ln_w = StBf16ToF32(get(E + "transformer.norm.weight"));
-  w.final_ln_b = StBf16ToF32(get(E + "transformer.norm.bias"));
+  w.final_ln_w = VoxtralStBf16ToF32(get(E + "transformer.norm.weight"));
+  w.final_ln_b = VoxtralStBf16ToF32(get(E + "transformer.norm.bias"));
   w.layers.resize(static_cast<size_t>(cfg.num_layers));
   for (int64_t l = 0; l < cfg.num_layers; ++l) {
     const std::string p = E + "transformer.layers." + std::to_string(l) + ".";
     multimodal::WhisperEncoderLayerWeights& lw = w.layers[static_cast<size_t>(l)];
-    lw.attn_ln_w = StBf16ToF32(get(p + "attention_norm.weight"));
-    lw.attn_ln_b = StBf16ToF32(get(p + "attention_norm.bias"));
-    lw.final_ln_w = StBf16ToF32(get(p + "ffn_norm.weight"));
-    lw.final_ln_b = StBf16ToF32(get(p + "ffn_norm.bias"));
-    lw.q_w = StBf16ToF32(get(p + "attention.wq.weight"));
-    lw.q_b = StBf16ToF32(get(p + "attention.wq.bias"));
-    lw.k_w = StBf16ToF32(get(p + "attention.wk.weight"));  // k_proj: NO bias
-    lw.v_w = StBf16ToF32(get(p + "attention.wv.weight"));
-    lw.v_b = StBf16ToF32(get(p + "attention.wv.bias"));
-    lw.out_w = StBf16ToF32(get(p + "attention.wo.weight"));
-    lw.out_b = StBf16ToF32(get(p + "attention.wo.bias"));
-    lw.fc1_w = StBf16ToF32(get(p + "feed_forward.w1.weight"));
-    lw.fc1_b = StBf16ToF32(get(p + "feed_forward.w1.bias"));
-    lw.fc2_w = StBf16ToF32(get(p + "feed_forward.w2.weight"));
-    lw.fc2_b = StBf16ToF32(get(p + "feed_forward.w2.bias"));
+    lw.attn_ln_w = VoxtralStBf16ToF32(get(p + "attention_norm.weight"));
+    lw.attn_ln_b = VoxtralStBf16ToF32(get(p + "attention_norm.bias"));
+    lw.final_ln_w = VoxtralStBf16ToF32(get(p + "ffn_norm.weight"));
+    lw.final_ln_b = VoxtralStBf16ToF32(get(p + "ffn_norm.bias"));
+    lw.q_w = VoxtralStBf16ToF32(get(p + "attention.wq.weight"));
+    lw.q_b = VoxtralStBf16ToF32(get(p + "attention.wq.bias"));
+    lw.k_w = VoxtralStBf16ToF32(get(p + "attention.wk.weight"));  // k_proj: NO bias
+    lw.v_w = VoxtralStBf16ToF32(get(p + "attention.wv.weight"));
+    lw.v_b = VoxtralStBf16ToF32(get(p + "attention.wv.bias"));
+    lw.out_w = VoxtralStBf16ToF32(get(p + "attention.wo.weight"));
+    lw.out_b = VoxtralStBf16ToF32(get(p + "attention.wo.bias"));
+    lw.fc1_w = VoxtralStBf16ToF32(get(p + "feed_forward.w1.weight"));
+    lw.fc1_b = VoxtralStBf16ToF32(get(p + "feed_forward.w1.bias"));
+    lw.fc2_w = VoxtralStBf16ToF32(get(p + "feed_forward.w2.weight"));
+    lw.fc2_b = VoxtralStBf16ToF32(get(p + "feed_forward.w2.bias"));
   }
-}
-
-// Permute the rows of a bf16 [n_heads*head_dim, K] q/k weight from the Meta-
-// interleaved rope layout (mistral consolidated) to the HF NeoX layout vLLM's
-// rotary_emb (is_neox_style=True) expects — the EXACT transform vLLM applies on
-// the mistral load path (verified bit-exact: permute(wq)==vLLM q_proj). Row map
-// per head: out(j*hd2 + i) <- in(2i + j), hd2 = head_dim/2. Pure byte reorder of
-// bf16 values (no arithmetic) => bit-exact. wv/wo are NOT permuted.
-std::vector<uint16_t> PermuteQKBf16(const StTensor& t, int64_t n_heads) {
-  VT_CHECK(t.dtype == "BF16" && t.shape.size() == 2, "voxtral: q/k permute needs 2-D BF16");
-  const int64_t d1 = t.shape[0], K = t.shape[1];
-  const int64_t hd = d1 / n_heads, hd2 = hd / 2;
-  VT_CHECK(hd * n_heads == d1 && hd2 * 2 == hd, "voxtral: q/k permute head split mismatch");
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
-  std::vector<uint16_t> out(static_cast<size_t>(d1) * K);
-  for (int64_t h = 0; h < n_heads; ++h)
-    for (int64_t i = 0; i < hd2; ++i)
-      for (int64_t j = 0; j < 2; ++j) {
-        const int64_t out_row = h * hd + j * hd2 + i;
-        const int64_t in_row = h * hd + 2 * i + j;
-        std::memcpy(&out[static_cast<size_t>(out_row) * K],
-                    &src[static_cast<size_t>(in_row) * K],
-                    static_cast<size_t>(K) * sizeof(uint16_t));
-      }
-  return out;
 }
 
 // Build the merged qkv OwnedTensor [Hq*Dh + 2*Hkv*Dh, K] (rows q|k|v) with q/k
@@ -367,8 +334,8 @@ OwnedTensor BuildPermutedQKV(const TensorResolver& get, const std::string& b,
   const StTensor& wv = get(b + "attention.wv.weight");
   const int64_t K = wq.shape[1];
   const int64_t qd = wq.shape[0], kd = wk.shape[0], vd = wv.shape[0];
-  std::vector<uint16_t> pq = PermuteQKBf16(wq, config.num_attention_heads);
-  std::vector<uint16_t> pk = PermuteQKBf16(wk, config.num_key_value_heads);
+  std::vector<uint16_t> pq = VoxtralPermuteQKBf16(wq, config.num_attention_heads);
+  std::vector<uint16_t> pk = VoxtralPermuteQKBf16(wk, config.num_key_value_heads);
   OwnedTensor m = dense_loaders::MakeOwned(DType::kBF16, {qd + kd + vd, K});
   auto* dst = reinterpret_cast<uint16_t*>(m.bytes.data());
   std::memcpy(dst, pq.data(), static_cast<size_t>(qd) * K * sizeof(uint16_t));
@@ -402,6 +369,56 @@ void LoadTextWeights(const TensorResolver& get, const HfConfig& config,
 
 }  // namespace
 
+// --- bf16 StTensor -> host f32 vector (encoder + adapter weights). --------------
+// `t.data` points into the safetensors mmap, whose payload offset carries NO
+// alignment guarantee (issue #772), so the bytes are read through
+// vt::LoadUnaligned rather than a `const uint16_t*` — the same treatment
+// dense_loaders::TransposeBf16 and minimax_h3_vae_loader.cpp already use, and
+// free: at -O2 it emits the identical `movzwl` and no call.
+std::vector<float> VoxtralStBf16ToF32(const StTensor& t) {
+  VT_CHECK(t.dtype == "BF16", "voxtral: expected BF16 tensor");
+  const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
+  const size_t n = t.nbytes / sizeof(uint16_t);
+  std::vector<float> out(n);
+  for (size_t i = 0; i < n; ++i)
+    out[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
+  return out;
+}
+
+// Permute the rows of a bf16 [n_heads*head_dim, K] q/k weight from the Meta-
+// interleaved rope layout (mistral consolidated) to the HF NeoX layout vLLM's
+// rotary_emb (is_neox_style=True) expects — the EXACT transform vLLM applies on
+// the mistral load path (verified bit-exact: permute(wq)==vLLM q_proj). Row map
+// per head: out(j*hd2 + i) <- in(2i + j), hd2 = head_dim/2. Pure byte reorder of
+// bf16 values (no arithmetic) => bit-exact. wv/wo are NOT permuted.
+//
+// The source row address is computed in `unsigned char` (issue #772): the
+// safetensors payload has no alignment guarantee, and forming
+// `reinterpret_cast<const uint16_t*>(t.data)` — let alone indexing it — is
+// undefined even though every access here is a memcpy that never dereferences
+// it as a uint16_t. That memcpy laundering is exactly why UBSan never reported
+// this site while it reported its two siblings. NOT vt::LoadUnaligned: this is a
+// bulk row copy, not a scalar load, so the `* sizeof(uint16_t)` that used to be
+// implicit in the pointer type is now explicit in the byte offset.
+std::vector<uint16_t> VoxtralPermuteQKBf16(const StTensor& t, int64_t n_heads) {
+  VT_CHECK(t.dtype == "BF16" && t.shape.size() == 2, "voxtral: q/k permute needs 2-D BF16");
+  const int64_t d1 = t.shape[0], K = t.shape[1];
+  const int64_t hd = d1 / n_heads, hd2 = hd / 2;
+  VT_CHECK(hd * n_heads == d1 && hd2 * 2 == hd, "voxtral: q/k permute head split mismatch");
+  const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
+  std::vector<uint16_t> out(static_cast<size_t>(d1) * K);
+  for (int64_t h = 0; h < n_heads; ++h)
+    for (int64_t i = 0; i < hd2; ++i)
+      for (int64_t j = 0; j < 2; ++j) {
+        const int64_t out_row = h * hd + j * hd2 + i;
+        const int64_t in_row = h * hd + 2 * i + j;
+        std::memcpy(&out[static_cast<size_t>(out_row) * K],
+                    src + static_cast<size_t>(in_row) * K * sizeof(uint16_t),
+                    static_cast<size_t>(K) * sizeof(uint16_t));
+      }
+  return out;
+}
+
 // ─── VoxtralDecodeGraph (BF16 Mistral/Llama full-attention decode CUDA-graph) ──
 // The Voxtral-text sibling of Qwen3MoeDecodeGraph (qwen3_moe.cpp) and
 // Qwen3_5DenseDecodeGraph (qwen3_5.cpp): the SAME cold -> warm -> capture -> replay
@@ -431,10 +448,13 @@ void LoadTextWeights(const TensorResolver& get, const HfConfig& config,
 struct VoxtralDecodeGraph::Impl {
   Impl(const Qwen3DenseWeights& w, const HfConfig& c, vt::Queue q, int64_t max_reqs)
       : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
-    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
-    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the kill switch is the SEAM's, not this
+    // driver's. `vt::GraphCaptureEnabled()` reads `VLLM_CPP_CUDAGRAPH` once per
+    // process into a function-local static; six drivers each read that variable
+    // for themselves before this row, and there was no one switch that turned
+    // capture off. This driver no longer owns a copy of it.
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on &&
+    enabled = vt::GraphCaptureEnabled() &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
@@ -444,9 +464,10 @@ struct VoxtralDecodeGraph::Impl {
                    "[VoxtralDecodeGraph] Voxtral text (Mistral/Llama) decode graph: "
                    "%lld total replays across %zu captured size(s)\n",
                    static_cast<long long>(replays), slots.size());
-    Backend& b = vt::GetBackend(queue.device.type);
-    for (auto& kv : slots)
-      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+    // No DestroyGraph loop: every segment handle belongs to the slot's
+    // `vt::BreakableGraph`, whose destructor releases it through
+    // `Backend::DestroyGraph`. That routing is what lets ENG-CUDAGRAPH-DEDUP
+    // (#1162) interpose at the backend later without editing this driver.
   }
 
   // One captured padded batch size. Owns its OWN persistent host inputs (the
@@ -458,9 +479,13 @@ struct VoxtralDecodeGraph::Impl {
     CommonAttentionMetadata attn_meta;
     std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
-    void* graph = nullptr;         // instantiated cudaGraphExec (opaque)
-    int fa_cols = -1;              // captured block-table column count
-    bool captured = false;
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the instantiated graph, its handle
+    // ownership, its release and its `captured()` state now live in the shared
+    // seam instead of in a raw `void*` plus a `bool` this driver maintained by
+    // hand. `vt::BreakableGraph` is non-copyable and is constructed in place by
+    // `slots[S]`, so the map still owns one per padded size.
+    vt::BreakableGraph graph;
+    int fa_cols = -1;  // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
 
@@ -543,18 +568,24 @@ ForwardLogits VoxtralDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam);
   s.fa_cols = cols;
-  if (cols_changed && s.graph != nullptr) {
-    b.DestroyGraph(s.graph);
-    s.graph = nullptr;
-    s.captured = false;
+  if (cols_changed && s.graph.captured()) {
+    // Reset() releases every segment through Backend::DestroyGraph and returns
+    // the container to its as-constructed state, which is also what lets the
+    // next capture open a scope on it (the scope refuses a container that
+    // already holds one).
+    s.graph.Reset();
     s.warm = false;
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, then relaunch the captured layer region.
-  if (s.captured) {
+  if (s.graph.captured()) {
     VoxtralEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-    b.ReplayGraph(impl_->queue, s.graph);
+    // Through the seam's container, never `Backend::ReplayGraph` directly: the
+    // container replays its segments in order (one, here, because a decode
+    // capture is kFull) and owns the G3 replay counter the reachability gate
+    // reads.
+    s.graph.Replay(impl_->queue);
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -565,19 +596,72 @@ ForwardLogits VoxtralDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   // instantiate the graph, then launch it.
   if (s.warm) {
     VoxtralEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-    b.BeginCapture(impl_->queue);
-    DBuf lg = ForwardLastLogits(d, s.hidden->t(), s.positions, S, s.attn_meta,
-                                attn_kv, impl_->weights, impl_->config);
-    s.graph = b.EndCaptureGraph(impl_->queue);
-    s.logits = std::make_unique<DBuf>(std::move(lg));
-    s.captured = true;
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the capture is the SHARED SEAM's, not this
+    // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
+    // the segment, the handle, its release, the drain a mid-capture throw needs
+    // and the G3 counters.
+    //
+    // kFULL, and the mode is the whole argument. vLLM's v1 default
+    // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63`) is documented at
+    // `:630-632` as a FULL graph for DECODE batches and a piecewise one for
+    // prefill and mixed batches, and `decode_mode()` (`:65-66`) returns the full
+    // half. This is a decode driver, so its capture is ONE segment with the
+    // attention calls INSIDE it — byte-identical in shape to the region this
+    // replaces. Opening it kPiecewise would turn every layer's attention into an
+    // eager call between two graph replays, which is not vLLM's decode behaviour
+    // and which nothing in this row's record supports.
+    std::optional<DBuf> lg;
+    {
+      vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      lg = ForwardLastLogits(d, s.hidden->t(), s.positions, S, s.attn_meta,
+                             attn_kv, impl_->weights, impl_->config);
+    }  // ~GraphCaptureScope closes the segment and files it on s.graph
+    // NOT CAPTURED covers TWO states, and returning `*lg` is correct for exactly
+    // one of them. `~GraphCaptureScope` must swallow a throwing `EndCaptureGraph`
+    // — a destructor that propagates terminates — so a FAILED capture leaves the
+    // container reporting what an INERT scope reports.
+    //
+    //   * INERT (`capture_failed() == false`): the backend cannot capture, or
+    //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, the region
+    //     above ran EAGERLY, and `*lg` is a real result.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph` threw
+    //     (`src/vt/cuda/cuda_backend.cu:229`, `Check()` at `:50`). Under stream
+    //     capture NOTHING between `BeginCapture` and the throw executed: every
+    //     kernel was RECORDED, so `*lg` is pool-recycled memory, and returning it
+    //     would hand this step uncomputed device memory as its logits — silently
+    //     wrong tokens, no fault, and a token gate cannot see it.
+    //
+    // So the failure PROPAGATES, carrying the runtime's own exception, which is
+    // exactly what the pre-W3 driver did (its `s.graph = b.EndCaptureGraph(...)`
+    // was unguarded). Gated at
+    // `tests/vllm/models/test_voxtral_decode_graph_seam.cpp`.
+    if (!s.graph.captured()) {
+      s.warm = false;  // either way this slot goes back to cold
+      if (s.graph.capture_failed()) {
+        const std::exception_ptr err = s.graph.capture_error();
+        s.graph.Reset();  // clear the failure with the graph it described
+        // The runtime's OWN diagnosis where the seam holds it. It is empty only
+        // on the arm where an exception was already propagating THROUGH the
+        // scope, which cannot reach this line; the refusal below is what makes
+        // that unreachability an assertion rather than a claim.
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "VoxtralDecodeGraph: the decode capture was ABANDONED and its logits "
+                 "were never computed; refusing to return uncaptured device memory");
+      }
+      ForwardLogits drained = WrapDeviceLogits(d, std::move(*lg), B, vocab);
+      drained.device_tensor =
+          MakeTensor(drained.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+      return drained;
+    }
+    s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
       std::fprintf(stderr,
                    "[VoxtralDecodeGraph] captured Voxtral text decode graph for "
                    "padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
-    b.ReplayGraph(impl_->queue, s.graph);
+    s.graph.Replay(impl_->queue);
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -592,7 +676,6 @@ ForwardLogits VoxtralDecodeGraph::Step(const std::vector<int32_t>& token_ids,
   DBuf lg = ForwardLastLogits(d, s.hidden->t(), s.positions, S, s.attn_meta, attn_kv,
                               impl_->weights, impl_->config);
   s.warm = true;
-  s.captured = false;
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), B, vocab);
   fl.device_tensor = MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device,
@@ -624,8 +707,8 @@ VoxtralWeights LoadVoxtralWeights(const SafetensorsFile& st,
   w.downsample_factor = 4;
   w.text_hidden = text_config.hidden_size;
   LoadEncoderWeights(get, embed_positions, w.encoder_cfg, w.encoder);
-  w.adapter_w_in = StBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.0.weight"));
-  w.adapter_w_out = StBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.2.weight"));
+  w.adapter_w_in = VoxtralStBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.0.weight"));
+  w.adapter_w_out = VoxtralStBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.2.weight"));
   LoadTextWeights(get, text_config, w.text);
   return w;
 }

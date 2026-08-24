@@ -1,7 +1,9 @@
 // Ported from: vllm/v1/attention/backends/registry.py (AttentionBackendEnum +
 // @register_backend self-registration) and the platform-driven selection in
-// vllm/platforms/cuda.py:361-470 (get_valid_backends / get_attn_backend_cls) @
-// pin e24d1b24 — the attention-backend REGISTRY + platform-priority SELECTION
+// vllm/platforms/cuda.py:359-394 (get_valid_backends) and :397-492
+// (get_attn_backend_cls) @ pin 5559679229 — re-anchored from `:361-470 @
+// e24d1b24`, the pin retired at W5 — the attention-backend REGISTRY +
+// platform-priority SELECTION
 // seam (extensibility item 4). This is the ENGINE-level "which AttentionBackend"
 // seam; the concrete attention KERNEL stays selected at the vt:: op-table level
 // (vt::PagedAttention -> GetOp(kPagedAttention, device.type)), which is already
@@ -61,9 +63,14 @@ std::unique_ptr<AttentionBackend> MakeAttentionBackend(vt::DeviceType device,
 // or this throws. Otherwise walk the platform's capability-ordered priority list
 // and return the first name registered for the platform's device (upstream's
 // min-priority valid backend). Throws if the priority list yields no registered
-// backend. Behavior-preserving today: on CUDA (every capability we ship on) and
-// CPU this returns "FLASH_ATTN" — the backend whose NHD KV layout the runtime
-// already uses.
+// backend. On CUDA (every capability we ship on) this returns "FLASH_ATTN". On
+// CPU it returns "CPU_ATTN" — upstream's own CPU answer (cpu.py:75-87), which
+// this tree finally registers as of issue #1371. Until then CPU_ATTN was a name
+// in CpuPlatform's priority list with no registrar behind it and the walk fell
+// through to FLASH_ATTN, which was behavior-preserving right up to the moment
+// FLASH_ATTN acquired flash_attn.py's `head_size % 8 == 0` rule and the CPU had
+// nothing left to answer with. Both names allocate the SAME NHD KV layout, so
+// the geometry the runtime uses did not change with the name.
 // `cfg` (W2) carries upstream's `use_mla` plus the `use_sparse` flag. It selects
 // which priority list the platform hands back (the MLA vs non-MLA branch of
 // _get_backend_priorities) AND is applied as a per-candidate FILTER mirroring
@@ -84,6 +91,21 @@ std::string SelectAttentionBackendName(
 std::unique_ptr<AttentionBackend> SelectAttentionBackend(
     const platforms::Platform& platform, const std::string& selected = "",
     const platforms::AttnSelectorConfig& cfg = platforms::AttnSelectorConfig{});
+
+// The runner's per-KV-group layout contract (M3, issue #41): the backend that
+// selection resolved must declare EXACTLY the view geometry the engine
+// allocates for one attention group — the NHD 5-dim
+// (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group, or
+// the fused MLA 3-dim (num_blocks, block_size, head_size) for an MLA group
+// (mla_attention.py:1216-1224; deepseek_v2.cpp views the cache exactly so) —
+// or the engine would silently view a cache the backend does not claim to own.
+// Throws std::invalid_argument on mismatch (and on the backend's own
+// precondition violations, e.g. block_size % 16), so a future backend with a
+// different layout fails LOUDLY at runner init instead of mis-viewing.
+// `is_mla` selects which view is expected.
+void CheckKvCacheShape(vt::DeviceType device, const std::string& name,
+                       int64_t num_blocks, int64_t block_size,
+                       int64_t num_kv_heads, int64_t head_size, bool is_mla);
 
 // Static-init self-registration helper (copies the vt-op / platform Registrar
 // idiom). Declare one file-scope instance per (device, backend) in the backend's

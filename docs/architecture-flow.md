@@ -1,6 +1,6 @@
 # vllm.cpp 软件架构流程分析
 
-> 生成时间：基于合并 `main` 后的最新代码快照（2026-08-24，ABI v23）。
+> 生成时间：基于合并 `main` 后的最新代码快照（2026-08-25，ABI v23）。
 > 分析范围：C++ 推理引擎核心、vt 张量运行时、调度与执行管线、服务入口、C ABI 与多模态扩展。
 
 ---
@@ -325,6 +325,7 @@ FromModelDir(path)
 | FP8 W8A8 | 部分路径支持 |
 | GGUF | F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K，CPU 直接计算压缩块 |
 | Marlin | W4A16 等交错布局 |
+| EXL3 | trellis 量化（SparkInfer DeepSeek-V4-Flash 等）：`vt::Exl3Gemm` 融合链（输入 Hadamard + sign/scale + trellis GEMM），CPU/CUDA 双路径（`cpu_exl3_kernels.cpp` / `cuda_exl3.cu`） |
 
 ### 8.4 GGUF 支持详情
 
@@ -348,7 +349,7 @@ GGUF 是 vllm.cpp 的一等公民输入格式，与 safetensors 并列：
 `vllm/v1/spec_decode/`、`vllm/v1/worker/gpu/spec_decode/`：
 
 - **MTP**：Qwen3.5/3.6 自带 `mtp.*` 头，verify/propose 循环。
-- **DFlash**：block-diffusion 草稿模型。
+- **DFlash**：block-diffusion 草稿模型；W11 起草稿块 K/V 常驻，verify attention 走 FA-2 split-KV lane。
 - **ngram**：draft-free ngram 提议器。
 - 拒绝采样（`rejection_sampler.cpp`）保证与 vLLM 同样 token 一致。
 
@@ -471,6 +472,7 @@ Qwen3.6-35B-A3B 是当前代码的一等公民目标模型之一，MoE + GDN-hyb
 - **DFlash / DSpark spec**：MoE 前向支持 `aux_tap` 多 tap 输出，用于 block-diffusion / dspark verify。
 - **前缀缓存**：dense full-attention 层默认开启；GDN 组默认关闭。
 - **异步设备镜像**：35B 的 dense 变体已默认走 `AsyncLLM` 消除同步 server 的 GPU 空闲。
+- **Packed GDN decode**：MoE safetensors 路径已合并 `in_proj_ba` owner 使 packed leg 可达（#1169/#1880；NVFP4 下每 token 快 ~3.5%）；GGUF 路径 loader 仍 split、packed leg 未达（#1793 owed）。
 
 ### 13.4 性能基准
 
